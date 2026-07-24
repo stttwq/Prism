@@ -40,7 +40,14 @@ $null
 .idea/
 .vscode/
 
-# Trellis local runtime & personal workspace journals
-.trellis/workspace/
+# Trellis local runtime / developer id (journals under workspace are tracked)
 .trellis/.runtime/
+.trellis/.cache/
+.trellis/.backup-*/
+.trellis/worktrees/
 .trellis/.developer
+# Keep session journals & index; ignore other workspace clutter if any
+.trellis/workspace/**
+!.trellis/workspace/*/
+!.trellis/workspace/*/journal*.md
+!.trellis/workspace/*/index.md
