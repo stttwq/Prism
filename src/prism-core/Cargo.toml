@@ -1,0 +1,38 @@
+[package]
+name = "prism-core"
+version = "0.1.0"
+edition = "2021"
+description = "Prism 后端：文件索引 / 搜索 / 程序清单 / 网页关键词，命名管道 JSON 服务"
+
+[[bin]]
+name = "prism-core"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "macros", "time", "sync"] }
+# 目录遍历（降级路径全盘扫描）
+walkdir = "2"
+# 索引磁盘缓存：紧凑二进制序列化，no_std 友好、体积小
+postcard = { version = "1", features = ["alloc"] }
+
+# MFT/USN 加速仅在 Windows 用到；非 Windows（如 CI Linux）自动省略，走目录遍历。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "z"     # 体积优先，配合 100MB 内存护栏
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
