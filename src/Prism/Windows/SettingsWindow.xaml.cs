@@ -1,3 +1,14 @@
-// 占位文件：SettingsWindow 后台逻辑
-// 规格见 .trellis/tasks/07-23-prism-planning/frontend-spec.md
-// 待用户确认骨架后再写实现代码
+using System.Windows;
+using Prism.ViewModels;
+
+namespace Prism.Windows;
+
+/// <summary>设置窗口（步骤 7 最小实现）。</summary>
+public partial class SettingsWindow : Window
+{
+    public SettingsWindow(SettingsViewModel viewModel)
+    {
+        InitializeComponent();
+        DataContext = viewModel;
+    }
+}

@@ -4,11 +4,13 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- WinForms 与 WPF 共存时由项目属性管理 DPI，避免与 app.manifest 冲突 (WFAC010)。 -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <RootNamespace>Prism</RootNamespace>
-    <AssemblyName>Prism</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- 关闭默认 Page 收集；仅显式登记已实现的 XAML。 -->
     <EnableDefaultPageItems>false</EnableDefaultPageItems>
@@ -17,6 +19,10 @@
   <ItemGroup>
     <!-- App.xaml 由 SDK 默认作为 ApplicationDefinition 处理。 -->
     <Page Include="Windows\SearchWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Page Include="Windows\SettingsWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
@@ -36,6 +42,10 @@
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\prism.ico" />
   </ItemGroup>
 
 </Project>
