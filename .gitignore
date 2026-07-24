@@ -1,0 +1,46 @@
+# Build outputs
+**/target/
+**/bin/
+**/obj/
+**/.vs/
+*.user
+*.suo
+
+# Runtime caches / data produced by prism-core
+**/data/index.bin
+**/debug/data/
+**/release/data/
+
+# .NET / NuGet
+*.nupkg
+project.lock.json
+packages/
+
+# Python
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
+
+# Shell misdirects (e.g. PowerShell $null → file)
+/$null
+$null
+
+# Local tooling / agent state (not product source)
+.claude/
+.agents/
+.codex/
+.cursor/
+.idea/
+.vscode/
+
+# Trellis local runtime & personal workspace journals
+.trellis/workspace/
+.trellis/.runtime/
+.trellis/.developer
