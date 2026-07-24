@@ -4,6 +4,7 @@ mod apps;
 mod config;
 mod index;
 mod ipc;
+mod websearch;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PIPE_NAME: &str = r"\\.\pipe\prism-core";
@@ -17,9 +18,20 @@ async fn main() {
     let data_dir = config::resolve_data_dir();
     let cfg = config::Config::load(&data_dir);
     log(format!("数据目录：{}", data_dir.display()));
+    log(format!(
+        "网页引擎 {} 个：{}",
+        cfg.web_engines.len(),
+        cfg.web_engines
+            .iter()
+            .map(|e| e.keyword.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
 
     let shared: index::SharedIndex = std::sync::Arc::new(std::sync::RwLock::new(None));
     let apps: apps::SharedApps = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+    // 引擎在启动时加载；设置页改引擎后需重启后端才会生效（步骤 8 可做热重载）。
+    let engines = std::sync::Arc::new(cfg.web_engines);
 
     // 异步构建/加载索引，不阻塞管道服务启动。
     {
@@ -40,7 +52,7 @@ async fn main() {
     }
 
     log(format!("命名管道服务监听：{PIPE_NAME}"));
-    if let Err(e) = ipc::serve(PIPE_NAME, shared, apps).await {
+    if let Err(e) = ipc::serve(PIPE_NAME, shared, apps, engines).await {
         log(format!("管道服务异常退出：{e}"));
         std::process::exit(1);
     }

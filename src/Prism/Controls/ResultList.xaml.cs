@@ -180,7 +180,8 @@ public partial class ResultList : UserControl
 
             if (icon is null || _icons is null) continue;
 
-            if (item.Kind == "more" || string.IsNullOrEmpty(item.ExecuteId))
+            // more 行无路径；web 的 execute_id 是 URL，系统图标 API 不适用。
+            if (item.Kind is "more" or "web" || string.IsNullOrEmpty(item.ExecuteId))
             {
                 icon.Tag = null;
                 icon.Source = null;

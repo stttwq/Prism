@@ -34,7 +34,7 @@ public sealed record Settings
     /// <summary>网页快捷搜索引擎列表。</summary>
     public List<WebEngine> WebEngines { get; init; } = [];
 
-    /// <summary>全新用户的默认设置：双击 Ctrl + 预设 g/b/bi 三个引擎。</summary>
+    /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
         HotkeyMode = HotkeyMode.DoubleCtrl,
@@ -43,11 +43,11 @@ public sealed record Settings
         WebEngines = DefaultEngines(),
     };
 
-    /// <summary>预设引擎：g=Google、b=百度、bi=Bing。</summary>
+    /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>
     public static List<WebEngine> DefaultEngines() =>
     [
-        new("g", "Google", "https://www.google.com/search?q={q}"),
-        new("b", "百度", "https://www.baidu.com/s?wd={q}"),
         new("bi", "Bing", "https://www.bing.com/search?q={q}"),
+        new("b", "百度", "https://www.baidu.com/s?wd={q}"),
+        new("g", "Google", "https://www.google.com/search?q={q}"),
     ];
 }

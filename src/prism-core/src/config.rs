@@ -6,12 +6,14 @@
 //! - settings.json 损坏时恢复默认，不 panic（design.md 回滚策略）。
 //! - 中文路径全程 Unicode（PathBuf/OsString），JSON 用 UTF-8。
 //!
-//! 后端本步只读取自己关心的字段（索引刷新间隔等），未知字段忽略，
-//! 以免与前端写入的字段（快捷键 / 网页引擎）冲突。
+//! 后端读取自己关心的字段（索引刷新间隔、网页引擎）；其余前端字段通过
+//! `#[serde(default)]` 忽略，避免冲突。
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::websearch::WebEngine;
 
 /// 设置文件名，与前端 `SettingsStore.SettingsFileName` 一致。
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -23,24 +25,37 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 pub struct Config {
     /// 无 USN 权限时的定时全量刷新间隔（秒），默认 300（5 分钟）。
     pub index_refresh_secs: u64,
+
+    /// 网页快捷搜索引擎列表。
+    /// 前端 JSON 属性名为 PascalCase `WebEngines`（见 SettingsStore 默认序列化）。
+    /// 也接受 camelCase `webEngines` 以便手工编辑。
+    #[serde(alias = "WebEngines", alias = "webEngines")]
+    pub web_engines: Vec<WebEngine>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             index_refresh_secs: 300,
+            // 缺省即带上 bi/b/g（必应优先），与前端 Settings.Default 一致。
+            web_engines: WebEngine::defaults(),
         }
     }
 }
 
 impl Config {
     /// 从数据目录加载配置；文件缺失或损坏时返回默认值（绝不 panic）。
+    /// `web_engines` 缺失或为空数组时回落预设 bi/b/g。
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(SETTINGS_FILE_NAME);
-        match std::fs::read_to_string(&path) {
+        let mut cfg = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        if cfg.web_engines.is_empty() {
+            cfg.web_engines = WebEngine::defaults();
         }
+        cfg
     }
 }
 
@@ -100,11 +115,24 @@ mod tests {
     }
 
     #[test]
+    fn default_includes_preset_engines() {
+        let cfg = Config::default();
+        assert_eq!(cfg.web_engines.len(), 3);
+        // 与 WebEngine::defaults 一致：必应优先。
+        assert_eq!(cfg.web_engines[0].keyword, "bi");
+        assert_eq!(cfg.web_engines[1].keyword, "b");
+        assert_eq!(cfg.web_engines[2].keyword, "g");
+    }
+
+    #[test]
     fn load_missing_file_returns_default() {
         let dir = std::env::temp_dir().join("prism_cfg_missing_test");
         let _ = std::fs::create_dir_all(&dir);
+        // 确保没有残留 settings.json
+        let _ = std::fs::remove_file(dir.join(SETTINGS_FILE_NAME));
         let cfg = Config::load(&dir);
         assert_eq!(cfg.index_refresh_secs, 300);
+        assert_eq!(cfg.web_engines.len(), 3);
     }
 
     #[test]
@@ -116,6 +144,31 @@ mod tests {
         std::fs::write(dir.join(SETTINGS_FILE_NAME), json).unwrap();
         let cfg = Config::load(&dir);
         assert_eq!(cfg.index_refresh_secs, 300);
+        // 空数组回落预设。
+        assert_eq!(cfg.web_engines.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_pascal_case_web_engines_from_frontend() {
+        // SettingsStore 默认 PascalCase：WebEngines / Keyword / Name / UrlTemplate
+        let dir = std::env::temp_dir().join("prism_cfg_pascal_engines");
+        let _ = std::fs::create_dir_all(&dir);
+        let json = r#"{
+            "HotkeyMode": "DoubleCtrl",
+            "ComboHotkey": "Alt+Space",
+            "AutoStart": false,
+            "WebEngines": [
+                { "Keyword": "gh", "Name": "GitHub", "UrlTemplate": "https://github.com/search?q={q}" },
+                { "Keyword": "g", "Name": "Google", "UrlTemplate": "https://www.google.com/search?q={q}" }
+            ]
+        }"#;
+        std::fs::write(dir.join(SETTINGS_FILE_NAME), json).unwrap();
+        let cfg = Config::load(&dir);
+        assert_eq!(cfg.web_engines.len(), 2);
+        assert_eq!(cfg.web_engines[0].keyword, "gh");
+        assert_eq!(cfg.web_engines[0].name, "GitHub");
+        assert!(cfg.web_engines[0].url_template.contains("{q}"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -126,6 +179,7 @@ mod tests {
         std::fs::write(dir.join(SETTINGS_FILE_NAME), b"{ not valid json ][").unwrap();
         let cfg = Config::load(&dir);
         assert_eq!(cfg.index_refresh_secs, 300);
+        assert_eq!(cfg.web_engines.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

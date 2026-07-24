@@ -6,7 +6,10 @@
 //!
 //! 第四步：search 接真实索引；execute 打开文件；reveal 在资源管理器中定位。
 //! 第五步：search 合并开始菜单程序，kind=app 置顶；execute 启动 .lnk。
+//! 第六步：网页关键词 bi/b/g（+ 自定义，必应优先）→ kind=web；execute 用默认浏览器打开 URL。
 //! actions / run_action 仍占位（动作面板在后续步骤）。
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,7 +17,11 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
 use crate::index::SharedIndex;
+use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
+
+/// 共享引擎列表（启动时从 settings.json 加载，只读）。
+pub type SharedEngines = Arc<Vec<WebEngine>>;
 
 /// 前端发来的请求消息。`type` 字段区分类型（snake_case）。
 #[derive(Debug, Deserialize)]
@@ -97,7 +104,12 @@ pub struct ActionItem {
 }
 /// 管道服务主循环：创建管道实例 → 等待前端连接 → 交给连接处理器 →
 /// 立刻建下一个实例等待重连。前端崩溃/重启不影响后端。
-pub async fn serve(pipe_name: &str, index: SharedIndex, apps: SharedApps) -> std::io::Result<()> {
+pub async fn serve(
+    pipe_name: &str,
+    index: SharedIndex,
+    apps: SharedApps,
+    engines: SharedEngines,
+) -> std::io::Result<()> {
     // first_pipe_instance 默认 true，确保本进程是该管道名的首个持有者。
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
@@ -112,8 +124,9 @@ pub async fn serve(pipe_name: &str, index: SharedIndex, apps: SharedApps) -> std
 
         let index = index.clone();
         let apps = apps.clone();
+        let engines = engines.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connected, index, apps).await {
+            if let Err(e) = handle_connection(connected, index, apps, engines).await {
                 log(format!("连接处理结束：{e}"));
             }
         });
@@ -125,6 +138,7 @@ async fn handle_connection(
     pipe: NamedPipeServer,
     index: SharedIndex,
     apps: SharedApps,
+    engines: SharedEngines,
 ) -> std::io::Result<()> {
     log("前端已连接");
     let (reader, mut writer) = tokio::io::split(pipe);
@@ -137,7 +151,7 @@ async fn handle_connection(
         }
 
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(req) => dispatch(req, &index, &apps),
+            Ok(req) => dispatch(req, &index, &apps, &engines),
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
             },
@@ -154,17 +168,49 @@ async fn handle_connection(
     log("前端断开连接");
     Ok(())
 }
-/// 请求分发。search 为纯读；execute/reveal 会调系统打开文件（有副作用）。
-pub fn dispatch(req: Request, index: &SharedIndex, apps: &SharedApps) -> Response {
+/// 请求分发。search 为纯读；execute/reveal 会调系统打开文件/URL（有副作用）。
+pub fn dispatch(
+    req: Request,
+    index: &SharedIndex,
+    apps: &SharedApps,
+    engines: &SharedEngines,
+) -> Response {
     match req {
         Request::Ping => Response::Pong {
             version: VERSION.to_string(),
         },
-        Request::Search { query, max } => search(&query, max, index, apps),
-        Request::Execute { id } => execute_path(&id),
+        Request::Search { query, max } => search(&query, max, index, apps, engines),
+        Request::Execute { id } => execute_id(&id),
         Request::Reveal { id } => reveal_path(&id),
         Request::Actions { .. } => Response::Actions { items: Vec::new() },
         Request::RunAction { .. } => Response::Status { is_indexing: false },
+    }
+}
+
+/// 执行选中项：http(s) URL 用默认浏览器打开；否则按文件/程序路径处理。
+/// URL 不走文件路径校验（绝对路径检查会误拒 `https://...`）。
+fn execute_id(id: &str) -> Response {
+    if websearch::is_http_url(id) {
+        return open_url(id.trim());
+    }
+    execute_path(id)
+}
+
+fn open_url(url: &str) -> Response {
+    // 基础防护：空、NUL、非 http(s) 已在 is_http_url 过滤；此处再挡控制字符。
+    if url.is_empty() || url.contains('\0') || url.chars().any(|c| c.is_control()) {
+        return Response::Error {
+            message: "网址无效".into(),
+        };
+    }
+    match open_with_shell(url) {
+        Ok(()) => {
+            log(format!("打开网址：{url}"));
+            Response::Status { is_indexing: false }
+        }
+        Err(e) => Response::Error {
+            message: format!("无法打开网址：{e}"),
+        },
     }
 }
 
@@ -202,6 +248,7 @@ fn reveal_path(path: &str) -> Response {
 
 /// 拒绝空路径、NUL、相对路径与可疑前缀，降低"任意 ShellExecute"风险。
 /// 正常搜索结果的 execute_id 都是绝对路径；恶意/损坏客户端会被挡下。
+/// 注意：http(s) URL 不经过此函数（见 `execute_id`）。
 fn validate_path(path: &str) -> Result<(), String> {
     let path = path.trim();
     if path.is_empty() {
@@ -217,7 +264,7 @@ fn validate_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// ShellExecuteW "open"：支持中文路径，走系统关联。
+/// ShellExecuteW "open"：支持中文路径与 URL，走系统关联 / 默认浏览器。
 #[cfg(windows)]
 fn open_with_shell(path: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -276,33 +323,48 @@ fn reveal_in_explorer(path: &str) -> Result<(), String> {
     Err(format!("非 Windows 平台无法定位：{path}"))
 }
 
-/// 执行搜索：程序结果置顶，其后接文件/文件夹；索引未就绪时 is_indexing=true。
+/// 执行搜索：网页匹配（若有）置顶 → 程序 → 文件/文件夹。
 ///
-/// 排序（design.md）：程序 > 文件。程序内部按完全/前缀/包含 + 名称短优先。
-fn search(query: &str, max: usize, index: &SharedIndex, apps: &SharedApps) -> Response {
+/// 排序选择：关键词命中时 web 结果排在最前（用户明确输入了引擎前缀，意图就是搜网页），
+/// 其后程序 > 文件（design.md）。索引未就绪时 is_indexing=true。
+fn search(
+    query: &str,
+    max: usize,
+    index: &SharedIndex,
+    apps: &SharedApps,
+    engines: &SharedEngines,
+) -> Response {
     let max = max.max(1);
     let mut items: Vec<SearchResult> = Vec::with_capacity(max.min(128));
 
+    // 0) 网页快捷搜索：关键词命中则插入一条 kind=web，置顶。
+    if let Some(hit) = websearch::try_match(query, engines.as_ref()) {
+        items.push(hit.into_search_result());
+    }
+
     // 1) 程序清单（通常秒级就绪；未扫完时为空，不阻塞文件搜索）。
-    if let Ok(apps_guard) = apps.read() {
-        // 程序最多占结果的前半，至少留几条给文件；小 max 时程序可占满。
-        let app_budget = if max <= 5 { max } else { (max / 2).max(5) };
-        for a in crate::apps::search(&apps_guard, query, app_budget) {
-            if items.len() >= max {
-                break;
+    if items.len() < max {
+        if let Ok(apps_guard) = apps.read() {
+            // 程序最多占结果的前半，至少留几条给文件；小 max 时程序可占满。
+            let app_budget = if max <= 5 { max } else { (max / 2).max(5) };
+            let remain_for_apps = max.saturating_sub(items.len()).min(app_budget);
+            for a in crate::apps::search(&apps_guard, query, remain_for_apps) {
+                if items.len() >= max {
+                    break;
+                }
+                items.push(SearchResult {
+                    kind: "app".into(),
+                    title: a.name.clone(),
+                    // 副标题：目标路径；解析失败时回退到 .lnk 路径。
+                    subtitle: if a.target_path != a.launch_path {
+                        a.target_path.clone()
+                    } else {
+                        a.launch_path.clone()
+                    },
+                    execute_id: a.launch_path.clone(),
+                    match_spans: match_spans(&a.name, query),
+                });
             }
-            items.push(SearchResult {
-                kind: "app".into(),
-                title: a.name.clone(),
-                // 副标题：目标路径；解析失败时回退到 .lnk 路径。
-                subtitle: if a.target_path != a.launch_path {
-                    a.target_path.clone()
-                } else {
-                    a.launch_path.clone()
-                },
-                execute_id: a.launch_path.clone(),
-                match_spans: match_spans(&a.name, query),
-            });
         }
     }
 
@@ -380,6 +442,10 @@ mod tests {
         Arc::new(RwLock::new(Some(crate::index::FileIndex::default())))
     }
 
+    fn default_engines() -> SharedEngines {
+        Arc::new(WebEngine::defaults())
+    }
+
     fn sample_apps() -> SharedApps {
         Arc::new(RwLock::new(vec![AppEntry {
             name: "微信".into(),
@@ -400,7 +466,12 @@ mod tests {
 
     #[test]
     fn ping_returns_pong_with_version() {
-        let resp = dispatch(parse(r#"{"type":"ping"}"#), &empty_index(), &empty_apps());
+        let resp = dispatch(
+            parse(r#"{"type":"ping"}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
         let v = to_json(&resp);
         assert_eq!(v["type"], "pong");
         assert_eq!(v["version"], VERSION);
@@ -412,6 +483,7 @@ mod tests {
             parse(r#"{"type":"search","query":"xyznope","max":100}"#),
             &empty_index(),
             &empty_apps(),
+            &default_engines(),
         );
         let v = to_json(&resp);
         assert_eq!(v["type"], "results");
@@ -426,6 +498,7 @@ mod tests {
             parse(r#"{"type":"search","query":"anything","max":10}"#),
             &ready_index(),
             &empty_apps(),
+            &default_engines(),
         );
         let v = to_json(&resp);
         assert_eq!(v["type"], "results");
@@ -439,6 +512,7 @@ mod tests {
             parse(r#"{"type":"search","query":"微信","max":10}"#),
             &ready_index(),
             &sample_apps(),
+            &default_engines(),
         );
         let v = to_json(&resp);
         assert_eq!(v["type"], "results");
@@ -454,6 +528,76 @@ mod tests {
     }
 
     #[test]
+    fn search_web_keyword_comes_first() {
+        let resp = dispatch(
+            parse(r#"{"type":"search","query":"g 天气","max":10}"#),
+            &ready_index(),
+            &sample_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        let items = v["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        assert_eq!(items[0]["kind"], "web");
+        assert!(items[0]["title"].as_str().unwrap_or("").contains("Google"));
+        let url = items[0]["execute_id"].as_str().unwrap_or("");
+        assert!(url.starts_with("https://www.google.com/search?q="));
+        assert!(url.contains("%E5%A4%A9%E6%B0%94"));
+    }
+
+    #[test]
+    fn search_bi_not_baidu() {
+        let resp = dispatch(
+            parse(r#"{"type":"search","query":"bi foo","max":5}"#),
+            &ready_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items[0]["kind"], "web");
+        assert!(items[0]["title"].as_str().unwrap_or("").contains("Bing"));
+        assert!(items[0]["execute_id"]
+            .as_str()
+            .unwrap_or("")
+            .contains("bing.com"));
+    }
+
+    #[test]
+    fn search_custom_engine_from_shared_list() {
+        let engines = Arc::new(vec![WebEngine {
+            keyword: "gh".into(),
+            name: "GitHub".into(),
+            url_template: "https://github.com/search?q={q}".into(),
+        }]);
+        let resp = dispatch(
+            parse(r#"{"type":"search","query":"gh prism","max":5}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        let v = to_json(&resp);
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items[0]["kind"], "web");
+        assert_eq!(
+            items[0]["execute_id"],
+            "https://github.com/search?q=prism"
+        );
+        // 预设 g 不在自定义列表中，不应命中。
+        let resp2 = dispatch(
+            parse(r#"{"type":"search","query":"g 天气","max":5}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        let items2 = to_json(&resp2)["items"].as_array().unwrap().clone();
+        assert!(
+            items2.iter().all(|i| i["kind"] != "web"),
+            "仅有自定义引擎时 g 不应出 web 结果"
+        );
+    }
+
+    #[test]
     fn search_max_defaults_when_absent() {
         let req = parse(r#"{"type":"search","query":"a"}"#);
         assert!(
@@ -465,7 +609,7 @@ mod tests {
     #[test]
     fn unknown_message_is_error_not_panic() {
         let resp = match serde_json::from_str::<Request>(r#"{"type":"bogus"}"#) {
-            Ok(req) => dispatch(req, &empty_index(), &empty_apps()),
+            Ok(req) => dispatch(req, &empty_index(), &empty_apps(), &default_engines()),
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
             },
@@ -479,6 +623,7 @@ mod tests {
             parse(r#"{"type":"execute","id":"Z:\\prism-no-such-file-xyz.dat"}"#),
             &empty_index(),
             &empty_apps(),
+            &default_engines(),
         );
         let v = to_json(&resp);
         assert_eq!(v["type"], "error");
@@ -491,6 +636,7 @@ mod tests {
             parse(r#"{"type":"execute","id":"not\\absolute.txt"}"#),
             &empty_index(),
             &empty_apps(),
+            &default_engines(),
         );
         let v = to_json(&resp);
         assert_eq!(v["type"], "error");
@@ -503,8 +649,35 @@ mod tests {
             parse(r#"{"type":"execute","id":""}"#),
             &empty_index(),
             &empty_apps(),
+            &default_engines(),
         );
         assert_eq!(to_json(&resp)["type"], "error");
+    }
+
+    #[test]
+    fn execute_https_url_not_rejected_as_relative_path() {
+        // 不走 validate_path；在无 GUI/沙箱环境 ShellExecute 可能失败，
+        // 但错误信息绝不能是「拒绝相对路径」。
+        let resp = dispatch(
+            parse(r#"{"type":"execute","id":"https://www.google.com/search?q=test"}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        let t = v["type"].as_str().unwrap_or("");
+        assert!(t == "status" || t == "error", "unexpected type {t}");
+        if t == "error" {
+            let msg = v["message"].as_str().unwrap_or("");
+            assert!(
+                !msg.contains("相对路径"),
+                "https URL 不应被路径校验拒绝：{msg}"
+            );
+            assert!(
+                msg.contains("网址") || msg.contains("ShellExecute") || msg.contains("无法打开"),
+                "错误应来自打开 URL 流程：{msg}"
+            );
+        }
     }
 
     #[test]
@@ -513,6 +686,7 @@ mod tests {
             parse(r#"{"type":"reveal","id":"Z:\\prism-no-such-file-xyz.dat"}"#),
             &empty_index(),
             &empty_apps(),
+            &default_engines(),
         );
         let v = to_json(&resp);
         let t = v["type"].as_str().unwrap_or("");

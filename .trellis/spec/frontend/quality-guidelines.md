@@ -25,6 +25,8 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - Discard search responses unless `seq`, current `Query`, and `resp.Query` all match.
 - While `is_indexing`, show status and poll (~0.5s, ~15s cap); do not start nested polls from poll callbacks.
 - Icons: existing path → no `USEFILEATTRIBUTES`; missing path → attributes fallback.
+- `kind=web` / `kind=more`: do **not** pass `ExecuteId` to shell icon APIs (`ExecuteId` for web is a URL).
+- `RevealSelected` must skip `kind` of `more` and `web` (no folder to reveal).
 
 ---
 
@@ -33,6 +35,7 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - Manual: type/backspace quickly (`clash` ↔ `cla`) — list and highlight match current text.
 - Manual: empty query Esc / click-away hides window.
 - Manual: app name (e.g. Chrome) appears as first `app` row and launches on Enter.
+- Manual: `bi 天气` shows a top `web` row; Enter opens default browser to Bing; Ctrl+Enter does nothing harmful for web.
 - `dotnet build src/Prism` clean (close running `Prism.exe` first if MSB3027 file lock).
 
 ---
