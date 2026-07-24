@@ -107,3 +107,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: Prism step 8 settings UI and memory budget
+
+**Date**: 2026-07-25
+**Task**: Prism step 8 settings UI and memory budget
+**Branch**: `main`
+
+### Summary
+
+完成 implement 步骤 8 中文设置页（快捷键/网页引擎/自启/数据目录、HotkeyRecorderBox、reload_engines 热重载）；索引 v3 父目录/文件名 intern + 噪声目录黑名单；前端 IconCache 上限/扩展名键/懒创建搜索窗/EmptyWorkingSet；release 空闲合计约 42MB WS / 37MB 私有。cargo test 57 绿、clippy/dotnet build 通过。任务 07-23-prism-planning 保持 in_progress（步骤 9–11 未做，未 archive）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5d8d0fb` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
