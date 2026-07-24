@@ -31,9 +31,16 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - `RevealSelected` must skip `kind` of `more` and `web` (no folder to reveal).
 - Tray app uses `ShutdownMode.OnExplicitShutdown`; only tray「退出」/ explicit `Shutdown()` ends the process.
 - On startup, apply `settings.AutoStart` to the registry so Run key matches settings after path changes.
+- Settings save must re-`Apply` hotkeys immediately (`HotkeyService.Apply`) and push engines via pipe `reload_engines` when connected.
+- Hotkey recorder output must use names `HotkeyService.ParseCombo` accepts (`Key` enum names: `Space`, `D1`, `OemComma`, …); require at least one modifier for global combos.
 - WPF + WinForms coexistence: prefer WPF types via `GlobalUsings.cs`; do not scatter per-file aliases.
 - Tray `NotifyIcon` / menu callbacks may fire off the WPF UI thread — marshal with `Dispatcher.BeginInvoke` before touching windows or view-models.
 - Own the tray `Icon` instance (clone pack resource / system icon) and dispose it after `NotifyIcon`.
+- `IconCache` must cap entries (FIFO ~128); key by extension for ordinary files, full path only for `.lnk`/`.exe`; dirs use a shared `dir:` key. Avoid `Directory.Exists` on the UI decoration path for every ordinary file — only probe FS for extension-less paths.
+- `Clear()` when the search window hides.
+- After hide: drop result list + icon bitmaps and idle `GC.Collect(Optimized)` so tray-resident WS shrinks; never collect on the input/search hot path.
+- Prefer workstation GC (`ServerGarbageCollection=false`) for the WPF tray process.
+- Create `SearchWindow` lazily on first show; after hide / settings close / backend connect idle, call `EmptyWorkingSet` so task-manager WS reflects tray-resident footprint (does not reduce private bytes).
 
 ---
 
@@ -45,6 +52,8 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - Manual: `bi 天气` shows a top `web` row; Enter opens default browser to Bing; Ctrl+Enter does nothing harmful for web.
 - Manual: tray icon visible; left-click toggles search; right-click 打开设置 / 重建索引 / 退出 work; 退出 removes tray icon.
 - Manual: settings「开机时自动启动」toggles `HKCU\…\Run\Prism` and persists in settings.json.
+- Manual: settings 改快捷键为组合键后立即生效；改网页引擎保存后无需重启即可用新关键词。
+- Manual: 设置页「数据目录」显示实际可写路径。
 - `dotnet build src/Prism` clean (close running `Prism.exe` first if MSB3027 file lock).
 
 ---

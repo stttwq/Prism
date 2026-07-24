@@ -14,6 +14,9 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- 关闭默认 Page 收集；仅显式登记已实现的 XAML。 -->
     <EnableDefaultPageItems>false</EnableDefaultPageItems>
+    <!-- 桌面托盘应用：工作站 GC（默认），显式关掉 Server GC，避免预留大堆。 -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,6 +34,10 @@
       <Generator>MSBuild:Compile</Generator>
     </Page>
     <Page Include="Controls\ResultList.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Page Include="Controls\HotkeyRecorderBox.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>

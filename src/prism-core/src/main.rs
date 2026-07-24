@@ -30,8 +30,8 @@ async fn main() {
 
     let shared: index::SharedIndex = std::sync::Arc::new(std::sync::RwLock::new(None));
     let apps: apps::SharedApps = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
-    // 引擎在启动时加载；设置页改引擎后需重启后端才会生效（步骤 8 可做热重载）。
-    let engines = std::sync::Arc::new(cfg.web_engines);
+    // 引擎可热重载：设置页保存后发 reload_engines，无需重启后端。
+    let engines = std::sync::Arc::new(std::sync::RwLock::new(cfg.web_engines));
 
     // 异步构建/加载索引，不阻塞管道服务启动。
     {

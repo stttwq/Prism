@@ -1,3 +1,25 @@
-<!-- 占位文件：控件 HotkeyRecorderBox -->
-<!-- 规格见 .trellis/tasks/07-23-prism-planning/frontend-spec.md -->
-<!-- 待用户确认骨架后再写实现代码 -->
+<UserControl x:Class="Prism.Controls.HotkeyRecorderBox"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Focusable="True"
+             MinHeight="32"
+             GotKeyboardFocus="OnGotKeyboardFocus"
+             LostKeyboardFocus="OnLostKeyboardFocus"
+             PreviewKeyDown="OnPreviewKeyDown"
+             MouseLeftButtonDown="OnMouseLeftButtonDown">
+    <Border x:Name="Chrome"
+            Background="White"
+            BorderBrush="#D0D3D8"
+            BorderThickness="1"
+            CornerRadius="4"
+            Padding="10,6">
+        <Grid>
+            <TextBlock x:Name="Display"
+                       VerticalAlignment="Center"
+                       FontSize="13"
+                       FontFamily="微软雅黑, Segoe UI"
+                       Foreground="#37393E"
+                       Text="点击此处，然后按下组合键"/>
+        </Grid>
+    </Border>
+</UserControl>

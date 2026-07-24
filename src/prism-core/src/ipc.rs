@@ -7,6 +7,7 @@
 //! 第四步：search 接真实索引；execute 打开文件；reveal 在资源管理器中定位。
 //! 第五步：search 合并开始菜单程序，kind=app 置顶；execute 启动 .lnk。
 //! 第六步：网页关键词 bi/b/g（+ 自定义，必应优先）→ kind=web；execute 用默认浏览器打开 URL。
+//! 第八步：reload_engines 热替换引擎列表（设置页保存后立即生效）。
 //! actions / run_action 仍占位（动作面板在后续步骤）。
 
 use std::sync::Arc;
@@ -20,8 +21,9 @@ use crate::index::SharedIndex;
 use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
 
-/// 共享引擎列表（启动时从 settings.json 加载，只读）。
-pub type SharedEngines = Arc<Vec<WebEngine>>;
+/// 共享引擎列表（可热重载）。
+/// 读路径：search 持读锁；写路径：reload_engines 换整表。
+pub type SharedEngines = Arc<std::sync::RwLock<Vec<WebEngine>>>;
 
 /// 前端发来的请求消息。`type` 字段区分类型（snake_case）。
 #[derive(Debug, Deserialize)]
@@ -50,6 +52,10 @@ pub enum Request {
         id: String,
         #[allow(dead_code)]
         action: String,
+    },
+    /// 设置页保存后热重载网页引擎列表（步骤 8）。
+    ReloadEngines {
+        engines: Vec<WebEngine>,
     },
 }
 
@@ -184,6 +190,31 @@ pub fn dispatch(
         Request::Reveal { id } => reveal_path(&id),
         Request::Actions { .. } => Response::Actions { items: Vec::new() },
         Request::RunAction { .. } => Response::Status { is_indexing: false },
+        Request::ReloadEngines { engines: list } => reload_engines(list, engines),
+    }
+}
+
+/// 热替换网页引擎列表；空列表回落预设 bi/b/g，与 Config::load 行为一致。
+fn reload_engines(mut engines: Vec<WebEngine>, shared: &SharedEngines) -> Response {
+    if engines.is_empty() {
+        engines = WebEngine::defaults();
+    }
+    let count = engines.len();
+    // 先拼好日志字符串再 move engines，避免借用与移动冲突。
+    let keywords = engines
+        .iter()
+        .map(|e| e.keyword.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    match shared.write() {
+        Ok(mut guard) => {
+            *guard = engines;
+            log(format!("网页引擎已热重载（{count} 个）：{keywords}"));
+            Response::Status { is_indexing: false }
+        }
+        Err(_) => Response::Error {
+            message: "无法更新网页引擎（锁被占用）".into(),
+        },
     }
 }
 
@@ -338,8 +369,11 @@ fn search(
     let mut items: Vec<SearchResult> = Vec::with_capacity(max.min(128));
 
     // 0) 网页快捷搜索：关键词命中则插入一条 kind=web，置顶。
-    if let Some(hit) = websearch::try_match(query, engines.as_ref()) {
-        items.push(hit.into_search_result());
+    // 持读锁拷一份列表引用期间的快照，避免 search 与 reload 互相阻塞过久。
+    if let Ok(guard) = engines.read() {
+        if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
+            items.push(hit.into_search_result());
+        }
     }
 
     // 1) 程序清单（通常秒级就绪；未扫完时为空，不阻塞文件搜索）。
@@ -378,7 +412,7 @@ fn search(
                     .iter()
                     .map(|e| {
                         let name = idx.entry_name(e);
-                        let path = idx.entry_path(e);
+                        let path = idx.entry_path(e); // v3: 由 dir+name 拼出
                         SearchResult {
                             kind: if e.kind == 1 {
                                 "folder".into()
@@ -386,8 +420,8 @@ fn search(
                                 "file".into()
                             },
                             title: name.to_string(),
-                            subtitle: path.to_string(),
-                            execute_id: path.to_string(),
+                            subtitle: path.clone(),
+                            execute_id: path,
                             match_spans: match_spans(name, query),
                         }
                     })
@@ -443,7 +477,11 @@ mod tests {
     }
 
     fn default_engines() -> SharedEngines {
-        Arc::new(WebEngine::defaults())
+        Arc::new(RwLock::new(WebEngine::defaults()))
+    }
+
+    fn engines_of(list: Vec<WebEngine>) -> SharedEngines {
+        Arc::new(RwLock::new(list))
     }
 
     fn sample_apps() -> SharedApps {
@@ -565,7 +603,7 @@ mod tests {
 
     #[test]
     fn search_custom_engine_from_shared_list() {
-        let engines = Arc::new(vec![WebEngine {
+        let engines = engines_of(vec![WebEngine {
             keyword: "gh".into(),
             name: "GitHub".into(),
             url_template: "https://github.com/search?q={q}".into(),
@@ -595,6 +633,104 @@ mod tests {
             items2.iter().all(|i| i["kind"] != "web"),
             "仅有自定义引擎时 g 不应出 web 结果"
         );
+    }
+
+    #[test]
+    fn reload_engines_replaces_list_and_affects_search() {
+        let engines = default_engines();
+        // 先确认预设 g 可用。
+        let before = dispatch(
+            parse(r#"{"type":"search","query":"g 天气","max":5}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&before)["items"][0]["kind"], "web");
+
+        // 热重载为仅 GitHub。
+        let resp = dispatch(
+            parse(
+                r#"{"type":"reload_engines","engines":[{"keyword":"gh","name":"GitHub","url_template":"https://github.com/search?q={q}"}]}"#,
+            ),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&resp)["type"], "status");
+
+        let after_g = dispatch(
+            parse(r#"{"type":"search","query":"g 天气","max":5}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        let items_g = to_json(&after_g)["items"].as_array().unwrap().clone();
+        assert!(
+            items_g.iter().all(|i| i["kind"] != "web"),
+            "reload 后 g 不应再命中"
+        );
+
+        let after_gh = dispatch(
+            parse(r#"{"type":"search","query":"gh prism","max":5}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&after_gh)["items"][0]["kind"], "web");
+        assert!(to_json(&after_gh)["items"][0]["execute_id"]
+            .as_str()
+            .unwrap_or("")
+            .contains("github.com"));
+    }
+
+    #[test]
+    fn reload_engines_empty_falls_back_to_defaults() {
+        let engines = engines_of(vec![WebEngine {
+            keyword: "only".into(),
+            name: "Only".into(),
+            url_template: "https://example.com?q={q}".into(),
+        }]);
+        let resp = dispatch(
+            parse(r#"{"type":"reload_engines","engines":[]}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&resp)["type"], "status");
+        // 空列表回落 bi/b/g，g 应再次可用。
+        let search = dispatch(
+            parse(r#"{"type":"search","query":"g hi","max":3}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&search)["items"][0]["kind"], "web");
+        assert!(to_json(&search)["items"][0]["title"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Google"));
+    }
+
+    #[test]
+    fn reload_engines_accepts_pascal_case_fields() {
+        // 前端 PipeClient 发 Keyword/Name/UrlTemplate。
+        let engines = default_engines();
+        let resp = dispatch(
+            parse(
+                r#"{"type":"reload_engines","engines":[{"Keyword":"gh","Name":"GitHub","UrlTemplate":"https://github.com/search?q={q}"}]}"#,
+            ),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&resp)["type"], "status");
+        let search = dispatch(
+            parse(r#"{"type":"search","query":"gh x","max":3}"#),
+            &ready_index(),
+            &empty_apps(),
+            &engines,
+        );
+        assert_eq!(to_json(&search)["items"][0]["kind"], "web");
     }
 
     #[test]

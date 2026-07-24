@@ -43,9 +43,15 @@ public partial class ResultList : UserControl
         get => _items;
         set
         {
-            _items = value ?? Array.Empty<SearchResult>();
+            var next = value ?? Array.Empty<SearchResult>();
+            // 同一引用无需整表重绑（避免虚拟化容器全毁重建）。
+            if (ReferenceEquals(_items, next))
+            {
+                UpdateListHeight();
+                return;
+            }
+            _items = next;
             _syncing = true;
-            List.ItemsSource = null; // 强制刷新容器
             List.ItemsSource = _items;
             UpdateListHeight();
             _syncing = false;
@@ -214,16 +220,32 @@ public partial class ResultList : UserControl
         }
     }
 
-    private static void ApplyMatchSpans(TextBlock block, string title, int[] spans)
+    // 缓存画刷，避免每次装饰行 new SolidColorBrush。
+    private Brush? _matchBrush;
+    private Brush? _normalBrush;
+
+    private Brush MatchBrush(FrameworkElement el) =>
+        _matchBrush ??= TryFindBrush(el, "TextMatch")
+            ?? Freeze(new SolidColorBrush(Color.FromRgb(0x1E, 0x7A, 0xD4)));
+
+    private Brush NormalBrush(FrameworkElement el) =>
+        _normalBrush ??= TryFindBrush(el, "TextTitle")
+            ?? Freeze(new SolidColorBrush(Color.FromRgb(0x30, 0x32, 0x37)));
+
+    private static Brush Freeze(SolidColorBrush b)
+    {
+        if (b.CanFreeze) b.Freeze();
+        return b;
+    }
+
+    private void ApplyMatchSpans(TextBlock block, string title, int[] spans)
     {
         block.Inlines.Clear();
         if (string.IsNullOrEmpty(title))
             return;
 
-        var matchBrush = TryFindBrush(block, "TextMatch")
-            ?? new SolidColorBrush(Color.FromRgb(0x1E, 0x7A, 0xD4));
-        var normalBrush = TryFindBrush(block, "TextTitle")
-            ?? new SolidColorBrush(Color.FromRgb(0x30, 0x32, 0x37));
+        var matchBrush = MatchBrush(block);
+        var normalBrush = NormalBrush(block);
 
         if (spans is not { Length: >= 2 })
         {

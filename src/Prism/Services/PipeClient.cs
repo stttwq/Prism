@@ -85,6 +85,22 @@ public sealed class PipeClient : IDisposable
     }
 
     /// <summary>
+    /// 通知后端热重载网页引擎列表（步骤 8）。
+    /// 字段名与前端 <see cref="WebEngine"/> / settings.json PascalCase 对齐，
+    /// 后端 IPC 用 serde alias 接收。
+    /// </summary>
+    public async Task ReloadEnginesAsync(IReadOnlyList<WebEngine> engines, CancellationToken ct = default)
+    {
+        var payload = engines.Select(e => new
+        {
+            Keyword = e.Keyword,
+            Name = e.Name,
+            UrlTemplate = e.UrlTemplate,
+        }).ToArray();
+        await SendAsync(new { type = "reload_engines", engines = payload }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 发送一条请求，读取一行响应并解析为 JSON。串行化以保证请求/响应配对。
     /// 重要：一旦请求写出，必须把对应响应读完，绝不能因 CancellationToken 中途放弃读——
     /// 否则管道里会残留旧响应，下一次 Search 会读到上一次的结果（表现为高亮/列表错位）。

@@ -21,6 +21,7 @@ public partial class SearchWindow : Window
     private const double SlideOffsetPx = 6;
 
     private SearchViewModel? _vm;
+    private IconCache? _icons;
     private bool _suppressQueryEvent;
     private bool _hiding;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
@@ -59,6 +60,7 @@ public partial class SearchWindow : Window
     public void Attach(SearchViewModel vm, IconCache icons)
     {
         _vm = vm;
+        _icons = icons;
         Results.SetIconCache(icons);
         vm.HideRequested += () =>
         {
@@ -191,8 +193,34 @@ public partial class SearchWindow : Window
             _hiding = false;
             // 隐藏后清掉键盘焦点，避免下次呼出时焦点状态错乱。
             try { Keyboard.ClearFocus(); } catch { /* ignore */ }
+            // 释放结果列表与图标位图，降低托盘空闲时工作集。
+            ReleaseIdleMemory();
         };
         BeginAnimation(OpacityProperty, fadeOut);
+    }
+
+    /// <summary>窗口隐藏后丢掉可再生成的 UI 数据，减轻常驻内存。</summary>
+    private void ReleaseIdleMemory()
+    {
+        try
+        {
+            _vm?.ResetForShow();
+            Results.Items = Array.Empty<SearchResult>();
+            Results.StatusMessage = "";
+            // 图标可再加载；清空避免 128 张位图长期占托管堆。
+            _icons?.Clear();
+            // 工作站 GC：空闲时把内存还一点给系统（不阻塞交互路径）。
+            Dispatcher.BeginInvoke(() =>
+            {
+                GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
+                // 再把工作集页还给 OS，任务管理器数字会明显下降。
+                App.TrimWorkingSet();
+            }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        }
+        catch
+        {
+            // 释放失败不影响下次呼出。
+        }
     }
 
     private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)

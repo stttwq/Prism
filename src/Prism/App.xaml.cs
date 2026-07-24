@@ -8,7 +8,7 @@ using Prism.Windows;
 namespace Prism;
 
 /// <summary>
-/// 应用入口。步骤 7：托盘 + 自启 + 最小设置窗；快捷键与管道搜索保持步骤 1–6 行为。
+/// 应用入口。托盘常驻；搜索窗懒创建；隐藏后清空图标缓存并修剪工作集。
 /// </summary>
 public partial class App : Application
 {
@@ -16,6 +16,16 @@ public partial class App : Application
 
     [DllImport("kernel32.dll")]
     private static extern bool AttachConsole(int dwProcessId);
+
+    /// <summary>
+    /// 把进程工作集还给系统（仅影响 Working Set 显示，不释放私有提交；
+    /// 适合托盘空闲时让任务管理器数字更接近真实占用）。
+    /// </summary>
+    [DllImport("psapi.dll")]
+    private static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
 
     private SettingsStore? _store;
     private AutoStartService? _autoStart;
@@ -34,7 +44,6 @@ public partial class App : Application
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
         // 从 `dotnet run` / 终端启动时挂上父控制台，便于看到"已启动"提示。
-        // 失败则忽略（双击 exe 启动时没有控制台）。
         try { AttachConsole(AttachParentProcess); } catch { /* ignore */ }
 
         _store = new SettingsStore();
@@ -43,7 +52,6 @@ public partial class App : Application
         _autoStart = new AutoStartService();
         try
         {
-            // 让注册表与 settings.json 一致（例如用户换了安装路径后重新写入）。
             _autoStart.Apply(settings.AutoStart);
         }
         catch (Exception ex)
@@ -56,8 +64,8 @@ public partial class App : Application
         _icons = new IconCache();
         _vm = new SearchViewModel(_state, _pipe);
 
-        _searchWindow = new SearchWindow();
-        _searchWindow.Attach(_vm, _icons);
+        // 搜索窗懒创建：冷启动托盘常驻时不先建 WPF 视觉树，降低初始工作集。
+        // 第一次双击 Ctrl / 托盘左键时再 EnsureSearchWindow。
 
         _hotkey = new HotkeyService();
         _hotkey.Triggered += ToggleSearchWindow;
@@ -72,18 +80,35 @@ public partial class App : Application
         Log("Prism 已启动（托盘常驻）。");
         Log("  · 双击 Ctrl 呼出搜索框，Esc 或点别处隐藏");
         Log("  · 托盘图标：左键呼出，右键打开设置 / 重建索引 / 退出");
+        Log("  · 设置页可改快捷键、网页搜索引擎、开机自启");
         Log("  · 输入文件名即时搜索；回车打开，Ctrl+Enter 打开所在文件夹");
 
         _ = TryStartBackendAsync();
+
+        // 启动稳定后修剪一次工作集（后端已连上前后各可再剪）。
+        _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+    }
+
+    private SearchWindow EnsureSearchWindow()
+    {
+        if (_searchWindow is not null)
+            return _searchWindow;
+
+        if (_vm is null || _icons is null)
+            throw new InvalidOperationException("SearchViewModel / IconCache 尚未初始化");
+
+        _searchWindow = new SearchWindow();
+        _searchWindow.Attach(_vm, _icons);
+        return _searchWindow;
     }
 
     private void ToggleSearchWindow()
     {
-        if (_searchWindow is null) return;
-        if (_searchWindow.IsVisible)
-            _searchWindow.HideAnimated();
+        var win = EnsureSearchWindow();
+        if (win.IsVisible)
+            win.HideAnimated();
         else
-            _searchWindow.ShowAndFocus();
+            win.ShowAndFocus();
     }
 
     private void OpenSettings()
@@ -96,16 +121,48 @@ public partial class App : Application
             return;
         }
 
-        var vm = new SettingsViewModel(_store, _autoStart);
+        var vm = new SettingsViewModel(
+            _store,
+            _autoStart,
+            onApplied: ApplySettings,
+            onEnginesChanged: ReloadBackendEnginesAsync);
         _settingsWindow = new SettingsWindow(vm);
-        _settingsWindow.Closed += (_, _) => _settingsWindow = null;
+        _settingsWindow.Closed += (_, _) =>
+        {
+            _settingsWindow = null;
+            // 设置窗关掉后也修剪一下工作集。
+            _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        };
         _settingsWindow.Show();
         _settingsWindow.Activate();
     }
 
+    private void ApplySettings(Settings settings)
+    {
+        try
+        {
+            _hotkey?.Apply(settings);
+            Log($"快捷键已应用：{settings.HotkeyMode}" +
+                (settings.HotkeyMode == HotkeyMode.Combo ? $" ({settings.ComboHotkey})" : ""));
+        }
+        catch (Exception ex)
+        {
+            Log("快捷键应用失败：" + ex.Message);
+            throw;
+        }
+    }
+
+    private async Task ReloadBackendEnginesAsync(IReadOnlyList<WebEngine> engines)
+    {
+        if (_pipe is null || !_pipe.IsConnected)
+            throw new InvalidOperationException("后端未连接，引擎将在下次启动时生效");
+
+        await _pipe.ReloadEnginesAsync(engines).ConfigureAwait(true);
+        Log($"后端引擎已热重载（{engines.Count} 个）");
+    }
+
     private void OnRebuildIndex()
     {
-        // 后端暂无 reindex IPC（仅有定时 refresh）；步骤 7 先提示，后续再补协议。
         MessageBox.Show(
             "索引会在后台自动建立与定期刷新。\n手动重建将在后续版本提供。",
             "Prism",
@@ -134,6 +191,24 @@ public partial class App : Application
             Log("后端暂未连上：" + ex.Message);
             Log("（可先 cargo build --manifest-path src/prism-core/Cargo.toml）");
             _tray?.SetTooltip("Prism · 后端未连接");
+        }
+        finally
+        {
+            // 后端拉起后工作集会涨一截；空闲修剪。
+            _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        }
+    }
+
+    /// <summary>空闲时调用：缩小任务管理器显示的工作集（私有提交不变）。</summary>
+    internal static void TrimWorkingSet()
+    {
+        try
+        {
+            EmptyWorkingSet(GetCurrentProcess());
+        }
+        catch
+        {
+            // 权限/兼容失败忽略。
         }
     }
 

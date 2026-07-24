@@ -198,8 +198,9 @@ public sealed class HotkeyService : IDisposable
     // ── Combo parser ───────────────────────────────────────────────────────
 
     /// <summary>
-    /// 把 "Alt+Space"、"Ctrl+Shift+F1" 等字符串解析为 (modifiers, vk)。
-    /// 不认识的组合返回 (0, 0)，调用方应提示用户重新设置。
+    /// 把 "Alt+Space"、"Ctrl+Shift+F1"、"Alt+D1" 等字符串解析为 (modifiers, vk)。
+    /// 主键优先按 <see cref="System.Windows.Input.Key"/> 枚举名解析（与 HotkeyRecorderBox 输出一致）；
+    /// 另接受单位数字 0-9 与常见别名。不认识的组合返回 (0, 0)。
     /// </summary>
     private static (uint mod, uint vk) ParseCombo(string combo)
     {
@@ -209,12 +210,24 @@ public sealed class HotkeyService : IDisposable
             switch (part.ToUpperInvariant())
             {
                 case "ALT":   mod |= 0x0001; break;
-                case "CTRL":  mod |= 0x0002; break;
+                case "CTRL":
+                case "CONTROL": mod |= 0x0002; break;
                 case "SHIFT": mod |= 0x0004; break;
-                case "WIN":   mod |= 0x0008; break;
+                case "WIN":
+                case "WINDOWS":
+                case "LWIN":
+                case "RWIN":  mod |= 0x0008; break;
                 default:
-                    if (Enum.TryParse<System.Windows.Input.Key>(part, true, out var key))
+                    if (part.Length == 1 && part[0] is >= '0' and <= '9')
+                    {
+                        // "Alt+1" → Key.D1
+                        if (Enum.TryParse<System.Windows.Input.Key>("D" + part, true, out var digitKey))
+                            vk = (uint)System.Windows.Input.KeyInterop.VirtualKeyFromKey(digitKey);
+                    }
+                    else if (Enum.TryParse<System.Windows.Input.Key>(part, true, out var key))
+                    {
                         vk = (uint)System.Windows.Input.KeyInterop.VirtualKeyFromKey(key);
+                    }
                     break;
             }
         }

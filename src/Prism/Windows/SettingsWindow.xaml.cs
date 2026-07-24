@@ -3,7 +3,7 @@ using Prism.ViewModels;
 
 namespace Prism.Windows;
 
-/// <summary>设置窗口（步骤 7 最小实现）。</summary>
+/// <summary>设置窗口：常规 / 网页搜索 / 关于（frontend-spec SettingsWindow）。</summary>
 public partial class SettingsWindow : Window
 {
     public SettingsWindow(SettingsViewModel viewModel)
@@ -11,4 +11,6 @@ public partial class SettingsWindow : Window
         InitializeComponent();
         DataContext = viewModel;
     }
+
+    private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
 }

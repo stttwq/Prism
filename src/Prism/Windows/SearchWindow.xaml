@@ -13,10 +13,12 @@
             Margin="20"
             Effect="{DynamicResource WindowShadow}">
         <Border.Resources>
+            <!-- Blur 过大吃 GPU/系统显存；24 在观感与开销间更平衡 -->
             <DropShadowEffect x:Key="WindowShadow"
-                              BlurRadius="40" Opacity="0.22"
-                              ShadowDepth="8" Direction="270"
-                              Color="#000000"/>
+                              BlurRadius="24" Opacity="0.20"
+                              ShadowDepth="6" Direction="270"
+                              Color="#000000"
+                              RenderingBias="Performance"/>
         </Border.Resources>
         <StackPanel>
             <controls:SearchHeader x:Name="Header"/>
