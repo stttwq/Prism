@@ -140,3 +140,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Prism step 9 UI polish: theme pin actions
+
+**Date**: 2026-07-25
+**Task**: Prism step 9 UI polish: theme pin actions
+**Branch**: `main`
+
+### Summary
+
+完成 implement 步骤 9 界面精修：Tokens.Dark + ThemeWatcher 跟随系统深浅色、PinButton 固定窗口、ActionPanel + 后端 open_folder/copy/cut/copy_path（剪贴板 CF_HDROP/CF_UNICODETEXT）、圆角裁剪/细滚动条/展开动画/展示更多蓝图标；trellis-check 修复动作失败可见 ActionStatus、→ 仅 file/folder 吞键、Pin 主题刷新、剪贴板失败 GlobalFree；cargo test 63 绿、clippy/dotnet build 通过。任务 07-23-prism-planning 保持 in_progress（步骤 10–11 未做，未 archive）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9430bec` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
