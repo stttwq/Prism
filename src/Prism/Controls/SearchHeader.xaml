@@ -1,0 +1,37 @@
+<UserControl x:Class="Prism.Controls.SearchHeader"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Height="68">
+    <Grid Margin="20,0">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- 输入框 + 占位文字 -->
+        <Grid Grid.Column="0">
+            <TextBlock x:Name="Placeholder"
+                       Text="搜索应用和文件"
+                       Foreground="{DynamicResource TextPlaceholder}"
+                       FontSize="{DynamicResource FontSizePlaceholder}"
+                       FontFamily="{DynamicResource AppFontFamily}"
+                       VerticalAlignment="Center"
+                       IsHitTestVisible="False"/>
+            <TextBox x:Name="QueryBox"
+                     Style="{DynamicResource QueryTextBoxStyle}"
+                     VerticalAlignment="Stretch"
+                     TextChanged="OnQueryTextChanged"
+                     PreviewKeyDown="OnQueryPreviewKeyDown"/>
+        </Grid>
+
+        <!-- 右侧淡灰放大镜装饰 -->
+        <TextBlock Grid.Column="1"
+                   Text="&#xE721;"
+                   FontFamily="Segoe MDL2 Assets"
+                   FontSize="22"
+                   Foreground="{DynamicResource TextPlaceholder}"
+                   VerticalAlignment="Center"
+                   Margin="12,0,0,0"
+                   Opacity="0.7"/>
+    </Grid>
+</UserControl>

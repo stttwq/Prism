@@ -1,0 +1,252 @@
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
+using Prism.Models;
+
+namespace Prism.Services;
+
+/// <summary>
+/// 命名管道客户端 + 后端进程守护。
+/// 第四步：search / execute / reveal；断线时抛 IOException，由调用方决定是否重连。
+/// </summary>
+public sealed class PipeClient : IDisposable
+{
+    private const string PipeName = "prism-core"; // 完整名 \\.\pipe\prism-core
+
+    private Process? _backend;
+    private NamedPipeClientStream? _stream;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+    private readonly SemaphoreSlim _ioLock = new(1, 1);
+
+    /// <summary>实际使用的后端可执行文件路径，供诊断显示。</summary>
+    public string BackendPath { get; private set; } = "";
+
+    /// <summary>管道是否已连接。</summary>
+    public bool IsConnected => _stream is { IsConnected: true };
+
+    /// <summary>拉起后端（若未运行）并连接管道。</summary>
+    public async Task StartAsync(CancellationToken ct = default)
+    {
+        EnsureBackendRunning();
+        await ConnectAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+    }
+
+    /// <summary>连接命名管道，UTF-8 无 BOM，按行(\n)收发。</summary>
+    private async Task ConnectAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        DisposeStreamOnly();
+
+        var stream = new NamedPipeClientStream(
+            ".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+
+        await stream.ConnectAsync((int)timeout.TotalMilliseconds, ct).ConfigureAwait(false);
+
+        var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        _stream = stream;
+        _reader = new StreamReader(stream, utf8);
+        _writer = new StreamWriter(stream, utf8) { AutoFlush = false, NewLine = "\n" };
+    }
+
+    /// <summary>发送 ping，返回后端版本号。</summary>
+    public async Task<string> PingAsync(CancellationToken ct = default)
+    {
+        var resp = await SendAsync(new { type = "ping" }, ct).ConfigureAwait(false);
+        return resp.GetProperty("version").GetString() ?? "";
+    }
+
+    /// <summary>即时搜索，返回后端原始结果（不含前端"展示更多"行）。</summary>
+    public async Task<SearchResponse> SearchAsync(string query, int max = 100, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(new { type = "search", query, max }, ct).ConfigureAwait(false);
+        var echo = resp.TryGetProperty("query", out var q) ? q.GetString() ?? query : query;
+        var indexing = resp.TryGetProperty("is_indexing", out var ix) && ix.ValueKind == JsonValueKind.True;
+        var items = new List<SearchResult>();
+        if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var el in arr.EnumerateArray())
+                items.Add(ParseResult(el));
+        }
+        return new SearchResponse(echo, items, indexing);
+    }
+
+    /// <summary>打开文件/文件夹/程序。</summary>
+    public async Task ExecuteAsync(string id, CancellationToken ct = default)
+    {
+        await SendAsync(new { type = "execute", id }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>在资源管理器中定位文件。</summary>
+    public async Task RevealAsync(string id, CancellationToken ct = default)
+    {
+        await SendAsync(new { type = "reveal", id }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 发送一条请求，读取一行响应并解析为 JSON。串行化以保证请求/响应配对。
+    /// 重要：一旦请求写出，必须把对应响应读完，绝不能因 CancellationToken 中途放弃读——
+    /// 否则管道里会残留旧响应，下一次 Search 会读到上一次的结果（表现为高亮/列表错位）。
+    /// 取消只作用于"等锁"和"业务层丢弃结果"；ViewModel 用 seq 丢弃过期 UI 更新。
+    /// </summary>
+    private async Task<JsonElement> SendAsync(object request, CancellationToken ct)
+    {
+        if (_writer is null || _reader is null)
+            throw new InvalidOperationException("管道尚未连接");
+
+        await _ioLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(request);
+                // 写出后必须完成配对读，故读写使用 None，避免取消留下孤儿响应。
+                await _writer.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+                await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+
+                var line = await _reader.ReadLineAsync(CancellationToken.None).ConfigureAwait(false)
+                    ?? throw new IOException("后端在返回响应前关闭了管道");
+
+                // 配对完成后再兑现取消，让上层丢弃结果而不破坏管道。
+                ct.ThrowIfCancellationRequested();
+
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (root.GetProperty("type").GetString() == "error")
+                {
+                    // 业务错误：管道仍可用，只把消息抛给调用方展示。
+                    var msg = root.TryGetProperty("message", out var m) ? m.GetString() : "未知错误";
+                    throw new InvalidOperationException("后端返回错误：" + msg);
+                }
+                return root.Clone();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException)
+            {
+                // 业务 error，保留连接。
+                throw;
+            }
+            catch
+            {
+                // 传输层失败：释放管道，IsConnected 变 false，上层可重连。
+                DisposeStreamOnly();
+                throw;
+            }
+        }
+        finally
+        {
+            _ioLock.Release();
+        }
+    }
+
+    private static SearchResult ParseResult(JsonElement el)
+    {
+        var kind = el.TryGetProperty("kind", out var k) ? k.GetString() ?? "file" : "file";
+        var title = el.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
+        var subtitle = el.TryGetProperty("subtitle", out var s) ? s.GetString() ?? "" : "";
+        var id = el.TryGetProperty("execute_id", out var e) ? e.GetString() ?? "" : "";
+        var spans = Array.Empty<int>();
+        if (el.TryGetProperty("match_spans", out var ms) && ms.ValueKind == JsonValueKind.Array)
+        {
+            var list = new List<int>();
+            foreach (var n in ms.EnumerateArray())
+                if (n.TryGetInt32(out var v)) list.Add(v);
+            spans = list.ToArray();
+        }
+        return new SearchResult(kind, title, subtitle, id, spans);
+    }
+
+    /// <summary>确保后端进程在运行；未运行则定位可执行文件并启动。</summary>
+    private void EnsureBackendRunning()
+    {
+        if (_backend is { HasExited: false })
+            return;
+
+        var exe = LocateBackend()
+            ?? throw new FileNotFoundException(
+                "未找到 prism-core.exe。开发期请先执行：cargo build --manifest-path src/prism-core/Cargo.toml");
+        BackendPath = exe;
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = exe,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        _backend = Process.Start(psi)
+            ?? throw new IOException("启动 prism-core.exe 失败");
+    }
+
+    /// <summary>
+    /// 定位后端可执行文件：
+    /// 1) 环境变量 PRISM_CORE_EXE；
+    /// 2) 与 Prism.exe 同目录；
+    /// 3) 从输出目录向上找 prism-core/target/{debug,release}。
+    /// </summary>
+    private static string? LocateBackend()
+    {
+        const string exeName = "prism-core.exe";
+
+        var env = Environment.GetEnvironmentVariable("PRISM_CORE_EXE");
+        if (!string.IsNullOrEmpty(env) && File.Exists(env))
+            return env;
+
+        var baseDir = AppContext.BaseDirectory;
+        var sideBySide = Path.Combine(baseDir, exeName);
+        if (File.Exists(sideBySide))
+            return sideBySide;
+
+        var dir = new DirectoryInfo(baseDir);
+        while (dir is not null)
+        {
+            foreach (var cfg in new[] { "debug", "release" })
+            {
+                var candidate = Path.Combine(
+                    dir.FullName, "prism-core", "target", cfg, exeName);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+            // 兼容从 src/Prism/bin/... 向上到 src/ 再进 prism-core
+            var sibling = Path.Combine(dir.FullName, "src", "prism-core", "target");
+            foreach (var cfg in new[] { "debug", "release" })
+            {
+                var candidate = Path.Combine(sibling, cfg, exeName);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+            dir = dir.Parent;
+        }
+        return null;
+    }
+
+    private void DisposeStreamOnly()
+    {
+        try { _writer?.Dispose(); } catch { /* ignore */ }
+        try { _reader?.Dispose(); } catch { /* ignore */ }
+        try { _stream?.Dispose(); } catch { /* ignore */ }
+        _writer = null;
+        _reader = null;
+        _stream = null;
+    }
+
+    public void Dispose()
+    {
+        DisposeStreamOnly();
+
+        try
+        {
+            if (_backend is { HasExited: false })
+                _backend.Kill(entireProcessTree: true);
+        }
+        catch { /* ignore */ }
+        _backend?.Dispose();
+        _ioLock.Dispose();
+    }
+}
+
+/// <summary>search 响应：回显 query + 结果列表；IsIndexing 表示索引尚未就绪。</summary>
+public sealed record SearchResponse(string Query, IReadOnlyList<SearchResult> Items, bool IsIndexing);
