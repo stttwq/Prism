@@ -22,6 +22,10 @@
     <sys:Double x:Key="FontSizeTitle">17</sys:Double>
     <sys:Double x:Key="FontSizeSubtitle">13</sys:Double>
     <sys:Double x:Key="FontSizeHotkeyHint">15</sys:Double>
+    <sys:Double x:Key="ActionItemHeight">44</sys:Double>
+    <sys:Double x:Key="IconSizeAction">20</sys:Double>
+    <sys:Double x:Key="FontSizeAction">16</sys:Double>
+    <sys:Double x:Key="FontSizeSectionLabel">15</sys:Double>
     <sys:Double x:Key="PadX">20</sys:Double>
     <FontFamily x:Key="AppFontFamily">微软雅黑, Segoe UI</FontFamily>
 </ResourceDictionary>

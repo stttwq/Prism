@@ -8,7 +8,7 @@
 //! 第五步：search 合并开始菜单程序，kind=app 置顶；execute 启动 .lnk。
 //! 第六步：网页关键词 bi/b/g（+ 自定义，必应优先）→ kind=web；execute 用默认浏览器打开 URL。
 //! 第八步：reload_engines 热替换引擎列表（设置页保存后立即生效）。
-//! actions / run_action 仍占位（动作面板在后续步骤）。
+//! 第九步：actions / run_action 接基础动作（打开所在文件夹/复制/剪切/复制路径）。
 
 use std::sync::Arc;
 
@@ -42,17 +42,9 @@ pub enum Request {
     /// 打开文件所在文件夹并选中。
     Reveal { id: String },
     /// 请求某文件的动作列表（→ 键动作面板）。
-    Actions {
-        #[allow(dead_code)]
-        id: String,
-    },
+    Actions { id: String },
     /// 执行动作面板里的某个动作。
-    RunAction {
-        #[allow(dead_code)]
-        id: String,
-        #[allow(dead_code)]
-        action: String,
-    },
+    RunAction { id: String, action: String },
     /// 设置页保存后热重载网页引擎列表（步骤 8）。
     ReloadEngines {
         engines: Vec<WebEngine>,
@@ -188,9 +180,23 @@ pub fn dispatch(
         Request::Search { query, max } => search(&query, max, index, apps, engines),
         Request::Execute { id } => execute_id(&id),
         Request::Reveal { id } => reveal_path(&id),
-        Request::Actions { .. } => Response::Actions { items: Vec::new() },
-        Request::RunAction { .. } => Response::Status { is_indexing: false },
+        Request::Actions { id } => list_actions(&id),
+        Request::RunAction { id, action } => run_action(&id, &action),
         Request::ReloadEngines { engines: list } => reload_engines(list, engines),
+    }
+}
+
+fn list_actions(id: &str) -> Response {
+    match crate::actions::list_actions(id) {
+        Ok(items) => Response::Actions { items },
+        Err(message) => Response::Error { message },
+    }
+}
+
+fn run_action(id: &str, action: &str) -> Response {
+    match crate::actions::run_action(id, action) {
+        Ok(()) => Response::Status { is_indexing: false },
+        Err(message) => Response::Error { message },
     }
 }
 
@@ -827,5 +833,47 @@ mod tests {
         let v = to_json(&resp);
         let t = v["type"].as_str().unwrap_or("");
         assert!(t == "status" || t == "error", "unexpected type {t}");
+    }
+
+    #[test]
+    fn actions_returns_basics_for_absolute_path() {
+        let resp = dispatch(
+            parse(r#"{"type":"actions","id":"C:\\Windows\\explorer.exe"}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        assert_eq!(v["type"], "actions");
+        let items = v["items"].as_array().unwrap();
+        assert!(items.iter().any(|i| i["id"] == "open_folder"));
+        assert!(items.iter().any(|i| i["id"] == "copy"));
+        assert!(items.iter().any(|i| i["id"] == "cut"));
+        assert!(items.iter().any(|i| i["id"] == "copy_path"));
+        assert_eq!(items.len(), 4, "第一版仅四条基础动作");
+    }
+
+    #[test]
+    fn actions_rejects_relative_path() {
+        let resp = dispatch(
+            parse(r#"{"type":"actions","id":"relative.txt"}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        assert_eq!(to_json(&resp)["type"], "error");
+    }
+
+    #[test]
+    fn run_action_unknown_is_error() {
+        let resp = dispatch(
+            parse(r#"{"type":"run_action","id":"C:\\Windows\\explorer.exe","action":"nope"}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        assert_eq!(v["type"], "error");
+        assert!(v["message"].as_str().unwrap_or("").contains("未知动作"));
     }
 }

@@ -1,3 +1,36 @@
-<!-- 占位文件：控件 PinButton -->
-<!-- 规格见 .trellis/tasks/07-23-prism-planning/frontend-spec.md -->
-<!-- 待用户确认骨架后再写实现代码 -->
+<UserControl x:Class="Prism.Controls.PinButton"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Width="28" Height="28"
+             Cursor="Hand"
+             ToolTip="固定窗口（失焦不隐藏）">
+    <Grid>
+        <Border x:Name="Bd"
+                Width="28" Height="28"
+                CornerRadius="14"
+                Background="{DynamicResource BgWindow}"
+                BorderBrush="{DynamicResource Divider}"
+                BorderThickness="1"
+                MouseLeftButtonUp="OnClick">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="8" Opacity="0.18"
+                                  ShadowDepth="2" Direction="270"
+                                  Color="#000000"
+                                  RenderingBias="Performance"/>
+            </Border.Effect>
+            <!-- 45° 斜向箭头（Segoe MDL2 OpenInNewWindow / 升级箭头） -->
+            <TextBlock x:Name="Arrow"
+                       Text="&#xE8A7;"
+                       FontFamily="Segoe MDL2 Assets"
+                       FontSize="12"
+                       Foreground="{DynamicResource TextSubtitle}"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       RenderTransformOrigin="0.5,0.5">
+                <TextBlock.RenderTransform>
+                    <RotateTransform Angle="45"/>
+                </TextBlock.RenderTransform>
+            </TextBlock>
+        </Border>
+    </Grid>
+</UserControl>

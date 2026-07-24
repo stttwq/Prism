@@ -8,4 +8,6 @@ global using KeyEventArgs = System.Windows.Input.KeyEventArgs;
 global using MessageBox = System.Windows.MessageBox;
 global using MessageBoxButton = System.Windows.MessageBoxButton;
 global using MessageBoxImage = System.Windows.MessageBoxImage;
+global using Pen = System.Windows.Media.Pen;
+global using Point = System.Windows.Point;
 global using UserControl = System.Windows.Controls.UserControl;

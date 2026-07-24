@@ -100,6 +100,35 @@ public sealed class PipeClient : IDisposable
         await SendAsync(new { type = "reload_engines", engines = payload }, ct).ConfigureAwait(false);
     }
 
+    /// <summary>请求某文件/文件夹的动作列表（→ 键动作面板）。</summary>
+    public async Task<IReadOnlyList<ActionItem>> GetActionsAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(new { type = "actions", id }, ct).ConfigureAwait(false);
+        var items = new List<ActionItem>();
+        if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var el in arr.EnumerateArray())
+                items.Add(ParseAction(el));
+        }
+        return items;
+    }
+
+    /// <summary>执行动作面板中的某一项。</summary>
+    public async Task RunActionAsync(string id, string action, CancellationToken ct = default)
+    {
+        await SendAsync(new { type = "run_action", id, action }, ct).ConfigureAwait(false);
+    }
+
+    private static ActionItem ParseAction(JsonElement el)
+    {
+        var id = el.TryGetProperty("id", out var i) ? i.GetString() ?? "" : "";
+        var label = el.TryGetProperty("label", out var l) ? l.GetString() ?? "" : "";
+        var glyph = el.TryGetProperty("icon_glyph", out var g) ? g.GetString() ?? "" : "";
+        var submenu = el.TryGetProperty("has_submenu", out var hs) && hs.ValueKind == JsonValueKind.True;
+        var header = el.TryGetProperty("is_section_header", out var sh) && sh.ValueKind == JsonValueKind.True;
+        return new ActionItem(id, label, glyph, submenu, header);
+    }
+
     /// <summary>
     /// 发送一条请求，读取一行响应并解析为 JSON。串行化以保证请求/响应配对。
     /// 重要：一旦请求写出，必须把对应响应读完，绝不能因 CancellationToken 中途放弃读——

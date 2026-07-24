@@ -1,5 +1,6 @@
 //! Prism 后端入口（prism-core.exe）
 
+mod actions;
 mod apps;
 mod config;
 mod index;

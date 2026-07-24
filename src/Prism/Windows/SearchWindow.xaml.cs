@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Prism.Models;
 using Prism.Services;
@@ -12,22 +13,25 @@ namespace Prism.Windows;
 
 /// <summary>
 /// 主搜索窗口（无边框、置顶、宽 660px，顶部距屏幕 25% 高度）。
-/// 第四步：接入 SearchHeader / ResultList / SearchViewModel，完成输入→搜索→打开链路。
+/// 第九步：PinButton / ActionPanel / 深浅色 / 展开动画。
 /// </summary>
 public partial class SearchWindow : Window
 {
     private const double FadeInMs = 120;
     private const double FadeOutMs = 80;
     private const double SlideOffsetPx = 6;
+    private const double PanelExpandMs = 100;
 
     private SearchViewModel? _vm;
     private IconCache? _icons;
+    private ThemeWatcher? _theme;
     private bool _suppressQueryEvent;
     private bool _hiding;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
     private bool _ignoreDeactivate;
+    private double _panelTargetHeight;
 
-    // ── 强制前台（启动自终端时 Activate 经常失败，导致空态 Esc/失焦都不生效）──
+    // ── 强制前台 ──
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -40,9 +44,10 @@ public partial class SearchWindow : Window
     public SearchWindow()
     {
         InitializeComponent();
-        // 窗口级隧道键：即使焦点不在 TextBox（或 TextBox 未拿到键盘焦点），Esc 也能隐藏。
         PreviewKeyDown += OnWindowPreviewKeyDown;
         Deactivated += OnDeactivated;
+        SizeChanged += (_, _) => UpdateCardClip();
+        Loaded += (_, _) => UpdateCardClip();
 
         Header.QueryChanged += OnHeaderQueryChanged;
         Header.QueryKeyDown += OnHeaderKeyDown;
@@ -54,13 +59,37 @@ public partial class SearchWindow : Window
             if (idx >= 0) _vm.State.SelectedIndex = idx;
             await _vm.ExecuteSelectedAsync();
         };
+        Actions.SelectedIndexChanged += idx =>
+        {
+            if (_vm is not null) _vm.State.SelectedActionIndex = idx;
+        };
+        Actions.ActionInvoked += async a =>
+        {
+            if (_vm is null) return;
+            // 同步选中再执行。
+            var list = _vm.State.Actions;
+            for (var i = 0; i < list.Count; i++)
+            {
+                if (ReferenceEquals(list[i], a) || list[i].Id == a.Id && list[i].Label == a.Label)
+                {
+                    _vm.State.SelectedActionIndex = i;
+                    break;
+                }
+            }
+            await _vm.ExecuteActionAsync();
+        };
+        Pin.IsPinnedChanged += pinned =>
+        {
+            if (_vm is not null) _vm.State.IsPinned = pinned;
+        };
     }
 
-    /// <summary>由 App 在启动时注入 ViewModel 与图标缓存。</summary>
-    public void Attach(SearchViewModel vm, IconCache icons)
+    /// <summary>由 App 在启动时注入 ViewModel、图标缓存与主题监听。</summary>
+    public void Attach(SearchViewModel vm, IconCache icons, ThemeWatcher? theme = null)
     {
         _vm = vm;
         _icons = icons;
+        _theme = theme;
         Results.SetIconCache(icons);
         vm.HideRequested += () =>
         {
@@ -68,12 +97,19 @@ public partial class SearchWindow : Window
             else Dispatcher.Invoke(HideAnimated);
         };
         vm.State.PropertyChanged += OnStateChanged;
+        if (_theme is not null)
+            _theme.ThemeApplied += OnThemeApplied;
+        Pin.IsPinned = vm.State.IsPinned;
     }
 
     public bool IsPinned
     {
         get => _vm?.State.IsPinned ?? false;
-        set { if (_vm is not null) _vm.State.IsPinned = value; }
+        set
+        {
+            if (_vm is not null) _vm.State.IsPinned = value;
+            Pin.IsPinned = value;
+        }
     }
 
     /// <summary>呼出：重置状态、定位、淡入、焦点到输入框。</summary>
@@ -81,20 +117,20 @@ public partial class SearchWindow : Window
     {
         _hiding = false;
         _ignoreDeactivate = true;
-        BeginAnimation(OpacityProperty, null); // 取消进行中的淡出
+        BeginAnimation(OpacityProperty, null);
 
         _vm?.ResetForShow();
         _suppressQueryEvent = true;
         Header.ClearQuery();
+        Header.SetMode(PanelMode.Idle);
         _suppressQueryEvent = false;
-        ApplyState(_vm?.State);
+        ApplyState(_vm?.State, animatePanel: false);
 
         PositionWindow();
         Opacity = 0;
         Show();
         ForceActivate();
-        Topmost = true; // 确保浮在最前
-        // 某些情况下需要"闪一下" Topmost 才能压过其它置顶窗。
+        Topmost = true;
         Topmost = false;
         Topmost = true;
 
@@ -106,17 +142,16 @@ public partial class SearchWindow : Window
         {
             EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
         };
-        var transform = new System.Windows.Media.TranslateTransform();
+        var transform = new TranslateTransform();
         RenderTransform = transform;
 
         BeginAnimation(OpacityProperty, fadeIn);
-        transform.BeginAnimation(System.Windows.Media.TranslateTransform.YProperty, slideIn);
+        transform.BeginAnimation(TranslateTransform.YProperty, slideIn);
 
         Dispatcher.BeginInvoke(() =>
         {
             ForceActivate();
             Header.FocusQuery();
-            // 约 300ms 后再响应失焦隐藏，躲开启动/焦点切换的瞬时 Deactivated。
             var t = new System.Windows.Threading.DispatcherTimer
             {
                 Interval = TimeSpan.FromMilliseconds(300),
@@ -126,10 +161,6 @@ public partial class SearchWindow : Window
         }, System.Windows.Threading.DispatcherPriority.Input);
     }
 
-    /// <summary>
-    /// 尽可能抢到前台焦点。从 `dotnet run`/终端拉起时，普通 Activate() 常被系统拒绝，
-    /// 窗口看得见但不是前台——此时 Esc 进不来、点别处也不会 Deactivated。
-    /// </summary>
     private void ForceActivate()
     {
         try
@@ -151,7 +182,6 @@ public partial class SearchWindow : Window
                 return;
             }
 
-            // AttachThreadInput 技巧：把当前线程与前台线程输入队列临时绑在一起，绕过前台限制。
             var foreThread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
             var appThread = GetCurrentThreadId();
             if (foreThread != appThread && foreThread != 0)
@@ -176,7 +206,6 @@ public partial class SearchWindow : Window
         }
         catch
         {
-            // 抢焦点失败不致命，用户点一下输入框仍可继续用。
             try { Activate(); } catch { /* ignore */ }
         }
     }
@@ -185,21 +214,18 @@ public partial class SearchWindow : Window
     {
         if (_hiding || !IsVisible) return;
         _hiding = true;
-        _ignoreDeactivate = true; // 隐藏过程中的失焦不再重入
+        _ignoreDeactivate = true;
         var fadeOut = new DoubleAnimation(Opacity, 0, TimeSpan.FromMilliseconds(FadeOutMs));
         fadeOut.Completed += (_, _) =>
         {
             Hide();
             _hiding = false;
-            // 隐藏后清掉键盘焦点，避免下次呼出时焦点状态错乱。
             try { Keyboard.ClearFocus(); } catch { /* ignore */ }
-            // 释放结果列表与图标位图，降低托盘空闲时工作集。
             ReleaseIdleMemory();
         };
         BeginAnimation(OpacityProperty, fadeOut);
     }
 
-    /// <summary>窗口隐藏后丢掉可再生成的 UI 数据，减轻常驻内存。</summary>
     private void ReleaseIdleMemory()
     {
         try
@@ -207,13 +233,11 @@ public partial class SearchWindow : Window
             _vm?.ResetForShow();
             Results.Items = Array.Empty<SearchResult>();
             Results.StatusMessage = "";
-            // 图标可再加载；清空避免 128 张位图长期占托管堆。
+            Actions.Items = Array.Empty<ActionItem>();
             _icons?.Clear();
-            // 工作站 GC：空闲时把内存还一点给系统（不阻塞交互路径）。
             Dispatcher.BeginInvoke(() =>
             {
                 GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
-                // 再把工作集页还给 OS，任务管理器数字会明显下降。
                 App.TrimWorkingSet();
             }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         }
@@ -227,7 +251,7 @@ public partial class SearchWindow : Window
     {
         if (e.Key == Key.Escape)
         {
-            HideAnimated();
+            HandleEscape();
             e.Handled = true;
         }
     }
@@ -237,15 +261,36 @@ public partial class SearchWindow : Window
         base.OnKeyDown(e);
         if (e.Key == Key.Escape)
         {
-            HideAnimated();
+            HandleEscape();
             e.Handled = true;
         }
+    }
+
+    private void HandleEscape()
+    {
+        if (_vm?.State.Mode == PanelMode.Actions)
+        {
+            LeaveActionsUi();
+            return;
+        }
+        HideAnimated();
+    }
+
+    private void LeaveActionsUi()
+    {
+        if (_vm is null) return;
+        _vm.LeaveActions();
+        _suppressQueryEvent = true;
+        Header.Query = _vm.State.Query;
+        Header.SetMode(PanelMode.Results);
+        _suppressQueryEvent = false;
+        ApplyState(_vm.State, animatePanel: true);
+        Header.FocusQuery();
     }
 
     private void OnDeactivated(object? sender, EventArgs e)
     {
         if (_ignoreDeactivate || IsPinned || _hiding) return;
-        // 空态 / 有内容 一视同仁：失焦即藏。
         HideAnimated();
     }
 
@@ -266,6 +311,8 @@ public partial class SearchWindow : Window
     {
         if (_vm is null) return;
 
+        var mode = _vm.State.Mode;
+
         switch (e.Key)
         {
             case Key.Up:
@@ -279,15 +326,41 @@ public partial class SearchWindow : Window
                 e.Handled = true;
                 break;
             case Key.Enter:
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+                if (mode == PanelMode.Actions)
+                {
+                    await _vm.ExecuteActionAsync();
+                }
+                else if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+                {
                     await _vm.RevealSelectedAsync();
+                }
                 else
+                {
                     await _vm.ExecuteSelectedAsync();
+                }
                 e.Handled = true;
                 break;
             case Key.Escape:
-                HideAnimated();
+                HandleEscape();
                 e.Handled = true;
+                break;
+            case Key.Right:
+                // 仅当当前选中 file/folder 时吞掉 → 并进入动作；
+                // 否则留给 TextBox 移动光标（app/web/more 或无选中）。
+                if (mode == PanelMode.Results
+                    && Keyboard.Modifiers == ModifierKeys.None
+                    && IsActionableSelection(_vm.State.SelectedResult))
+                {
+                    await EnterActionsUiAsync();
+                    e.Handled = true;
+                }
+                break;
+            case Key.Left:
+                if (mode == PanelMode.Actions && Keyboard.Modifiers == ModifierKeys.None)
+                {
+                    LeaveActionsUi();
+                    e.Handled = true;
+                }
                 break;
             case Key.D1: case Key.NumPad1: await CtrlNumber(1, e); break;
             case Key.D2: case Key.NumPad2: await CtrlNumber(2, e); break;
@@ -301,9 +374,27 @@ public partial class SearchWindow : Window
         }
     }
 
+    private static bool IsActionableSelection(SearchResult? item) =>
+        item is { Kind: "file" or "folder" } && !string.IsNullOrEmpty(item.ExecuteId);
+
+    private async Task EnterActionsUiAsync()
+    {
+        if (_vm is null) return;
+        await _vm.EnterActionsAsync().ConfigureAwait(true);
+        if (_vm.State.Mode != PanelMode.Actions) return;
+
+        _suppressQueryEvent = true;
+        Header.ClearQuery();
+        Header.SetMode(PanelMode.Actions);
+        _suppressQueryEvent = false;
+        ApplyState(_vm.State, animatePanel: true);
+        Header.FocusQuery();
+    }
+
     private async Task CtrlNumber(int n, KeyEventArgs e)
     {
         if (_vm is null || !Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) return;
+        if (_vm.State.Mode == PanelMode.Actions) return;
         await _vm.ExecuteIndexAsync(n);
         e.Handled = true;
     }
@@ -321,34 +412,133 @@ public partial class SearchWindow : Window
             Dispatcher.Invoke(() => OnStateChanged(sender, e));
             return;
         }
-        ApplyState(_vm?.State);
+
+        // IsPinned 同步到按钮（不经 Pin 自己的事件环）。
+        if (e.PropertyName == nameof(AppState.IsPinned) && _vm is not null)
+        {
+            if (Pin.IsPinned != _vm.State.IsPinned)
+                Pin.IsPinned = _vm.State.IsPinned;
+        }
+
+        ApplyState(_vm?.State, animatePanel: true);
     }
 
-    private void ApplyState(AppState? state)
+    private void OnThemeApplied()
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(OnThemeApplied);
+            return;
+        }
+        Results.InvalidateThemeBrushes();
+        Pin.RefreshTheme();
+    }
+
+    private void ApplyState(AppState? state, bool animatePanel)
     {
         if (state is null) return;
 
-        // 有输入 / 有结果 / 有状态提示时展开列表区。
-        var showList = !string.IsNullOrEmpty(state.Query)
-            || state.Results.Count > 0
-            || !string.IsNullOrEmpty(state.StatusMessage);
+        Header.SetMode(state.Mode);
 
-        Divider.Visibility = showList ? Visibility.Visible : Visibility.Collapsed;
-        Results.Visibility = showList ? Visibility.Visible : Visibility.Collapsed;
+        var showResults = state.Mode is PanelMode.Results or PanelMode.Idle
+            && (!string.IsNullOrEmpty(state.Query)
+                || state.Results.Count > 0
+                || !string.IsNullOrEmpty(state.StatusMessage));
+        var showActions = state.Mode == PanelMode.Actions;
 
-        if (!ReferenceEquals(Results.Items, state.Results))
-            Results.Items = state.Results;
-        if (Results.SelectedIndex != state.SelectedIndex)
-            Results.SelectedIndex = state.SelectedIndex;
+        Divider.Visibility = (showResults || showActions) ? Visibility.Visible : Visibility.Collapsed;
 
-        // 无结果时显示空态/索引提示；有结果时仍显示"打开失败"等错误。
-        Results.StatusMessage = state.StatusMessage;
+        if (showActions)
+        {
+            Results.Visibility = Visibility.Collapsed;
+            Actions.Visibility = Visibility.Visible;
+            if (!ReferenceEquals(Actions.Items, state.Actions))
+                Actions.Items = state.Actions;
+            if (Actions.SelectedIndex != state.SelectedActionIndex)
+                Actions.SelectedIndex = state.SelectedActionIndex;
+            // Results 的 StatusMessage 在 Actions 态隐藏，改走底部 ActionStatus。
+            Results.StatusMessage = "";
+            AnimatePanelHeight(Actions.Height > 0 ? Actions.Height : Actions.MinHeight, animatePanel);
+            SetActionStatus(state.StatusMessage);
+        }
+        else if (showResults)
+        {
+            Actions.Visibility = Visibility.Collapsed;
+            Results.Visibility = Visibility.Visible;
+            if (!ReferenceEquals(Results.Items, state.Results))
+                Results.Items = state.Results;
+            if (Results.SelectedIndex != state.SelectedIndex)
+                Results.SelectedIndex = state.SelectedIndex;
+            Results.StatusMessage = state.StatusMessage;
+            AnimatePanelHeight(Results.Height > 0 ? Results.Height : Results.MinHeight, animatePanel);
+            SetActionStatus("");
+        }
+        else
+        {
+            Results.Visibility = Visibility.Collapsed;
+            Actions.Visibility = Visibility.Collapsed;
+            Results.StatusMessage = state.StatusMessage;
+            AnimatePanelHeight(0, animatePanel);
+            SetActionStatus("");
+        }
+
+        UpdateCardClip();
+    }
+
+    private void SetActionStatus(string? message)
+    {
+        var text = message ?? "";
+        ActionStatus.Text = text;
+        ActionStatus.Visibility = string.IsNullOrEmpty(text)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    private void AnimatePanelHeight(double target, bool animate)
+    {
+        if (double.IsNaN(target) || target < 0) target = 0;
+        if (Math.Abs(_panelTargetHeight - target) < 0.5 && PanelHost.Height == target)
+            return;
+        _panelTargetHeight = target;
+
+        if (!animate || !IsVisible)
+        {
+            PanelHost.BeginAnimation(HeightProperty, null);
+            PanelHost.Height = target;
+            return;
+        }
+
+        var from = double.IsNaN(PanelHost.Height) ? 0 : PanelHost.ActualHeight;
+        if (from <= 0 && PanelHost.Visibility == Visibility.Visible)
+            from = PanelHost.ActualHeight;
+        var anim = new DoubleAnimation(from, target, TimeSpan.FromMilliseconds(PanelExpandMs))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            FillBehavior = FillBehavior.Stop,
+        };
+        anim.Completed += (_, _) =>
+        {
+            PanelHost.Height = target;
+        };
+        PanelHost.BeginAnimation(HeightProperty, anim);
+    }
+
+    private void UpdateCardClip()
+    {
+        if (CardClip is null || Card is null) return;
+        var w = Card.ActualWidth;
+        var h = Card.ActualHeight;
+        if (w <= 0 || h <= 0) return;
+        CardClip.Rect = new Rect(0, 0, w, h);
     }
 
     private void SyncSelectionToList()
     {
         if (_vm is null) return;
-        Results.SelectedIndex = _vm.State.SelectedIndex;
+        if (_vm.State.Mode == PanelMode.Actions)
+            Actions.SelectedIndex = _vm.State.SelectedActionIndex;
+        else
+            Results.SelectedIndex = _vm.State.SelectedIndex;
     }
 
     private int IndexOfResult(SearchResult r)

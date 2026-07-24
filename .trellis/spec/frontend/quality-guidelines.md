@@ -41,6 +41,10 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - After hide: drop result list + icon bitmaps and idle `GC.Collect(Optimized)` so tray-resident WS shrinks; never collect on the input/search hot path.
 - Prefer workstation GC (`ServerGarbageCollection=false`) for the WPF tray process.
 - Create `SearchWindow` lazily on first show; after hide / settings close / backend connect idle, call `EmptyWorkingSet` so task-manager WS reflects tray-resident footprint (does not reduce private bytes).
+- Theme: only `ThemeWatcher` writes `AppState.Theme` and swaps the Tokens.* resource dictionary; ResultList must `InvalidateThemeBrushes()` on theme change so MatchSpans colors update.
+- Pin: `IsPinned=true` blocks deactivate-hide; Esc still hides. PinButton sits outside the card (margin -12) and must not be clipped by the card `RectangleGeometry`.
+- Actions: enter only for `kind` file/folder via →; ← / Esc leaves Actions back to Results (restore prior query). Pipe `actions` / `run_action` pair like other requests (never abandon mid-flight).
+- Visual tokens live in `Themes/Tokens.*.xaml`; controls must use `DynamicResource` keys from frontend-spec §5 — no hardcoded hex in SearchWindow/ResultList/ActionPanel.
 
 ---
 
@@ -54,6 +58,10 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - Manual: settings「开机时自动启动」toggles `HKCU\…\Run\Prism` and persists in settings.json.
 - Manual: settings 改快捷键为组合键后立即生效；改网页引擎保存后无需重启即可用新关键词。
 - Manual: 设置页「数据目录」显示实际可写路径。
+- Manual: 系统切换深/浅色后搜索窗背景与文字随之切换。
+- Manual: 右上角固定按钮点击后失焦不隐藏；再点取消；Esc 仍隐藏。
+- Manual: 选中文件按 → 出现动作列表（打开所在文件夹/复制/剪切/复制路径）；← 或 Esc 返回结果；回车执行后隐藏。
+- Manual: 窗口圆角不裁切阴影、列表展开有短动画、"展示更多"行有蓝底图标。
 - `dotnet build src/Prism` clean (close running `Prism.exe` first if MSB3027 file lock).
 
 ---
@@ -63,5 +71,7 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - [ ] Pipe client never abandons a half-finished request/response pair
 - [ ] Indexing poll continues when apps returned but files still loading
 - [ ] Focus/hide works in Idle and Results
-- [ ] No silent swallow of execute/reveal errors without status text
+- [ ] No silent swallow of execute/reveal/run_action errors without status text
 - [ ] NotifyIcon disposed on exit; Run key path is quoted
+- [ ] Theme change refreshes ResultList brushes + PinButton background
+- [ ] → only handled for file/folder selection; Action errors show under ActionStatus

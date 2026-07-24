@@ -10,7 +10,7 @@ namespace Prism.Controls;
 /// <summary>
 /// 结果列表（frontend-spec.md ResultList）。
 /// 虚拟化 ListBox；标题默认绑定 + MatchSpans 染蓝；图标经 IconCache 异步加载。
-/// 高度按条数计算（最多 9 行），避免放在 StackPanel 里高度塌成 0。
+/// "more" 行使用蓝底双箭头装饰图标。
 /// </summary>
 public partial class ResultList : UserControl
 {
@@ -23,6 +23,9 @@ public partial class ResultList : UserControl
     private bool _syncing;
     private ScrollViewer? _scrollViewer;
     private bool _scrollHooked;
+    private Brush? _matchBrush;
+    private Brush? _normalBrush;
+    private ImageSource? _moreIcon;
 
     public ResultList()
     {
@@ -37,14 +40,21 @@ public partial class ResultList : UserControl
 
     public void SetIconCache(IconCache cache) => _icons = cache;
 
-    /// <summary>结果集合。</summary>
+    /// <summary>主题切换后丢弃缓存画刷，下次装饰时重新取。</summary>
+    public void InvalidateThemeBrushes()
+    {
+        _matchBrush = null;
+        _normalBrush = null;
+        _moreIcon = null;
+        DecorateVisibleItems();
+    }
+
     public IReadOnlyList<SearchResult> Items
     {
         get => _items;
         set
         {
             var next = value ?? Array.Empty<SearchResult>();
-            // 同一引用无需整表重绑（避免虚拟化容器全毁重建）。
             if (ReferenceEquals(_items, next))
             {
                 UpdateListHeight();
@@ -65,7 +75,6 @@ public partial class ResultList : UserControl
         }
     }
 
-    /// <summary>当前选中下标；-1 表示无选中。</summary>
     public int SelectedIndex
     {
         get => List.SelectedIndex;
@@ -80,7 +89,6 @@ public partial class ResultList : UserControl
         }
     }
 
-    /// <summary>列表区状态提示（无结果 / 索引中 / 错误）。</summary>
     public string StatusMessage
     {
         get => StatusText.Text;
@@ -93,10 +101,7 @@ public partial class ResultList : UserControl
         }
     }
 
-    /// <summary>选中项变化（用户点击）。</summary>
     public event Action<int>? SelectedIndexChanged;
-
-    /// <summary>双击某项。</summary>
     public event Action<SearchResult>? ItemInvoked;
 
     private void UpdateListHeight()
@@ -105,7 +110,6 @@ public partial class ResultList : UserControl
         var h = rows * RowHeight;
         if (!string.IsNullOrEmpty(StatusText.Text) && rows == 0)
             h = StatusRowHeight;
-        // 有结果又有状态时，在列表下留一点状态行空间。
         if (!string.IsNullOrEmpty(StatusText.Text) && rows > 0)
             h += StatusRowHeight;
 
@@ -184,10 +188,16 @@ public partial class ResultList : UserControl
                 }
             }
 
-            if (icon is null || _icons is null) continue;
+            if (icon is null) continue;
 
-            // more 行无路径；web 的 execute_id 是 URL，系统图标 API 不适用。
-            if (item.Kind is "more" or "web" || string.IsNullOrEmpty(item.ExecuteId))
+            if (item.Kind == "more")
+            {
+                icon.Tag = "more";
+                icon.Source = MoreIcon();
+                continue;
+            }
+
+            if (item.Kind is "web" || string.IsNullOrEmpty(item.ExecuteId) || _icons is null)
             {
                 icon.Tag = null;
                 icon.Source = null;
@@ -205,6 +215,40 @@ public partial class ResultList : UserControl
         }
     }
 
+    private ImageSource MoreIcon()
+    {
+        if (_moreIcon is not null) return _moreIcon;
+
+        // 蓝底圆角方块 + 白色双箭头（用 DrawingImage，避免位图依赖）。
+        var blue = TryFindBrush(this, "TextMatch")
+            ?? Freeze(new SolidColorBrush(Color.FromRgb(0x1E, 0x7A, 0xD4)));
+        var white = Freeze(new SolidColorBrush(Colors.White));
+
+        var group = new DrawingGroup();
+        using (var ctx = group.Open())
+        {
+            ctx.DrawRoundedRectangle(blue, null, new Rect(0, 0, 32, 32), 6, 6);
+            // 简易双箭头：两条折线
+            var pen = new Pen(white, 2.2) { StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
+            if (pen.CanFreeze) pen.Freeze();
+            var geo1 = new PathGeometry(new[]
+            {
+                new PathFigure(new Point(10, 12), new[] { new LineSegment(new Point(16, 8), true), new LineSegment(new Point(22, 12), true) }, false),
+            });
+            var geo2 = new PathGeometry(new[]
+            {
+                new PathFigure(new Point(10, 20), new[] { new LineSegment(new Point(16, 24), true), new LineSegment(new Point(22, 20), true) }, false),
+            });
+            ctx.DrawGeometry(null, pen, geo1);
+            ctx.DrawGeometry(null, pen, geo2);
+        }
+        if (group.CanFreeze) group.Freeze();
+        var img = new DrawingImage(group);
+        if (img.CanFreeze) img.Freeze();
+        _moreIcon = img;
+        return img;
+    }
+
     private async Task LoadIconAsync(string path, Image target)
     {
         if (_icons is null) return;
@@ -219,10 +263,6 @@ public partial class ResultList : UserControl
             // 图标失败不影响搜索。
         }
     }
-
-    // 缓存画刷，避免每次装饰行 new SolidColorBrush。
-    private Brush? _matchBrush;
-    private Brush? _normalBrush;
 
     private Brush MatchBrush(FrameworkElement el) =>
         _matchBrush ??= TryFindBrush(el, "TextMatch")

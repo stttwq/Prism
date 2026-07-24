@@ -7,28 +7,53 @@
         Topmost="True" ShowInTaskbar="False" ShowActivated="True" Focusable="True"
         WindowStartupLocation="Manual"
         Opacity="0">
-    <!-- 第四步：输入 + 结果列表；动作面板后续步骤 -->
-    <Border Background="{DynamicResource BgWindow}"
-            CornerRadius="10"
-            Margin="20"
-            Effect="{DynamicResource WindowShadow}">
-        <Border.Resources>
-            <!-- Blur 过大吃 GPU/系统显存；24 在观感与开销间更平衡 -->
-            <DropShadowEffect x:Key="WindowShadow"
-                              BlurRadius="24" Opacity="0.20"
-                              ShadowDepth="6" Direction="270"
-                              Color="#000000"
-                              RenderingBias="Performance"/>
-        </Border.Resources>
-        <StackPanel>
-            <controls:SearchHeader x:Name="Header"/>
-            <!-- 输入区与列表间 1px 分隔线（Results 时显示） -->
-            <Border x:Name="Divider"
-                    Height="1"
-                    Background="{DynamicResource Divider}"
-                    Visibility="Collapsed"/>
-            <controls:ResultList x:Name="Results"
-                                 Visibility="Collapsed"/>
-        </StackPanel>
-    </Border>
+    <!-- 第九步：PinButton + ActionPanel + 圆角裁剪 + 展开动画 -->
+    <Grid Margin="20">
+        <!-- 主卡片：圆角 + 阴影；Clip 保证列表不溢出圆角 -->
+        <Border x:Name="Card"
+                Background="{DynamicResource BgWindow}"
+                CornerRadius="10"
+                Effect="{DynamicResource WindowShadow}"
+                SnapsToDevicePixels="True">
+            <Border.Resources>
+                <DropShadowEffect x:Key="WindowShadow"
+                                  BlurRadius="24" Opacity="0.20"
+                                  ShadowDepth="6" Direction="270"
+                                  Color="#000000"
+                                  RenderingBias="Performance"/>
+            </Border.Resources>
+            <Border.Clip>
+                <RectangleGeometry x:Name="CardClip" RadiusX="10" RadiusY="10"/>
+            </Border.Clip>
+            <StackPanel>
+                <controls:SearchHeader x:Name="Header"/>
+                <Border x:Name="Divider"
+                        Height="1"
+                        Background="{DynamicResource Divider}"
+                        Visibility="Collapsed"/>
+                <!-- 面板容器：Results / Actions 互斥；高度动画在 code-behind -->
+                <Grid x:Name="PanelHost" ClipToBounds="True">
+                    <controls:ResultList x:Name="Results"
+                                         Visibility="Collapsed"/>
+                    <controls:ActionPanel x:Name="Actions"
+                                          Visibility="Collapsed"/>
+                </Grid>
+                <!-- Actions 态 / 全局错误提示（Results 空态仍用 ResultList.StatusMessage） -->
+                <TextBlock x:Name="ActionStatus"
+                           Margin="20,8,20,12"
+                           FontSize="13"
+                           FontFamily="{DynamicResource AppFontFamily}"
+                           Foreground="{DynamicResource TextSubtitle}"
+                           TextWrapping="Wrap"
+                           Visibility="Collapsed"/>
+            </StackPanel>
+        </Border>
+
+        <!-- PinButton：锚在卡片右上角外侧（右移 12、上移 12） -->
+        <controls:PinButton x:Name="Pin"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Top"
+                            Margin="0,-12,-12,0"
+                            Panel.ZIndex="10"/>
+    </Grid>
 </Window>

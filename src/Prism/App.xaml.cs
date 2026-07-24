@@ -37,6 +37,7 @@ public partial class App : Application
     private SearchWindow? _searchWindow;
     private SettingsWindow? _settingsWindow;
     private TrayService? _tray;
+    private ThemeWatcher? _theme;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -64,6 +65,10 @@ public partial class App : Application
         _icons = new IconCache();
         _vm = new SearchViewModel(_state, _pipe);
 
+        // 深浅色跟随系统（替换 App.xaml 中的 Tokens 字典）。
+        _theme = new ThemeWatcher(_state);
+        _theme.Start();
+
         // 搜索窗懒创建：冷启动托盘常驻时不先建 WPF 视觉树，降低初始工作集。
         // 第一次双击 Ctrl / 托盘左键时再 EnsureSearchWindow。
 
@@ -82,6 +87,8 @@ public partial class App : Application
         Log("  · 托盘图标：左键呼出，右键打开设置 / 重建索引 / 退出");
         Log("  · 设置页可改快捷键、网页搜索引擎、开机自启");
         Log("  · 输入文件名即时搜索；回车打开，Ctrl+Enter 打开所在文件夹");
+        Log("  · 选中文件后按 → 打开动作面板（打开所在文件夹/复制/剪切/复制路径）");
+        Log($"  · 当前主题：{(_state.Theme == AppTheme.Dark ? "深色" : "浅色")}（跟随系统）");
 
         _ = TryStartBackendAsync();
 
@@ -98,7 +105,7 @@ public partial class App : Application
             throw new InvalidOperationException("SearchViewModel / IconCache 尚未初始化");
 
         _searchWindow = new SearchWindow();
-        _searchWindow.Attach(_vm, _icons);
+        _searchWindow.Attach(_vm, _icons, _theme);
         return _searchWindow;
     }
 
@@ -222,6 +229,7 @@ public partial class App : Application
     {
         _tray?.Dispose();
         _hotkey?.Dispose();
+        _theme?.Dispose();
         _pipe?.Dispose();
         base.OnExit(e);
     }

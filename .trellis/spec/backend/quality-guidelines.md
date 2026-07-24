@@ -32,6 +32,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 - Match spans: UTF-16 code unit offsets (WPF `string` indexing).
 - Web engines load at backend start from shared `settings.json`; empty/missing list falls back to defaults (Bing-first: `bi`, `b`, `g`).
 - `reload_engines` IPC replaces the in-memory list immediately (RwLock); empty list falls back to defaults. Accept PascalCase engine fields from the frontend.
+- `actions` / `run_action`: path validation same as execute/reveal (absolute only). First-version actions are exactly four: `open_folder` (explorer /select), `copy`/`cut` (CF_HDROP + Preferred DropEffect), `copy_path` (CF_UNICODETEXT). Do not ship placeholder "快捷菜单" rows that cannot run. On clipboard `SetClipboardData` failure, `GlobalFree` the unowned `HGLOBAL` (system only takes ownership after success).
 
 ---
 
@@ -41,6 +42,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 - IPC tests: empty index `is_indexing=true`; ready empty index `is_indexing=false`; apps appear with `kind=app`.
 - Web-search tests: Chinese query URL-encoding; `bi` vs `b`; custom engine list; `execute` https not rejected as relative path; web row sorts before apps when keyword matches.
 - `reload_engines` tests: replace list affects subsequent search; empty list falls back to defaults; PascalCase fields parse.
+- Actions tests: list_actions rejects relative; basics present; unknown run_action errors; IPC `actions` / `run_action` wiring.
 - `cargo test --manifest-path src/prism-core/Cargo.toml` must stay green before calling a step done.
 
 ---

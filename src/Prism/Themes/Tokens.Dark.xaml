@@ -1,3 +1,32 @@
-<!-- 占位文件：设计令牌·深色 -->
-<!-- 规格见 .trellis/tasks/07-23-prism-planning/frontend-spec.md -->
-<!-- 待用户确认骨架后再写实现代码 -->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+    <!-- 深色主题令牌（frontend-spec.md §5，浅色同布局的等价配色） -->
+    <SolidColorBrush x:Key="BgWindow" Color="#202124"/>
+    <SolidColorBrush x:Key="BgItemSelected" Color="#2E3033"/>
+    <SolidColorBrush x:Key="TextQuery" Color="#E8EAED"/>
+    <SolidColorBrush x:Key="TextPlaceholder" Color="#6E7276"/>
+    <SolidColorBrush x:Key="TextTitle" Color="#E8EAED"/>
+    <SolidColorBrush x:Key="TextMatch" Color="#6FB5F2"/>
+    <SolidColorBrush x:Key="TextSubtitle" Color="#9AA0A6"/>
+    <SolidColorBrush x:Key="Divider" Color="#3C4043"/>
+    <SolidColorBrush x:Key="ScrollThumb" Color="#5F6368"/>
+
+    <!-- 尺寸/字体与浅色相同 -->
+    <sys:Double x:Key="WindowWidth">660</sys:Double>
+    <sys:Double x:Key="RadiusWindow">10</sys:Double>
+    <sys:Double x:Key="HeaderHeight">68</sys:Double>
+    <sys:Double x:Key="FontSizeQuery">26</sys:Double>
+    <sys:Double x:Key="FontSizePlaceholder">22</sys:Double>
+    <sys:Double x:Key="ItemHeight">62</sys:Double>
+    <sys:Double x:Key="IconSizeItem">32</sys:Double>
+    <sys:Double x:Key="FontSizeTitle">17</sys:Double>
+    <sys:Double x:Key="FontSizeSubtitle">13</sys:Double>
+    <sys:Double x:Key="FontSizeHotkeyHint">15</sys:Double>
+    <sys:Double x:Key="ActionItemHeight">44</sys:Double>
+    <sys:Double x:Key="IconSizeAction">20</sys:Double>
+    <sys:Double x:Key="FontSizeAction">16</sys:Double>
+    <sys:Double x:Key="FontSizeSectionLabel">15</sys:Double>
+    <sys:Double x:Key="PadX">20</sys:Double>
+    <FontFamily x:Key="AppFontFamily">微软雅黑, Segoe UI</FontFamily>
+</ResourceDictionary>
