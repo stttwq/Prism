@@ -74,3 +74,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Prism step 7: tray icon and registry autostart
+
+**Date**: 2026-07-24
+**Task**: Prism step 7: tray icon and registry autostart
+**Branch**: `main`
+
+### Summary
+
+完成 implement 步骤 7 托盘与自启：NotifyIcon（打开设置/重建索引占位/退出）、HKCU Run 自启（路径加引号）、最小设置窗（开机自启+数据目录）、WPF+WinForms GlobalUsings 与图标生命周期；dotnet build 通过。任务 07-23-prism-planning 保持 in_progress（步骤 8–11 未做，未 archive）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8073045` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
