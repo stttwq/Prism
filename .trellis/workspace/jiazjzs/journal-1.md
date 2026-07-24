@@ -41,3 +41,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Prism step 6: web shortcut search (Bing-first)
+
+**Date**: 2026-07-24
+**Task**: Prism step 6: web shortcut search (Bing-first)
+**Branch**: `main`
+
+### Summary
+
+完成 implement 步骤 6 网页快捷搜索：websearch 解析 bi/b/g 与 settings.json 自定义引擎（必应优先），IPC 搜索 web 置顶、execute 默认浏览器打开 URL；前端 web 行跳过系统图标；同步前后端 quality-guidelines。cargo test 45 全绿、clippy/dotnet build 通过。任务 07-23-prism-planning 保持 in_progress（步骤 7–11 未做，未 archive）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e993e9e` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
