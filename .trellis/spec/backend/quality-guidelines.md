@@ -60,6 +60,28 @@ Baseline (2026-07-25, dev machine, full index loaded, idle): total **~38MB priva
 
 ---
 
+## Installer / Packaging (step 11)
+
+Executable layout after build lives in **`dist/`** at repo root (the installer source — Inno Setup pulls from there):
+
+1. **Frontend single-file, framework-dependent** — do not self-contain (bloats to ~150MB+). From repo root:
+   ```
+   dotnet publish src/Prism -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
+   ```
+   Output: `src/Prism/bin/Release/net8.0-windows/win-x64/publish/Prism.exe` (~300KB, single file, no `Prism.dll` beside it). Copy to `dist/Prism.exe`.
+2. **Backend** — `cargo build --release --manifest-path src/prism-core/Cargo.toml`; copy `src/prism-core/target/release/prism-core.exe` to `dist/`.
+3. `dist/prism.ico` (also the setup/uninstall icon).
+4. `dist/prism.iss` — Inno Setup **Chinese** wizard. Run `ISCC.exe dist\prism.iss` → `dist\PrismSetup-<ver>.exe`.
+
+Installer conventions baked into the ISS (do not break without reason):
+- **Self-start registry** writes `HKCU\...\Run\Prism` = `"<dir>\Prism.exe"` — **same value name and quoting** as `Prism.Services.AutoStartService` so the settings page and installer agree. `PrivilegesRequired=lowest` + `PrivilegesRequiredOverridesAllowed=dialog` → installing under Program Files auto-prompts UAC; the exe itself stays `asInvoker` (MFT ascent handled by backend).
+- **Do NOT pre-create `data`** in the ISS. Data-dir resolution happens at Prism first launch (`config::resolve_data_dir`): install dir `\data` if writable (e.g. `D:\工具\Prism`), else `%LocalAppData%\Prism` (Program Files case). `[UninstallDelete]` removes `{app}\data` only; user-data-folder content survives uninstall.
+- `CloseApplications=force` + an `[UninstallRun]` `taskkill Prism.exe`/`prism-core.exe` before deleting — tray-resident process would otherwise lock the exe.
+
+Install acceptance (prd.md R7): run the produced setup twice — once into a **Chinese-named dir** (`D:\工具\Prism`; verify index appears under the install dir `\data`) and once into **Program Files** (UAC; verify index lands in `%LocalAppData%\Prism` and the settings page shows that path). This double-install is the gate for step 11; it requires Inno Setup + the real setup exe, so it runs locally, not in the dev session.
+
+---
+
 ## Code Review Checklist
 
 - [ ] Pipe write always paired with a full line read
