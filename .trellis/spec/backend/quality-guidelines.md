@@ -47,6 +47,19 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 
 ---
 
+## Memory Acceptance (≤100MB hard gate)
+
+Task Manager's "内存(专用工作集)" column = **Private Working Set** = `Get-Process <name> | % PrivateMemorySize64`. The ≤100MB gate (design.md) is the **sum of `Prism.exe` + `prism-core.exe`** private working sets, at idle, **after the index is loaded** (pipe `search` returns `is_indexing:false`).
+
+Procedure:
+1. **Rebuild both release binaries first** — release artifacts go stale silently: a commit made after the last build is NOT reflected in the exe. `cargo build --release` + `dotnet build src/Prism -c Release`, then **manually copy** `prism-core.exe` beside `Prism.exe` in the publish dir (the csproj has no target that does this).
+2. Launch `Prism.exe` (it spawns `prism-core.exe`); confirm `is_indexing:false` via a pipe search before measuring.
+3. Sum `PrivateMemorySize64` across both processes vs 100MB. (`WorkingSet64` runs ~10MB higher — private WS is the Task-Manager-matching figure; report both.)
+
+Baseline (2026-07-25, dev machine, full index loaded, idle): total **~38MB private WS** / ~50MB WS — backend ~22MB, frontend ~16MB. Comfortably under the 70/30 split.
+
+---
+
 ## Code Review Checklist
 
 - [ ] Pipe write always paired with a full line read
