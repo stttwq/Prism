@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
+- **Total Sessions**: 7
 - **Last Active**: 2026-07-25
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~208 | Active |
+| `journal-1.md` | ~242 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-07-25 | Prism step 11: first installer package (PrismSetup-1.0.0.exe, double-install accepted) | `9ead91d` | `main` |
 | 6 | 2026-07-25 | Prism step 10: memory acceptance (≤100MB verified) | `faddfb0` | `main` |
 | 5 | 2026-07-25 | Prism step 9 UI polish: theme pin actions | `9430bec` | `main` |
 | 4 | 2026-07-25 | Prism step 8 settings UI and memory budget | `5d8d0fb` | `main` |

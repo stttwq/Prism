@@ -207,46 +207,36 @@
 
 - None - task complete
 
-## Session 7: Prism step 11: installer artifacts (iss + dist, compile/install pending local)
+
+
+## Session 7: Prism step 11: first installer package (PrismSetup-1.0.0.exe, double-install accepted)
 
 **Date**: 2026-07-25
-**Task**: Prism step 11: 安装包脚本与产物（编译/安装验收待本地）
+**Task**: Prism step 11: first installer package (PrismSetup-1.0.0.exe, double-install accepted)
 **Branch**: `main`
 
 ### Summary
 
-完成 implement 步骤 11 的脚本与产物准备（按用户选定交付范围：只产出脚本+产物+说明，本地用 ISCC 编译与双套安装验收）：
-- 前端单文件发布（framework-dependent，PublishSingleFile）→ dist/Prism.exe（299KB）。
-- 后端 release 产物 → dist/prism-core.exe（502KB）。
-- dist/prism.ico。
-- dist/prism.iss：Inno Setup 中文向导（选目录/开始菜单/桌面（默认不勾）/开机自启勾选）；HKCU Run\Prism 自启值名与前端 AutoStartService 一致；Unicode 全程；PrivilegesRequired=lowest+overridesAllowed=dialog（装 Program Files 时 UAC 自动提示）；CloseApplications=force + 卸载 taskkill 退出常驻进程；中文目录与 Program Files 两套数据目录策略由 Prism 首启自检承载（安装包不预建 data）。
-- README.md 补完中文使用说明（安装/使用/设置自启/数据位置/卸载/内存验收）。
+完成 implement 第 11 步并产出 Prism 第一个软件包：dist 安装源（前端单文件 frame-dependent 发布 + 后端 release + ico）与 Inno Setup 中文安装脚本 prism.iss；用户本地用 Inno Setup 7（装在 D:\LS\Setup7）编译生成 PrismSetup-1.0.0.exe，并完成中文目录 D:\工具\Prism 与 Program Files 双套安装验收——前者索引落安装目录\data、后者退回 %LocalAppData%\Prism，全部功能正常。README 补完中文使用说明，backend quality-guidelines 新增 Installer/Packaging 节。任务 07-23-prism-planning 已 archive。
 
 ### Main Changes
 
-- dist/: 新增 Prism.exe、prism-core.exe、prism.ico、prism.iss（安装源 + Inno 脚本）
-- README.md: 由「使用说明待补充」改为完整中文使用说明
-- 发布命令：`dotnet publish src/Prism -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true`；后端 `cargo build --release --manifest-path src/prism-core/Cargo.toml`
+- Detailed change bullets were not supplied; see the summary above.
 
 ### Git Commits
 
 | Hash | Message |
 |------|---------|
-| (未提交，待本地编译验收后一并提交) | - |
+| `9ead91d` | (see git log) |
 
 ### Testing
 
-- 产物齐全校验：dist/ 四文件齐备；前端单文件发布成功（Prism.exe 299KB 单文件，无 Prism.dll 伴生）。
-- 数据目录探测逻辑前后端已实现（config.rs resolve_data_dir / SettingsStore.ResolveDataDir），第10步内存验收已确认可降级 LocalAppData。
-- 安装包编译（ISCC）与「中文目录 D:\工具\Prism」「Program Files」两套安装验收待本地执行（Inno Setup 当前未装）。
+- Validation was not recorded for this session.
 
 ### Status
 
-[OK] **步骤 11 脚本/产物部分完成**
+[OK] **Completed**
 
 ### Next Steps
 
-- 本地安装 Inno Setup 6 → 跑 `ISCC.exe dist\prism.iss` 生成 PrismSetup-1.0.0.exe
-- 在 D:\工具\Prism 安装验收：索引出现在安装目录 data；功能正常
-- 在 Program Files（UAC）安装验收：索引自动存 %LocalAppData%\Prism，设置页显示实际位置；功能正常
-- 两套验收 OK 后提交 git 并归档任务 07-23-prism-planning
+- None - task complete
