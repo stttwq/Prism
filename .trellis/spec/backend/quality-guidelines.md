@@ -60,6 +60,55 @@ Baseline (2026-07-25, dev machine, full index loaded, idle): total **~38MB priva
 
 ---
 
+## Indexing: Known Gaps (post-step-11 review)
+
+Two user-observed issues found after the step-11 install acceptance. Deferred to a follow-up task (no code change yet — recorded here so the next task picks them up).
+
+### Gap A — first-install index-build wait
+
+**Symptom (user-reported, 2026-07-25):** On first install + launch (no disk cache yet), the frontend connects but search returns nothing or partial results until the backend finishes the full-build scan. Users may mistake this for a broken app.
+
+**Mechanism (`index.rs` build_or_load):**
+1. Frontend pulls up the backend and connects the named pipe — timeout 10 s, normally **millisecond-level** handshake (`PipeClient.ConnectAsync`, frontend `is_indexing` echo).
+2. Backend `load_cache` runs on `spawn_blocking`:
+   - **cache present** (restart case): deserialize `data\index.bin` — measured **seconds** (the `加载耗时 {}ms` log line exists but the actual value was not captured in step-10 acceptance; the `~秒级常驻` claim is qualitative). After load completes, `is_indexing=false` and search is fully usable.
+   - **cache absent** (first install): falls through to `build_full_index()` — full MFT enumeration across all NTFS volumes. **Dozens of seconds to minutes** depending on file count / MFT permission. During this window `is_indexing=true` and results are partial.
+
+**Why "seconds after restart" is the steady state but "first install" stalls:** cache presence is the difference. Reboot → cache loads in seconds. First install → no cache → full build.
+
+**Improvement routes (light → heavy):**
+- **A1 (frontend signal, low cost):** surface the existing `is_indexing` from `results` in the UI — "Prism 正在首次构建全盘索引…请稍候" instead of a bare empty result. No backend change. Already the IPC contract (`results` includes `is_indexing`).
+- **A2 (progress):** backend pushes periodic `index_progress{scanned,total_estimate}`; frontend shows a progress bar. `total_estimate` from last scan count stored in cache.
+- **A3 (MFT/USN fast path):** real USN Journal path at fast-build — cut first build from minutes to seconds (also GAP B's answer).
+
+**Open measurement:** capture `load_cache` ms on this machine (the log line is there) before deciding whether A1's UI wording is even needed (<2s ⇒ perhaps not).
+
+### Gap B — new-file detection latency (no real-time USN watch)
+
+**Symptom (user-reported, 2026-07-25):** Files created/renamed/deleted after index build do **not** appear promptly in search — up to a **~5-minute** blind window.
+
+**Mechanism:** `build_or_load` only does a **one-shot MFT enumeration** via `FSCTL_ENUM_USN_DATA` to build the index fast; there is **no USN Journal subscription / `FSCTL_READ_USN_JOURNAL` long-poll**. New-file awareness comes solely from `index_refresh_secs` (default **300**, from `Config::default`) triggering **full re-enumeration + whole-index swap** (`build_full_index`) on that interval.
+
+- Worst case latency ≈ `index_refresh_secs`; average ≈ half that.
+- Each refresh is a redundant full enumeration (USN could read just the delta). Wasted work on top of the latency.
+
+**Gap vs design.md:** design.md "数据流 / 重要权衡" flags planned real-time increment via USN Journal (needs admin; refuse ⇒ degrade to directory scan). **Step 3 actually shipped only the MFT-enumeration half — the realtime-increment half was not implemented.** This is the documented feature debt.
+
+**Improvement routes (light → heavy):**
+- **B1 (tunable, trivial):** lower `index_refresh_secs` default (300 → 60 or 30). Trades periodic full-enum disk/CPU churn for a shorter blind window. Patches the symptom, not the cause.
+- **B2 (USN Journal realtime watch, the real fix, matches design.md):** new backend module — spawn a tokio task holding the USN journal's `Min/MaxUsn`, `FSCTL_READ_USN_JOURNAL` long-poll, apply create/rename/delete events as **incremental** updates to the shared index (**not** full swap). New files visible in **seconds**. Requires admin to read the journal; refuse ⇒ fall back to current periodic full rebuild.
+- **B3 (ReadDirectoryChangesW fallback):** per-root watch without admin, for the degrade path under B2.
+
+### Recommended next-task shape
+
+One follow-up task covers both gaps coherently because A3 and B2 are the same USN-Journal work:
+- **B2** (USN realtime watch) is the centrepiece — fixes the ~5-min blind window *and* gives A3 its fast first-build path.
+- **A1/A2** (frontend `is_indexing` surfacing + progress) layered on top for the residual first-install window that even USN fast-build leaves.
+- **B1** optional stop-gap if B2 is deferred.
+- **Open measurement** (capture `load_cache` ms) should be the first step of that task — it tells us whether A1 wording is needed at all.
+
+---
+
 ## Installer / Packaging (step 11)
 
 Executable layout after build lives in **`dist/`** at repo root (the installer source — Inno Setup pulls from there):
