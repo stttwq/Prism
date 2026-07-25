@@ -173,3 +173,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Prism step 10: memory acceptance (≤100MB verified)
+
+**Date**: 2026-07-25
+**Task**: Prism step 10: memory acceptance (≤100MB verified)
+**Branch**: `main`
+
+### Summary
+
+完成 implement 步骤 10 内存验收：发现发布二进制静默过期（不含 step 9 改动），rebuild 双 release 并手动复制 prism-core.exe 至发布目录；命名管道确认 is_indexing:false（索引已从 18MB v3 缓存加载常驻）；实测前后端合计私有工作集约 38MB / 工作集约 50MB，远低于 100MB（后端约 22MB≤70、前端约 16MB≤30）。验收方法+实测基线沉淀入 backend quality-guidelines。任务 07-23-prism-planning 保持 in_progress（步骤 11 未做，未 archive）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `faddfb0` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

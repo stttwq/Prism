@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-07-25
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~175 | Active |
+| `journal-1.md` | ~208 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-07-25 | Prism step 10: memory acceptance (≤100MB verified) | `faddfb0` | `main` |
 | 5 | 2026-07-25 | Prism step 9 UI polish: theme pin actions | `9430bec` | `main` |
 | 4 | 2026-07-25 | Prism step 8 settings UI and memory budget | `5d8d0fb` | `main` |
 | 3 | 2026-07-24 | Prism step 7: tray icon and registry autostart | `8073045` | `main` |
