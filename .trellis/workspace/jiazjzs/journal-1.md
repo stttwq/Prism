@@ -240,3 +240,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: Prism post-step-11: indexing known gaps recorded (first-install wait + new-file ~5min latency)
+
+**Date**: 2026-07-25
+**Task**: Prism post-step-11: indexing known gaps recorded (first-install wait + new-file ~5min latency)
+**Branch**: `main`
+
+### Summary
+
+第11步首个安装包与双套验收完成后，用户复盘点出两个索引相关缺口，未改代码、沉入 backend quality-guidelines 新增「Indexing: Known Gaps」节：Gap A 首次装无缓存→全量建索引期间（分钟级）搜不全、重启有缓存 load_cache 秒级（真实 ms 未测，日志已有「加载耗时」行可抓）；Gap B 新增文件靠 index_refresh_secs=300 全量重建感知、最坏~5min 盲区，根因是 design.md 规划的 USN Journal 实时监听未落地（第3步只做了 MFT 一次性枚举那半）。给出改善路线 A1/A2/A3 与 B1/B2/B3，注明后续任务形状（B2 USN 实时 watch 为核心，先抓 load_cache ms 决定 A1 文案）。无代码改动。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1592277` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
