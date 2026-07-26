@@ -19,7 +19,10 @@
 
 ### Main Changes
 
-- Detailed change bullets were not supplied; see the summary above.
+- `ResultList` now applies stable-key collection diffs without resetting `ItemsSource`.
+- Existing result rows no longer gain a transient searching-status row during replacement queries.
+- Same-target panel height animations and identical status assignments are layout no-ops.
+- Frontend quality guidelines now capture the stable-refresh contract and manual regression case.
 
 ### Git Commits
 
@@ -32,15 +35,18 @@
 
 ### Testing
 
-- Validation was not recorded for this session.
+- `dotnet build src/Prism -c Release --no-restore` (0 warnings, 0 errors)
+- `dotnet test src/Prism -c Release --no-restore`
+- Targeted `dotnet format --verify-no-changes`
+- Manual `abc` to `ab` backspace regression confirmed by the user
 
 ### Status
 
-[OK] **Completed**
+[OK] **R4 completed; parent task remains in progress**
 
 ### Next Steps
 
-- None - task complete
+- Continue the remaining `prism-optimize-round1` requirements (R1/R2/R3) in a future session.
 
 
 ## Session 2: Prism step 6: web shortcut search (Bing-first)
@@ -294,6 +300,39 @@
 | Hash | Message |
 |------|---------|
 | `199bb99` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 10: R4 差量刷新与抖动修复
+
+**Date**: 2026-07-26
+**Task**: R4 差量刷新与抖动修复
+**Branch**: `main`
+
+### Summary
+
+实现 ResultList 稳定键差量更新，消除搜索状态行与重复高度动画导致的退格跳动；用户手测确认修复，并将布局稳定约束写入前端规范。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fb5b7a7` | (see git log) |
 
 ### Testing
 
