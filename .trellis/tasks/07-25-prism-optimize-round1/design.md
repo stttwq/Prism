@@ -62,6 +62,7 @@ build_full_index() 时逐卷记录 NextUsn 位点
 
 ## R5 more 行实装（前端）
 
+- `SearchViewModel` 用单一常量定义首屏 limit=8；呼出窗口或查询变化时都重置为 8，避免长列表占满交互区。
 - `ApplySearchResponse`：仅当 `resp.Items.Count >= max` 时追加 More 行。
 - ResultList 加 `MouseLeftButtonUp`（单击）：命中行若 `Kind=="more"` 直接 `ItemInvoked`；其他行维持单击选中、双击执行。
 - ShowMore 后（limit=1000）返回 <1000 条 → 不再追加 more 行，自然消失。

@@ -12,11 +12,14 @@ namespace Prism.ViewModels;
 /// </summary>
 public sealed class SearchViewModel
 {
+    private const int InitialResultLimit = 8;
+    private const int ExpandedResultLimit = 1000;
+
     private readonly AppState _state;
     private readonly PipeClient _pipe;
     private readonly DispatcherTimer _debounce;
     private CancellationTokenSource? _searchCts;
-    private int _resultLimit = 100;
+    private int _resultLimit = InitialResultLimit;
     private string _pendingQuery = "";
     private int _searchSeq;
     /// <summary>进入 Actions 前保存的搜索词，离开时恢复。</summary>
@@ -66,7 +69,7 @@ public sealed class SearchViewModel
         _debounce.Stop();
         _searchSeq++;
         CancelSearch();
-        _resultLimit = 100;
+        _resultLimit = InitialResultLimit;
         _pendingQuery = "";
         _queryBeforeActions = "";
         _allActions = Array.Empty<ActionItem>();
@@ -95,7 +98,7 @@ public sealed class SearchViewModel
             return;
         }
 
-        _resultLimit = 100;
+        _resultLimit = InitialResultLimit;
 
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -313,7 +316,7 @@ public sealed class SearchViewModel
 
     private async Task ShowMoreAsync()
     {
-        _resultLimit = 1000;
+        _resultLimit = ExpandedResultLimit;
         await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
     }
 
@@ -383,7 +386,7 @@ public sealed class SearchViewModel
     {
         var list = new List<SearchResult>(resp.Items.Count + 1);
         list.AddRange(resp.Items);
-        if (resp.Items.Count > 0)
+        if (resp.Items.Count > 0 && resp.Items.Count >= max)
             list.Add(SearchResult.More(query));
 
         var prevId = _state.SelectedResult?.ExecuteId;

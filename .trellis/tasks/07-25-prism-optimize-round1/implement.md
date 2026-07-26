@@ -5,6 +5,7 @@
 1. **实测 load_cache 耗时（AC4）**
    - 运行 release 后端，抓日志「加载耗时 {}ms」，记入 `research/load-cache-ms.md`；>2s 则 R2 文案覆盖加载期。
 2. **R5 more 行实装（最小、先热身）**
+   - `SearchViewModel`：首屏 limit 设为 8，呼出/查询变化时统一重置；第 9 行按需显示 More。
    - `SearchViewModel.ApplySearchResponse`：`resp.Items.Count >= max` 才加 More 行。
    - `ResultList`：单击 more 行触发 ItemInvoked。
    - 验证：dotnet build；手测 AC7。

@@ -9,6 +9,7 @@
                  VirtualizingPanel.IsVirtualizing="True"
                  VirtualizingPanel.VirtualizationMode="Recycling"
                  SelectionChanged="OnSelectionChanged"
+                 PreviewMouseLeftButtonUp="OnPreviewMouseLeftButtonUp"
                  MouseDoubleClick="OnDoubleClick">
             <ListBox.ItemTemplate>
                 <DataTemplate>

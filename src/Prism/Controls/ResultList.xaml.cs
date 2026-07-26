@@ -134,6 +134,15 @@ public partial class ResultList : UserControl
         DecorateVisibleItems();
     }
 
+    private void OnPreviewMouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        var source = e.OriginalSource as DependencyObject;
+        if (source is null) return;
+        if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
+        if (container.DataContext is SearchResult { Kind: "more" } result)
+            ItemInvoked?.Invoke(result);
+    }
+
     private void OnDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
         if (List.SelectedItem is SearchResult r)

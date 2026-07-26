@@ -49,7 +49,7 @@
 
 ## 3. 现状缺陷精确描述（为什么改）
 
-1. **more 行**：`ApplySearchResponse` 里只要 `resp.Items.Count > 0` 就恒追加 `SearchResult.More(query)` 行；单击它只是选中（ListBox 默认行为），只有双击（`OnDoubleClick`→`ItemInvoked`）或 Enter 才触发 `ShowMoreAsync()`（limit 100→1000 重搜）。用户感知："点了没反应 = 没实装"。
+1. **more 行**：`ApplySearchResponse` 里只要 `resp.Items.Count > 0` 就恒追加 `SearchResult.More(query)` 行；单击它只是选中（ListBox 默认行为），只有双击（`OnDoubleClick`→`ItemInvoked`）或 Enter 才触发 `ShowMoreAsync()`（首屏 limit 现调整为 8，加载更多到 1000）。用户感知："点了没反应 = 没实装"。
 2. **抖动**：每次搜索响应 `_state.Results = list`（全新 List 实例）→ `ApplyState` 里 `ReferenceEquals` 不等 → `ResultList.Items` setter 重设 `List.ItemsSource` → 全部容器重建；`DecorateVisibleItems` 把 icon.Source 先置 null 再异步加载 → 图标闪空；`UpdateListHeight` 重算 → 高度跳。删一个字母时肉眼可见"颤一下"。
 3. **右键**：`ResultList.xaml` 只挂了 `MouseDoubleClick`，无任何右键处理，无 ContextMenu。
 4. **索引进度**：`is_indexing=true` 时仅有静态文案「索引加载中…」，首装全盘构建分钟级，用户无进度感知。
@@ -59,6 +59,8 @@
 ### W1 "显示更多结果"实装
 
 **改动 A — 条件显示**（`SearchViewModel.ApplySearchResponse`）：
+
+首屏请求上限统一为 8：用常量供字段初始化、`ResetForShow` 和 `OnQueryChanged` 复用；这样最多显示 8 条实际结果，第 9 行才是 more。服务层 `PipeClient.SearchAsync` 的默认值保持不变，ViewModel 始终显式传入上限。
 
 ```csharp
 // 现状：if (resp.Items.Count > 0) list.Add(SearchResult.More(query));
@@ -76,9 +78,9 @@ if (resp.Items.Count > 0 && resp.Items.Count >= max)
 - 非 more 行：不改行为（单击选中、双击执行）。
 - `SearchWindow` 侧无需改：现有 `Results.ItemInvoked` 订阅会同步 SelectedIndex 并调 `ExecuteSelectedAsync()`，其中 `Kind=="more"` 分支已调 `ShowMoreAsync()`。
 
-**注意**：`OnQueryChanged` 里每次输入会把 `_resultLimit` 重置回 100，这是既有行为，保留。
+**注意**：`OnQueryChanged` 里每次输入都把 `_resultLimit` 重置回首屏上限 8；`ShowMoreAsync` 仍提升到 1000。
 
-**验收**：搜一个大结果词（如 "a"），滚到底单击"显示更多结果"→ 列表增到最多 1000 条且 more 行消失（若确实 <1000）；搜一个只有几条结果的词 → 无 more 行。
+**验收**：搜一个大结果词（如 "a"），首屏显示 8 条实际结果且第 9 行为"显示更多结果"；单击后列表增到最多 1000 条且 more 行消失（若确实 <1000）。搜一个少于 8 条结果的词 → 无 more 行。
 
 ### W2 结果列表差量刷新
 

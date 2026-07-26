@@ -10,7 +10,7 @@
 - **Gap A**：首装无缓存 → `build_full_index()` 全盘枚举分钟级，期间结果不全。前端已有 `is_indexing` 轮询与「索引加载中…」文案（`SearchViewModel.ApplySearchResponse`），但无进度信息；重启走 `load_cache`，实际毫秒数从未测过（日志有「加载耗时 {}ms」行）。
 - **右键菜单未开发**：`ResultList.xaml` 只有 `MouseDoubleClick`，无 ContextMenu / 右键处理；动作能力已存在（→ 键 ActionPanel + 后端 get_actions/run_action）。
 - **删字母列表抖动**：每次搜索响应整表替换 `_state.Results`（`SearchViewModel.ApplySearchResponse` → `ResultList.Items` setter 重设 `ItemsSource`），容器重建、图标先置 null 再异步加载、高度重算，视觉上"颤一下"。
-- **"显示更多"点击无效**：`ShowMoreAsync`（limit 100→1000 重搜）只在 Enter/双击时触发；单击 "more" 行仅选中不执行。且 "more" 行在任何有结果时恒显示（`ApplySearchResponse`），结果不足 limit 时点了也无变化。
+- **"显示更多"点击无效**：原 `ShowMoreAsync`（limit 100→1000 重搜）只在 Enter/双击时触发；单击 "more" 行仅选中不执行。且 "more" 行在任何有结果时恒显示（`ApplySearchResponse`），结果不足 limit 时点了也无变化。R5 初次验收后，首屏 limit 进一步由 100 调整为 8。
 - 后端 `max` 参数透传正常（`ipc.rs`，缺省 100）。
 
 ## 需求
@@ -35,6 +35,7 @@
 
 ### R5 "显示更多结果"实装
 - 单击 "more" 行即触发加载更多（与 Enter/双击一致）。
+- 首屏最多显示 8 条实际结果；结果可能更多时，第 9 行显示 "more"。
 - 仅当结果可能还有更多时显示 "more" 行（返回条数达到当前 limit 才显示）；加载后若无新增则行消失。
 
 ## 验收标准
@@ -45,7 +46,7 @@
 - AC4：`load_cache` 实测毫秒数记入任务 research/ 或 spec。
 - AC5：右键 file/folder 结果出菜单，五个动作全部可用且与 ActionPanel 行为一致；深浅色主题均正常。
 - AC6：输入 "abc" 再退格成 "ab"，结果列表更新时无整表闪动、共有行图标不闪空。
-- AC7：单击"显示更多结果"加载到最多 1000 条；结果不足 limit 时不显示该行。
+- AC7：首屏最多显示 8 条实际结果，第 9 行按需显示"显示更多结果"；单击后加载到最多 1000 条；结果不足 limit 时不显示该行。
 - AC8：`cargo test` / `cargo clippy` / `dotnet build` 全绿；空闲内存仍满足后端 ≤70MB / 前端 ≤30MB 预算（USN 监听常驻不显著抬高基线）。
 
 ## 不做（Out of Scope）
