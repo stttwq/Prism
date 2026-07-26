@@ -208,6 +208,32 @@ public sealed class SearchViewModel
         if (item.Kind is not ("file" or "folder")) return;
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
+        var actions = await GetActionsForAsync(item).ConfigureAwait(true);
+        if (actions.Count == 0)
+        {
+            if (string.IsNullOrEmpty(_state.StatusMessage))
+                _state.StatusMessage = "无可用动作";
+            return;
+        }
+
+        _queryBeforeActions = _state.Query;
+        _allActions = actions;
+        _state.ActionTarget = item;
+        _state.Actions = actions;
+        _state.SelectedActionIndex = FirstSelectable(actions);
+        _state.Mode = PanelMode.Actions;
+        _state.StatusMessage = "";
+        // 输入框清空，供过滤动作。
+        _state.Query = "";
+        _pendingQuery = "";
+    }
+
+    /// <summary>获取程序、文件或文件夹的动作列表，供动作面板和右键菜单共用。</summary>
+    public async Task<IReadOnlyList<ActionItem>> GetActionsForAsync(SearchResult item)
+    {
+        if (item.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(item.ExecuteId))
+            return Array.Empty<ActionItem>();
+
         try
         {
             if (!_pipe.IsConnected)
@@ -215,25 +241,13 @@ public sealed class SearchViewModel
 
             var actions = await _pipe.GetActionsAsync(item.ExecuteId).ConfigureAwait(true);
             if (actions.Count == 0)
-            {
                 _state.StatusMessage = "无可用动作";
-                return;
-            }
-
-            _queryBeforeActions = _state.Query;
-            _allActions = actions;
-            _state.ActionTarget = item;
-            _state.Actions = actions;
-            _state.SelectedActionIndex = FirstSelectable(actions);
-            _state.Mode = PanelMode.Actions;
-            _state.StatusMessage = "";
-            // 输入框清空，供过滤动作。
-            _state.Query = "";
-            _pendingQuery = "";
+            return actions;
         }
         catch (Exception ex)
         {
             _state.StatusMessage = "动作列表失败：" + ShortMsg(ex);
+            return Array.Empty<ActionItem>();
         }
     }
 
@@ -256,9 +270,16 @@ public sealed class SearchViewModel
         if (_state.Mode != PanelMode.Actions) return;
         var action = _state.SelectedAction;
         var target = _state.ActionTarget;
-        if (action is null || action.IsSectionHeader) return;
-        if (target is null || string.IsNullOrEmpty(target.ExecuteId)) return;
-        if (string.IsNullOrEmpty(action.Id) || action.IsSectionHeader)
+        if (action is null || target is null) return;
+
+        await RunActionOnAsync(target, action).ConfigureAwait(true);
+    }
+
+    /// <summary>执行指定目标上的动作，保持所有入口的成功隐藏和错误提示一致。</summary>
+    public async Task RunActionOnAsync(SearchResult target, ActionItem action)
+    {
+        if (action.IsSectionHeader || string.IsNullOrEmpty(action.Id)) return;
+        if (target.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(target.ExecuteId))
             return;
 
         try

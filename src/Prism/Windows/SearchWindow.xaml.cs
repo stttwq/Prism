@@ -1,10 +1,13 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Threading;
 using Prism.Models;
 using Prism.Services;
 using Prism.ViewModels;
@@ -29,6 +32,9 @@ public partial class SearchWindow : Window
     private bool _hiding;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
     private bool _ignoreDeactivate;
+    private bool _contextMenuOpen;
+    private bool _contextMenuActionPending;
+    private int _contextMenuRequestSeq;
     private double _panelTargetHeight;
 
     // ── 强制前台 ──
@@ -52,6 +58,7 @@ public partial class SearchWindow : Window
         Header.QueryChanged += OnHeaderQueryChanged;
         Header.QueryKeyDown += OnHeaderKeyDown;
         Results.SelectedIndexChanged += OnResultsSelected;
+        Results.ContextMenuRequested += OnContextMenuRequested;
         Results.ItemInvoked += async r =>
         {
             if (_vm is null) return;
@@ -152,12 +159,7 @@ public partial class SearchWindow : Window
         {
             ForceActivate();
             Header.FocusQuery();
-            var t = new System.Windows.Threading.DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(300),
-            };
-            t.Tick += (_, _) => { t.Stop(); _ignoreDeactivate = false; };
-            t.Start();
+            ReleaseDeactivateGuardAfterDelay();
         }, System.Windows.Threading.DispatcherPriority.Input);
     }
 
@@ -290,8 +292,94 @@ public partial class SearchWindow : Window
 
     private void OnDeactivated(object? sender, EventArgs e)
     {
-        if (_ignoreDeactivate || IsPinned || _hiding) return;
+        if (_ignoreDeactivate || _contextMenuOpen || _contextMenuActionPending || IsPinned || _hiding)
+            return;
         HideAnimated();
+    }
+
+    private async void OnContextMenuRequested(SearchResult target)
+    {
+        if (_vm is null) return;
+
+        var requestSeq = ++_contextMenuRequestSeq;
+        var actions = await _vm.GetActionsForAsync(target).ConfigureAwait(true);
+        if (requestSeq != _contextMenuRequestSeq || !IsVisible || _hiding || IndexOfResult(target) < 0)
+            return;
+        if (actions.Count == 0) return;
+
+        var menu = new ContextMenu
+        {
+            PlacementTarget = Results,
+            Placement = PlacementMode.MousePoint,
+        };
+        menu.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuStyle");
+
+        var separatorPending = false;
+        foreach (var action in actions)
+        {
+            if (action.IsSectionHeader)
+            {
+                separatorPending = menu.Items.Count > 0;
+                continue;
+            }
+
+            if (separatorPending)
+            {
+                var separator = new Separator();
+                separator.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuSeparatorStyle");
+                menu.Items.Add(separator);
+                separatorPending = false;
+            }
+
+            var item = new MenuItem { Header = action.Label };
+            item.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuItemStyle");
+            item.Click += async (_, _) =>
+            {
+                if (_vm is null) return;
+                _contextMenuActionPending = true;
+                _ignoreDeactivate = true;
+                try
+                {
+                    await _vm.RunActionOnAsync(target, action).ConfigureAwait(true);
+                }
+                finally
+                {
+                    _contextMenuActionPending = false;
+                    if (!_contextMenuOpen)
+                        ReleaseDeactivateGuardAfterDelay();
+                }
+            };
+            menu.Items.Add(item);
+        }
+
+        if (menu.Items.Count == 0) return;
+
+        _contextMenuOpen = true;
+        _ignoreDeactivate = true;
+        menu.Closed += (_, _) =>
+        {
+            _contextMenuOpen = false;
+            if (IsVisible && !_hiding)
+                Dispatcher.BeginInvoke(Header.FocusQuery, DispatcherPriority.Input);
+            if (!_contextMenuActionPending)
+                ReleaseDeactivateGuardAfterDelay();
+        };
+        menu.IsOpen = true;
+    }
+
+    private void ReleaseDeactivateGuardAfterDelay()
+    {
+        var timer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(300),
+        };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            if (!_contextMenuOpen && !_contextMenuActionPending && !_hiding)
+                _ignoreDeactivate = false;
+        };
+        timer.Start();
     }
 
     private void PositionWindow()

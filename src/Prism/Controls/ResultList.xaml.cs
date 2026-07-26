@@ -165,6 +165,7 @@ public partial class ResultList : UserControl
 
     public event Action<int>? SelectedIndexChanged;
     public event Action<SearchResult>? ItemInvoked;
+    public event Action<SearchResult>? ContextMenuRequested;
 
     private void UpdateListHeight()
     {
@@ -203,6 +204,23 @@ public partial class ResultList : UserControl
         if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
         if (container.DataContext is SearchResult { Kind: "more" } result)
             ItemInvoked?.Invoke(result);
+    }
+
+    private void OnMouseRightButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        var source = e.OriginalSource as DependencyObject;
+        if (source is null) return;
+        if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
+
+        var index = List.ItemContainerGenerator.IndexFromContainer(container);
+        if (index < 0 || index >= _items.Count) return;
+        var result = _items[index];
+        if (result.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(result.ExecuteId))
+            return;
+
+        List.SelectedIndex = index;
+        ContextMenuRequested?.Invoke(result);
+        e.Handled = true;
     }
 
     private void OnDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
