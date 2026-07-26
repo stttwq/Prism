@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
+- **Total Sessions**: 12
 - **Last Active**: 2026-07-26
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~341 | Active |
+| `journal-1.md` | ~413 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,8 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-07-26 | R2 后端索引构建进度字段 | `154ee16` | `main` |
+| 11 | 2026-07-26 | Prism R3 结果右键菜单 | `f74090b` | `main` |
 | 10 | 2026-07-26 | R4 差量刷新与抖动修复 | `fb5b7a7` | `main` |
 | 9 | 2026-07-26 | Prism 第一轮优化：AC4 与 R5 | `199bb99` | `main` |
 | 8 | 2026-07-25 | Prism post-step-11: indexing known gaps recorded (first-install wait + new-file ~5min latency) | `1592277` | `main` |

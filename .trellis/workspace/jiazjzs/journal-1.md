@@ -345,3 +345,69 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: Prism R3 结果右键菜单
+
+**Date**: 2026-07-26
+**Task**: Prism R3 结果右键菜单
+**Branch**: `main`
+
+### Summary
+
+完成 Prism 搜索结果右键菜单：app/file/folder 复用现有 actions/run_action，适配深浅主题与失焦保护；用户手测通过，构建、63 项 Rust 测试及 Clippy 全绿。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f74090b` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 12: R2 后端索引构建进度字段
+
+**Date**: 2026-07-26
+**Task**: R2 后端索引构建进度字段
+**Branch**: `main`
+
+### Summary
+
+实现后端共享索引构建进度、MFT/walkdir 扫描计数与 results.index_progress 可选字段；补齐 IPC 序列化测试，并完成真实冷启动验证。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `154ee16` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
