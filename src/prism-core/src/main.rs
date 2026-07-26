@@ -30,6 +30,7 @@ async fn main() {
     ));
 
     let shared: index::SharedIndex = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let progress: index::SharedProgress = std::sync::Arc::new(index::IndexProgress::default());
     let apps: apps::SharedApps = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
     // 引擎可热重载：设置页保存后发 reload_engines，无需重启后端。
     let engines = std::sync::Arc::new(std::sync::RwLock::new(cfg.web_engines));
@@ -37,10 +38,11 @@ async fn main() {
     // 异步构建/加载索引，不阻塞管道服务启动。
     {
         let shared2 = shared.clone();
+        let progress2 = progress.clone();
         let data_dir2 = data_dir.clone();
         let refresh = cfg.index_refresh_secs;
         tokio::spawn(async move {
-            index::build_or_load(data_dir2, shared2, refresh).await;
+            index::build_or_load(data_dir2, shared2, progress2, refresh).await;
         });
     }
 
@@ -53,7 +55,7 @@ async fn main() {
     }
 
     log(format!("命名管道服务监听：{PIPE_NAME}"));
-    if let Err(e) = ipc::serve(PIPE_NAME, shared, apps, engines).await {
+    if let Err(e) = ipc::serve(PIPE_NAME, shared, progress, apps, engines).await {
         log(format!("管道服务异常退出：{e}"));
         std::process::exit(1);
     }

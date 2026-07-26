@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -34,6 +35,33 @@ pub struct FileIndex {
     /// 去重后的目录与文件名（UTF-8，以 `\0` 分隔）。
     pool: Vec<u8>,
     entries: Vec<IndexEntry>,
+}
+
+/// 全量构建进度。`total_estimate=0` 表示没有可用的历史总数估计。
+#[derive(Debug, Default)]
+pub struct IndexProgress {
+    pub active: AtomicBool,
+    pub scanned: AtomicU64,
+    pub total_estimate: AtomicU64,
+}
+
+/// 索引构建任务与 IPC 服务共享的进度状态。
+pub type SharedProgress = Arc<IndexProgress>;
+
+struct ActiveBuild<'a>(&'a IndexProgress);
+
+impl IndexProgress {
+    fn begin_build(&self) -> ActiveBuild<'_> {
+        self.scanned.store(0, Ordering::Relaxed);
+        self.active.store(true, Ordering::Relaxed);
+        ActiveBuild(self)
+    }
+}
+
+impl Drop for ActiveBuild<'_> {
+    fn drop(&mut self) {
+        self.0.active.store(false, Ordering::Relaxed);
+    }
 }
 
 impl FileIndex {
@@ -297,7 +325,7 @@ fn path_is_excluded(path: &str) -> bool {
 
 // ── 目录遍历 ──────────────────────────────────────────────────────────────────
 
-fn build_by_walkdir(roots: &[PathBuf]) -> FileIndex {
+fn build_by_walkdir(roots: &[PathBuf], progress: Option<&IndexProgress>) -> FileIndex {
     let mut pb = PoolBuilder::new();
     let mut entries: Vec<IndexEntry> = Vec::with_capacity(200_000);
 
@@ -321,6 +349,9 @@ fn build_by_walkdir(roots: &[PathBuf]) -> FileIndex {
             });
 
         for entry in walker.flatten() {
+            if let Some(progress) = progress {
+                progress.scanned.fetch_add(1, Ordering::Relaxed);
+            }
             let path_str = entry.path().to_string_lossy();
             if path_str.is_empty() || path_is_excluded(&path_str) {
                 continue;
@@ -358,6 +389,7 @@ mod mft {
         drive_letter: char,
         pb: &mut PoolBuilder,
         entries: &mut Vec<IndexEntry>,
+        progress: &IndexProgress,
     ) -> bool {
         let volume_path: Vec<u16> = format!("\\\\.\\{}:", drive_letter)
             .encode_utf16()
@@ -379,7 +411,7 @@ mod mft {
             return false;
         };
 
-        let ok = append_mft(handle, drive_letter, pb, entries);
+        let ok = append_mft(handle, drive_letter, pb, entries, progress);
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -391,6 +423,7 @@ mod mft {
         drive: char,
         pb: &mut PoolBuilder,
         entries: &mut Vec<IndexEntry>,
+        progress: &IndexProgress,
     ) -> bool {
         let mut map: HashMap<u64, (u64, String, bool)> = HashMap::with_capacity(500_000);
 
@@ -430,6 +463,7 @@ mod mft {
                 if rec.RecordLength == 0 {
                     break;
                 }
+                progress.scanned.fetch_add(1, Ordering::Relaxed);
                 let name_len = rec.FileNameLength as usize / 2;
                 let name_ptr = unsafe {
                     (buf.as_ptr().add(offset) as *const u16).add(rec.FileNameOffset as usize / 2)
@@ -590,9 +624,15 @@ fn load_cache(data_dir: &Path) -> Option<FileIndex> {
 
 pub type SharedIndex = Arc<RwLock<Option<FileIndex>>>;
 
-pub async fn build_or_load(data_dir: PathBuf, shared: SharedIndex, refresh_secs: u64) {
+pub async fn build_or_load(
+    data_dir: PathBuf,
+    shared: SharedIndex,
+    progress: SharedProgress,
+    refresh_secs: u64,
+) {
     let data_dir_for_load = data_dir.clone();
     let shared_for_load = shared.clone();
+    let progress_for_load = progress.clone();
 
     crate::log("正在加载索引缓存…");
     let loaded = tokio::task::spawn_blocking(move || {
@@ -601,10 +641,14 @@ pub async fn build_or_load(data_dir: PathBuf, shared: SharedIndex, refresh_secs:
             Some(cached) => {
                 cached.log_stats("从缓存加载索引");
                 crate::log(format!("加载耗时 {}ms", t0.elapsed().as_millis()));
+                progress_for_load
+                    .total_estimate
+                    .store(cached.len() as u64, Ordering::Relaxed);
                 *shared_for_load.write().unwrap() = Some(cached);
                 true
             }
             None => {
+                progress_for_load.total_estimate.store(0, Ordering::Relaxed);
                 crate::log("无可用缓存，开始全量构建（期间搜索结果为空）");
                 false
             }
@@ -616,9 +660,10 @@ pub async fn build_or_load(data_dir: PathBuf, shared: SharedIndex, refresh_secs:
     if !loaded {
         let shared2 = shared.clone();
         let data_dir2 = data_dir.clone();
+        let progress2 = progress.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let t0 = std::time::Instant::now();
-            let index = build_full_index();
+            let index = build_full_index(&progress2);
             index.log_stats("全量索引完成");
             crate::log(format!("全量构建耗时 {}s", t0.elapsed().as_secs()));
             save_cache(&index, &data_dir2);
@@ -633,9 +678,18 @@ pub async fn build_or_load(data_dir: PathBuf, shared: SharedIndex, refresh_secs:
                 tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
                 let shared3 = shared.clone();
                 let data_dir3 = data_dir.clone();
+                let progress3 = progress.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    let total_estimate = shared3
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().map(FileIndex::len))
+                        .unwrap_or(0);
+                    progress3
+                        .total_estimate
+                        .store(total_estimate as u64, Ordering::Relaxed);
                     let t0 = std::time::Instant::now();
-                    let index = build_full_index();
+                    let index = build_full_index(&progress3);
                     index.log_stats("定时刷新索引");
                     crate::log(format!("刷新耗时 {}s", t0.elapsed().as_secs()));
                     save_cache(&index, &data_dir3);
@@ -650,7 +704,8 @@ pub async fn build_or_load(data_dir: PathBuf, shared: SharedIndex, refresh_secs:
     }
 }
 
-fn build_full_index() -> FileIndex {
+fn build_full_index(progress: &IndexProgress) -> FileIndex {
+    let _active_build = progress.begin_build();
     let roots = local_ntfs_roots();
 
     #[cfg(target_os = "windows")]
@@ -662,7 +717,7 @@ fn build_full_index() -> FileIndex {
 
         for root in &roots {
             let letter = root.to_string_lossy().chars().next().unwrap_or('C');
-            if !mft::try_append_volume(letter, &mut pb, &mut entries) {
+            if !mft::try_append_volume(letter, &mut pb, &mut entries, progress) {
                 mft_ok = false;
                 break;
             }
@@ -672,10 +727,12 @@ fn build_full_index() -> FileIndex {
             crate::log("MFT 枚举成功");
             return pb.into_index(entries);
         }
+        // MFT 结果会被整个丢弃，降级扫描从零重新计数，避免进度重复累计。
+        progress.scanned.store(0, Ordering::Relaxed);
         crate::log("MFT 枚举失败，降级目录遍历");
     }
 
-    build_by_walkdir(&roots)
+    build_by_walkdir(&roots, Some(progress))
 }
 
 // ── 单元测试 ──────────────────────────────────────────────────────────────────
@@ -698,7 +755,7 @@ mod tests {
     #[test]
     fn walkdir_builds_nonempty_index() {
         let tmp = std::env::temp_dir();
-        let idx = build_by_walkdir(&[tmp]);
+        let idx = build_by_walkdir(&[tmp], None);
         let _ = idx.len();
     }
 

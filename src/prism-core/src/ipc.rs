@@ -10,6 +10,7 @@
 //! 第八步：reload_engines 热替换引擎列表（设置页保存后立即生效）。
 //! 第九步：actions / run_action 接基础动作（打开所在文件夹/复制/剪切/复制路径）。
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
-use crate::index::SharedIndex;
+use crate::index::{SharedIndex, SharedProgress};
 use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
 
@@ -67,6 +68,8 @@ pub enum Response {
         items: Vec<SearchResult>,
         #[serde(default)]
         is_indexing: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index_progress: Option<IndexProgressDto>,
     },
     /// 动作面板列表。
     Actions { items: Vec<ActionItem> },
@@ -74,6 +77,13 @@ pub enum Response {
     Status { is_indexing: bool },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error { message: String },
+}
+
+/// 首次全量构建期间随 `results` 返回的索引进度快照。
+#[derive(Debug, Serialize)]
+pub struct IndexProgressDto {
+    pub scanned: u64,
+    pub total_estimate: u64,
 }
 
 /// 单条搜索结果，字段对应 frontend-spec.md 第 2 节 `SearchResult` record。
@@ -105,6 +115,7 @@ pub struct ActionItem {
 pub async fn serve(
     pipe_name: &str,
     index: SharedIndex,
+    progress: SharedProgress,
     apps: SharedApps,
     engines: SharedEngines,
 ) -> std::io::Result<()> {
@@ -121,10 +132,11 @@ pub async fn serve(
         server = ServerOptions::new().create(pipe_name)?;
 
         let index = index.clone();
+        let progress = progress.clone();
         let apps = apps.clone();
         let engines = engines.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connected, index, apps, engines).await {
+            if let Err(e) = handle_connection(connected, index, progress, apps, engines).await {
                 log(format!("连接处理结束：{e}"));
             }
         });
@@ -135,6 +147,7 @@ pub async fn serve(
 async fn handle_connection(
     pipe: NamedPipeServer,
     index: SharedIndex,
+    progress: SharedProgress,
     apps: SharedApps,
     engines: SharedEngines,
 ) -> std::io::Result<()> {
@@ -149,7 +162,7 @@ async fn handle_connection(
         }
 
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(req) => dispatch(req, &index, &apps, &engines),
+            Ok(req) => dispatch(req, &index, &progress, &apps, &engines),
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
             },
@@ -170,6 +183,7 @@ async fn handle_connection(
 pub fn dispatch(
     req: Request,
     index: &SharedIndex,
+    progress: &SharedProgress,
     apps: &SharedApps,
     engines: &SharedEngines,
 ) -> Response {
@@ -177,7 +191,7 @@ pub fn dispatch(
         Request::Ping => Response::Pong {
             version: VERSION.to_string(),
         },
-        Request::Search { query, max } => search(&query, max, index, apps, engines),
+        Request::Search { query, max } => search(&query, max, index, progress, apps, engines),
         Request::Execute { id } => execute_id(&id),
         Request::Reveal { id } => reveal_path(&id),
         Request::Actions { id } => list_actions(&id),
@@ -368,6 +382,7 @@ fn search(
     query: &str,
     max: usize,
     index: &SharedIndex,
+    progress: &SharedProgress,
     apps: &SharedApps,
     engines: &SharedEngines,
 ) -> Response {
@@ -440,10 +455,20 @@ fn search(
     };
     items.extend(file_items);
 
+    let index_progress = if is_indexing && progress.active.load(Ordering::Relaxed) {
+        Some(IndexProgressDto {
+            scanned: progress.scanned.load(Ordering::Relaxed),
+            total_estimate: progress.total_estimate.load(Ordering::Relaxed),
+        })
+    } else {
+        None
+    };
+
     Response::Results {
         query: query.to_string(),
         items,
         is_indexing,
+        index_progress,
     }
 }
 
@@ -469,6 +494,21 @@ mod tests {
     use super::*;
     use crate::apps::AppEntry;
     use std::sync::{Arc, RwLock};
+
+    fn dispatch(
+        req: Request,
+        index: &SharedIndex,
+        apps: &SharedApps,
+        engines: &SharedEngines,
+    ) -> Response {
+        super::dispatch(
+            req,
+            index,
+            &Arc::new(crate::index::IndexProgress::default()),
+            apps,
+            engines,
+        )
+    }
 
     fn empty_index() -> SharedIndex {
         Arc::new(RwLock::new(None))
@@ -534,6 +574,31 @@ mod tests {
         assert_eq!(v["query"], "xyznope");
         assert_eq!(v["items"].as_array().unwrap().len(), 0);
         assert_eq!(v["is_indexing"], true, "索引未就绪应标记 is_indexing");
+        assert!(
+            v.get("index_progress").is_none(),
+            "无活跃构建时不应序列化 index_progress"
+        );
+    }
+
+    #[test]
+    fn search_serializes_active_index_progress() {
+        let progress = Arc::new(crate::index::IndexProgress::default());
+        progress.active.store(true, Ordering::Relaxed);
+        progress.scanned.store(12_345, Ordering::Relaxed);
+        progress.total_estimate.store(67_890, Ordering::Relaxed);
+
+        let resp = super::dispatch(
+            parse(r#"{"type":"search","query":"xyznope","max":100}"#),
+            &empty_index(),
+            &progress,
+            &empty_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        assert_eq!(v["type"], "results");
+        assert_eq!(v["is_indexing"], true);
+        assert_eq!(v["index_progress"]["scanned"], 12_345);
+        assert_eq!(v["index_progress"]["total_estimate"], 67_890);
     }
 
     #[test]
@@ -548,6 +613,24 @@ mod tests {
         assert_eq!(v["type"], "results");
         assert_eq!(v["is_indexing"], false);
         assert_eq!(v["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn search_omits_progress_after_index_is_ready() {
+        let progress = Arc::new(crate::index::IndexProgress::default());
+        progress.active.store(true, Ordering::Relaxed);
+        progress.scanned.store(123, Ordering::Relaxed);
+
+        let resp = super::dispatch(
+            parse(r#"{"type":"search","query":"anything","max":10}"#),
+            &ready_index(),
+            &progress,
+            &empty_apps(),
+            &default_engines(),
+        );
+        let v = to_json(&resp);
+        assert_eq!(v["is_indexing"], false);
+        assert!(v.get("index_progress").is_none());
     }
 
     #[test]
