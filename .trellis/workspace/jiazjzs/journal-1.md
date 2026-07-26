@@ -273,3 +273,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: Prism 第一轮优化：AC4 与 R5
+
+**Date**: 2026-07-26
+**Task**: Prism 第一轮优化：AC4 与 R5
+**Branch**: `main`
+
+### Summary
+
+完成 AC4：实测 616223 条索引缓存 load_cache 正式 5 次为 83–87ms，均值 84.8ms，并记录到任务 research。完成 R5：仅在结果达到 limit 时显示 more 行，单击即可加载更多；根据验收反馈将首屏调整为 8 条、第 9 行显示更多，展开上限保持 1000。用户已手测确认全部场景正常；Release 构建 0 warning/0 error，测试产物已清理。当前任务保留 in_progress，后续继续 R4/R3/R2/R1。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `199bb99` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

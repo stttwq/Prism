@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
-- **Last Active**: 2026-07-25
+- **Total Sessions**: 9
+- **Last Active**: 2026-07-26
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~275 | Active |
+| `journal-1.md` | ~308 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-07-26 | Prism 第一轮优化：AC4 与 R5 | `199bb99` | `main` |
 | 8 | 2026-07-25 | Prism post-step-11: indexing known gaps recorded (first-install wait + new-file ~5min latency) | `1592277` | `main` |
 | 7 | 2026-07-25 | Prism step 11: first installer package (PrismSetup-1.0.0.exe, double-install accepted) | `9ead91d` | `main` |
 | 6 | 2026-07-25 | Prism step 10: memory acceptance (≤100MB verified) | `faddfb0` | `main` |
