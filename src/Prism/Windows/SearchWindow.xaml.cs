@@ -497,8 +497,17 @@ public partial class SearchWindow : Window
     private void AnimatePanelHeight(double target, bool animate)
     {
         if (double.IsNaN(target) || target < 0) target = 0;
-        if (Math.Abs(_panelTargetHeight - target) < 0.5 && PanelHost.Height == target)
+        if (Math.Abs(_panelTargetHeight - target) < 0.5)
+        {
+            // AppState raises several notifications for one response. Do not
+            // restart an in-flight animation when its destination is unchanged.
+            if (!animate || !IsVisible)
+            {
+                PanelHost.BeginAnimation(HeightProperty, null);
+                PanelHost.Height = target;
+            }
             return;
+        }
         _panelTargetHeight = target;
 
         if (!animate || !IsVisible)

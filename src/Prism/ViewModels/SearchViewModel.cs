@@ -114,7 +114,7 @@ public sealed class SearchViewModel
         }
 
         _state.Mode = PanelMode.Results;
-        _state.StatusMessage = "搜索中…";
+        SetSearchingStatus();
 
         _debounce.Stop();
         _debounce.Start();
@@ -349,7 +349,7 @@ public sealed class SearchViewModel
         try
         {
             if (seq == _searchSeq)
-                _state.StatusMessage = "搜索中…";
+                SetSearchingStatus();
 
             var resp = await _pipe.SearchAsync(query, max, cts.Token).ConfigureAwait(true);
 
@@ -379,6 +379,20 @@ public sealed class SearchViewModel
             {
                 // 保持断开提示。
             }
+        }
+    }
+
+    private void SetSearchingStatus()
+    {
+        if (_state.Results.Count == 0)
+        {
+            _state.StatusMessage = "搜索中…";
+        }
+        else if (!_state.IsIndexing)
+        {
+            // Keep existing rows at a stable height while the replacement
+            // response is in flight. Indexing progress remains visible.
+            _state.StatusMessage = "";
         }
     }
 

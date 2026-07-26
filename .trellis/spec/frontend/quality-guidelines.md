@@ -25,6 +25,8 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 
 - Debounce input (~50ms); bump `_searchSeq` on query clear / show reset so in-flight polls die.
 - Discard search responses unless `seq`, current `Query`, and `resp.Query` all match.
+- Keep result-panel geometry stable while replacing a non-empty result set: do not add the transient `搜索中…` status row when rows are already visible. Empty-result searches may show it; `is_indexing` progress must remain visible.
+- Treat one search response as a burst of `AppState.PropertyChanged` notifications. `AnimatePanelHeight(target)` must not restart an in-flight animation when `target` is unchanged, and identical `ResultList.StatusMessage` assignments must be layout no-ops.
 - While `is_indexing`, show status and poll (~0.5s, ~15s cap); do not start nested polls from poll callbacks.
 - Icons: existing path → no `USEFILEATTRIBUTES`; missing path → attributes fallback.
 - `kind=web` / `kind=more`: do **not** pass `ExecuteId` to shell icon APIs (`ExecuteId` for web is a URL).
@@ -49,6 +51,8 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 ---
 
 ## Testing Requirements
+
+- Manual: with a full first page visible, type `abc` and backspace to `ab`; assert the status row does not appear between responses, the panel height stays constant, shared row icons do not clear, and no same-target height animation restarts.
 
 - Manual: type/backspace quickly (`clash` ↔ `cla`) — list and highlight match current text.
 - Manual: empty query Esc / click-away hides window.

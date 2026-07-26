@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -20,6 +21,7 @@ public partial class ResultList : UserControl
 
     private IconCache? _icons;
     private IReadOnlyList<SearchResult> _items = Array.Empty<SearchResult>();
+    private readonly ObservableCollection<SearchResult> _displayItems = [];
     private bool _syncing;
     private ScrollViewer? _scrollViewer;
     private bool _scrollHooked;
@@ -30,6 +32,7 @@ public partial class ResultList : UserControl
     public ResultList()
     {
         InitializeComponent();
+        List.ItemsSource = _displayItems;
         List.ItemContainerGenerator.StatusChanged += OnGeneratorStatusChanged;
         List.Loaded += (_, _) =>
         {
@@ -55,16 +58,22 @@ public partial class ResultList : UserControl
         set
         {
             var next = value ?? Array.Empty<SearchResult>();
-            if (ReferenceEquals(_items, next))
-            {
-                UpdateListHeight();
-                return;
-            }
+            if (ReferenceEquals(_items, next)) return;
+
+            var countChanged = _items.Count != next.Count;
             _items = next;
             _syncing = true;
-            List.ItemsSource = _items;
-            UpdateListHeight();
-            _syncing = false;
+            try
+            {
+                SynchronizeDisplayItems(next);
+            }
+            finally
+            {
+                _syncing = false;
+            }
+
+            if (countChanged)
+                UpdateListHeight();
             Dispatcher.BeginInvoke(
                 System.Windows.Threading.DispatcherPriority.Loaded,
                 () =>
@@ -74,6 +83,56 @@ public partial class ResultList : UserControl
                 });
         }
     }
+
+    private void SynchronizeDisplayItems(IReadOnlyList<SearchResult> next)
+    {
+        for (var i = 0; i < next.Count; i++)
+        {
+            var desired = next[i];
+            if (i < _displayItems.Count && HasSameKey(_displayItems[i], desired))
+            {
+                RefreshBoundFieldsIfNeeded(i, desired);
+                continue;
+            }
+
+            var existingIndex = FindByKey(desired, i + 1);
+            if (existingIndex >= 0)
+            {
+                _displayItems.Move(existingIndex, i);
+                RefreshBoundFieldsIfNeeded(i, desired);
+            }
+            else
+            {
+                _displayItems.Insert(i, desired);
+            }
+        }
+
+        while (_displayItems.Count > next.Count)
+            _displayItems.RemoveAt(_displayItems.Count - 1);
+    }
+
+    private int FindByKey(SearchResult desired, int startIndex)
+    {
+        for (var i = startIndex; i < _displayItems.Count; i++)
+        {
+            if (HasSameKey(_displayItems[i], desired))
+                return i;
+        }
+        return -1;
+    }
+
+    private void RefreshBoundFieldsIfNeeded(int index, SearchResult desired)
+    {
+        // MatchSpans are painted from _items in DecorateVisibleItems, so a
+        // query-only highlight change does not replace the row container.
+        if (!string.Equals(_displayItems[index].Subtitle, desired.Subtitle, StringComparison.Ordinal))
+            _displayItems[index] = desired;
+    }
+
+    private static bool HasSameKey(SearchResult left, SearchResult right) =>
+        string.Equals(left.Kind, right.Kind, StringComparison.Ordinal)
+        && string.Equals(left.ExecuteId, right.ExecuteId, StringComparison.Ordinal)
+        && string.Equals(left.Title, right.Title, StringComparison.Ordinal);
 
     public int SelectedIndex
     {
@@ -94,8 +153,11 @@ public partial class ResultList : UserControl
         get => StatusText.Text;
         set
         {
-            StatusText.Text = value ?? "";
-            var show = !string.IsNullOrEmpty(value);
+            var next = value ?? "";
+            if (string.Equals(StatusText.Text, next, StringComparison.Ordinal)) return;
+
+            StatusText.Text = next;
+            var show = !string.IsNullOrEmpty(next);
             StatusText.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
             UpdateListHeight();
         }
@@ -167,14 +229,16 @@ public partial class ResultList : UserControl
 
     private void DecorateVisibleItems()
     {
+        if (_syncing) return;
         HookScrollViewer();
 
         for (var i = 0; i < List.Items.Count; i++)
         {
             if (List.ItemContainerGenerator.ContainerFromIndex(i) is not ListBoxItem container)
                 continue;
-            if (List.Items[i] is not SearchResult item)
+            if (i >= _items.Count)
                 continue;
+            var item = _items[i];
 
             var titleBlock = FindDescendant<TextBlock>(container, "TitleBlock");
             var hotkey = FindDescendant<TextBlock>(container, "HotkeyHint");
