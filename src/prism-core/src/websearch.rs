@@ -255,10 +255,7 @@ mod tests {
         }];
         let hit = try_match("gh rust async", &engines).expect("自定义引擎应命中");
         assert_eq!(hit.engine_name, "GitHub");
-        assert_eq!(
-            hit.url,
-            "https://github.com/search?q=rust%20async"
-        );
+        assert_eq!(hit.url, "https://github.com/search?q=rust%20async");
         // 预设关键词在仅有自定义列表时不应命中。
         assert!(try_match("g 天气", &engines).is_none());
     }

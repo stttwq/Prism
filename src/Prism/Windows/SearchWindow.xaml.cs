@@ -25,6 +25,7 @@ public partial class SearchWindow : Window
     private const double SlideOffsetPx = 6;
     private const double PanelExpandMs = 100;
 
+    private readonly IndexerGenerationClient _generationClient = new();
     private SearchViewModel? _vm;
     private IconCache? _icons;
     private ThemeWatcher? _theme;
@@ -54,6 +55,15 @@ public partial class SearchWindow : Window
         Deactivated += OnDeactivated;
         SizeChanged += (_, _) => UpdateCardClip();
         Loaded += (_, _) => UpdateCardClip();
+        Closed += (_, _) => _generationClient.Dispose();
+        _generationClient.GenerationChanged += _ => Dispatcher.BeginInvoke(() =>
+        {
+            if (IsVisible && !_hiding && _vm is not null
+                && !string.IsNullOrWhiteSpace(_vm.State.Query))
+            {
+                _vm.OnIndexGenerationChanged();
+            }
+        });
 
         Header.QueryChanged += OnHeaderQueryChanged;
         Header.QueryKeyDown += OnHeaderKeyDown;
@@ -136,6 +146,7 @@ public partial class SearchWindow : Window
         PositionWindow();
         Opacity = 0;
         Show();
+        SyncGenerationPolling();
         ForceActivate();
         Topmost = true;
         Topmost = false;
@@ -216,6 +227,7 @@ public partial class SearchWindow : Window
     {
         if (_hiding || !IsVisible) return;
         _hiding = true;
+        _generationClient.SetActive(false);
         _ignoreDeactivate = true;
         var fadeOut = new DoubleAnimation(Opacity, 0, TimeSpan.FromMilliseconds(FadeOutMs));
         fadeOut.Completed += (_, _) =>
@@ -508,7 +520,19 @@ public partial class SearchWindow : Window
                 Pin.IsPinned = _vm.State.IsPinned;
         }
 
+        if (e.PropertyName == nameof(AppState.Query))
+            SyncGenerationPolling();
+
         ApplyState(_vm?.State, animatePanel: true);
+    }
+
+    private void SyncGenerationPolling()
+    {
+        var active = IsVisible
+            && !_hiding
+            && _vm is not null
+            && !string.IsNullOrWhiteSpace(_vm.State.Query);
+        _generationClient.SetActive(active);
     }
 
     private void OnThemeApplied()

@@ -821,10 +821,7 @@ mod tests {
 
     #[test]
     fn same_filename_interned_across_dirs() {
-        let idx = make_test_index(&[
-            ("C:\\a\\readme.md", 0),
-            ("C:\\b\\readme.md", 0),
-        ]);
+        let idx = make_test_index(&[("C:\\a\\readme.md", 0), ("C:\\b\\readme.md", 0)]);
         assert_eq!(idx.entries[0].name_off, idx.entries[1].name_off);
         assert_ne!(idx.entries[0].dir_off, idx.entries[1].dir_off);
     }

@@ -96,12 +96,8 @@ fn reveal_in_explorer(path: &str) -> Result<(), String> {
 fn clipboard_set_text(text: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
-    use windows::Win32::System::DataExchange::{
-        EmptyClipboard, OpenClipboard, SetClipboardData,
-    };
-    use windows::Win32::System::Memory::{
-        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-    };
+    use windows::Win32::System::DataExchange::{EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     let wide: Vec<u16> = std::ffi::OsStr::new(text)
@@ -164,9 +160,7 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
     use windows::Win32::System::DataExchange::{
         EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{
-        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_HDROP;
     use windows::Win32::UI::Shell::DROPFILES;
 
@@ -203,11 +197,7 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
         let df = ptr as *mut DROPFILES;
         (*df).pFiles = header_size as u32;
         (*df).fWide = windows::Win32::Foundation::BOOL(1);
-        std::ptr::copy_nonoverlapping(
-            wide.as_ptr() as *const u8,
-            ptr.add(header_size),
-            list_bytes,
-        );
+        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr.add(header_size), list_bytes);
         let _ = GlobalUnlock(hmem);
 
         if SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0)).is_err() {
@@ -216,9 +206,10 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
         }
 
         // Preferred DropEffect（复制 vs 剪切）；失败不回滚 HDROP（资源管理器仍可粘贴为复制）。
-        let fmt_name: Vec<u16> = OsStrExt::encode_wide(std::ffi::OsStr::new("Preferred DropEffect"))
-            .chain(std::iter::once(0))
-            .collect();
+        let fmt_name: Vec<u16> =
+            OsStrExt::encode_wide(std::ffi::OsStr::new("Preferred DropEffect"))
+                .chain(std::iter::once(0))
+                .collect();
         let fmt = RegisterClipboardFormatW(PCWSTR(fmt_name.as_ptr()));
         if fmt != 0 {
             if let Ok(heffect) = GlobalAlloc(GMEM_MOVEABLE, 4) {

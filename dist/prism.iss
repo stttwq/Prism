@@ -19,6 +19,8 @@
 #define MyAppPublisher "Prism"
 #define MyAppExeName "Prism.exe"
 #define MyFullSourceDir "."
+#define IndexerServiceName "PrismIndexer"
+#define IndexerServiceExe "prism-indexer-service.exe"
 
 [Setup]
 ; 注意：AppId 一经发布不得更改，否则会被识别为不同软件导致重复安装。
@@ -45,10 +47,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; 卸载前自动退出常驻进程（任务窗口一律最小化关闭），避免文件占用。
 CloseApplications=force
 RestartApplications=no
-; 安装/卸载权限：普通用户即可。装到 Program Files 时 Windows 会自动提示 UAC，
-; Prism.exe 本身只需 asInvoker（见 app.manifest，MFT 加速由后端按需处理）。
-PrivilegesRequiredOverridesAllowed=dialog
-PrivilegesRequired=lowest
+; 安装器需要一次管理员授权来注册 LocalSystem 索引服务；
+; Prism.exe 本身仍为 asInvoker，日常启动不会提示 UAC。
+PrivilegesRequired=admin
 WizardStyle=modern
 DisableProgramGroupPage=no
 ; 卸载后保留用户数据（若因便携模式落在安装目录\data，则一并删除；用户级安装时数据在 LocalAppData 不受影响）。
@@ -64,9 +65,10 @@ Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescripti
 Name: "autostart"; Description: "开机自动启动 Prism(&A)"; GroupDescription: "附加任务："; Flags: checkedonce
 
 [Files]
-; 安装源：dist 目录下的两个 exe 与图标。选项 ignoreversion 表示每次以打包版本覆盖。
+; 安装源：dist 目录下的三个 exe 与图标。选项 ignoreversion 表示每次以打包版本覆盖。
 Source: "Prism.exe";        DestDir: "{app}"; Flags: ignoreversion
 Source: "prism-core.exe";   DestDir: "{app}"; Flags: ignoreversion
+Source: "{#IndexerServiceExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "prism.ico";        DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -99,4 +101,157 @@ Type: filesandordirs; Name: "{app}\data"
 function InitializeSetup(): Boolean;
 begin
   Result := True;
+end;
+
+function RunSc(const Parameters: String): Integer;
+var
+  ResultCode: Integer;
+begin
+  if not Exec(ExpandConstant('{sys}\sc.exe'), Parameters, '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
+    Result := -1
+  else
+    Result := ResultCode;
+end;
+
+const
+  SC_MANAGER_CONNECT = $0001;
+  SERVICE_QUERY_STATUS = $0004;
+  SERVICE_STOPPED = 1;
+  SERVICE_RUNNING = 4;
+
+type
+  TServiceStatus = record
+    ServiceType: Cardinal;
+    CurrentState: Cardinal;
+    ControlsAccepted: Cardinal;
+    Win32ExitCode: Cardinal;
+    ServiceSpecificExitCode: Cardinal;
+    CheckPoint: Cardinal;
+    WaitHint: Cardinal;
+  end;
+
+function OpenSCManager(MachineName, DatabaseName: String;
+  DesiredAccess: Cardinal): THandle;
+  external 'OpenSCManagerW@advapi32.dll stdcall';
+function OpenService(ServiceManager: THandle; ServiceName: String;
+  DesiredAccess: Cardinal): THandle;
+  external 'OpenServiceW@advapi32.dll stdcall';
+function QueryServiceStatus(Service: THandle;
+  var ServiceStatus: TServiceStatus): Boolean;
+  external 'QueryServiceStatus@advapi32.dll stdcall';
+function CloseServiceHandle(Handle: THandle): Boolean;
+  external 'CloseServiceHandle@advapi32.dll stdcall';
+function GetTickCount64(): Int64;
+  external 'GetTickCount64@kernel32.dll stdcall';
+
+function ReadServiceState(var Exists: Boolean): Cardinal;
+var
+  ManagerHandle: THandle;
+  ServiceHandle: THandle;
+  Status: TServiceStatus;
+begin
+  Result := 0;
+  Exists := False;
+  ManagerHandle := OpenSCManager('', '', SC_MANAGER_CONNECT);
+  if ManagerHandle = 0 then
+    exit;
+
+  ServiceHandle := OpenService(ManagerHandle, '{#IndexerServiceName}',
+    SERVICE_QUERY_STATUS);
+  if ServiceHandle <> 0 then
+  begin
+    Exists := True;
+    if QueryServiceStatus(ServiceHandle, Status) then
+      Result := Status.CurrentState;
+    CloseServiceHandle(ServiceHandle);
+  end;
+  CloseServiceHandle(ManagerHandle);
+end;
+
+function WaitForServiceState(TargetState: Cardinal; AllowMissing: Boolean;
+  TimeoutMilliseconds: Integer): Boolean;
+var
+  Exists: Boolean;
+  StartedAt: Int64;
+begin
+  StartedAt := GetTickCount64();
+  repeat
+    Result := ReadServiceState(Exists) = TargetState;
+    if Result or (AllowMissing and not Exists) then
+    begin
+      Result := True;
+      exit;
+    end;
+    Sleep(100);
+  until GetTickCount64() - StartedAt >= TimeoutMilliseconds;
+  Result := False;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  { Stop an existing service before Inno replaces its executable. }
+  ResultCode := RunSc('stop {#IndexerServiceName}');
+  if (ResultCode <> 0) and (ResultCode <> 1060) and (ResultCode <> 1062) then
+  begin
+    Result := Format('Unable to stop Prism indexer service (sc.exe: %d).', [ResultCode]);
+    exit;
+  end;
+  if not WaitForServiceState(SERVICE_STOPPED, True, 30000) then
+  begin
+    Result := 'Timed out waiting for the Prism indexer service to stop.';
+    exit;
+  end;
+  Result := '';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  ServicePath: String;
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+
+  ServicePath := ExpandConstant('{app}\{#IndexerServiceExe}');
+  ResultCode := RunSc('create {#IndexerServiceName} binPath= "\"' + ServicePath +
+    '\"" start= auto obj= LocalSystem DisplayName= "Prism Indexer"');
+  if (ResultCode <> 0) and (ResultCode <> 1073) then
+    RaiseException(Format('Unable to create Prism indexer service (sc.exe: %d).', [ResultCode]));
+
+  ResultCode := RunSc('config {#IndexerServiceName} binPath= "\"' + ServicePath +
+    '\"" start= auto obj= LocalSystem DisplayName= "Prism Indexer"');
+  if ResultCode <> 0 then
+    RaiseException(Format('Unable to configure Prism indexer service (sc.exe: %d).', [ResultCode]));
+
+  ResultCode := RunSc('failure {#IndexerServiceName} reset= 86400 actions= restart/5000/restart/15000/""/0');
+  if ResultCode <> 0 then
+    RaiseException(Format('Unable to configure Prism indexer recovery (sc.exe: %d).', [ResultCode]));
+  RunSc('failureflag {#IndexerServiceName} 1');
+
+  ResultCode := RunSc('start {#IndexerServiceName}');
+  if (ResultCode <> 0) and (ResultCode <> 1056) then
+    RaiseException(Format('Unable to start Prism indexer service (sc.exe: %d).', [ResultCode]));
+  if not WaitForServiceState(SERVICE_RUNNING, False, 30000) then
+    RaiseException('Timed out waiting for the Prism indexer service to start.');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+begin
+  if CurUninstallStep <> usUninstall then
+    exit;
+
+  ResultCode := RunSc('stop {#IndexerServiceName}');
+  if (ResultCode <> 0) and (ResultCode <> 1060) and (ResultCode <> 1062) then
+    Log(Format('Unable to stop Prism indexer service during uninstall (sc.exe: %d).', [ResultCode]));
+  if not WaitForServiceState(SERVICE_STOPPED, True, 30000) then
+    Log('Timed out waiting for the Prism indexer service to stop during uninstall.');
+
+  ResultCode := RunSc('delete {#IndexerServiceName}');
+  if (ResultCode <> 0) and (ResultCode <> 1060) and (ResultCode <> 1072) then
+    Log(Format('Unable to delete Prism indexer service during uninstall (sc.exe: %d).', [ResultCode]));
 end;

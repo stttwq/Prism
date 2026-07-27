@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows.Threading;
 using Prism.Models;
 using Prism.Services;
@@ -18,6 +19,7 @@ public sealed class SearchViewModel
     private readonly AppState _state;
     private readonly PipeClient _pipe;
     private readonly DispatcherTimer _debounce;
+    private readonly DispatcherTimer _generationDebounce;
     private CancellationTokenSource? _searchCts;
     private int _resultLimit = InitialResultLimit;
     private string _pendingQuery = "";
@@ -41,6 +43,37 @@ public sealed class SearchViewModel
             Interval = TimeSpan.FromMilliseconds(50),
         };
         _debounce.Tick += OnDebounceTick;
+        _generationDebounce = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(100),
+        };
+        _generationDebounce.Tick += OnGenerationDebounceTick;
+    }
+
+    /// <summary>Schedules one refresh through the existing broker search path.</summary>
+    public void OnIndexGenerationChanged()
+    {
+        if (_state.Mode != PanelMode.Results || string.IsNullOrWhiteSpace(_state.Query))
+            return;
+
+        _generationDebounce.Stop();
+        _generationDebounce.Start();
+    }
+
+    private async void OnGenerationDebounceTick(object? sender, EventArgs e)
+    {
+        _generationDebounce.Stop();
+        if (_state.Mode != PanelMode.Results || string.IsNullOrWhiteSpace(_state.Query))
+            return;
+
+        try
+        {
+            await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "搜索失败：" + ShortMsg(ex);
+        }
     }
 
     private async void OnDebounceTick(object? sender, EventArgs e)
@@ -67,6 +100,7 @@ public sealed class SearchViewModel
     public void ResetForShow()
     {
         _debounce.Stop();
+        _generationDebounce.Stop();
         _searchSeq++;
         CancelSearch();
         _resultLimit = InitialResultLimit;
@@ -103,6 +137,7 @@ public sealed class SearchViewModel
         if (string.IsNullOrWhiteSpace(text))
         {
             _debounce.Stop();
+            _generationDebounce.Stop();
             _searchSeq++;
             CancelSearch();
             _state.Results = Array.Empty<SearchResult>();
@@ -447,6 +482,10 @@ public sealed class SearchViewModel
                 : "索引加载中，请稍候…";
             if (startPoll)
                 _ = PollUntilReadyAsync(query, max, seq);
+        }
+        else if (!string.IsNullOrWhiteSpace(resp.IndexError))
+        {
+            _state.StatusMessage = "文件索引不可用：" + ShortMsg(new IOException(resp.IndexError));
         }
         else if (list.Count > 0)
         {

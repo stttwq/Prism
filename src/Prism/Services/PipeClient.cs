@@ -63,13 +63,17 @@ public sealed class PipeClient : IDisposable
         var resp = await SendAsync(new { type = "search", query, max }, ct).ConfigureAwait(false);
         var echo = resp.TryGetProperty("query", out var q) ? q.GetString() ?? query : query;
         var indexing = resp.TryGetProperty("is_indexing", out var ix) && ix.ValueKind == JsonValueKind.True;
+        var indexError = resp.TryGetProperty("index_error", out var error)
+            && error.ValueKind == JsonValueKind.String
+            ? error.GetString()
+            : null;
         var items = new List<SearchResult>();
         if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
         {
             foreach (var el in arr.EnumerateArray())
                 items.Add(ParseResult(el));
         }
-        return new SearchResponse(echo, items, indexing);
+        return new SearchResponse(echo, items, indexing, indexError);
     }
 
     /// <summary>打开文件/文件夹/程序。</summary>
@@ -294,4 +298,8 @@ public sealed class PipeClient : IDisposable
 }
 
 /// <summary>search 响应：回显 query + 结果列表；IsIndexing 表示索引尚未就绪。</summary>
-public sealed record SearchResponse(string Query, IReadOnlyList<SearchResult> Items, bool IsIndexing);
+public sealed record SearchResponse(
+    string Query,
+    IReadOnlyList<SearchResult> Items,
+    bool IsIndexing,
+    string? IndexError);

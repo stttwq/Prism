@@ -131,6 +131,61 @@ Install acceptance (prd.md R7): run the produced setup twice — once into a **C
 
 ---
 
+## R1 USN Service Contract (supersedes Gap B above)
+
+### 1. Scope / Trigger
+
+The LocalSystem indexer owns synchronous NTFS/USN calls from `spawn_blocking`; SCM stop must not leave the service in `RUNNING` after the cache checkpoint completes.
+
+### 2. Signatures
+
+- `indexer_runtime::Shutdown::request()` sets the stop flag and wakes the Tokio runtime.
+- `indexer_runtime::run(Arc<Shutdown>) -> Result<(), String>` checkpoints and aborts the pipe task before returning.
+- The service control callback reports `StopPending`; the service reports `Stopped` after bounded runtime teardown.
+
+### 3. Contracts
+
+- A watcher checks stop/epoch before reading USN and again before taking the live-index write lock.
+- Runtime teardown uses `shutdown_timeout(2s)` so a blocking OS call cannot hold SCM in `RUNNING` indefinitely.
+- Healthy operation uses `FSCTL_READ_USN_JOURNAL` incremental replay; periodic full-volume scans are forbidden.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| SCM Stop | Report `STOP_PENDING`, wake runtime, checkpoint, then report `STOPPED`. |
+| Stop while a watcher waits on USN | Do not apply a post-stop batch; bounded teardown permits process exit. |
+| Journal id/checkpoint invalid | Queue one serialized rebuild; never run concurrent full rebuilds. |
+| Pipe client disconnect | Close only that connection; keep the accept loop alive. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: stop completes under 10 seconds and restart replays stop-window changes without changing the cache timestamp.
+- Base: no changes arrive while stopped; restart loads the cache and resumes watchers.
+- Bad: service remains `RUNNING` after checkpoint or silently starts a periodic full scan.
+
+### 6. Tests Required
+
+- Unit: shutdown requested before waiting is observed; an in-flight waiter is woken.
+- Protocol: named-pipe roundtrip passes after restart.
+- Machine: clean stop duration, stop-window create/rename/delete replay, USN latency P95/max, and Private Working Set sample.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: runtime drop waits indefinitely for a blocking watcher.
+runtime.block_on(run(stop));
+
+// Correct: bound runtime teardown after the service has been asked to stop.
+let result = runtime.block_on(run(stop));
+runtime.shutdown_timeout(Duration::from_secs(2));
+```
+
+> **Warning**: `PrivateMemorySize64` is committed private bytes, not Task Manager's
+> Private Working Set. Use `WorkingSetPrivate` for the AC9 process-memory gate.
+
+The historical Gap B text above describes the pre-R1 implementation. R1 resolves it with the USN watcher and measured P95 32.1 ms / max 177.2 ms over 120 operations.
+
 ## Code Review Checklist
 
 - [ ] Pipe write always paired with a full line read

@@ -10,6 +10,7 @@
 //! 第八步：reload_engines 热替换引擎列表（设置页保存后立即生效）。
 //! 第九步：actions / run_action 接基础动作（打开所在文件夹/复制/剪切/复制路径）。
 
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -18,7 +19,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
+#[cfg(test)]
 use crate::index::{SharedIndex, SharedProgress};
+use crate::indexer_client;
 use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
 
@@ -47,9 +50,7 @@ pub enum Request {
     /// 执行动作面板里的某个动作。
     RunAction { id: String, action: String },
     /// 设置页保存后热重载网页引擎列表（步骤 8）。
-    ReloadEngines {
-        engines: Vec<WebEngine>,
-    },
+    ReloadEngines { engines: Vec<WebEngine> },
 }
 
 fn default_max() -> usize {
@@ -70,6 +71,10 @@ pub enum Response {
         is_indexing: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         index_progress: Option<IndexProgressDto>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index_error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index_generation: Option<u64>,
     },
     /// 动作面板列表。
     Actions { items: Vec<ActionItem> },
@@ -114,8 +119,6 @@ pub struct ActionItem {
 /// 立刻建下一个实例等待重连。前端崩溃/重启不影响后端。
 pub async fn serve(
     pipe_name: &str,
-    index: SharedIndex,
-    progress: SharedProgress,
     apps: SharedApps,
     engines: SharedEngines,
 ) -> std::io::Result<()> {
@@ -131,12 +134,10 @@ pub async fn serve(
         let connected = server;
         server = ServerOptions::new().create(pipe_name)?;
 
-        let index = index.clone();
-        let progress = progress.clone();
         let apps = apps.clone();
         let engines = engines.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connected, index, progress, apps, engines).await {
+            if let Err(e) = handle_connection(connected, apps, engines).await {
                 log(format!("连接处理结束：{e}"));
             }
         });
@@ -146,8 +147,6 @@ pub async fn serve(
 /// 单个连接的收发循环：逐行读入 JSON 请求，分发后逐行写回 JSON 响应。
 async fn handle_connection(
     pipe: NamedPipeServer,
-    index: SharedIndex,
-    progress: SharedProgress,
     apps: SharedApps,
     engines: SharedEngines,
 ) -> std::io::Result<()> {
@@ -162,7 +161,10 @@ async fn handle_connection(
         }
 
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(req) => dispatch(req, &index, &progress, &apps, &engines),
+            Ok(Request::Search { query, max }) => {
+                search_service(&query, max, &apps, &engines).await
+            }
+            Ok(req) => dispatch_non_search(req, &engines),
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
             },
@@ -179,7 +181,103 @@ async fn handle_connection(
     log("前端断开连接");
     Ok(())
 }
+
+fn dispatch_non_search(req: Request, engines: &SharedEngines) -> Response {
+    match req {
+        Request::Ping => Response::Pong {
+            version: VERSION.to_string(),
+        },
+        Request::Execute { id } => execute_id(&id),
+        Request::Reveal { id } => reveal_path(&id),
+        Request::Actions { id } => list_actions(&id),
+        Request::RunAction { id, action } => run_action(&id, &action),
+        Request::ReloadEngines { engines: list } => reload_engines(list, engines),
+        Request::Search { .. } => Response::Error {
+            message: "search must be dispatched asynchronously".into(),
+        },
+    }
+}
+
+async fn search_service(
+    query: &str,
+    max: usize,
+    apps: &SharedApps,
+    engines: &SharedEngines,
+) -> Response {
+    let max = max.max(1);
+    let mut items = prefix_results(query, max, apps, engines);
+    let remaining = max.saturating_sub(items.len());
+    let service = indexer_client::search(query, remaining).await;
+    let (is_indexing, index_error, index_generation) = match service {
+        Ok(reply) => {
+            for item in reply.items {
+                if items.len() >= max {
+                    break;
+                }
+                items.push(SearchResult {
+                    kind: if item.is_directory { "folder" } else { "file" }.into(),
+                    title: item.name.clone(),
+                    subtitle: item.path.clone(),
+                    execute_id: item.path,
+                    match_spans: match_spans(&item.name, query),
+                });
+            }
+            (
+                reply.status.building || !reply.status.ready,
+                reply.status.message.filter(|_| reply.status.degraded),
+                Some(reply.generation),
+            )
+        }
+        Err(error) => (false, Some(error), None),
+    };
+    Response::Results {
+        query: query.to_owned(),
+        items,
+        is_indexing,
+        index_progress: None,
+        index_error,
+        index_generation,
+    }
+}
+
+fn prefix_results(
+    query: &str,
+    max: usize,
+    apps: &SharedApps,
+    engines: &SharedEngines,
+) -> Vec<SearchResult> {
+    let mut items = Vec::with_capacity(max.min(128));
+    if let Ok(guard) = engines.read() {
+        if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
+            items.push(hit.into_search_result());
+        }
+    }
+    if items.len() < max {
+        if let Ok(apps_guard) = apps.read() {
+            let app_budget = if max <= 5 { max } else { (max / 2).max(5) };
+            let remaining = max.saturating_sub(items.len()).min(app_budget);
+            for app in crate::apps::search(&apps_guard, query, remaining) {
+                if items.len() >= max {
+                    break;
+                }
+                items.push(SearchResult {
+                    kind: "app".into(),
+                    title: app.name.clone(),
+                    subtitle: if app.target_path != app.launch_path {
+                        app.target_path.clone()
+                    } else {
+                        app.launch_path.clone()
+                    },
+                    execute_id: app.launch_path.clone(),
+                    match_spans: match_spans(&app.name, query),
+                });
+            }
+        }
+    }
+    items
+}
 /// 请求分发。search 为纯读；execute/reveal 会调系统打开文件/URL（有副作用）。
+#[cfg(test)]
 pub fn dispatch(
     req: Request,
     index: &SharedIndex,
@@ -378,6 +476,7 @@ fn reveal_in_explorer(path: &str) -> Result<(), String> {
 ///
 /// 排序选择：关键词命中时 web 结果排在最前（用户明确输入了引擎前缀，意图就是搜网页），
 /// 其后程序 > 文件（design.md）。索引未就绪时 is_indexing=true。
+#[cfg(test)]
 fn search(
     query: &str,
     max: usize,
@@ -469,6 +568,8 @@ fn search(
         items,
         is_indexing,
         index_progress,
+        index_error: None,
+        index_generation: None,
     }
 }
 
@@ -534,8 +635,8 @@ mod tests {
         Arc::new(RwLock::new(vec![AppEntry {
             name: "微信".into(),
             name_lower: "微信".into(),
-            launch_path: r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\微信.lnk"
-                .into(),
+            launch_path:
+                r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\微信.lnk".into(),
             target_path: r"C:\Program Files\Tencent\WeChat\WeChat.exe".into(),
         }]))
     }
@@ -706,10 +807,7 @@ mod tests {
         let v = to_json(&resp);
         let items = v["items"].as_array().unwrap();
         assert_eq!(items[0]["kind"], "web");
-        assert_eq!(
-            items[0]["execute_id"],
-            "https://github.com/search?q=prism"
-        );
+        assert_eq!(items[0]["execute_id"], "https://github.com/search?q=prism");
         // 预设 g 不在自定义列表中，不应命中。
         let resp2 = dispatch(
             parse(r#"{"type":"search","query":"g 天气","max":5}"#),

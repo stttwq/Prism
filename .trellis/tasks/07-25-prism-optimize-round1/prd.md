@@ -1,62 +1,68 @@
-# PRD — Prism 第一轮优化：USN 实时索引 + 前端体验修缮
+# PRD — Prism 第一轮优化：Everything 式实时索引 + 前端体验修缮
 
 ## 目标与用户价值
 
-初版（1.0.0）验收后发现的最痛体验缺口一次收敛：新文件搜不到（最坏 ~5 分钟盲区）、首装建索引期间像"坏了"、右键无菜单、删字母时列表抖动、"显示更多结果"点击无效。本轮完成后，文件变更秒级可搜、索引状态可见、鼠标交互补齐、列表刷新平滑。
+Prism 在普通用户权限下提供接近 Everything 的本地 NTFS 文件名搜索体验：首次安装快速建库，创建、改名、移动和删除文件或目录后无需全盘扫描即可近实时反映；重启只加载内存数据库快照并重放停机窗口。已完成的索引进度、右键菜单、平滑刷新和“显示更多”体验保持不回归。
 
-## 背景（已确认事实）
+## 背景与已确认事实
 
-- **Gap B（核心）**：`index.rs build_or_load` 只做一次性 MFT 枚举（`FSCTL_ENUM_USN_DATA`），无 USN Journal 实时订阅；新文件靠 `index_refresh_secs=300` 定时全量重建感知（`index.rs:630-650`）。design.md 规划的 USN 实时增量未落地，是记录在案的功能债（spec backend/quality-guidelines.md「Indexing: Known Gaps」）。
-- **Gap A**：首装无缓存 → `build_full_index()` 全盘枚举分钟级，期间结果不全。前端已有 `is_indexing` 轮询与「索引加载中…」文案（`SearchViewModel.ApplySearchResponse`），但无进度信息；重启走 `load_cache`，实际毫秒数从未测过（日志有「加载耗时 {}ms」行）。
-- **右键菜单未开发**：`ResultList.xaml` 只有 `MouseDoubleClick`，无 ContextMenu / 右键处理；动作能力已存在（→ 键 ActionPanel + 后端 get_actions/run_action）。
-- **删字母列表抖动**：每次搜索响应整表替换 `_state.Results`（`SearchViewModel.ApplySearchResponse` → `ResultList.Items` setter 重设 `ItemsSource`），容器重建、图标先置 null 再异步加载、高度重算，视觉上"颤一下"。
-- **"显示更多"点击无效**：原 `ShowMoreAsync`（limit 100→1000 重搜）只在 Enter/双击时触发；单击 "more" 行仅选中不执行。且 "more" 行在任何有结果时恒显示（`ApplySearchResponse`），结果不足 limit 时点了也无变化。R5 初次验收后，首屏 limit 进一步由 100 调整为 8。
-- 后端 `max` 参数透传正常（`ipc.rs`，缺省 100）。
+- 当前 `index.rs` 只用 `FSCTL_ENUM_USN_DATA` 做一次性 MFT 枚举，之后每 300 秒全量重建；没有 `FSCTL_READ_USN_JOURNAL` 实时监听。
+- 当前条目只保存预拼父目录字符串和文件名，不保存 FRN/父节点。一般目录改名会使全部后代路径失效，无法通过局部更新正确处理。
+- `prism-core.exe` 还负责剪贴板、ShellExecute、用户网页配置和应用搜索，不能整体以 LocalSystem 运行。
+- 当前 616,223 条索引反序列化后约 19.44MB，前后端空闲私有工作集合计约 38MB；产品总内存硬门槛为 100MB。
+- Everything 官方公开的关键机制是特权服务、NTFS USN Change Journal、内存数据库与位点追平；Listary 官方确认本地 NTFS 实时索引，但未公开内部结构。证据见 `research/everything-index-architecture.md`。
 
 ## 需求
 
-### R1 USN Journal 实时增量监听（Gap B 根治，B2）
-- 后端每 NTFS 卷一个监听任务：记录枚举时的 USN 位点，`FSCTL_READ_USN_JOURNAL` 长轮询，将 create/rename/delete 事件**增量**应用到共享索引（非整表换）。
-- 新建/重命名/删除文件后 ≤5 秒可搜到/搜不到。
-- 无权限读 Journal 时降级：保留现有定时全量重建路径（不阻塞启动、不崩溃），并把 `index_refresh_secs` 缺省下调（300→60，B1 兜底）。
-- Journal wrap / 溢出（`ERROR_JOURNAL_ENTRY_DELETED`）时触发一次全量重建自愈。
+### R1 Everything 式 NTFS 实时索引
 
-### R2 首建/加载状态可见（Gap A，A1+A2）
-- 首步实测：抓取本机 `load_cache` 毫秒数并记录（决定重启场景是否也需提示）。
-- 首次全量构建期间：后端在 `results` 响应中带进度（已扫条数/上次总数估计）；前端显示「正在首次构建全盘索引…（N 万条）」样式的可感知进度，替代干等。
+- 安装时创建自动启动的 `prism-indexer-service.exe` LocalSystem 服务；`Prism.exe` 与 `prism-core.exe` 继续以 `asInvoker` 普通权限运行，日常启动不得出现 UAC。
+- 服务自动索引所有本地固定 NTFS 卷；非 NTFS、网络盘、内容索引不进入本轮。
+- 初次构建直接枚举 MFT，并在枚举前记录 USN 位点；发布索引前重放构建窗口，不能出现“快照建立后到监听启动前”的漏事件窗口。
+- 索引采用 FRN 层级节点模型，路径由父链按需构造。文件和目录创建、改名、移动、删除都必须增量更新；一般目录改名不得触发全量重建。
+- 服务持续读取 USN Change Journal。若卷没有 Journal，服务以不缩小现有配置为前提创建最小 32MB Journal；卸载时不删除系统 Journal。
+- 服务保存 `索引 + journal_id + next_usn` 一致快照。重启后从保存位点重放；仅在缓存损坏、journal id 变化、位点早于 `FirstUsn` 或明确不变量破坏时全量重建。
+- 健康状态禁止定时全盘重建。缓存检查点只在首建完成、服务优雅停止、每 60 分钟或累计 100,000 个 USN 事件时执行（先到为准）。
+- 服务与 broker 使用独立、本机专用、版本化命名管道；服务协议只暴露 `hello/status/search/wait_generation`，不暴露执行文件、写文件或任意重建命令。
+- broker 保留现有前端 IPC 和结果合并顺序，把文件搜索转发给服务；服务不可用时应用/网页搜索仍可用，并明确返回文件索引不可用状态，禁止静默启动高频全盘扫描。
+- 搜索窗口可见且查询非空时，索引 generation 变化应触发一次去抖重搜，使已打开结果无需继续键入也能刷新。
 
-### R3 结果行右键菜单
-- 右键任一 file/folder 结果弹出 ContextMenu，动作集与 ActionPanel 一致（打开、打开所在文件夹、复制、剪切、复制路径），复用后端 get_actions/run_action，不新增动作实现。
-- web / more 行右键不弹菜单（或仅"打开"）。深浅色主题下菜单样式与 Tokens 一致。
+### R2 首建/加载状态可见
 
-### R4 列表刷新平滑（去抖动）
-- 搜索响应到达时对现有列表做**差量更新**（原位增删改），未变化的行不重建容器、图标不闪空。
-- 删除一个字母时肉眼无整表闪烁/跳动；选中项保持逻辑不变（仍按 ExecuteId 保持）。
+- 已完成：后端 `results` 响应提供构建进度，前端显示扫描进度；现有序列化和 UI 行为不得回归。
+- 已实测 v3 缓存加载 83–87ms；服务 v5 缓存需重新测量并记录。
 
-### R5 "显示更多结果"实装
-- 单击 "more" 行即触发加载更多（与 Enter/双击一致）。
-- 首屏最多显示 8 条实际结果；结果可能更多时，第 9 行显示 "more"。
-- 仅当结果可能还有更多时显示 "more" 行（返回条数达到当前 limit 才显示）；加载后若无新增则行消失。
+### R3–R5 已完成体验项
+
+- R3：结果行右键菜单复用现有动作后端。
+- R4：结果列表差量刷新，未变化行和图标不重建。
+- R5：首屏 8 条、按需显示“更多”、单击可展开至 1000 条。
 
 ## 验收标准
 
-- AC1：新建文件后 5 秒内可搜到；删除后 5 秒内消失（管理员权限下实测）。
-- AC2：无管理员权限启动不崩溃，搜索可用，新文件最坏 ~60 秒可见（降级路径）。
-- AC3：首装（删掉 data 目录）启动后立刻搜索，UI 显示构建进度提示而非空白；构建完成后提示消失。
-- AC4：`load_cache` 实测毫秒数记入任务 research/ 或 spec。
-- AC5：右键 file/folder 结果出菜单，五个动作全部可用且与 ActionPanel 行为一致；深浅色主题均正常。
-- AC6：输入 "abc" 再退格成 "ab"，结果列表更新时无整表闪动、共有行图标不闪空。
-- AC7：首屏最多显示 8 条实际结果，第 9 行按需显示"显示更多结果"；单击后加载到最多 1000 条；结果不足 limit 时不显示该行。
-- AC8：`cargo test` / `cargo clippy` / `dotnet build` 全绿；空闲内存仍满足后端 ≤70MB / 前端 ≤30MB 预算（USN 监听常驻不显著抬高基线）。
+- AC1：安装过程只出现一次管理员授权；安装完成后，以普通用户启动 Prism 不出现 UAC，服务状态为 Running。
+- AC2：本地 NTFS 暖机状态下连续执行至少 30 组文件创建、改名、移动、删除，后端索引可见延迟 P95 ≤500ms、最大 ≤1s。
+- AC3：包含至少 100 个后代文件的目录改名/移动后，所有后代新路径最大 1s 内正确，旧路径消失，日志中无全量重建。
+- AC4：搜索窗口保持同一查询不继续输入时，相关文件创建或删除后结果最大 1s 内自动刷新。
+- AC5：停止服务后进行文件创建/改名/删除，再启动服务；有效 Journal 场景只重放停机窗口、不做 MFT 全量重建，最终结果正确。
+- AC6：模拟缓存损坏、journal id 变化或 `next_usn < FirstUsn` 时只触发一次自愈重建，旧索引在新索引发布前保持可搜索。
+- AC7：健康监听 30 分钟内无周期全盘枚举；除首次构建/检查点外无完整索引持续写盘。检查点采用临时文件 + 原子替换，损坏文件可自动恢复。
+- AC8：服务管道拒绝远程客户端；普通用户只能调用只读协议，不能通过服务执行路径、写文件或触发任意重建。
+- AC9：当前 616,223 条样本下，`Prism.exe + prism-core.exe + prism-indexer-service.exe` 空闲私有工作集合计 ≤100MB，其中 UI ≤30MB、两个 Rust 进程合计 ≤70MB；持续 10,000 次增量事件后无单调失控增长。
+- AC10：`cargo test`、`cargo clippy -- -D warnings`、两个 Rust release binary、`dotnet build -c Release` 和 Inno Setup 编译全部通过；现有 R2–R5 回归全绿。
 
-## 不做（Out of Scope）
+## 不做
 
-- A3 之外的首建提速（USN fast-build 顺带收益即可，不单独优化 MFT 枚举）。
-- 托盘「重建索引」占位实装（下一轮）。
-- 安装包 .NET 运行时自检/自带（下一轮）。
-- 内容搜索、网络盘、非 NTFS 卷监听。
+- ReFS、FAT/exFAT、网络盘、云端占位文件和文件内容索引。
+- 完整 NTFS 硬链接多名称一致性；junction 不跟随。
+- 按 Windows 文件 ACL 对机器级文件名索引逐条过滤；本版本定位单用户工作站。
+- 服务设置 UI、手动“重建索引”按钮和远程服务协议。
+- 搜索算法的大规模倒排/ngram 重写；本轮只替换文件树存储和变更来源。
 
 ## 关键决策
 
-- 范围按 spec「Recommended next-task shape」：B2 为核心 + A1/A2 + B1 兜底；用户 2026-07-25 批准，并追加 R3/R4/R5 三个前端问题。
-- 右键菜单复用现有动作后端，不做独立 shell context menu（IContextMenu 集成成本高，本轮不需要）。
+- 用户 2026-07-26 选择升级为 Everything 式实现，替代此前“完整路径字符串 + 目录事件去抖重建”的方案。
+- 采用三进程边界：WPF UI、普通权限 broker、LocalSystem 索引服务；索引只在服务常驻一份。
+- 使用按卷的紧凑 MFT record slot 表，不使用百万项 `HashMap<u64, Node>`；一般目录改名通过父节点关系自然生效。
+- 安装器改为管理员安装服务，但应用本身保持普通权限；便携/无服务模式不承诺 Everything 级实时索引。
+- 规划范围已收敛；实施仍需用户在本规划摘要之后单独明确批准。

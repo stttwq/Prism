@@ -1,1 +1,5 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file":".trellis/tasks/07-25-prism-optimize-round1/backend-spec.md","reason":"Everything 式索引、USN 一致性、服务 IPC、权限与缓存的任务级强制契约"}
+{"file":".trellis/tasks/07-25-prism-optimize-round1/research/everything-index-architecture.md","reason":"公开机制、仓库基线、容量估算和已选架构的证据"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Rust 后端现有 IPC、搜索排序、缓存、测试和内存约束"}
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"WPF 管道配对、查询序列、轮询与 UI 响应约束"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"服务、broker、WPF 三层协议和 generation 数据流的跨层检查"}
