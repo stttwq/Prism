@@ -411,3 +411,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: 完成 R1 Everything 式 USN 实时索引
+
+**Date**: 2026-07-27
+**Task**: 完成 R1 Everything 式 USN 实时索引
+**Branch**: `main`
+
+### Summary
+
+实装 LocalSystem 索引服务、FRN 层级索引、MFT/USN 实时监听与停机回放、v5 缓存、只读 IPC、WPF generation 刷新和 Inno 服务安装；修复阻塞 watcher 导致的 SCM 停止卡死，并完成延迟、内存、协议、安装及构建验收。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0296463` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
