@@ -1,0 +1,5 @@
+{"file":"docs/POST-ROADMAP-REVISED.md","reason":"当前目录、Ctrl+G、宿主范围和 Enter 行为"}
+{"file":"src/prism-core/src/hierarchy.rs","reason":"parent_record 祖先验证与 NodeSlot 内存边界"}
+{"file":"src/prism-core/src/indexer_ipc.rs","reason":"可选 root 请求与错误协议"}
+{"file":"src/Prism/Windows/SearchWindow.xaml.cs","reason":"前台宿主捕获、热键和窗口交互入口"}
+{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"scope、空输入、缓存和状态转换"}

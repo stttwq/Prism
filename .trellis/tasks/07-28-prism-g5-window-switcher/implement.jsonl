@@ -1,0 +1,4 @@
+{"file":"docs/POST-ROADMAP-REVISED.md","reason":"窗口模式、范围、历史和明确排除能力"}
+{"file":"src/prism-core/src/ipc.rs","reason":"稳定 window kind、typed target 与 execute 协议"}
+{"file":"src/prism-core/src/search.rs","reason":"跨类型匹配等级与 broker provider 合并"}
+{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"窗口模式、迟到响应和历史展示状态"}

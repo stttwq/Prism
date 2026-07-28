@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/error-handling.md","reason":"Shell 取消、权限和系统错误分类检查"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"结构化、脱敏、轮转和日志失败要求"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"旧链删除、测试迁移与权限边界质量门"}
+

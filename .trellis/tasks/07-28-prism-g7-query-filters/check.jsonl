@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"parser 表驱动、Top-K 正确性和性能门"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"过滤查询身份与缓存失效"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"raw query 到 indexer FilterSet 的跨层一致性"}
+

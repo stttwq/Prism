@@ -1,0 +1,5 @@
+{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G3 Shell/COM、协议、日志、排除和权限契约"}
+{"file":"src/prism-core/src/actions.rs","reason":"现有 reveal/execute 与 Shell 调用入口"}
+{"file":"src/prism-core/src/index.rs","reason":"待审计的旧索引测试链"}
+{"file":"src/prism-core/src/indexer_runtime.rs","reason":"LocalSystem 服务职责与命令边界"}
+{"file":"src/prism-core/src/config.rs","reason":"设置、排除和持久化现状"}

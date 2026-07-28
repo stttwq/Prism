@@ -1,0 +1,4 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"root 从 WPF 到 indexer 的跨层完整性"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"HostContext、scope 与失败降级状态"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"父链、协议和机器测试质量门"}
+

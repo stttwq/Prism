@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/error-handling.md","reason":"成功、取消、权限、冲突和部分完成分类"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"Destination/Rename/Running/Generation 状态检查"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"typed target 到 Shell 副作用及索引刷新的全链路"}
+

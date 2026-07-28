@@ -1,0 +1,4 @@
+{"file":"docs/POST-ROADMAP-REVISED.md","reason":"已锁定的历史、拼音触发、匹配和高亮行为"}
+{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G2 sidecar、内存门禁、降级和阶段依赖"}
+{"file":"src/prism-core/src/hierarchy.rs","reason":"12B NodeSlot、名称池与文件搜索数据边界"}
+{"file":"src/prism-core/src/search.rs","reason":"统一匹配等级、跨类型排序和 broker 合并点"}

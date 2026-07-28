@@ -1,0 +1,5 @@
+{"file":"docs/POST-ROADMAP-REVISED.md","reason":"网页专用模式、默认关闭、800ms、图标授权和历史边界"}
+{"file":"src/prism-core/src/websearch.rs","reason":"现有网页关键词、URL 构造和引擎配置"}
+{"file":"src/Prism/Models/WebEngineEditItem.cs","reason":"自定义引擎编辑与保存数据"}
+{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"Web mode、取消、迟到响应和结果合并"}
+{"file":"src/Prism/Services/IconCache.cs","reason":"现有图标缓存边界与复用可能"}

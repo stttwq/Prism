@@ -1,0 +1,3 @@
+{"file":".trellis/spec/backend/error-handling.md","reason":"窗口失效、激活拒绝与取消分类"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"Window mode 与成功/失败 UI 转换"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"枚举、opaque target、execute 与历史数据流"}

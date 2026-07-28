@@ -1,0 +1,3 @@
+{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G0 测量口径、性能门槛和旧数字治理"}
+{"file":"src/prism-core/src/ipc.rs","reason":"端到端 broker 搜索协议与现有可采集字段"}
+{"file":"src/prism-core/src/indexer_ipc.rs","reason":"indexer ready、generation 与状态协议"}

@@ -1,0 +1,5 @@
+{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G7 语法、Top-K 前过滤与明确排除范围"}
+{"file":"src/prism-core/src/search.rs","reason":"broker 查询解析、provider 合并与结果类型"}
+{"file":"src/prism-core/src/hierarchy.rs","reason":"extension/path/root 的候选阶段执行点"}
+{"file":"src/prism-core/src/indexer_ipc.rs","reason":"结构化 filters 和请求上限"}
+{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"filters 请求身份、缓存和迟到响应"}

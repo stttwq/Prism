@@ -1,0 +1,5 @@
+{"file":"docs/POST-ROADMAP-REVISED.md","reason":"已锁定动作清单、子流程、删除确认和动作后状态"}
+{"file":"src/prism-core/src/actions.rs","reason":"现有 execute/reveal/Shell 行为与应用启动"}
+{"file":"src/prism-core/src/ipc.rs","reason":"actions/run_action 与 typed target 协议"}
+{"file":"src/Prism/Controls/ActionPanel.xaml.cs","reason":"现有动作面板与选择交互"}
+{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"动作模式、generation 和窗口隐藏状态"}

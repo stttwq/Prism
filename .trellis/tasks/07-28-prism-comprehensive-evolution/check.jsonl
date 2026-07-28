@@ -1,0 +1,3 @@
+{"file":"docs/PRISM-OPTIMIZATION-REPORT.md","reason":"核对仓库事实、旧数字和技术纠偏"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"核对 backend 与权限边界契约"}
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"核对 WPF 状态与管道契约"}

@@ -1,0 +1,4 @@
+{"file":"docs/PRISM-OPTIMIZATION-REPORT.md","reason":"Q1-Q13 审计、Top-K 错误与协议纠偏"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"跨 indexer、broker、WPF 的完整数据流检查"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"WPF 状态转换和异步结果一致性检查"}
+
