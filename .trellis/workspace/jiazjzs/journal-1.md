@@ -444,3 +444,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: 完成 Prism G0 可复现基线
+
+**Date**: 2026-07-29
+**Task**: 完成 Prism G0 可复现基线
+**Branch**: `feature`
+
+### Summary
+
+完成 G0 搜索、全量扫描与三进程内存基线；修复基准脚本自扰动和内存硬门问题，更新三进程 Memory Acceptance，并在验收机恢复健康的默认 z 服务。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `19408bb` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

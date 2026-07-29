@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
-- **Last Active**: 2026-07-27
+- **Total Sessions**: 14
+- **Last Active**: 2026-07-29
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~446 | Active |
+| `journal-1.md` | ~479 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-07-29 | 完成 Prism G0 可复现基线 | `19408bb` | `feature` |
 | 13 | 2026-07-27 | 完成 R1 Everything 式 USN 实时索引 | `0296463` | `main` |
 | 12 | 2026-07-26 | R2 后端索引构建进度字段 | `154ee16` | `main` |
 | 11 | 2026-07-26 | Prism R3 结果右键菜单 | `f74090b` | `main` |
