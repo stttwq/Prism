@@ -1,3 +1,5 @@
-{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G0 测量口径、性能门槛和旧数字治理"}
-{"file":"src/prism-core/src/ipc.rs","reason":"端到端 broker 搜索协议与现有可采集字段"}
-{"file":"src/prism-core/src/indexer_ipc.rs","reason":"indexer ready、generation 与状态协议"}
+{"file":".trellis/spec/backend/index.md","reason":"后端规范索引与相关指南入口"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"基准、IPC、内存口径与质量门要求"}
+{"file":"src/prism-core/src/ipc.rs","reason":"端到端 broker 搜索响应、generation 与错误字段"}
+{"file":"src/prism-core/src/indexer_ipc.rs","reason":"indexer ready、degraded、generation 与状态协议"}
+{"file":"src/prism-core/src/hierarchy.rs","reason":"裸扫描节点过滤和名称匹配语义"}

@@ -1,0 +1,21 @@
+{
+  "build_mode": "release",
+  "early_termination": false,
+  "g1_decision_input_only": true,
+  "generation": 302734,
+  "matches": 381,
+  "max_ms": 55.643,
+  "name_candidates": 643786,
+  "opt_level_evidence": "CARGO_PROFILE_RELEASE_OPT_LEVEL=3",
+  "opt_level_label": "3",
+  "p50_ms": 37.851,
+  "p95_ms": 53.064,
+  "path_constructions": 0,
+  "percentile_method": "nearest_rank",
+  "reported_index_memory_bytes": 62914400,
+  "run_id": "g0-0bcb42f-3-final",
+  "sample_count": 30,
+  "scanned_nodes": 2439315,
+  "schema_version": 1,
+  "volume_count": 3
+}

@@ -49,14 +49,94 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 
 ## Memory Acceptance (≤100MB hard gate)
 
-Task Manager's "内存(专用工作集)" column = **Private Working Set** = `Get-Process <name> | % PrivateMemorySize64`. The ≤100MB gate (design.md) is the **sum of `Prism.exe` + `prism-core.exe`** private working sets, at idle, **after the index is loaded** (pipe `search` returns `is_indexing:false`).
+### 1. Scope / Trigger
 
-Procedure:
-1. **Rebuild both release binaries first** — release artifacts go stale silently: a commit made after the last build is NOT reflected in the exe. `cargo build --release` + `dotnet build src/Prism -c Release`, then **manually copy** `prism-core.exe` beside `Prism.exe` in the publish dir (the csproj has no target that does this).
-2. Launch `Prism.exe` (it spawns `prism-core.exe`); confirm `is_indexing:false` via a pipe search before measuring.
-3. Sum `PrivateMemorySize64` across both processes vs 100MB. (`WorkingSet64` runs ~10MB higher — private WS is the Task-Manager-matching figure; report both.)
+Apply this gate to an idle Release build after the LocalSystem indexer reports
+`ready=true`, `building=false`, and `degraded=false`. The gate covers all three
+resident product processes: `Prism.exe`, `prism-core.exe`, and
+`prism-indexer-service.exe`.
 
-Baseline (2026-07-25, dev machine, full index loaded, idle): total **~38MB private WS** / ~50MB WS — backend ~22MB, frontend ~16MB. Comfortably under the 70/30 split.
+### 2. Signatures
+
+Run the synchronized sampler from a normal-user shell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Measure-ProcessMemory.ps1 `
+  -OutputDirectory <explicit-output-directory> `
+  -ReleaseDirectory <three-binary-release-directory> `
+  -RunId <run-id>
+```
+
+The installed `PrismIndexer` service binary must have the same SHA-256 as
+`<three-binary-release-directory>\prism-indexer-service.exe`.
+
+### 3. Contracts
+
+- Hard-gate metric: the synchronized sum of
+  `Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`, mapped by PID,
+  for the three processes above. The maximum sampled sum must be at most
+  100 MiB (`100 * 1024 * 1024` bytes).
+- `WorkingSet64` and `PrivateMemorySize64` are diagnostics only.
+  `PrivateMemorySize64` is committed private bytes and is not Private Working
+  Set; it must never be substituted for `WorkingSetPrivate`.
+- Every sample records all three PIDs, per-process values, the synchronized
+  total, and a healthy indexer status. PIDs must remain unchanged throughout
+  the series.
+- A generation may advance between samples because the service applies live
+  USN events. Each memory record owns the healthy status and generation read at
+  that sample point; cross-sample generation equality is not required.
+- G0 baseline, Windows build 22631.5696, five one-second samples, commit
+  `0bcb42f0862dd1badf942f786a3eeefbe5049cc7`:
+
+| Effective profile | Frontend P50 | Broker P50 | Indexer P50 | Total P50 | Total max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| committed `opt-level="z"` | 1.676 MiB | 2.008 MiB | 27.453 MiB | 31.137 MiB | 31.145 MiB |
+| isolated `opt-level=3` decision input | 3.594 MiB | 2.020 MiB | 45.516 MiB | 51.129 MiB | 51.301 MiB |
+
+The `z` row is the current acceptance baseline. The `3` row is a G1 decision
+input, not a profile change or a new target.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Missing, duplicate, exited, or changed PID | Fail the run; publish no success summary. |
+| Service PID differs from `PrismIndexer` SCM PID | Fail the run. |
+| Frontend/broker path or installed service hash differs from the Release set | Fail the run. |
+| Indexer is not ready, is building/degraded, or reports generation zero | Fail the run. |
+| Fewer than three process records in any sample | Fail the run. |
+| Maximum synchronized Private Working Set exceeds 100 MiB | Fail acceptance and retain raw evidence. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: five synchronized samples contain stable PIDs, a healthy indexer, and a
+  maximum three-process `WorkingSetPrivate` sum below 100 MiB.
+- Base: generation advances between samples while every sample remains healthy;
+  retain all samples and report the generation list.
+- Bad: sum `PrivateMemorySize64`, omit the service, mix Debug/stale binaries, or
+  combine values captured at different times.
+
+### 6. Tests Required
+
+- `tools\bench\Test-Bench.ps1` passes, including buffered JSONL publication.
+- PowerShell parsing succeeds for every `tools/bench/*.ps1` and `*.psm1` file.
+- Raw JSONL count equals the declared sample count; every record contains three
+  process samples; recomputing each total from its process records matches the
+  stored total exactly.
+- The environment and service checks prove Release hashes and SCM PID identity
+  before accepting a measurement.
+
+### 7. Wrong vs Correct
+
+```powershell
+# Wrong: committed private bytes, only two processes, nonsynchronized reads.
+(Get-Process Prism, prism-core | Measure-Object PrivateMemorySize64 -Sum).Sum
+
+# Correct: one CIM formatted-performance snapshot, match WorkingSetPrivate by
+# IDProcess, then sum Prism + prism-core + prism-indexer-service for that sample.
+Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
+  Select-Object IDProcess, WorkingSetPrivate
+```
 
 ---
 

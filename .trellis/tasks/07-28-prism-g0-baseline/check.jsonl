@@ -1,3 +1,13 @@
-{"file":"docs/PRISM-OPTIMIZATION-REPORT.md","reason":"核对三进程事实、NodeSlot/名字池和未复测数字"}
+{"file":".trellis/spec/backend/index.md","reason":"后端规范索引与审查入口"}
 {"file":".trellis/spec/backend/quality-guidelines.md","reason":"核对测试、基准与质量门要求"}
-
+{"file":".trellis/tasks/07-28-prism-g0-baseline/progress.md","reason":"核对已完成验证、正式裸扫描结果和机器阻塞"}
+{"file":".trellis/tasks/07-28-prism-g0-baseline/research/scan-z-final/scan-floor-summary.json","reason":"核对产品匹配路径对齐后的 opt-level z 最终聚合"}
+{"file":".trellis/tasks/07-28-prism-g0-baseline/research/scan-3-final/scan-floor-summary.json","reason":"核对产品匹配路径对齐后的 opt-level 3 最终聚合"}
+{"file":".trellis/tasks/07-28-prism-g0-baseline/research/scan-z-final/scan-floor-samples.jsonl","reason":"复算 opt-level z 的最终样本数、百分位和扫描计数"}
+{"file":".trellis/tasks/07-28-prism-g0-baseline/research/scan-3-final/scan-floor-samples.jsonl","reason":"复算 opt-level 3 的最终样本数、百分位和扫描计数"}
+{"file":"tools/bench/Bench.Common.psm1","reason":"核对严格模式、百分位、样本矩阵、环境与命名管道公共契约"}
+{"file":"tools/bench/Invoke-SearchBaseline.ps1","reason":"核对请求配对、健康状态、generation 固定和失败即停语义"}
+{"file":"tools/bench/Measure-ProcessMemory.ps1","reason":"核对三进程 PID 映射、Private Working Set 和同步汇总"}
+{"file":"tools/bench/Summarize-Baseline.ps1","reason":"核对独立聚合不接受缺失或混合样本"}
+{"file":"tools/bench/Test-Bench.ps1","reason":"核对 PowerShell 基准回归测试"}
+{"file":"tools/bench/scan-floor/src/main.rs","reason":"核对只读全量扫描、输出安全和确定性聚合"}

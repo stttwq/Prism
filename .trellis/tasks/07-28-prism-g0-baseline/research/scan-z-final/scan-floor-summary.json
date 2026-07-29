@@ -1,0 +1,21 @@
+{
+  "build_mode": "release",
+  "early_termination": false,
+  "g1_decision_input_only": true,
+  "generation": 302734,
+  "matches": 381,
+  "max_ms": 57.906,
+  "name_candidates": 643786,
+  "opt_level_evidence": "committed scan-floor release profile opt-level=z",
+  "opt_level_label": "z",
+  "p50_ms": 39.531,
+  "p95_ms": 50.252,
+  "path_constructions": 0,
+  "percentile_method": "nearest_rank",
+  "reported_index_memory_bytes": 62914400,
+  "run_id": "g0-0bcb42f-z-final",
+  "sample_count": 30,
+  "scanned_nodes": 2439315,
+  "schema_version": 1,
+  "volume_count": 3
+}

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "query_set_version": "g0-v1",
+  "queries": [
+    {
+      "id": "ascii_exact",
+      "query": "Prism",
+      "categories": ["ascii", "exact"],
+      "volume_scope": ["all_indexed_volumes"]
+    },
+    {
+      "id": "ascii_prefix",
+      "query": "pris",
+      "categories": ["ascii", "prefix"],
+      "volume_scope": ["all_indexed_volumes"]
+    },
+    {
+      "id": "ascii_contains",
+      "query": "ism",
+      "categories": ["ascii", "contains"],
+      "volume_scope": ["all_indexed_volumes"]
+    },
+    {
+      "id": "chinese",
+      "query": "工具",
+      "categories": ["chinese"],
+      "volume_scope": ["all_indexed_volumes"]
+    },
+    {
+      "id": "rare_term",
+      "query": "prism-g0-a71f9c-rare",
+      "categories": ["rare_term", "synthetic"],
+      "volume_scope": ["all_indexed_volumes"]
+    },
+    {
+      "id": "no_hit",
+      "query": "prism-g0-no-hit-019fabfb9808",
+      "categories": ["no_hit", "synthetic"],
+      "volume_scope": ["all_indexed_volumes"]
+    },
+    {
+      "id": "cross_volume",
+      "query": "prism-g0-cross-volume-fixture",
+      "categories": ["cross_volume", "synthetic"],
+      "volume_scope": ["C:\\", "D:\\"]
+    }
+  ]
+}

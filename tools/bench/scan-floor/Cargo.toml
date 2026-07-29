@@ -1,0 +1,16 @@
+[package]
+name = "prism-g0-scan-floor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+prism-core = { path = "../../../src/prism-core" }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

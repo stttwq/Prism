@@ -3,7 +3,7 @@
   "name": "prism-g0-baseline",
   "title": "G0 可复现基线",
   "description": "建立三进程内存与搜索性能的可复现基线。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
