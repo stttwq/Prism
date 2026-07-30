@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
-- **Last Active**: 2026-07-29
+- **Total Sessions**: 15
+- **Last Active**: 2026-07-30
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~479 | Active |
+| `journal-1.md` | ~515 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 15 | 2026-07-30 | 完成 Prism G1 搜索正确性与协议演进 | `974dee9`, `3993200`, `d84581a`, `f5eed7f` | `feature` |
 | 14 | 2026-07-29 | 完成 Prism G0 可复现基线 | `19408bb` | `feature` |
 | 13 | 2026-07-27 | 完成 R1 Everything 式 USN 实时索引 | `0296463` | `main` |
 | 12 | 2026-07-26 | R2 后端索引构建进度字段 | `154ee16` | `main` |

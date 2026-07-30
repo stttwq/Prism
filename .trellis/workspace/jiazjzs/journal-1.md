@@ -477,3 +477,39 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: 完成 Prism G1 搜索正确性与协议演进
+
+**Date**: 2026-07-30
+**Task**: 完成 Prism G1 搜索正确性与协议演进
+**Branch**: `feature`
+
+### Summary
+
+完成全局 Top-K、USN 补放稳健性、IPC handshake/truncation/generation/filter 契约、WPF 可注入搜索状态与测试地基。Rust 95 tests/clippy/format、C# 7 tests、WPF Release 0 warnings/errors 通过；正式搜索 max=8/1000、三进程内存和 scan-floor 验收通过。G1 已归档。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `974dee9` | (see git log) |
+| `3993200` | (see git log) |
+| `d84581a` | (see git log) |
+| `f5eed7f` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
