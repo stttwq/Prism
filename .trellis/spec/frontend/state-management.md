@@ -18,6 +18,23 @@ Questions to answer:
 
 (To be filled by the team)
 
+## Prism Search State
+
+- `SearchViewModel` depends on `ISearchClient`, `IDebounceTimerFactory`, and
+  `ISearchScheduler`; production dispatcher timers register their callback once
+  and expose restart/stop behavior.
+- A response may seed local prefix filtering only when it is not indexing, has
+  no index error, is not truncated, carries an index generation, and contains
+  no web result. Query deletion or replacement and generation notification
+  invalidate that cache.
+- A written pipe request always consumes its paired line response. UI
+  cancellation uses a monotonically increasing search sequence to discard late
+  responses without desynchronizing the transport.
+- The frontend adds the More row only when `is_truncated` is true. Item count
+  equal to `max` is not sufficient evidence of truncation.
+- Protocol kinds are retained as raw strings and projected to
+  `SearchResultKind`; unknown strings map to `Unknown` without throwing.
+
 ---
 
 ## State Categories

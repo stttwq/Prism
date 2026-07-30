@@ -25,7 +25,7 @@ public partial class SearchWindow : Window
     private const double SlideOffsetPx = 6;
     private const double PanelExpandMs = 100;
 
-    private readonly IndexerGenerationClient _generationClient = new();
+    private readonly IIndexGenerationClient _generationClient;
     private SearchViewModel? _vm;
     private IconCache? _icons;
     private ThemeWatcher? _theme;
@@ -48,8 +48,13 @@ public partial class SearchWindow : Window
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     private const int SW_SHOW = 5;
 
-    public SearchWindow()
+    public SearchWindow() : this(new IndexerGenerationClient())
     {
+    }
+
+    public SearchWindow(IIndexGenerationClient generationClient)
+    {
+        _generationClient = generationClient;
         InitializeComponent();
         PreviewKeyDown += OnWindowPreviewKeyDown;
         Deactivated += OnDeactivated;
@@ -304,7 +309,12 @@ public partial class SearchWindow : Window
 
     private void OnDeactivated(object? sender, EventArgs e)
     {
-        if (_ignoreDeactivate || _contextMenuOpen || _contextMenuActionPending || IsPinned || _hiding)
+        if (!SearchWindowFocusPolicy.ShouldHide(
+                _ignoreDeactivate,
+                _contextMenuOpen,
+                _contextMenuActionPending,
+                IsPinned,
+                _hiding))
             return;
         HideAnimated();
     }

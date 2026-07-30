@@ -1,5 +1,4 @@
 using System.IO;
-using System.Windows.Threading;
 using Prism.Models;
 using Prism.Services;
 
@@ -17,13 +16,17 @@ public sealed class SearchViewModel
     private const int ExpandedResultLimit = 1000;
 
     private readonly AppState _state;
-    private readonly PipeClient _pipe;
-    private readonly DispatcherTimer _debounce;
-    private readonly DispatcherTimer _generationDebounce;
+    private readonly ISearchClient _pipe;
+    private readonly IDebounceTimer _debounce;
+    private readonly IDebounceTimer _generationDebounce;
+    private readonly ISearchScheduler _scheduler;
     private CancellationTokenSource? _searchCts;
     private int _resultLimit = InitialResultLimit;
     private string _pendingQuery = "";
     private int _searchSeq;
+    private string _lastInputQuery = "";
+    private SearchCacheEntry? _completeCache;
+    private SearchContext _searchContext = SearchContext.Default;
     /// <summary>进入 Actions 前保存的搜索词，离开时恢复。</summary>
     private string _queryBeforeActions = "";
     /// <summary>后端返回的完整动作列表；输入时按 Label 子串过滤。</summary>
@@ -34,20 +37,22 @@ public sealed class SearchViewModel
     /// <summary>执行成功后请求隐藏窗口（由 SearchWindow 订阅）。</summary>
     public event Action? HideRequested;
 
-    public SearchViewModel(AppState state, PipeClient pipe)
+    private sealed record SearchCacheEntry(SearchResponse Response, SearchContext Context);
+
+    public SearchViewModel(
+        AppState state,
+        ISearchClient pipe,
+        IDebounceTimerFactory? timerFactory = null,
+        ISearchScheduler? scheduler = null)
     {
         _state = state;
         _pipe = pipe;
-        _debounce = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(50),
-        };
-        _debounce.Tick += OnDebounceTick;
-        _generationDebounce = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(100),
-        };
-        _generationDebounce.Tick += OnGenerationDebounceTick;
+        timerFactory ??= new DispatcherDebounceTimerFactory();
+        _scheduler = scheduler ?? new SearchScheduler();
+        _debounce = timerFactory.Create(
+            TimeSpan.FromMilliseconds(50), () => _ = OnDebounceTickAsync());
+        _generationDebounce = timerFactory.Create(
+            TimeSpan.FromMilliseconds(100), () => _ = OnGenerationDebounceTickAsync());
     }
 
     /// <summary>Schedules one refresh through the existing broker search path.</summary>
@@ -56,11 +61,20 @@ public sealed class SearchViewModel
         if (_state.Mode != PanelMode.Results || string.IsNullOrWhiteSpace(_state.Query))
             return;
 
-        _generationDebounce.Stop();
-        _generationDebounce.Start();
+        _completeCache = null;
+        _generationDebounce.Restart();
     }
 
-    private async void OnGenerationDebounceTick(object? sender, EventArgs e)
+    public void SetSearchContext(SearchContext context)
+    {
+        if (_searchContext.IsEquivalentTo(context)) return;
+        _searchContext = context;
+        _completeCache = null;
+        if (_state.Mode == PanelMode.Results && !string.IsNullOrWhiteSpace(_state.Query))
+            _generationDebounce.Restart();
+    }
+
+    private async Task OnGenerationDebounceTickAsync()
     {
         _generationDebounce.Stop();
         if (_state.Mode != PanelMode.Results || string.IsNullOrWhiteSpace(_state.Query))
@@ -76,7 +90,7 @@ public sealed class SearchViewModel
         }
     }
 
-    private async void OnDebounceTick(object? sender, EventArgs e)
+    private async Task OnDebounceTickAsync()
     {
         _debounce.Stop();
         // Actions 模式下输入只过滤动作，不发搜索。
@@ -105,6 +119,8 @@ public sealed class SearchViewModel
         CancelSearch();
         _resultLimit = InitialResultLimit;
         _pendingQuery = "";
+        _lastInputQuery = "";
+        _completeCache = null;
         _queryBeforeActions = "";
         _allActions = Array.Empty<ActionItem>();
         _state.Query = "";
@@ -121,14 +137,16 @@ public sealed class SearchViewModel
     /// <summary>输入框文本变化（由 SearchHeader 调用）。</summary>
     public void OnQueryChanged(string text)
     {
+        if (!text.StartsWith(_lastInputQuery, StringComparison.Ordinal))
+            _completeCache = null;
+        _lastInputQuery = text;
         _state.Query = text;
         _pendingQuery = text;
 
         if (_state.Mode == PanelMode.Actions)
         {
             // 动作过滤：即时，无需防抖太久，但仍走 debounce 避免每键重绑。
-            _debounce.Stop();
-            _debounce.Start();
+            _debounce.Restart();
             return;
         }
 
@@ -151,8 +169,7 @@ public sealed class SearchViewModel
         _state.Mode = PanelMode.Results;
         SetSearchingStatus();
 
-        _debounce.Stop();
-        _debounce.Start();
+        _debounce.Restart();
     }
 
     public void MoveSelection(int delta)
@@ -382,6 +399,11 @@ public sealed class SearchViewModel
 
         var seq = ++_searchSeq;
         CancelSearch();
+        if (TryFilterCompleteCache(query, out var cached))
+        {
+            ApplySearchResponse(cached, query, max, seq, startPoll: false, updateCache: false);
+            return;
+        }
         var cts = new CancellationTokenSource();
         _searchCts = cts;
 
@@ -407,7 +429,7 @@ public sealed class SearchViewModel
             if (seq == _searchSeq)
                 SetSearchingStatus();
 
-            var resp = await _pipe.SearchAsync(query, max, cts.Token).ConfigureAwait(true);
+            var resp = await _pipe.SearchAsync(query, max, _searchContext, cts.Token).ConfigureAwait(true);
 
             if (seq != _searchSeq) return;
             if (cts.IsCancellationRequested) return;
@@ -452,12 +474,28 @@ public sealed class SearchViewModel
         }
     }
 
-    private void ApplySearchResponse(SearchResponse resp, string query, int max, int seq, bool startPoll = true)
+    private void ApplySearchResponse(
+        SearchResponse resp,
+        string query,
+        int max,
+        int seq,
+        bool startPoll = true,
+        bool updateCache = true)
     {
         var list = new List<SearchResult>(resp.Items.Count + 1);
         list.AddRange(resp.Items);
-        if (resp.Items.Count > 0 && resp.Items.Count >= max)
+        if (resp.IsTruncated)
             list.Add(SearchResult.More(query));
+
+        if (updateCache
+            && !resp.IsIndexing
+            && string.IsNullOrWhiteSpace(resp.IndexError)
+            && !resp.IsTruncated
+            && resp.IndexGeneration.HasValue
+            && resp.Items.All(item => item.ResultKind != SearchResultKind.Web))
+        {
+            _completeCache = new SearchCacheEntry(resp, _searchContext);
+        }
 
         var prevId = _state.SelectedResult?.ExecuteId;
         _state.Results = list;
@@ -503,7 +541,7 @@ public sealed class SearchViewModel
         {
             try
             {
-                await Task.Delay(500).ConfigureAwait(true);
+                await _scheduler.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(true);
             }
             catch { return; }
 
@@ -514,7 +552,8 @@ public sealed class SearchViewModel
 
             try
             {
-                var resp = await _pipe.SearchAsync(query, max).ConfigureAwait(true);
+                var resp = await _pipe.SearchAsync(
+                    query, max, _searchContext).ConfigureAwait(true);
                 if (seq != _searchSeq) return;
                 if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
                 if (!string.Equals(resp.Query, query, StringComparison.Ordinal)) return;
@@ -555,6 +594,25 @@ public sealed class SearchViewModel
         try { _searchCts?.Cancel(); } catch { /* ignore */ }
         _searchCts?.Dispose();
         _searchCts = null;
+    }
+
+    private bool TryFilterCompleteCache(string query, out SearchResponse response)
+    {
+        var cached = _completeCache;
+        if (cached is null
+            || !cached.Context.IsEquivalentTo(_searchContext)
+            || !query.StartsWith(cached.Response.Query, StringComparison.Ordinal)
+            || string.Equals(query, cached.Response.Query, StringComparison.Ordinal))
+        {
+            response = null!;
+            return false;
+        }
+
+        var items = cached.Response.Items
+            .Where(item => item.Title.Contains(query, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        response = cached.Response with { Query = query, Items = items };
+        return true;
     }
 
     private static string ShortMsg(Exception ex)

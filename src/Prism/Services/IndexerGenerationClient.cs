@@ -9,7 +9,13 @@ namespace Prism.Services;
 /// Long-polls the privileged indexer on a dedicated connection. This connection is
 /// never shared with the broker request/response stream.
 /// </summary>
-public sealed class IndexerGenerationClient : IDisposable
+public interface IIndexGenerationClient : IDisposable
+{
+    event Action<ulong>? GenerationChanged;
+    void SetActive(bool active);
+}
+
+public sealed class IndexerGenerationClient : IIndexGenerationClient
 {
     public const string FullPipeName = @"\\.\pipe\prism-indexer-v1";
     private const string PipeName = "prism-indexer-v1";

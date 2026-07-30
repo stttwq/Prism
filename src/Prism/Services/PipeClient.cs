@@ -11,9 +11,10 @@ namespace Prism.Services;
 /// 命名管道客户端 + 后端进程守护。
 /// 第四步：search / execute / reveal；断线时抛 IOException，由调用方决定是否重连。
 /// </summary>
-public sealed class PipeClient : IDisposable
+public sealed class PipeClient : ISearchClient, IDisposable
 {
     private const string PipeName = "prism-core"; // 完整名 \\.\pipe\prism-core
+    private const int ProtocolVersion = 1;
 
     private Process? _backend;
     private NamedPipeClientStream? _stream;
@@ -48,6 +49,18 @@ public sealed class PipeClient : IDisposable
         _stream = stream;
         _reader = new StreamReader(stream, utf8);
         _writer = new StreamWriter(stream, utf8) { AutoFlush = false, NewLine = "\n" };
+
+        var hello = await SendAsync(
+            new { type = "hello", protocol = ProtocolVersion }, ct).ConfigureAwait(false);
+        if (!hello.TryGetProperty("type", out var type)
+            || type.GetString() != "hello"
+            || !hello.TryGetProperty("protocol", out var protocol)
+            || !protocol.TryGetInt32(out var version)
+            || version != ProtocolVersion)
+        {
+            DisposeStreamOnly();
+            throw new IOException("Broker protocol version mismatch");
+        }
     }
 
     /// <summary>发送 ping，返回后端版本号。</summary>
@@ -60,12 +73,39 @@ public sealed class PipeClient : IDisposable
     /// <summary>即时搜索，返回后端原始结果（不含前端"展示更多"行）。</summary>
     public async Task<SearchResponse> SearchAsync(string query, int max = 100, CancellationToken ct = default)
     {
-        var resp = await SendAsync(new { type = "search", query, max }, ct).ConfigureAwait(false);
+        return await SearchAsync(query, max, SearchContext.Default, ct).ConfigureAwait(false);
+    }
+
+    public async Task<SearchResponse> SearchAsync(
+        string query,
+        int max,
+        SearchContext context,
+        CancellationToken ct = default)
+    {
+        var filters = context.Filters.Count == 0
+            ? null
+            : context.Filters.Select(filter => new
+            {
+                field = filter.Field,
+                value = filter.Value,
+            }).ToArray();
+        var resp = await SendAsync(new { type = "search", query, max, filters }, ct).ConfigureAwait(false);
+        return ParseSearchResponse(resp, query);
+    }
+
+    internal static SearchResponse ParseSearchResponse(JsonElement resp, string query)
+    {
         var echo = resp.TryGetProperty("query", out var q) ? q.GetString() ?? query : query;
         var indexing = resp.TryGetProperty("is_indexing", out var ix) && ix.ValueKind == JsonValueKind.True;
         var indexError = resp.TryGetProperty("index_error", out var error)
             && error.ValueKind == JsonValueKind.String
             ? error.GetString()
+            : null;
+        var truncated = resp.TryGetProperty("is_truncated", out var truncatedValue)
+            && truncatedValue.ValueKind == JsonValueKind.True;
+        ulong? generation = resp.TryGetProperty("index_generation", out var generationValue)
+            && generationValue.TryGetUInt64(out var parsedGeneration)
+            ? parsedGeneration
             : null;
         var items = new List<SearchResult>();
         if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
@@ -73,7 +113,7 @@ public sealed class PipeClient : IDisposable
             foreach (var el in arr.EnumerateArray())
                 items.Add(ParseResult(el));
         }
-        return new SearchResponse(echo, items, indexing, indexError);
+        return new SearchResponse(echo, items, indexing, indexError, truncated, generation);
     }
 
     /// <summary>打开文件/文件夹/程序。</summary>
@@ -192,9 +232,9 @@ public sealed class PipeClient : IDisposable
         }
     }
 
-    private static SearchResult ParseResult(JsonElement el)
+    internal static SearchResult ParseResult(JsonElement el)
     {
-        var kind = el.TryGetProperty("kind", out var k) ? k.GetString() ?? "file" : "file";
+        var kind = el.TryGetProperty("kind", out var k) ? k.GetString() ?? "" : "";
         var title = el.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
         var subtitle = el.TryGetProperty("subtitle", out var s) ? s.GetString() ?? "" : "";
         var id = el.TryGetProperty("execute_id", out var e) ? e.GetString() ?? "" : "";
@@ -206,7 +246,22 @@ public sealed class PipeClient : IDisposable
                 if (n.TryGetInt32(out var v)) list.Add(v);
             spans = list.ToArray();
         }
-        return new SearchResult(kind, title, subtitle, id, spans);
+        SearchMatchMetadata? metadata = null;
+        if (el.TryGetProperty("match_metadata", out var match)
+            && match.ValueKind == JsonValueKind.Object
+            && match.TryGetProperty("class", out var matchClass)
+            && match.TryGetProperty("position", out var position)
+            && match.TryGetProperty("score", out var score)
+            && matchClass.TryGetInt32(out var parsedClass)
+            && position.TryGetInt32(out var parsedPosition)
+            && score.TryGetInt32(out var parsedScore))
+        {
+            metadata = new SearchMatchMetadata(parsedClass, parsedPosition, parsedScore);
+        }
+        return new SearchResult(kind, title, subtitle, id, spans)
+        {
+            MatchMetadata = metadata,
+        };
     }
 
     /// <summary>确保后端进程在运行；未运行则定位可执行文件并启动。</summary>
@@ -302,4 +357,6 @@ public sealed record SearchResponse(
     string Query,
     IReadOnlyList<SearchResult> Items,
     bool IsIndexing,
-    string? IndexError);
+    string? IndexError,
+    bool IsTruncated = false,
+    ulong? IndexGeneration = null);
