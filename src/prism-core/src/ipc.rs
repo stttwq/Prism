@@ -19,11 +19,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
+use crate::hierarchy::MatchMetadata;
 #[cfg(test)]
 use crate::index::{SharedIndex, SharedProgress};
 use crate::indexer_client;
+use crate::indexer_ipc::{validate_search_request, SearchFilter};
 use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
+
+pub const BROKER_PROTOCOL: u32 = 1;
 
 /// 共享引擎列表（可热重载）。
 /// 读路径：search 持读锁；写路径：reload_engines 换整表。
@@ -33,6 +37,9 @@ pub type SharedEngines = Arc<std::sync::RwLock<Vec<WebEngine>>>;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Hello {
+        protocol: u32,
+    },
     /// 连接自检：期望回 pong。
     Ping,
     /// 即时搜索。
@@ -40,17 +47,30 @@ pub enum Request {
         query: String,
         #[serde(default = "default_max")]
         max: usize,
+        #[serde(default)]
+        filters: Option<Vec<SearchFilter>>,
     },
     /// 执行选中项（打开文件 / 启动程序 / 打开网址）。
-    Execute { id: String },
+    Execute {
+        id: String,
+    },
     /// 打开文件所在文件夹并选中。
-    Reveal { id: String },
+    Reveal {
+        id: String,
+    },
     /// 请求某文件的动作列表（→ 键动作面板）。
-    Actions { id: String },
+    Actions {
+        id: String,
+    },
     /// 执行动作面板里的某个动作。
-    RunAction { id: String, action: String },
+    RunAction {
+        id: String,
+        action: String,
+    },
     /// 设置页保存后热重载网页引擎列表（步骤 8）。
-    ReloadEngines { engines: Vec<WebEngine> },
+    ReloadEngines {
+        engines: Vec<WebEngine>,
+    },
 }
 
 fn default_max() -> usize {
@@ -60,8 +80,14 @@ fn default_max() -> usize {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    Hello {
+        protocol: u32,
+        version: String,
+    },
     /// ping 的回应，附带后端版本供前端自检。
-    Pong { version: String },
+    Pong {
+        version: String,
+    },
     /// 搜索结果列表（"展示更多"行由前端追加）。
     /// `is_indexing=true` 表示索引尚未就绪，items 可能为空。
     Results {
@@ -75,13 +101,31 @@ pub enum Response {
         index_error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         index_generation: Option<u64>,
+        #[serde(default)]
+        is_truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        matched_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scanned_nodes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name_candidates: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entered_top_k: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path_constructions: Option<u64>,
     },
     /// 动作面板列表。
-    Actions { items: Vec<ActionItem> },
+    Actions {
+        items: Vec<ActionItem>,
+    },
     /// 后端状态推送（如索引进行中）。
-    Status { is_indexing: bool },
+    Status {
+        is_indexing: bool,
+    },
     /// 出错时回传，前端在列表区以单行提示展示。
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// 首次全量构建期间随 `results` 返回的索引进度快照。
@@ -92,16 +136,27 @@ pub struct IndexProgressDto {
 }
 
 /// 单条搜索结果，字段对应 frontend-spec.md 第 2 节 `SearchResult` record。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchResultKind {
+    App,
+    File,
+    Folder,
+    Web,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     /// "app" | "file" | "folder" | "web"（"more" 行由前端生成）。
-    pub kind: String,
+    pub kind: SearchResultKind,
     pub title: String,
     pub subtitle: String,
     /// 回传后端用于 execute/reveal/actions 的标识。
     pub execute_id: String,
     /// 标题中要染蓝的区间，扁平数组 [start,len,start,len,...]。
     pub match_spans: Vec<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_metadata: Option<MatchMetadata>,
 }
 
 /// 动作面板单项，字段对应 frontend-spec.md 第 2 节 `ActionItem` record。
@@ -161,9 +216,11 @@ async fn handle_connection(
         }
 
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(Request::Search { query, max }) => {
-                search_service(&query, max, &apps, &engines).await
-            }
+            Ok(Request::Search {
+                query,
+                max,
+                filters,
+            }) => search_service(&query, max, filters, &apps, &engines).await,
             Ok(req) => dispatch_non_search(req, &engines),
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
@@ -184,6 +241,13 @@ async fn handle_connection(
 
 fn dispatch_non_search(req: Request, engines: &SharedEngines) -> Response {
     match req {
+        Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
+            protocol,
+            version: VERSION.to_string(),
+        },
+        Request::Hello { protocol } => Response::Error {
+            message: format!("broker protocol {protocol} is incompatible with {BROKER_PROTOCOL}"),
+        },
         Request::Ping => Response::Pong {
             version: VERSION.to_string(),
         },
@@ -201,67 +265,30 @@ fn dispatch_non_search(req: Request, engines: &SharedEngines) -> Response {
 async fn search_service(
     query: &str,
     max: usize,
+    filters: Option<Vec<SearchFilter>>,
     apps: &SharedApps,
     engines: &SharedEngines,
 ) -> Response {
-    let max = max.max(1);
-    let mut items = prefix_results(query, max, apps, engines);
-    let remaining = max.saturating_sub(items.len());
-    let service = indexer_client::search(query, remaining).await;
-    let (is_indexing, index_error, index_generation) = match service {
-        Ok(reply) => {
-            for item in reply.items {
-                if items.len() >= max {
-                    break;
-                }
-                items.push(SearchResult {
-                    kind: if item.is_directory { "folder" } else { "file" }.into(),
-                    title: item.name.clone(),
-                    subtitle: item.path.clone(),
-                    execute_id: item.path,
-                    match_spans: match_spans(&item.name, query),
-                });
-            }
-            (
-                reply.status.building || !reply.status.ready,
-                reply.status.message.filter(|_| reply.status.degraded),
-                Some(reply.generation),
-            )
-        }
-        Err(error) => (false, Some(error), None),
-    };
-    Response::Results {
-        query: query.to_owned(),
-        items,
-        is_indexing,
-        index_progress: None,
-        index_error,
-        index_generation,
+    if let Err(message) = validate_search_request(max, filters.as_deref()) {
+        return Response::Error { message };
     }
-}
-
-fn prefix_results(
-    query: &str,
-    max: usize,
-    apps: &SharedApps,
-    engines: &SharedEngines,
-) -> Vec<SearchResult> {
+    let filters = filters.filter(|values| !values.is_empty());
     let mut items = Vec::with_capacity(max.min(128));
     if let Ok(guard) = engines.read() {
         if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
             items.push(hit.into_search_result());
         }
     }
-    if items.len() < max {
+    let result_slots = max.saturating_sub(items.len());
+    let mut ranked = Vec::new();
+    let mut app_match_count = 0u64;
+    if result_slots > 0 {
         if let Ok(apps_guard) = apps.read() {
-            let app_budget = if max <= 5 { max } else { (max / 2).max(5) };
-            let remaining = max.saturating_sub(items.len()).min(app_budget);
-            for app in crate::apps::search(&apps_guard, query, remaining) {
-                if items.len() >= max {
-                    break;
-                }
-                items.push(SearchResult {
-                    kind: "app".into(),
+            let app_matches = crate::apps::search(&apps_guard, query, usize::MAX);
+            app_match_count = app_matches.len() as u64;
+            for app in app_matches {
+                ranked.push(SearchResult {
+                    kind: SearchResultKind::App,
                     title: app.name.clone(),
                     subtitle: if app.target_path != app.launch_path {
                         app.target_path.clone()
@@ -270,11 +297,109 @@ fn prefix_results(
                     },
                     execute_id: app.launch_path.clone(),
                     match_spans: match_spans(&app.name, query),
+                    match_metadata: rank_title(&app.name, query),
                 });
             }
         }
     }
-    items
+    let service =
+        indexer_client::search_with_filters(query, result_slots.max(1), filters.as_deref()).await;
+    let (
+        is_indexing,
+        index_error,
+        index_generation,
+        index_truncated,
+        index_matched_count,
+        scanned_nodes,
+        name_candidates,
+        entered_top_k,
+        path_constructions,
+    ) = match service {
+        Ok(reply) => {
+            for item in reply.items {
+                ranked.push(SearchResult {
+                    kind: if item.is_directory {
+                        SearchResultKind::Folder
+                    } else {
+                        SearchResultKind::File
+                    },
+                    title: item.name.clone(),
+                    subtitle: item.path.clone(),
+                    execute_id: item.path,
+                    match_spans: match_spans(&item.name, query),
+                    match_metadata: item
+                        .match_metadata
+                        .or_else(|| rank_title(&item.name, query)),
+                });
+            }
+            (
+                reply.status.building || !reply.status.ready,
+                reply.status.message.filter(|_| reply.status.degraded),
+                Some(reply.generation),
+                reply.is_truncated,
+                reply.matched_count,
+                reply.scanned_nodes,
+                reply.name_candidates,
+                reply.entered_top_k,
+                reply.path_constructions,
+            )
+        }
+        Err(error) => (
+            false,
+            Some(error),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+    ranked.sort_by(compare_search_results);
+    let is_truncated = index_truncated || ranked.len() > result_slots;
+    ranked.truncate(result_slots);
+    items.extend(ranked);
+    let matched_count = index_matched_count.map(|count| count.saturating_add(app_match_count));
+    Response::Results {
+        query: query.to_owned(),
+        items,
+        is_indexing,
+        index_progress: None,
+        index_error,
+        index_generation,
+        is_truncated,
+        matched_count,
+        scanned_nodes,
+        name_candidates,
+        entered_top_k,
+        path_constructions,
+    }
+}
+
+fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
+    let title_lower = title.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let byte_position = title_lower.find(&query_lower)?;
+    Some(MatchMetadata {
+        class: if title_lower == query_lower {
+            0
+        } else if byte_position == 0 {
+            1
+        } else {
+            2
+        },
+        position: title_lower[..byte_position].encode_utf16().count() as u32,
+        score: title.encode_utf16().count() as u32,
+    })
+}
+
+fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    left.match_metadata
+        .cmp(&right.match_metadata)
+        .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        .then_with(|| left.subtitle.cmp(&right.subtitle))
+        .then(left.kind.cmp(&right.kind))
 }
 /// 请求分发。search 为纯读；execute/reveal 会调系统打开文件/URL（有副作用）。
 #[cfg(test)]
@@ -286,10 +411,24 @@ pub fn dispatch(
     engines: &SharedEngines,
 ) -> Response {
     match req {
+        Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
+            protocol,
+            version: VERSION.to_string(),
+        },
+        Request::Hello { protocol } => Response::Error {
+            message: format!("broker protocol {protocol} is incompatible with {BROKER_PROTOCOL}"),
+        },
         Request::Ping => Response::Pong {
             version: VERSION.to_string(),
         },
-        Request::Search { query, max } => search(&query, max, index, progress, apps, engines),
+        Request::Search {
+            query,
+            max,
+            filters,
+        } => match validate_search_request(max, filters.as_deref()) {
+            Ok(()) => search(&query, max, index, progress, apps, engines),
+            Err(message) => Response::Error { message },
+        },
         Request::Execute { id } => execute_id(&id),
         Request::Reveal { id } => reveal_path(&id),
         Request::Actions { id } => list_actions(&id),
@@ -507,7 +646,7 @@ fn search(
                     break;
                 }
                 items.push(SearchResult {
-                    kind: "app".into(),
+                    kind: SearchResultKind::App,
                     title: a.name.clone(),
                     // 副标题：目标路径；解析失败时回退到 .lnk 路径。
                     subtitle: if a.target_path != a.launch_path {
@@ -517,6 +656,7 @@ fn search(
                     },
                     execute_id: a.launch_path.clone(),
                     match_spans: match_spans(&a.name, query),
+                    match_metadata: rank_title(&a.name, query),
                 });
             }
         }
@@ -535,14 +675,15 @@ fn search(
                         let path = idx.entry_path(e); // v3: 由 dir+name 拼出
                         SearchResult {
                             kind: if e.kind == 1 {
-                                "folder".into()
+                                SearchResultKind::Folder
                             } else {
-                                "file".into()
+                                SearchResultKind::File
                             },
                             title: name.to_string(),
                             subtitle: path.clone(),
                             execute_id: path,
                             match_spans: match_spans(name, query),
+                            match_metadata: rank_title(name, query),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -570,6 +711,12 @@ fn search(
         index_progress,
         index_error: None,
         index_generation: None,
+        is_truncated: false,
+        matched_count: None,
+        scanned_nodes: None,
+        name_candidates: None,
+        entered_top_k: None,
+        path_constructions: None,
     }
 }
 
@@ -660,6 +807,38 @@ mod tests {
         let v = to_json(&resp);
         assert_eq!(v["type"], "pong");
         assert_eq!(v["version"], VERSION);
+    }
+
+    #[test]
+    fn broker_handshake_accepts_current_and_rejects_incompatible_protocol() {
+        let current = dispatch(
+            parse(r#"{"type":"hello","protocol":1}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        let value = to_json(&current);
+        assert_eq!(value["type"], "hello");
+        assert_eq!(value["protocol"], BROKER_PROTOCOL);
+
+        let incompatible = dispatch(
+            parse(r#"{"type":"hello","protocol":999}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        assert_eq!(to_json(&incompatible)["type"], "error");
+    }
+
+    #[test]
+    fn broker_rejects_search_limits_before_dispatch() {
+        let response = dispatch(
+            parse(r#"{"type":"search","query":"x","max":1001}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        assert_eq!(to_json(&response)["type"], "error");
     }
 
     #[test]

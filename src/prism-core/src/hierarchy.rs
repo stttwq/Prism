@@ -1,5 +1,8 @@
 //! Compact FRN-indexed hierarchy shared by MFT construction and USN replay.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use serde::{Deserialize, Serialize};
 
 pub const FLAG_PRESENT: u16 = 0x0001;
@@ -42,6 +45,61 @@ pub struct IndexHit {
     pub name: String,
     pub path: String,
     pub is_directory: bool,
+    pub match_metadata: MatchMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MatchMetadata {
+    pub class: u8,
+    pub position: u32,
+    pub score: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchOutcome {
+    pub items: Vec<IndexHit>,
+    pub is_truncated: bool,
+    pub scanned_nodes: u64,
+    pub name_candidates: u64,
+    pub matched_count: u64,
+    pub entered_top_k: u64,
+    pub path_constructions: u64,
+}
+
+#[derive(Debug, Eq)]
+struct RankedCandidate<'a> {
+    volume_index: usize,
+    mount_path: &'a str,
+    record: u32,
+    name: &'a str,
+    is_directory: bool,
+    metadata: MatchMetadata,
+}
+
+impl PartialEq for RankedCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Ord for RankedCandidate<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.metadata
+            .class
+            .cmp(&other.metadata.class)
+            .then(self.metadata.position.cmp(&other.metadata.position))
+            .then(self.metadata.score.cmp(&other.metadata.score))
+            .then_with(|| self.name.cmp(other.name))
+            .then_with(|| self.mount_path.cmp(other.mount_path))
+            .then(self.record.cmp(&other.record))
+            .then(self.is_directory.cmp(&other.is_directory))
+    }
+}
+
+impl PartialOrd for RankedCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,12 +195,12 @@ impl VolumeIndex {
     ) -> Result<ApplyOutcome, String> {
         let (record, sequence) = Self::split_frn(frn)?;
         let (parent_record, _) = Self::split_frn(parent_frn)?;
-        self.ensure_slot(record)?;
         if parent_record as usize >= self.nodes.len()
             || self.nodes[parent_record as usize].flags & FLAG_PRESENT == 0
         {
             return Err(format!("broken parent chain at record {record}"));
         }
+        self.ensure_slot(record)?;
 
         let parent_excluded = self.nodes[parent_record as usize].flags & FLAG_EXCLUDED != 0;
         let excluded = parent_excluded
@@ -217,36 +275,7 @@ impl VolumeIndex {
     }
 
     pub fn search(&self, query: &str, max: usize) -> Vec<IndexHit> {
-        if query.is_empty() || max == 0 {
-            return Vec::new();
-        }
-        let query = query.to_lowercase();
-        let mut hits = Vec::with_capacity(max.min(64));
-        for (record, slot) in self.nodes.iter().enumerate() {
-            if slot.flags & (FLAG_PRESENT | FLAG_EXCLUDED) != FLAG_PRESENT
-                || slot.name_off == NO_NAME
-            {
-                continue;
-            }
-            let Ok(name) = self.name_at(slot.name_off) else {
-                continue;
-            };
-            if !contains_case_insensitive(name, &query) {
-                continue;
-            }
-            let Ok(path) = self.path_for(record as u32) else {
-                continue;
-            };
-            hits.push(IndexHit {
-                name: name.to_owned(),
-                path,
-                is_directory: slot.flags & FLAG_DIRECTORY != 0,
-            });
-            if hits.len() == max {
-                break;
-            }
-        }
-        hits
+        search_volumes(std::slice::from_ref(self), query, max).items
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -407,15 +436,8 @@ impl VolumeIndex {
 }
 
 impl IndexState {
-    pub fn search(&self, query: &str, max: usize) -> Vec<IndexHit> {
-        let mut hits = Vec::with_capacity(max.min(64));
-        for volume in &self.volumes {
-            hits.extend(volume.search(query, max.saturating_sub(hits.len())));
-            if hits.len() == max {
-                break;
-            }
-        }
-        hits
+    pub fn search(&self, query: &str, max: usize) -> SearchOutcome {
+        search_volumes(&self.volumes, query, max)
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -438,16 +460,120 @@ fn is_excluded_name(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-fn contains_case_insensitive(name: &str, query_lower: &str) -> bool {
-    if name.is_ascii() && query_lower.is_ascii() {
-        name.as_bytes().windows(query_lower.len()).any(|window| {
-            window
-                .iter()
-                .zip(query_lower.as_bytes())
-                .all(|(left, right)| left.to_ascii_lowercase() == *right)
-        })
+fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
+    let byte_position = find_case_insensitive(name, query_lower)?;
+    let name_lower = if name.is_ascii() {
+        None
     } else {
-        name.to_lowercase().contains(query_lower)
+        Some(name.to_lowercase())
+    };
+    let normalized = name_lower.as_deref().unwrap_or(name);
+    let class = if normalized.len() == query_lower.len() {
+        0
+    } else if byte_position == 0 {
+        1
+    } else {
+        2
+    };
+    let position = normalized[..byte_position].encode_utf16().count() as u32;
+    Some(MatchMetadata {
+        class,
+        position,
+        score: name.encode_utf16().count() as u32,
+    })
+}
+
+fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
+    if name.is_ascii() && query_lower.is_ascii() {
+        name.as_bytes()
+            .windows(query_lower.len())
+            .position(|window| {
+                window
+                    .iter()
+                    .zip(query_lower.as_bytes())
+                    .all(|(left, right)| left.to_ascii_lowercase() == *right)
+            })
+    } else {
+        name.to_lowercase().find(query_lower)
+    }
+}
+
+fn search_volumes(volumes: &[VolumeIndex], query: &str, max: usize) -> SearchOutcome {
+    if query.is_empty() || max == 0 {
+        return SearchOutcome {
+            items: Vec::new(),
+            is_truncated: false,
+            scanned_nodes: 0,
+            name_candidates: 0,
+            matched_count: 0,
+            entered_top_k: 0,
+            path_constructions: 0,
+        };
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut heap = BinaryHeap::with_capacity(max);
+    let mut scanned_nodes = 0u64;
+    let mut name_candidates = 0u64;
+    let mut matched_count = 0u64;
+    let mut entered_top_k = 0u64;
+    for (volume_index, volume) in volumes.iter().enumerate() {
+        for (record, slot) in volume.nodes.iter().enumerate() {
+            scanned_nodes = scanned_nodes.saturating_add(1);
+            if slot.flags & (FLAG_PRESENT | FLAG_EXCLUDED) != FLAG_PRESENT
+                || slot.name_off == NO_NAME
+            {
+                continue;
+            }
+            name_candidates = name_candidates.saturating_add(1);
+            let Ok(name) = volume.name_at(slot.name_off) else {
+                continue;
+            };
+            let Some(metadata) = match_metadata(name, &query_lower) else {
+                continue;
+            };
+            matched_count = matched_count.saturating_add(1);
+            let candidate = RankedCandidate {
+                volume_index,
+                mount_path: &volume.mount_path,
+                record: record as u32,
+                name,
+                is_directory: slot.flags & FLAG_DIRECTORY != 0,
+                metadata,
+            };
+            if heap.len() < max {
+                heap.push(candidate);
+                entered_top_k = entered_top_k.saturating_add(1);
+            } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+                heap.pop();
+                heap.push(candidate);
+                entered_top_k = entered_top_k.saturating_add(1);
+            }
+        }
+    }
+
+    let ranked = heap.into_sorted_vec();
+    let path_constructions = ranked.len() as u64;
+    let items = ranked
+        .into_iter()
+        .filter_map(|candidate| {
+            let volume = &volumes[candidate.volume_index];
+            volume.path_for(candidate.record).ok().map(|path| IndexHit {
+                name: candidate.name.to_owned(),
+                path,
+                is_directory: candidate.is_directory,
+                match_metadata: candidate.metadata,
+            })
+        })
+        .collect();
+    SearchOutcome {
+        items,
+        is_truncated: matched_count > max as u64,
+        scanned_nodes,
+        name_candidates,
+        matched_count,
+        entered_top_k,
+        path_constructions,
     }
 }
 
@@ -585,5 +711,93 @@ mod tests {
         volume.nodes[10].parent_record = 5;
         volume.nodes[10].name_off = 999;
         assert!(volume.validate().is_err());
+    }
+
+    #[test]
+    fn global_top_k_allows_late_volume_exact_match_to_win() {
+        let mut first = volume();
+        for record in 10..30 {
+            first
+                .upsert(
+                    frn(record, 1),
+                    frn(5, 0),
+                    &format!("needle-extra-{record}.txt"),
+                    false,
+                )
+                .unwrap();
+        }
+        let mut second = VolumeIndex::new(
+            VolumeId {
+                guid: "later-volume".into(),
+                serial: 8,
+            },
+            "D:\\".into(),
+            10,
+            11,
+            5,
+        )
+        .unwrap();
+        second
+            .upsert(frn(99, 1), frn(5, 0), "needle", false)
+            .unwrap();
+        let state = IndexState {
+            volumes: vec![first, second],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+
+        let outcome = state.search("needle", 8);
+        assert_eq!(outcome.items.len(), 8);
+        assert_eq!(outcome.items[0].path, r"D:\needle");
+        assert!(outcome.is_truncated);
+        assert_eq!(outcome.path_constructions, 8);
+        assert_eq!(outcome.matched_count, 21);
+    }
+
+    #[test]
+    fn max_one_thousand_has_no_hidden_intermediate_cap() {
+        let mut volume = volume();
+        for record in 10..1011 {
+            volume
+                .upsert(
+                    frn(record, 1),
+                    frn(5, 0),
+                    &format!("item-{record:04}"),
+                    false,
+                )
+                .unwrap();
+        }
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 2,
+            events_since_checkpoint: 0,
+        };
+
+        let outcome = state.search("item", 1000);
+        assert_eq!(outcome.items.len(), 1000);
+        assert_eq!(outcome.path_constructions, 1000);
+        assert_eq!(outcome.matched_count, 1001);
+        assert!(outcome.is_truncated);
+        assert_eq!(outcome.items[0].name, "item-0010");
+    }
+
+    #[test]
+    fn stable_name_tie_break_does_not_follow_record_order() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "xb", false).unwrap();
+        volume.upsert(frn(100, 1), frn(5, 0), "xa", false).unwrap();
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 3,
+            events_since_checkpoint: 0,
+        };
+
+        let names = state
+            .search("x", 8)
+            .items
+            .into_iter()
+            .map(|item| item.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["xa", "xb"]);
     }
 }

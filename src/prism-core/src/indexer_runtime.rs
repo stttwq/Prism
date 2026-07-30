@@ -10,7 +10,10 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::hierarchy::{ApplyOutcome, IndexState};
 use crate::index_cache;
-use crate::indexer_ipc::{IndexerItem, IndexerRequest, IndexerResponse, IndexerStatus};
+use crate::indexer_ipc::{
+    validate_search_request, IndexerItem, IndexerRequest, IndexerResponse, IndexerStatus,
+    SearchFilter,
+};
 use crate::ntfs::{self, VolumeDescriptor};
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 
@@ -109,20 +112,37 @@ impl ServiceState {
         }
     }
 
-    fn search(&self, query: &str, max: usize) -> Result<(u64, Vec<IndexerItem>), String> {
+    fn search(
+        &self,
+        query: &str,
+        max: usize,
+        filters: Option<&[SearchFilter]>,
+    ) -> Result<IndexerResponse, String> {
+        validate_search_request(max, filters)?;
         let guard = self.index.read().map_err(|_| "index lock is poisoned")?;
         let state = guard.as_ref().ok_or("file index is not ready")?;
         let generation = state.generation;
-        let items = state
-            .search(query, max.min(1000))
+        let outcome = state.search(query, max);
+        let items = outcome
+            .items
             .into_iter()
             .map(|hit| IndexerItem {
                 name: hit.name,
                 path: hit.path,
                 is_directory: hit.is_directory,
+                match_metadata: Some(hit.match_metadata),
             })
             .collect();
-        Ok((generation, items))
+        Ok(IndexerResponse::Results {
+            generation,
+            items,
+            is_truncated: outcome.is_truncated,
+            matched_count: Some(outcome.matched_count),
+            scanned_nodes: Some(outcome.scanned_nodes),
+            name_candidates: Some(outcome.name_candidates),
+            entered_top_k: Some(outcome.entered_top_k),
+            path_constructions: Some(outcome.path_constructions),
+        })
     }
 
     async fn wait_generation(&self, after: u64, timeout_ms: u64) -> u64 {
@@ -499,8 +519,12 @@ pub(crate) async fn handle_connection(
     while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
         let response = match serde_json::from_str::<IndexerRequest>(&line) {
             Ok(IndexerRequest::Status) => IndexerResponse::Status(state.status()),
-            Ok(IndexerRequest::Search { query, max }) => match state.search(&query, max) {
-                Ok((generation, items)) => IndexerResponse::Results { generation, items },
+            Ok(IndexerRequest::Search {
+                query,
+                max,
+                filters,
+            }) => match state.search(&query, max, filters.as_deref()) {
+                Ok(response) => response,
                 Err(message) => IndexerResponse::Error { message },
             },
             Ok(IndexerRequest::WaitGeneration { after, timeout_ms }) => {
@@ -533,6 +557,7 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexer_ipc::{MAX_FILTERS, MAX_FILTER_VALUE_BYTES, MAX_SEARCH_RESULTS};
 
     #[tokio::test]
     async fn generation_wait_observes_publish() {
@@ -568,5 +593,25 @@ mod tests {
             .await
             .expect("shutdown request should wake the runtime")
             .unwrap();
+    }
+
+    #[test]
+    fn search_request_limits_are_enforced() {
+        assert!(validate_search_request(0, None).is_err());
+        assert!(validate_search_request(MAX_SEARCH_RESULTS + 1, None).is_err());
+        assert!(validate_search_request(8, Some(&[])).is_ok());
+        let too_many = vec![
+            SearchFilter {
+                field: "ext".into(),
+                value: "txt".into(),
+            };
+            MAX_FILTERS + 1
+        ];
+        assert!(validate_search_request(8, Some(&too_many)).is_err());
+        let long_value = SearchFilter {
+            field: "path".into(),
+            value: "x".repeat(MAX_FILTER_VALUE_BYTES + 1),
+        };
+        assert!(validate_search_request(8, Some(&[long_value])).is_err());
     }
 }

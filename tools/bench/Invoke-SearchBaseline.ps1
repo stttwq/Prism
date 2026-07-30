@@ -87,6 +87,14 @@ function New-SearchSample {
     }
     $generation = [UInt64]$response.index_generation
     if ($generation -eq 0) { throw 'Broker response reported generation zero.' }
+    $truncatedProperty = $response.PSObject.Properties['is_truncated']
+    $matchedProperty = $response.PSObject.Properties['matched_count']
+    $scannedProperty = $response.PSObject.Properties['scanned_nodes']
+    $candidateProperty = $response.PSObject.Properties['name_candidates']
+    $enteredProperty = $response.PSObject.Properties['entered_top_k']
+    $pathProperty = $response.PSObject.Properties['path_constructions']
+    $measured = { param($Property) [ordered]@{ value = [UInt64]$Property.Value; status = 'measured' } }
+    $pending = { [ordered]@{ value = $null; status = 'g1_pending' } }
     return [ordered]@{
         schema_version = 1
         run_id = $RunId
@@ -104,12 +112,15 @@ function New-SearchSample {
         generation = $generation
         response_bytes = $Result.ResponseBytes
         result_count_reached_max = ($items.Count -eq $Max)
-        truncated = [ordered]@{ value = $null; status = 'g1_pending' }
+        truncated = if ($null -ne $truncatedProperty) {
+            [ordered]@{ value = [bool]$truncatedProperty.Value; status = 'measured' }
+        } else { & $pending }
         workload = [ordered]@{
-            scanned_nodes = [ordered]@{ value = $null; status = 'g1_pending' }
-            name_candidates = [ordered]@{ value = $null; status = 'g1_pending' }
-            entered_top_k = [ordered]@{ value = $null; status = 'g1_pending' }
-            path_constructions = [ordered]@{ value = $null; status = 'g1_pending' }
+            scanned_nodes = if ($null -ne $scannedProperty) { & $measured $scannedProperty } else { & $pending }
+            name_candidates = if ($null -ne $candidateProperty) { & $measured $candidateProperty } else { & $pending }
+            matching_names = if ($null -ne $matchedProperty) { & $measured $matchedProperty } else { & $pending }
+            entered_top_k = if ($null -ne $enteredProperty) { & $measured $enteredProperty } else { & $pending }
+            path_constructions = if ($null -ne $pathProperty) { & $measured $pathProperty } else { & $pending }
         }
     }
 }

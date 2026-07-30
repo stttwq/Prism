@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::SearchResult;
+use crate::ipc::{SearchResult, SearchResultKind};
 
 /// 一个网页搜索引擎（与前端 `WebEngine` record 字段对齐）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,11 +67,12 @@ impl WebHit {
         let subtitle = self.url.clone();
         let match_spans = match_spans_in_title(&title, &self.query_terms);
         SearchResult {
-            kind: "web".into(),
+            kind: SearchResultKind::Web,
             title,
             subtitle,
             execute_id: self.url,
             match_spans,
+            match_metadata: None,
         }
     }
 }
@@ -200,7 +201,7 @@ mod tests {
             "https://www.google.com/search?q=%E5%A4%A9%E6%B0%94"
         );
         let r = hit.into_search_result();
-        assert_eq!(r.kind, "web");
+        assert_eq!(r.kind, SearchResultKind::Web);
         assert!(r.execute_id.starts_with("https://www.google.com/"));
         assert!(r.title.contains("Google"));
         assert!(r.title.contains("天气"));

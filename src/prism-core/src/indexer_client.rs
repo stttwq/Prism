@@ -5,23 +5,44 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
-use crate::indexer_ipc::{IndexerItem, IndexerRequest, IndexerResponse, IndexerStatus};
+use crate::indexer_ipc::{
+    IndexerItem, IndexerRequest, IndexerResponse, IndexerStatus, SearchFilter,
+};
 use crate::{INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 
 pub struct SearchReply {
     pub status: IndexerStatus,
     pub generation: u64,
     pub items: Vec<IndexerItem>,
+    pub is_truncated: bool,
+    pub matched_count: Option<u64>,
+    pub scanned_nodes: Option<u64>,
+    pub name_candidates: Option<u64>,
+    pub entered_top_k: Option<u64>,
+    pub path_constructions: Option<u64>,
 }
 
 pub async fn search(query: &str, max: usize) -> Result<SearchReply, String> {
-    search_pipe(INDEXER_PIPE_NAME, query, max).await
+    search_with_filters(query, max, None).await
 }
 
-async fn search_pipe(pipe_name: &str, query: &str, max: usize) -> Result<SearchReply, String> {
+pub async fn search_with_filters(
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+) -> Result<SearchReply, String> {
+    search_pipe(INDEXER_PIPE_NAME, query, max, filters).await
+}
+
+async fn search_pipe(
+    pipe_name: &str,
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+) -> Result<SearchReply, String> {
     tokio::time::timeout(
         Duration::from_secs(2),
-        search_pipe_inner(pipe_name, query, max),
+        search_pipe_inner(pipe_name, query, max, filters),
     )
     .await
     .map_err(|_| "indexer service request timed out".to_string())?
@@ -31,6 +52,7 @@ async fn search_pipe_inner(
     pipe_name: &str,
     query: &str,
     max: usize,
+    filters: Option<&[SearchFilter]>,
 ) -> Result<SearchReply, String> {
     let pipe = connect(pipe_name).await?;
     let (reader, mut writer) = tokio::io::split(pipe);
@@ -60,6 +82,12 @@ async fn search_pipe_inner(
             generation: status.generation,
             status,
             items: Vec::new(),
+            is_truncated: false,
+            matched_count: Some(0),
+            scanned_nodes: Some(0),
+            name_candidates: Some(0),
+            entered_top_k: Some(0),
+            path_constructions: Some(0),
         });
     }
 
@@ -68,14 +96,30 @@ async fn search_pipe_inner(
         &IndexerRequest::Search {
             query: query.to_owned(),
             max,
+            filters: filters.map(ToOwned::to_owned),
         },
     )
     .await?;
     match read_response(&mut lines).await? {
-        IndexerResponse::Results { generation, items } => Ok(SearchReply {
+        IndexerResponse::Results {
+            generation,
+            items,
+            is_truncated,
+            matched_count,
+            scanned_nodes,
+            name_candidates,
+            entered_top_k,
+            path_constructions,
+        } => Ok(SearchReply {
             status,
             generation,
             items,
+            is_truncated,
+            matched_count,
+            scanned_nodes,
+            name_candidates,
+            entered_top_k,
+            path_constructions,
         }),
         IndexerResponse::Error { message } => Err(message),
         _ => Err("indexer service returned an invalid search response".into()),
@@ -163,7 +207,7 @@ mod tests {
             handle_connection(server, state).await.unwrap();
         });
 
-        let reply = search_pipe(&pipe_name, "needle", 10).await.unwrap();
+        let reply = search_pipe(&pipe_name, "needle", 10, None).await.unwrap();
         assert!(reply.status.ready);
         assert_eq!(reply.items.len(), 1);
         assert_eq!(reply.items[0].path, r"C:\needle.txt");

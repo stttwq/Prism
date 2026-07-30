@@ -123,15 +123,14 @@ directory, then run the same query fixture, iteration count, machine state, and
 run notes with `-StartBroker`. Build and run `scan-floor` the same way for the
 full-scan comparison. Keep both raw datasets; do not remove outliers.
 
-## Protocol gaps
+## Protocol counters
 
-The current broker/indexer protocol exposes generation, volume count, indexer
-memory, result count, response bytes, and readiness. It does not expose scanned
-node count, name-candidate count, Top-K admission count, path-construction
-count, truncation, runtime cache version, total node count, or name-pool
-capacity. Those fields are emitted as `g1_pending`; the scripts never invent
-values. The standalone full-scan tool reports only counters it measures
-directly.
+The G1 broker/indexer protocol exposes generation, truncation, scanned node
+count, eligible name-candidate count, matching-name count, Top-K admission
+count, path-construction count, volume count, indexer memory, result count,
+response bytes, and readiness. The script records older responses with absent
+optional fields as `g1_pending`; it never infers truncation from result count.
+Runtime cache version, total node count, and name-pool capacity remain pending.
 
 ## Checks
 

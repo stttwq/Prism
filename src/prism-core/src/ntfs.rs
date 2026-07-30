@@ -1,5 +1,7 @@
 //! NTFS MFT enumeration and USN journal replay.
 
+use std::collections::BTreeMap;
+
 use crate::hierarchy::{ApplyOutcome, VolumeId, VolumeIndex};
 use crate::log;
 
@@ -94,28 +96,86 @@ pub fn apply_records(
     records: &[UsnRecord],
     next_usn: i64,
 ) -> Result<ApplyOutcome, String> {
+    apply_records_inner(volume, records, next_usn, false).map(|(outcome, _)| outcome)
+}
+
+fn apply_replay_records(
+    volume: &mut VolumeIndex,
+    records: &[UsnRecord],
+    next_usn: i64,
+) -> Result<(ApplyOutcome, usize), String> {
+    apply_records_inner(volume, records, next_usn, true)
+}
+
+fn apply_records_inner(
+    volume: &mut VolumeIndex,
+    records: &[UsnRecord],
+    next_usn: i64,
+    tolerate_unreachable: bool,
+) -> Result<(ApplyOutcome, usize), String> {
     let snapshot = volume.snapshot_mutations(records.iter().map(|record| record.frn))?;
     let result = (|| {
+        let mut pending = BTreeMap::<u32, &UsnRecord>::new();
         for record in records {
+            let record_number = VolumeIndex::split_frn(record.frn)?.0;
+            // A later event for the same slot supersedes an earlier deferred create/rename.
+            pending.remove(&record_number);
             if record.reason & USN_REASON_FILE_DELETE != 0 {
                 // Delete is terminal when NTFS coalesces several reasons into one record.
                 volume.delete(record.frn)?;
-            } else if record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0
-                && volume.upsert(
+            } else if record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
+                match volume.upsert(
                     record.frn,
                     record.parent_frn,
                     &record.name,
                     record.is_directory,
-                )? == ApplyOutcome::RebuildRequired
-            {
-                return Ok(ApplyOutcome::RebuildRequired);
+                ) {
+                    Ok(ApplyOutcome::Applied) => {}
+                    Ok(ApplyOutcome::RebuildRequired) => {
+                        return Ok((ApplyOutcome::RebuildRequired, 0));
+                    }
+                    Err(error) if error.starts_with("broken parent chain") => {
+                        pending.insert(record_number, record);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             // RENAME_OLD carries the old name. The following RENAME_NEW updates the same slot.
         }
+
+        loop {
+            let before = pending.len();
+            let deferred = std::mem::take(&mut pending);
+            for (record_number, record) in deferred {
+                match volume.upsert(
+                    record.frn,
+                    record.parent_frn,
+                    &record.name,
+                    record.is_directory,
+                ) {
+                    Ok(ApplyOutcome::Applied) => {}
+                    Ok(ApplyOutcome::RebuildRequired) => {
+                        return Ok((ApplyOutcome::RebuildRequired, 0));
+                    }
+                    Err(error) if error.starts_with("broken parent chain") => {
+                        pending.insert(record_number, record);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+
+        if !pending.is_empty() && !tolerate_unreachable {
+            let record = pending.keys().next().copied().unwrap_or_default();
+            return Err(format!("broken parent chain at record {record}"));
+        }
         volume.next_usn = next_usn;
-        Ok(ApplyOutcome::Applied)
+        Ok((ApplyOutcome::Applied, pending.len()))
     })();
-    if !matches!(result, Ok(ApplyOutcome::Applied)) {
+    if !matches!(result, Ok((ApplyOutcome::Applied, _))) {
         volume.rollback_mutations(snapshot);
     }
     result
@@ -376,15 +436,26 @@ mod platform {
         volume: &mut VolumeIndex,
         high_water: i64,
     ) -> Result<(), String> {
-        while volume.next_usn < high_water {
-            let before = volume.next_usn;
-            let (next, records) = read_changes(handle, volume.journal_id, before, false)?;
-            if apply_records(volume, &records, next)? == ApplyOutcome::RebuildRequired {
-                return Err("excluded-directory boundary changed during MFT replay".into());
-            }
+        let mut cursor = volume.next_usn;
+        let mut replay = Vec::new();
+        while cursor < high_water {
+            let before = cursor;
+            let (next, mut records) = read_changes(handle, volume.journal_id, before, false)?;
             if next <= before {
                 return Err("USN replay cursor did not advance".into());
             }
+            replay.append(&mut records);
+            cursor = next;
+        }
+        let (outcome, skipped) = apply_replay_records(volume, &replay, cursor)?;
+        if outcome == ApplyOutcome::RebuildRequired {
+            return Err("excluded-directory boundary changed during MFT replay".into());
+        }
+        if skipped > 0 {
+            log(format!(
+                "skipping {skipped} unreachable USN records during MFT replay on {}",
+                volume.mount_path
+            ));
         }
         Ok(())
     }
@@ -649,6 +720,54 @@ mod tests {
         .unwrap();
         assert!(volume.search("gone", 10).is_empty());
         assert_eq!(volume.next_usn, 11);
+    }
+
+    #[test]
+    fn replay_resolves_child_before_parent_and_skips_stale_orphans() {
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "test".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            10,
+            5,
+        )
+        .unwrap();
+        let records = [
+            UsnRecord {
+                frn: 12,
+                parent_frn: 11,
+                usn: 10,
+                reason: USN_REASON_FILE_CREATE,
+                is_directory: false,
+                name: "child.txt".into(),
+            },
+            UsnRecord {
+                frn: 11,
+                parent_frn: 5,
+                usn: 11,
+                reason: USN_REASON_FILE_CREATE,
+                is_directory: true,
+                name: "parent".into(),
+            },
+            UsnRecord {
+                frn: 13,
+                parent_frn: 99,
+                usn: 12,
+                reason: USN_REASON_FILE_CREATE,
+                is_directory: false,
+                name: "stale.txt".into(),
+            },
+        ];
+
+        let (outcome, skipped) = apply_replay_records(&mut volume, &records, 13).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(skipped, 1);
+        assert_eq!(volume.path_for(12).unwrap(), r"C:\parent\child.txt");
+        assert!(volume.search("stale", 10).is_empty());
+        assert_eq!(volume.next_usn, 13);
     }
 
     #[test]

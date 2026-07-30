@@ -24,10 +24,29 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 
 ## Required Patterns
 
-- Search merge order when query has **no** web-engine keyword: **apps (`kind=app`) first**, then files/folders. Respect `max`; leave room for files when `max` is large.
+- Search ranking when query has **no** web-engine keyword: apps, files, and folders
+  compete in one global order: exact name, prefix, contains position, centralized
+  score, then stable name/path/kind ties. Do not reserve slots by kind.
 - When the query matches a web-engine keyword (`bi`/`b`/`g` or custom from `settings.json` `WebEngines`): insert one **`kind=web`** hit **first**, then apps, then files. Longer keywords win (`bi` before `b`).
 - `execute` for `kind=web`: `execute_id` is an `http(s)` URL — open via ShellExecute **without** path validation (absolute-path checks reject URLs). File/app execute still validates paths.
 - `results` JSON must include **`is_indexing`** so the UI can poll until the file index is ready even if apps already returned.
+- The indexer scans every eligible name across every volume into a bounded heap
+  sized by the request `max`. Only heap finalists may call `path_for`; never stop
+  on the first `max` MFT records or concatenate per-volume truncations.
+- Broker and indexer search requests accept optional `filters` (at most 32
+  field/value entries) as a reserved read-only channel. Missing and empty are
+  equivalent; G1 does not apply filter semantics.
+- A ready result returns a nonzero `index_generation` and an accurate
+  `is_truncated`. Index building/partial readiness is reported by `is_indexing`,
+  not `is_truncated`.
+- Broker connections start with `hello { protocol }`; incompatible protocol
+  numbers return an explicit error. Legacy `ping` remains available.
+- MFT snapshot catch-up must collect the complete bounded USN replay window and
+  defer create/rename records whose parent is not present yet. Retry deferred
+  records after later parent events; once the high-water mark is reached, skip
+  only records that are still unreachable and advance the checkpoint. Live USN
+  batches remain strict: an unresolved parent rolls the batch back and queues a
+  serialized rebuild instead of silently losing a current file.
 - Path validation for file/app `execute`/`reveal`: reject empty, NUL, and relative paths.
 - Match spans: UTF-16 code unit offsets (WPF `string` indexing).
 - Web engines load at backend start from shared `settings.json`; empty/missing list falls back to defaults (Bing-first: `bi`, `b`, `g`).
@@ -40,6 +59,12 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 
 - Unit tests for apps search scoring (exact > prefix > contains) and Chinese names.
 - IPC tests: empty index `is_indexing=true`; ready empty index `is_indexing=false`; apps appear with `kind=app`.
+- Ranking tests: late-volume winners enter `max=8`, `max=1000` has no hidden
+  intermediate cap, stable ties do not depend on record scan order, and path
+  construction count is bounded by returned finalists.
+- USN replay tests: child-before-parent within the catch-up window resolves to a
+  valid path; a stale orphan is skipped only in snapshot catch-up; the same
+  unresolved parent in a live batch still rolls back all earlier mutations.
 - Web-search tests: Chinese query URL-encoding; `bi` vs `b`; custom engine list; `execute` https not rejected as relative path; web row sorts before apps when keyword matches.
 - `reload_engines` tests: replace list affects subsequent search; empty list falls back to defaults; PascalCase fields parse.
 - Actions tests: list_actions rejects relative; basics present; unknown run_action errors; IPC `actions` / `run_action` wiring.
@@ -270,6 +295,7 @@ The historical Gap B text above describes the pre-R1 implementation. R1 resolves
 
 - [ ] Pipe write always paired with a full line read
 - [ ] Heavy work off the async pipe path
+- [ ] MFT catch-up handles child-before-parent and stale orphan records without a rebuild loop
 - [ ] New result kinds covered in frontend parse / icons (`web` skips shell path icons)
 - [ ] No debug-only logging that floods stderr in hot paths
 - [ ] Merge order: web (if keyword) > apps > files; without keyword apps > files
