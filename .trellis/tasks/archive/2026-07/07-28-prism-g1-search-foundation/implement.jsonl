@@ -1,4 +1,4 @@
-{"file":"src/prism-core/src/search.rs","reason":"当前文件/应用排序与搜索入口"}
+{"file":"src/prism-core/src/indexer_runtime.rs","reason":"indexer 侧只读搜索入口与 generation 来源"}
 {"file":"src/prism-core/src/hierarchy.rs","reason":"NodeSlot、路径构造和跨卷索引搜索"}
 {"file":"src/prism-core/src/indexer_ipc.rs","reason":"indexer 请求、结果、generation 与协议限制"}
 {"file":"src/prism-core/src/ipc.rs","reason":"broker 协议、结果 kind 和请求响应边界"}

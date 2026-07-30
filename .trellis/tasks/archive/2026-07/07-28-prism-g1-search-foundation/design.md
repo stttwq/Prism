@@ -14,7 +14,7 @@ scan name metadata -> classify + score -> global bounded heap(max)
 
 ## IPC Evolution
 
-broker 和 indexer 各自维护协议版本。升级顺序为：reader 接受缺失新字段并提供安全默认值，部署后 writer 才发送新字段。稳定 kind 使用小写字符串；C# converter 将未知字符串保留原值并映射 `Unknown`，UI 只能提供无副作用降级。
+broker 和 indexer 各自维护协议版本。新增字段一律可选，reader 接受缺失字段并提供安全默认值、安全忽略未知值。**不需要 reader 版本先部署、writer 版本后部署**：三个二进制由同一 Inno 安装包一次替换，不存在混版运行窗口。稳定 kind 使用小写字符串；C# converter 将未知字符串保留原值并映射 `Unknown`，UI 只能提供无副作用降级。
 
 每条请求保留 request id 或严格串行语义。若客户端业务层取消显示，传输层仍需读完对应响应，或关闭连接并为后续请求建立新连接，禁止把旧响应误配给新请求。
 
