@@ -513,3 +513,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: 完成 Prism G9 首建可用性与进度
+
+**Date**: 2026-07-31
+**Task**: 完成 Prism G9 首建可用性与进度
+**Branch**: `feature`
+
+### Summary
+
+完成系统卷优先的逐卷首建发布与即时 USN watcher，新增可选进度和前端安全轮询，修复取消、重试计数及缓存保存完成时序；三卷机器验收、稳态延迟和三进程内存门均通过。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bc01766` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
