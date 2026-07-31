@@ -28,6 +28,12 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - Keep result-panel geometry stable while replacing a non-empty result set: do not add the transient `搜索中…` status row when rows are already visible. Empty-result searches may show it; `is_indexing` progress must remain visible.
 - Treat one search response as a burst of `AppState.PropertyChanged` notifications. `AnimatePanelHeight(target)` must not restart an in-flight animation when `target` is unchanged, and identical `ResultList.StatusMessage` assignments must be layout no-ops.
 - While `is_indexing`, show status and poll (~0.5s, ~15s cap); do not start nested polls from poll callbacks.
+- Apply every matching poll response, including an empty `items` array, because
+  it may carry newer volume progress or the terminal `is_indexing=false` state.
+  At the polling cap, keep the last real progress text visible until a later
+  search replaces it.
+- Never seed or locally narrow the prefix cache from `is_indexing=true` results;
+  partial-volume completeness is independent of `is_truncated`.
 - Icons: existing path → no `USEFILEATTRIBUTES`; missing path → attributes fallback.
 - `kind=web` / `kind=more`: do **not** pass `ExecuteId` to shell icon APIs (`ExecuteId` for web is a URL).
 - `RevealSelected` must skip `kind` of `more` and `web` (no folder to reveal).
@@ -74,6 +80,8 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 
 - [ ] Pipe client never abandons a half-finished request/response pair
 - [ ] Indexing poll continues when apps returned but files still loading
+- [ ] Progress-only and empty-item poll responses refresh status; polling cap retains the last real progress
+- [ ] Partial-index responses never seed the prefix cache, regardless of generation or truncation fields
 - [ ] Focus/hide works in Idle and Results
 - [ ] No silent swallow of execute/reveal/run_action errors without status text
 - [ ] NotifyIcon disposed on exit; Run key path is quoted

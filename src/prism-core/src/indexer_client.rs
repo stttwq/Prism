@@ -77,6 +77,9 @@ async fn search_pipe_inner(
         IndexerResponse::Error { message } => return Err(message),
         _ => return Err("indexer service returned an invalid status response".into()),
     };
+    // Only a completely unready index short-circuits. `ready && building` — a first build
+    // that has published some volumes — must still issue the Search so the volumes that
+    // are already indexed return results.
     if !status.ready {
         return Ok(SearchReply {
             generation: status.generation,
@@ -211,6 +214,57 @@ mod tests {
         assert!(reply.status.ready);
         assert_eq!(reply.items.len(), 1);
         assert_eq!(reply.items[0].path, r"C:\needle.txt");
+        drop(reply);
+        server_task.await.unwrap();
+    }
+
+    /// A partially built index answers searches instead of being short-circuited to an
+    /// empty reply. Before per-volume publishing this state could not occur, so the
+    /// `!status.ready` early return covered every build; now it must not swallow the
+    /// volumes that are already live.
+    #[tokio::test]
+    async fn partially_built_index_still_answers_searches() {
+        let pipe_name = format!(r"\\.\pipe\prism-indexer-partial-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&pipe_name)
+            .unwrap();
+        let state = ServiceState::new();
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "system".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "needle.txt", false).unwrap();
+        // Only the first of several volumes has landed: ready and building are both true.
+        state.merge_and_publish(volume);
+        let server_task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            handle_connection(server, state).await.unwrap();
+        });
+
+        let reply = search_pipe(&pipe_name, "needle", 10, None).await.unwrap();
+        assert!(reply.status.ready, "a merged volume makes the index ready");
+        assert!(
+            reply.status.building,
+            "the remaining volumes are still building"
+        );
+        assert_eq!(
+            reply.items.len(),
+            1,
+            "results from published volumes must survive the not-ready early return"
+        );
+        assert!(
+            !reply.is_truncated,
+            "an incomplete index is not the same as a max-truncated result set"
+        );
         drop(reply);
         server_task.await.unwrap();
     }

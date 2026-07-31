@@ -291,6 +291,99 @@ runtime.shutdown_timeout(Duration::from_secs(2));
 
 The historical Gap B text above describes the pre-R1 implementation. R1 resolves it with the USN watcher and measured P95 32.1 ms / max 177.2 ms over 120 operations.
 
+## G9 Per-Volume First-Build Contract (supersedes Gap A above)
+
+### 1. Scope / Trigger
+
+This contract applies when the v5 cache is absent or rejected and the LocalSystem
+indexer must enumerate more than one fixed NTFS volume. A first build must become
+useful after the system volume, without making a partial index restart-persistent.
+
+### 2. Signatures
+
+- `ntfs::order_volumes(Vec<VolumeDescriptor>, Option<char>) -> Vec<VolumeDescriptor>`
+  moves `%SystemDrive%` first and preserves every other volume's relative order.
+- `ntfs::build_volume_with_progress(&VolumeDescriptor, &dyn Fn() -> bool,
+  &mut dyn FnMut(u64)) -> Result<VolumeIndex, String>` reports one count per MFT
+  IO batch and cooperatively cancels enumeration, hierarchy insertion, and replay.
+- `ServiceState::merge_and_publish(VolumeIndex)` adds or replaces one live volume
+  and advances `generation`; `persist_first_build_with` saves the complete snapshot
+  before `finish_first_build` publishes completion.
+- `IndexerStatus.build_progress: Option<BuildProgress>` contains
+  `volumes_total`, `volumes_done`, optional `current_volume`, optional
+  `records_scanned`, and optional `records_estimate`.
+
+### 3. Contracts
+
+- During first build, `ready=false && building=true` means no volume is published;
+  `ready=true && building=true` means published volumes are searchable but the
+  result set is incomplete; `ready=true && building=false` means the complete v5
+  cache has been saved successfully.
+- Each volume follows build -> merge/publish -> watcher start -> progress increment.
+  The watcher resumes at the built volume's USN checkpoint, so create/rename/delete
+  events after publication are not lost while later volumes build.
+- `first_build_complete=false` blocks every checkpoint path. Stop or cancellation
+  during first build leaves no v5 cache and the next start performs a full rebuild.
+- Cache persistence must finish before externally observable completion. A save
+  failure propagates and must not clear `building` or open the persistence gate.
+- Every progress field is additive and optional. Missing `build_progress` preserves
+  old-reader behavior; polling is pull-based and counters update per IO batch, not
+  per record.
+- Partial-index state is not `is_truncated`: truncation remains only the `max`
+  result-limit condition. Broker results expose partial-build state through
+  `is_indexing` and optional `index_progress`.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| System drive is present | Build it first; keep the remaining order stable. |
+| Stop arrives inside volume build | Cancel cooperatively, do not retry, publish, or save a cache. |
+| First build attempt fails then retries | Remove the failed attempt's record count before reporting retry progress. |
+| One volume is published | Search it immediately and start only that volume's watcher. |
+| Cache save fails after all volumes build | Return an error; do not report `building=false`. |
+| Optional progress fields are absent | Decode successfully and retain legacy status behavior. |
+| Index is partial | Do not seed frontend prefix cache and do not set `is_truncated` solely for incompleteness. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: C: is searchable while D:/E: still build, changes on C: are visible, then
+  the cache is saved and completion becomes visible.
+- Base: a valid cache loads as one whole-index publish; progress is absent and the
+  existing watcher startup path is unchanged.
+- Bad: report completion before cache save, write a two-of-three-volume cache,
+  retry cancellation, or keep polling only when result items are non-empty.
+
+### 6. Tests Required
+
+- Unit: stable system-volume ordering, per-volume merge/generation/waiter behavior,
+  cancellation without retry, retry progress reset, partial checkpoint suppression,
+  and save-before-completion ordering including save failure.
+- Protocol/frontend: optional progress round-trip and omission, partial search
+  responses, no prefix-cache seed while indexing, empty-item progress polling, and
+  apps/web availability during file-index build.
+- Machine: multi-volume timeline, system-volume first-searchable time, all-ready
+  time, partial-build watcher create/rename/delete, interrupted cache absence,
+  restart full rebuild, steady query limits, and three-process Private Working Set.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: clients can observe completion before restart-safe persistence exists.
+state.finish_first_build();
+index_cache::save(&snapshot, data_dir)?;
+
+// Correct: save the complete snapshot, then publish the terminal status.
+index_cache::save(&snapshot, data_dir)?;
+state.finish_first_build();
+```
+
+G9 acceptance on three fixed NTFS volumes is recorded under
+`artifacts/bench/g9-20260731-final4`: the system volume became searchable at
+1.401 s, all volumes at 4.540 s, interrupted build persistence stayed absent,
+watcher operations were visible in 17.4-18.8 ms, and three-process Private
+Working Set peaked at 55,554,048 bytes (100 MiB hard gate).
+
 ## Code Review Checklist
 
 - [ ] Pipe write always paired with a full line read

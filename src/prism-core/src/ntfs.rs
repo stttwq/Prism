@@ -31,6 +31,39 @@ pub struct VolumeDescriptor {
     pub mount_path: String,
 }
 
+/// Drive letter of `%SystemDrive%`, or `None` when the variable is missing or malformed.
+pub fn system_drive_letter() -> Option<char> {
+    let value = std::env::var("SystemDrive").ok()?;
+    let letter = value.chars().next()?.to_ascii_uppercase();
+    letter.is_ascii_alphabetic().then_some(letter)
+}
+
+/// Moves the system volume to the front, leaving every other volume in its original
+/// relative order (R3).
+///
+/// The system volume is what the user searches first after an install, so it must be
+/// indexed first by construction rather than by relying on `C:` happening to sort first.
+/// The reorder is stable so that benchmark runs stay comparable.
+pub fn order_volumes(
+    descriptors: Vec<VolumeDescriptor>,
+    system_drive: Option<char>,
+) -> Vec<VolumeDescriptor> {
+    let Some(system_drive) = system_drive else {
+        return descriptors;
+    };
+    let mut ordered = Vec::with_capacity(descriptors.len());
+    let mut rest = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        if descriptor.drive_letter.to_ascii_uppercase() == system_drive {
+            ordered.push(descriptor);
+        } else {
+            rest.push(descriptor);
+        }
+    }
+    ordered.append(&mut rest);
+    ordered
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct JournalInfo {
     pub journal_id: u64,
@@ -330,9 +363,23 @@ mod platform {
     }
 
     pub fn build_volume(descriptor: &VolumeDescriptor) -> Result<VolumeIndex, String> {
+        build_volume_with_progress(descriptor, &|| false, &mut |_| {})
+    }
+
+    /// Builds one volume, reporting enumerated record counts as they arrive.
+    ///
+    /// `on_records` is invoked once per `FSCTL_ENUM_USN_DATA` batch, not once per record,
+    /// so first-build progress reporting stays off the per-record hot path (R4).
+    pub fn build_volume_with_progress(
+        descriptor: &VolumeDescriptor,
+        should_cancel: &dyn Fn() -> bool,
+        on_records: &mut dyn FnMut(u64),
+    ) -> Result<VolumeIndex, String> {
+        ensure_build_continues(should_cancel)?;
         let handle = open_volume(descriptor, true)?;
         let checkpoint = query_or_create_journal(&handle)?;
-        let mut raw_records = enumerate_mft(&handle)?;
+        let mut raw_records = enumerate_mft(&handle, should_cancel, on_records)?;
+        ensure_build_continues(should_cancel)?;
         let root_record = raw_records
             .iter()
             .find_map(|record| {
@@ -363,12 +410,16 @@ mod platform {
         });
         let mut pending = raw_records;
         for _ in 0..64 {
+            ensure_build_continues(should_cancel)?;
             if pending.is_empty() {
                 break;
             }
             let mut next = Vec::new();
             let before = pending.len();
-            for record in pending {
+            for (position, record) in pending.into_iter().enumerate() {
+                if position & 0x0fff == 0 {
+                    ensure_build_continues(should_cancel)?;
+                }
                 if record.name.is_empty() {
                     continue;
                 }
@@ -403,10 +454,11 @@ mod platform {
         }
 
         let current = query_journal(&handle)?;
+        ensure_build_continues(should_cancel)?;
         if current.journal_id != checkpoint.journal_id || checkpoint.next_usn < current.first_usn {
             return Err("USN journal wrapped during MFT enumeration".into());
         }
-        replay_until(&handle, &mut volume, current.next_usn)?;
+        replay_until(&handle, &mut volume, current.next_usn, should_cancel)?;
         volume.finish_initial_build();
         Ok(volume)
     }
@@ -435,10 +487,12 @@ mod platform {
         handle: &VolumeHandle,
         volume: &mut VolumeIndex,
         high_water: i64,
+        should_cancel: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let mut cursor = volume.next_usn;
         let mut replay = Vec::new();
         while cursor < high_water {
+            ensure_build_continues(should_cancel)?;
             let before = cursor;
             let (next, mut records) = read_changes(handle, volume.journal_id, before, false)?;
             if next <= before {
@@ -447,6 +501,7 @@ mod platform {
             replay.append(&mut records);
             cursor = next;
         }
+        ensure_build_continues(should_cancel)?;
         let (outcome, skipped) = apply_replay_records(volume, &replay, cursor)?;
         if outcome == ApplyOutcome::RebuildRequired {
             return Err("excluded-directory boundary changed during MFT replay".into());
@@ -460,7 +515,11 @@ mod platform {
         Ok(())
     }
 
-    fn enumerate_mft(handle: &VolumeHandle) -> Result<Vec<UsnRecord>, String> {
+    fn enumerate_mft(
+        handle: &VolumeHandle,
+        should_cancel: &dyn Fn() -> bool,
+        on_records: &mut dyn FnMut(u64),
+    ) -> Result<Vec<UsnRecord>, String> {
         let mut input = MFT_ENUM_DATA_V0 {
             StartFileReferenceNumber: 0,
             LowUsn: 0,
@@ -469,9 +528,11 @@ mod platform {
         let mut records = Vec::with_capacity(500_000);
         let mut output = vec![0u8; 256 * 1024];
         loop {
+            ensure_build_continues(should_cancel)?;
             match ioctl_buffer(handle.0, FSCTL_ENUM_USN_DATA, &input, &mut output) {
                 Ok(bytes) if bytes >= 8 => {
                     let (next, batch) = parse_usn_buffer(&output[..bytes])?;
+                    on_records(batch.len() as u64);
                     records.extend(batch);
                     if next as u64 <= input.StartFileReferenceNumber {
                         break;
@@ -484,6 +545,14 @@ mod platform {
             }
         }
         Ok(records)
+    }
+
+    fn ensure_build_continues(should_cancel: &dyn Fn() -> bool) -> Result<(), String> {
+        if should_cancel() {
+            Err("volume build cancelled".into())
+        } else {
+            Ok(())
+        }
     }
 
     fn ioctl_in<T>(handle: HANDLE, code: u32, input: &T) -> Result<(), String> {

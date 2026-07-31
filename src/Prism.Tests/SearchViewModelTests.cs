@@ -181,6 +181,78 @@ public sealed class SearchViewModelTests
         Assert.Equal("future_kind", future.Kind);
     }
 
+    [Fact]
+    public async Task PartialIndexResultsNeverSeedThePrefixCache()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(IndexingResponse(
+            "a",
+            new IndexProgress(10, 100, 2, 1, "D:\\"),
+            Result("alpha")));
+        client.Enqueue(Response("al", false, 2, Result("alpha")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new PausedScheduler());
+
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1 && state.IsIndexing);
+
+        vm.OnQueryChanged("al");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2 && !state.IsIndexing);
+
+        Assert.Equal("alpha", state.Results[0].Title);
+    }
+
+    [Fact]
+    public async Task ProgressOnlyPollRefreshesTheVisibleVolumeStatus()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(IndexingResponse(
+            "missing",
+            new IndexProgress(10, 100, 2, 0, "C:\\")));
+        client.Enqueue(IndexingResponse(
+            "missing",
+            new IndexProgress(60, 100, 2, 1, "D:\\")));
+        client.Enqueue(Response("missing", false, 3));
+        var timers = new ManualTimerFactory();
+        var scheduler = new ManualSearchScheduler();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, scheduler);
+
+        vm.OnQueryChanged("missing");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1 && scheduler.PendingCount == 1);
+        Assert.Contains("0/2", state.StatusMessage);
+        Assert.Contains("C:\\", state.StatusMessage);
+
+        scheduler.FireNext();
+        await Eventually(() => client.SearchCount == 2 && scheduler.PendingCount == 1);
+        Assert.Empty(state.Results);
+        Assert.Contains("1/2", state.StatusMessage);
+        Assert.Contains("D:\\", state.StatusMessage);
+
+        scheduler.FireNext();
+        await Eventually(() => client.SearchCount == 3 && !state.IsIndexing);
+    }
+
+    [Fact]
+    public void ProtocolReaderParsesOptionalBuildProgress()
+    {
+        using var document = JsonDocument.Parse(
+            """{"type":"results","query":"x","items":[],"is_indexing":true,"index_progress":{"scanned":12,"total_estimate":100,"volumes_total":3,"volumes_done":1,"current_volume":"D:\\"}}""");
+
+        var response = PipeClient.ParseSearchResponse(document.RootElement, "fallback");
+
+        Assert.True(response.IsIndexing);
+        Assert.Equal(12UL, response.IndexProgress?.Scanned);
+        Assert.Equal(100UL, response.IndexProgress?.TotalEstimate);
+        Assert.Equal(3, response.IndexProgress?.VolumesTotal);
+        Assert.Equal(1, response.IndexProgress?.VolumesDone);
+        Assert.Equal("D:\\", response.IndexProgress?.CurrentVolume);
+    }
+
     private static SearchResult Result(string title) =>
         new("file", title, $"C:\\{title}", $"C:\\{title}", []);
 
@@ -190,6 +262,12 @@ public sealed class SearchViewModelTests
         ulong generation,
         params SearchResult[] results) =>
         new(query, results, false, null, truncated, generation);
+
+    private static SearchResponse IndexingResponse(
+        string query,
+        IndexProgress progress,
+        params SearchResult[] results) =>
+        new(query, results, true, null, false, 1, progress);
 
     private static async Task Eventually(Func<bool> condition)
     {
@@ -229,6 +307,38 @@ public sealed class SearchViewModelTests
     private sealed class ImmediateScheduler : ISearchScheduler
     {
         public Task Delay(TimeSpan delay, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    private sealed class PausedScheduler : ISearchScheduler
+    {
+        public Task Delay(TimeSpan delay, CancellationToken ct = default) =>
+            new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+    }
+
+    private sealed class ManualSearchScheduler : ISearchScheduler
+    {
+        private readonly Queue<TaskCompletionSource> _pending = [];
+        private readonly object _gate = new();
+
+        public int PendingCount
+        {
+            get { lock (_gate) return _pending.Count; }
+        }
+
+        public Task Delay(TimeSpan delay, CancellationToken ct = default)
+        {
+            var completion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_gate) _pending.Enqueue(completion);
+            return completion.Task;
+        }
+
+        public void FireNext()
+        {
+            TaskCompletionSource completion;
+            lock (_gate) completion = _pending.Dequeue();
+            completion.SetResult();
+        }
     }
 
     private sealed class FakeSearchClient : ISearchClient

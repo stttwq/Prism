@@ -23,7 +23,7 @@ use crate::hierarchy::MatchMetadata;
 #[cfg(test)]
 use crate::index::{SharedIndex, SharedProgress};
 use crate::indexer_client;
-use crate::indexer_ipc::{validate_search_request, SearchFilter};
+use crate::indexer_ipc::{validate_search_request, BuildProgress, SearchFilter};
 use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
 
@@ -96,7 +96,9 @@ pub enum Response {
         #[serde(default)]
         is_indexing: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
-        index_progress: Option<IndexProgressDto>,
+        // Boxed so the optional progress block does not inflate every `Response` variant.
+        // Serialization is unchanged: `Box` is transparent to serde.
+        index_progress: Option<Box<IndexProgressDto>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         index_error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,11 +130,20 @@ pub enum Response {
     },
 }
 
-/// 首次全量构建期间随 `results` 返回的索引进度快照。
-#[derive(Debug, Serialize)]
+/// 首次构建期间随 `results` 返回的索引进度快照。
+///
+/// `scanned` / `total_estimate` 为旧字段，保持原义。逐卷字段（G9）全部可选：
+/// 首次安装无缓存可估算记录总量时它们缺失，前端退化为"已完成 N/M 卷"。
+#[derive(Debug, Default, Serialize)]
 pub struct IndexProgressDto {
     pub scanned: u64,
     pub total_estimate: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes_done: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_volume: Option<String>,
 }
 
 /// 单条搜索结果，字段对应 frontend-spec.md 第 2 节 `SearchResult` record。
@@ -306,6 +317,7 @@ async fn search_service(
         indexer_client::search_with_filters(query, result_slots.max(1), filters.as_deref()).await;
     let (
         is_indexing,
+        index_progress,
         index_error,
         index_generation,
         index_truncated,
@@ -334,6 +346,11 @@ async fn search_service(
             }
             (
                 reply.status.building || !reply.status.ready,
+                reply
+                    .status
+                    .build_progress
+                    .as_ref()
+                    .map(|progress| Box::new(build_progress_dto(progress))),
                 reply.status.message.filter(|_| reply.status.degraded),
                 Some(reply.generation),
                 reply.is_truncated,
@@ -346,6 +363,7 @@ async fn search_service(
         }
         Err(error) => (
             false,
+            None,
             Some(error),
             None,
             false,
@@ -365,7 +383,7 @@ async fn search_service(
         query: query.to_owned(),
         items,
         is_indexing,
-        index_progress: None,
+        index_progress,
         index_error,
         index_generation,
         is_truncated,
@@ -374,6 +392,18 @@ async fn search_service(
         name_candidates,
         entered_top_k,
         path_constructions,
+    }
+}
+
+/// 把 indexer 的逐卷进度转成前端 DTO。记录数缺失时用 0 表示"未知"，
+/// 与旧字段的既有含义一致；卷计数总是可用。
+fn build_progress_dto(progress: &BuildProgress) -> IndexProgressDto {
+    IndexProgressDto {
+        scanned: progress.records_scanned.unwrap_or(0),
+        total_estimate: progress.records_estimate.unwrap_or(0),
+        volumes_total: Some(progress.volumes_total),
+        volumes_done: Some(progress.volumes_done),
+        current_volume: progress.current_volume.clone(),
     }
 }
 
@@ -696,10 +726,11 @@ fn search(
     items.extend(file_items);
 
     let index_progress = if is_indexing && progress.active.load(Ordering::Relaxed) {
-        Some(IndexProgressDto {
+        Some(Box::new(IndexProgressDto {
             scanned: progress.scanned.load(Ordering::Relaxed),
             total_estimate: progress.total_estimate.load(Ordering::Relaxed),
-        })
+            ..Default::default()
+        }))
     } else {
         None
     };
@@ -935,6 +966,20 @@ mod tests {
     }
 
     #[test]
+    fn search_apps_remain_available_while_file_index_builds() {
+        let resp = dispatch(
+            parse(r#"{"type":"search","query":"微信","max":10}"#),
+            &empty_index(),
+            &sample_apps(),
+            &default_engines(),
+        );
+        let value = to_json(&resp);
+        assert_eq!(value["is_indexing"], true);
+        assert_eq!(value["items"][0]["kind"], "app");
+        assert_eq!(value["items"][0]["title"], "微信");
+    }
+
+    #[test]
     fn search_web_keyword_comes_first() {
         let resp = dispatch(
             parse(r#"{"type":"search","query":"g 天气","max":10}"#),
@@ -950,6 +995,19 @@ mod tests {
         let url = items[0]["execute_id"].as_str().unwrap_or("");
         assert!(url.starts_with("https://www.google.com/search?q="));
         assert!(url.contains("%E5%A4%A9%E6%B0%94"));
+    }
+
+    #[test]
+    fn search_web_remains_available_while_file_index_builds() {
+        let resp = dispatch(
+            parse(r#"{"type":"search","query":"g 天气","max":10}"#),
+            &empty_index(),
+            &empty_apps(),
+            &default_engines(),
+        );
+        let value = to_json(&resp);
+        assert_eq!(value["is_indexing"], true);
+        assert_eq!(value["items"][0]["kind"], "web");
     }
 
     #[test]

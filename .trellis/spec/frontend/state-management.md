@@ -27,6 +27,12 @@ Questions to answer:
   no index error, is not truncated, carries an index generation, and contains
   no web result. Query deletion or replacement and generation notification
   invalidate that cache.
+- `is_indexing=true` means file results are incomplete even when the response is
+  already searchable. Such responses never seed the prefix cache; volume
+  publication advances generation and the next poll replaces the visible set.
+- Poll responses update indexing state even when `Items` is empty. The optional
+  volume progress is retained after the bounded polling window expires so the
+  UI does not regress to an indefinite generic waiting message.
 - A written pipe request always consumes its paired line response. UI
   cancellation uses a monotonically increasing search sequence to discard late
   responses without desynchronizing the transport.

@@ -113,8 +113,42 @@ public sealed class PipeClient : ISearchClient, IDisposable
             foreach (var el in arr.EnumerateArray())
                 items.Add(ParseResult(el));
         }
-        return new SearchResponse(echo, items, indexing, indexError, truncated, generation);
+        return new SearchResponse(
+            echo, items, indexing, indexError, truncated, generation, ParseProgress(resp));
     }
+
+    /// <summary>
+    /// 解析可选的 index_progress。整体缺失或字段缺失都不报错：旧后端不发这个字段，
+    /// 首次安装也没有记录总量可估算。
+    /// </summary>
+    private static IndexProgress? ParseProgress(JsonElement resp)
+    {
+        if (!resp.TryGetProperty("index_progress", out var progress)
+            || progress.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return new IndexProgress(
+            Scanned: ReadUInt64(progress, "scanned") ?? 0,
+            TotalEstimate: ReadUInt64(progress, "total_estimate") ?? 0,
+            VolumesTotal: ReadInt32(progress, "volumes_total"),
+            VolumesDone: ReadInt32(progress, "volumes_done"),
+            CurrentVolume: progress.TryGetProperty("current_volume", out var volume)
+                && volume.ValueKind == JsonValueKind.String
+                ? volume.GetString()
+                : null);
+    }
+
+    private static ulong? ReadUInt64(JsonElement owner, string name) =>
+        owner.TryGetProperty(name, out var value) && value.TryGetUInt64(out var parsed)
+            ? parsed
+            : null;
+
+    private static int? ReadInt32(JsonElement owner, string name) =>
+        owner.TryGetProperty(name, out var value) && value.TryGetInt32(out var parsed)
+            ? parsed
+            : null;
 
     /// <summary>打开文件/文件夹/程序。</summary>
     public async Task ExecuteAsync(string id, CancellationToken ct = default)
@@ -352,11 +386,45 @@ public sealed class PipeClient : ISearchClient, IDisposable
     }
 }
 
-/// <summary>search 响应：回显 query + 结果列表；IsIndexing 表示索引尚未就绪。</summary>
+/// <summary>
+/// 首建进度快照（G9）。整体可缺失；各字段也可单独缺失——首次安装没有旧缓存可估算
+/// 记录总量，此时只有卷计数可用。
+/// </summary>
+/// <param name="Scanned">已扫描记录数，0 表示未知。</param>
+/// <param name="TotalEstimate">记录总量估算，0 表示未知。</param>
+/// <param name="VolumesTotal">待建卷总数。</param>
+/// <param name="VolumesDone">已建完并已可搜的卷数。</param>
+/// <param name="CurrentVolume">正在建索引的卷挂载点。</param>
+public sealed record IndexProgress(
+    ulong Scanned,
+    ulong TotalEstimate,
+    int? VolumesTotal,
+    int? VolumesDone,
+    string? CurrentVolume)
+{
+    /// <summary>可解释进度文案。无卷计数时回落到"请稍候"由调用方决定。</summary>
+    public string? Describe()
+    {
+        if (VolumesTotal is not > 0 || VolumesDone is null) return null;
+        var scope = CurrentVolume is { Length: > 0 }
+            ? $"，正在扫描 {CurrentVolume}"
+            : "";
+        return $"已完成 {VolumesDone}/{VolumesTotal} 个磁盘{scope}";
+    }
+}
+
+/// <summary>
+/// search 响应：回显 query + 结果列表。
+///
+/// <paramref name="IsIndexing"/> 表示索引尚未建完，可能完全未就绪（无结果），
+/// 也可能部分就绪（已有结果但仍在补充，G9 的 ready &amp;&amp; building）。它与
+/// <paramref name="IsTruncated"/> 是两种不同的"不完整"：后者只表示"命中数超过 max"。
+/// </summary>
 public sealed record SearchResponse(
     string Query,
     IReadOnlyList<SearchResult> Items,
     bool IsIndexing,
     string? IndexError,
     bool IsTruncated = false,
-    ulong? IndexGeneration = null);
+    ulong? IndexGeneration = null,
+    IndexProgress? IndexProgress = null);

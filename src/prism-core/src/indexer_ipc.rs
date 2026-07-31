@@ -61,6 +61,12 @@ pub enum IndexerResponse {
     },
 }
 
+/// Index availability snapshot.
+///
+/// `ready` and `building` are independent: during a first build they are both true
+/// once at least one volume has been published, meaning "searchable, still filling in".
+/// A partially built index is **not** expressed through `Results::is_truncated`, which
+/// only ever means "more matches existed than `max` allowed".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerStatus {
     pub ready: bool,
@@ -71,6 +77,24 @@ pub struct IndexerStatus {
     pub memory_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// First-build progress. Absent when no build is running, and absent field-by-field
+    /// when a figure is unknown, so older readers keep their previous behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_progress: Option<BuildProgress>,
+}
+
+/// Per-volume first-build progress. Every field beyond the volume counts is optional:
+/// a first install has no previous cache to estimate a record total from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildProgress {
+    pub volumes_total: usize,
+    pub volumes_done: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_volume: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records_scanned: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records_estimate: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +177,62 @@ mod tests {
                 ..
             } if values.is_empty()
         ));
+    }
+
+    #[test]
+    fn status_without_build_progress_still_decodes() {
+        let status: IndexerStatus = serde_json::from_str(
+            r#"{"ready":true,"building":false,"degraded":false,"generation":7,"volumes":3,"memory_bytes":10}"#,
+        )
+        .unwrap();
+        assert!(status.build_progress.is_none());
+    }
+
+    #[test]
+    fn absent_build_progress_is_not_serialized() {
+        let status = IndexerStatus {
+            ready: false,
+            building: true,
+            degraded: false,
+            generation: 0,
+            volumes: 0,
+            memory_bytes: 0,
+            message: None,
+            build_progress: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("build_progress"), "{json}");
+    }
+
+    #[test]
+    fn partial_build_progress_round_trips_without_optional_figures() {
+        let status = IndexerStatus {
+            ready: true,
+            building: true,
+            degraded: false,
+            generation: 2,
+            volumes: 1,
+            memory_bytes: 4,
+            message: None,
+            build_progress: Some(BuildProgress {
+                volumes_total: 3,
+                volumes_done: 1,
+                current_volume: Some("D:\\".into()),
+                records_scanned: Some(1_234),
+                records_estimate: None,
+            }),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("records_estimate"), "{json}");
+        let decoded: IndexerStatus = serde_json::from_str(&json).unwrap();
+        let progress = decoded.build_progress.unwrap();
+        assert_eq!(progress.volumes_done, 1);
+        assert_eq!(progress.volumes_total, 3);
+        assert_eq!(progress.current_volume.as_deref(), Some("D:\\"));
+        assert_eq!(progress.records_scanned, Some(1_234));
+        assert_eq!(progress.records_estimate, None);
+        // ready && building is the partial-index combination, and it is not truncation.
+        assert!(decoded.ready && decoded.building);
     }
 
     #[test]

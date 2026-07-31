@@ -1,0 +1,7 @@
+{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G9 首建可用性、进度契约与依赖位置"}
+{"file":"src/prism-core/src/indexer_runtime.rs","reason":"run/load_or_build/build_all 首建阻塞点、ServiceState 发布与 watcher 启动、checkpoint 落盘"}
+{"file":"src/prism-core/src/ntfs.rs","reason":"build_volume 的 USN checkpoint 顺序、enumerate_mft 缓冲区、pending 重试循环、discover_volumes 顺序"}
+{"file":"src/prism-core/src/indexer_ipc.rs","reason":"IndexerStatus 增加可选 build_progress"}
+{"file":"src/prism-core/src/indexer_client.rs","reason":"!status.ready 早退逻辑需适配 ready && building 组合"}
+{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"is_indexing 文案升级为进度、部分索引下的缓存失效"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"R1 USN Service Contract 需补逐卷发布与落盘门契约"}

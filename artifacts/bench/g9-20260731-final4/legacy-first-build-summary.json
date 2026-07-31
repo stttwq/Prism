@@ -1,0 +1,16 @@
+﻿{
+    "schema_version":  1,
+    "pass":  true,
+    "source":  "pre-G9 installed service backup; G0 did not record first-build timing",
+    "legacy_binary_sha256":  "9D10FEB743584C891A7DC64F0596E563481BF947291011DC9230EEC582587A0E",
+    "fixed_ntfs_volumes":  [
+                               "C:",
+                               "D:",
+                               "E:"
+                           ],
+    "service_start_to_running_ms":  47.671,
+    "first_ready_ms":  1657.039,
+    "legacy_stop_ms":  2673.21,
+    "current_binary_sha256":  "EFD636F20DEAE2E15DFC6005EF911434B1852AE085C8BAAFFA3BA0B9DEE7E7E8",
+    "service_restored_running":  true
+}

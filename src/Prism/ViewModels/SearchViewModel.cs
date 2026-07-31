@@ -515,9 +515,7 @@ public sealed class SearchViewModel
 
         if (resp.IsIndexing)
         {
-            _state.StatusMessage = list.Count > 0
-                ? "索引加载中，正在补充文件结果…"
-                : "索引加载中，请稍候…";
+            _state.StatusMessage = IndexingStatus(resp, list.Count > 0);
             if (startPoll)
                 _ = PollUntilReadyAsync(query, max, seq);
         }
@@ -535,8 +533,27 @@ public sealed class SearchViewModel
         }
     }
 
+    /// <summary>
+    /// 索引未建完时的提示文案。后端给出逐卷进度就显示可解释进度（G9 R4），
+    /// 缺进度字段时回落到原来的等待文案，行为与旧后端一致。
+    /// </summary>
+    private static string IndexingStatus(SearchResponse resp, bool hasResults)
+    {
+        var progress = resp.IndexProgress?.Describe();
+        if (progress is { Length: > 0 })
+        {
+            return hasResults
+                ? $"正在建立索引（{progress}），已可搜索部分文件…"
+                : $"正在建立索引（{progress}）…";
+        }
+        return hasResults
+            ? "索引加载中，正在补充文件结果…"
+            : "索引加载中，请稍候…";
+    }
+
     private async Task PollUntilReadyAsync(string query, int max, int seq)
     {
+        SearchResponse? lastIndexingResponse = null;
         for (var i = 0; i < 30; i++)
         {
             try
@@ -564,10 +581,10 @@ public sealed class SearchViewModel
                     return;
                 }
 
-                if (resp.Items.Count > 0)
-                    ApplySearchResponse(resp, query, max, seq, startPoll: false);
-                else
-                    _state.StatusMessage = "索引加载中，请稍候…";
+                // Progress-only responses are still meaningful. Applying them keeps the
+                // displayed volume/count snapshot current even when this query has no hits.
+                lastIndexingResponse = resp;
+                ApplySearchResponse(resp, query, max, seq, startPoll: false);
             }
             catch (OperationCanceledException)
             {
@@ -583,9 +600,11 @@ public sealed class SearchViewModel
             && string.Equals(query, _state.Query, StringComparison.Ordinal)
             && _state.IsIndexing)
         {
-            _state.StatusMessage = _state.Results.Count > 0
-                ? "文件索引仍在加载，当前仅显示已就绪结果"
-                : "索引仍在加载，请稍后再试";
+            _state.StatusMessage = lastIndexingResponse is not null
+                ? IndexingStatus(lastIndexingResponse, _state.Results.Count > 0)
+                : _state.Results.Count > 0
+                    ? "文件索引仍在加载，当前仅显示已就绪结果"
+                    : "索引仍在加载，请稍后再试";
         }
     }
 
