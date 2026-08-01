@@ -1,0 +1,34 @@
+{
+    "schema_version":  1,
+    "fault":  "corrupt",
+    "expected_status":  "corrupt",
+    "captured_at_utc":  "2026-08-01T15:56:24.3502423Z",
+    "installed_sidecar_fault_sha256":  "11D510E067D2CDCD7559BD86D27A2F4C20BABD43670346B97AF99B522C1F0075",
+    "valid_sidecar_sha256":  "A4CC2094F6FD0882237365D2A6EA891BC9A8417DF8FF7FF9789175AC317F4447",
+    "literal_query":  {
+                          "type":  "results",
+                          "result_count":  8,
+                          "pinyin_status":  "corrupt",
+                          "match_kinds":  [
+                                              "literal"
+                                          ],
+                          "contains_paths_or_titles":  false
+                      },
+    "pinyin_query":  {
+                         "type":  "results",
+                         "result_count":  8,
+                         "pinyin_status":  "corrupt",
+                         "match_kinds":  [
+                                             "literal"
+                                         ],
+                         "contains_paths_or_titles":  false
+                     },
+    "service_status":  {
+                           "ready":  true,
+                           "building":  false,
+                           "degraded":  false,
+                           "generation":  67753,
+                           "volumes":  3,
+                           "pinyin_status":  "corrupt"
+                       }
+}

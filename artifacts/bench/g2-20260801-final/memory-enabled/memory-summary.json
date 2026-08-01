@@ -1,0 +1,49 @@
+{
+    "schema_version":  1,
+    "run_id":  "g2-20260801-final-enabled",
+    "sample_count":  10,
+    "memory_gate_metric":  "sum(private_working_set_bytes) for Prism.exe + prism-core.exe + prism-indexer-service.exe",
+    "memory_gate_limit_bytes":  104857600,
+    "memory_gate_passed":  true,
+    "diagnostic_metric":  "working_set_bytes and private_bytes are reported separately; private_bytes is not private working set",
+    "process_aggregates":  [
+                               {
+                                   "label":  "frontend",
+                                   "private_working_set_p50_bytes":  4198400,
+                                   "private_working_set_max_bytes":  4198400
+                               },
+                               {
+                                   "label":  "broker",
+                                   "private_working_set_p50_bytes":  3477504,
+                                   "private_working_set_max_bytes":  3477504
+                               },
+                               {
+                                   "label":  "indexer",
+                                   "private_working_set_p50_bytes":  50237440,
+                                   "private_working_set_max_bytes":  50237440
+                               }
+                           ],
+    "totals":  {
+                   "private_working_set_p50_bytes":  57913344,
+                   "private_working_set_max_bytes":  57913344,
+                   "working_set_p50_bytes":  91422720,
+                   "working_set_max_bytes":  91422720
+               },
+    "indexer":  {
+                    "generations":  [
+                                        60017,
+                                        60029,
+                                        60053,
+                                        60069,
+                                        60077,
+                                        60085,
+                                        60088,
+                                        60114,
+                                        60153
+                                    ],
+                    "generation_changed_during_sampling":  true,
+                    "consistency":  "Each memory record includes a healthy indexer status captured at that sample point.",
+                    "volume_count":  3,
+                    "reported_index_memory_bytes":  61978520
+                }
+}

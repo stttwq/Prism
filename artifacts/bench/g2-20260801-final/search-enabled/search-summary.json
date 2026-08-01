@@ -1,0 +1,167 @@
+{
+    "schema_version":  1,
+    "run_id":  "g2-20260801-final-enabled",
+    "query_set_version":  "g0-v1",
+    "percentile_method":  "nearest_rank",
+    "raw_sample_count":  422,
+    "warm_sample_count":  420,
+    "aggregates":  [
+                       {
+                           "query_id":  "ascii_contains",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  56.57,
+                           "p95_ms":  97.039,
+                           "max_ms":  103.178,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000
+                       },
+                       {
+                           "query_id":  "ascii_contains",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  46.086,
+                           "p95_ms":  46.872,
+                           "max_ms":  46.922,
+                           "result_count_min":  8,
+                           "result_count_max":  8
+                       },
+                       {
+                           "query_id":  "ascii_exact",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  53.428,
+                           "p95_ms":  79.046,
+                           "max_ms":  79.873,
+                           "result_count_min":  915,
+                           "result_count_max":  915
+                       },
+                       {
+                           "query_id":  "ascii_exact",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  43.295,
+                           "p95_ms":  44.087,
+                           "max_ms":  44.276,
+                           "result_count_min":  8,
+                           "result_count_max":  8
+                       },
+                       {
+                           "query_id":  "ascii_prefix",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  53.93,
+                           "p95_ms":  55.715,
+                           "max_ms":  87.815,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000
+                       },
+                       {
+                           "query_id":  "ascii_prefix",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  43.485,
+                           "p95_ms":  44.33,
+                           "max_ms":  44.992,
+                           "result_count_min":  8,
+                           "result_count_max":  8
+                       },
+                       {
+                           "query_id":  "chinese",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  82.306,
+                           "p95_ms":  86.882,
+                           "max_ms":  87.99,
+                           "result_count_min":  31,
+                           "result_count_max":  31
+                       },
+                       {
+                           "query_id":  "chinese",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  81.348,
+                           "p95_ms":  82.133,
+                           "max_ms":  83.915,
+                           "result_count_min":  8,
+                           "result_count_max":  8
+                       },
+                       {
+                           "query_id":  "cross_volume",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  33.5,
+                           "p95_ms":  34.335,
+                           "max_ms":  34.425,
+                           "result_count_min":  0,
+                           "result_count_max":  0
+                       },
+                       {
+                           "query_id":  "cross_volume",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  33.642,
+                           "p95_ms":  35.169,
+                           "max_ms":  35.223,
+                           "result_count_min":  0,
+                           "result_count_max":  0
+                       },
+                       {
+                           "query_id":  "no_hit",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  33.381,
+                           "p95_ms":  34.235,
+                           "max_ms":  34.392,
+                           "result_count_min":  0,
+                           "result_count_max":  0
+                       },
+                       {
+                           "query_id":  "no_hit",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  33.409,
+                           "p95_ms":  34.224,
+                           "max_ms":  34.342,
+                           "result_count_min":  0,
+                           "result_count_max":  0
+                       },
+                       {
+                           "query_id":  "rare_term",
+                           "max":  1000,
+                           "sample_count":  30,
+                           "p50_ms":  35.436,
+                           "p95_ms":  36.713,
+                           "max_ms":  38.641,
+                           "result_count_min":  0,
+                           "result_count_max":  0
+                       },
+                       {
+                           "query_id":  "rare_term",
+                           "max":  8,
+                           "sample_count":  30,
+                           "p50_ms":  35.335,
+                           "p95_ms":  35.971,
+                           "max_ms":  35.975,
+                           "result_count_min":  0,
+                           "result_count_max":  0
+                       }
+                   ],
+    "g1_decision_input_only":  true,
+    "startup":  {
+                    "broker_started_by_runner":  false,
+                    "broker_start_to_pipe_ms":  60.13,
+                    "broker_version":  "0.1.0",
+                    "ready_generation":  59667,
+                    "indexer_volumes":  3,
+                    "indexer_reported_memory_bytes":  61978520
+                },
+    "index_generations":  {
+                              "initial_ready_generation":  59667,
+                              "distinct_count":  16,
+                              "minimum":  59667,
+                              "maximum":  59790,
+                              "changed_during_sampling":  true,
+                              "consistency":  "Each result and generation are captured atomically under the index read lock."
+                          }
+}

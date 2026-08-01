@@ -1,0 +1,9 @@
+﻿E:\LS\DM\Listary\artifacts\bench\g2-20260801-final\fault-corrupt.json
+检索不到变量“$LASTEXITCODE”，因为未设置该变量。
+所在位置 E:\LS\DM\Listary\artifacts\bench\g2-20260801-final\Invoke-PinyinFaultFixtureLogged.ps1:15 字符: 10
++     exit $LASTEXITCODE
++          ~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (LASTEXITCODE:String) []，RuntimeException
+    + FullyQualifiedErrorId : VariableIsUndefined
+ 
+

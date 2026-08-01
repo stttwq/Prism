@@ -91,12 +91,15 @@ Filename: "{app}\Prism.exe"; Description: "立即启动 Prism"; Flags: nowait po
 [UninstallRun]
 ; 卸载前先退出 Prism（托盘常驻进程，否则 Prism.exe 被占用无法删除）。
 ; 调用 taskkill 退出进程；找不到不影响卸载继续。
-Filename: "{cmd}"; Parameters: "/C taskkill /IM Prism.exe /T 2>nul & taskkill /IM prism-core.exe /T 2>nul"; Flags: runhidden; RunOnceId: "KillPrism"
+Filename: "{cmd}"; Parameters: "/C taskkill /F /IM Prism.exe /T 2>nul & taskkill /F /IM prism-core.exe /T 2>nul"; Flags: runhidden; RunOnceId: "KillPrism"
 
 [UninstallDelete]
 ; 便携模式下数据落在 {app}\data，随软件卸载清理；用户级安装数据在 LocalAppData 不受影响。
 Type: filesandordirs; Name: "{app}\data"
-; LocalSystem 索引器的数据是可重建派生缓存，卸载时不得残留在 ProgramData。
+; 仅在目录已经为空时删除安装目录，不触碰用户额外放入的文件。
+Type: dirifempty; Name: "{app}"
+; LocalSystem 索引器的 index-v5.bin / pinyin-v1.bin 均为可重建派生缓存，
+; 卸载时整个 ProgramData 目录不得残留。
 Type: filesandordirs; Name: "{commonappdata}\Prism"
 
 [Code]

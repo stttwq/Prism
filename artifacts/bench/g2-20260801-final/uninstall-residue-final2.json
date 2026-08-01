@@ -1,0 +1,15 @@
+{
+    "schema_version":  1,
+    "captured_at_utc":  "2026-08-01T16:30:44.9794756Z",
+    "uninstall_exit_code":  0,
+    "programdata_prism_exists":  false,
+    "install_directory_exists":  false,
+    "installed_binaries_remaining":  [
+
+                                     ],
+    "running_processes":  [
+
+                          ],
+    "service_absent":  true,
+    "passed":  true
+}
