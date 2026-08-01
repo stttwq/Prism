@@ -3,7 +3,7 @@
   "name": "prism-g3-engineering-foundation",
   "title": "G3 工程地基与权限边界",
   "description": "固化 Shell/COM、协议类型、日志、排除规则并清理旧链。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

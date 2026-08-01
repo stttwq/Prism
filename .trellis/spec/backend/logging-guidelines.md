@@ -1,51 +1,49 @@
 # Logging Guidelines
 
-> How logging is done in this project.
+## Scenario: Fail-Open Process Logs
 
----
+### 1. Scope / Trigger
 
-## Overview
+Broker and indexer diagnostics must not leak search payloads or gate availability.
 
-<!--
-Document your project's logging conventions here.
+### 2. Signatures
 
-Questions to answer:
-- What logging library do you use?
-- What are the log levels and when to use each?
-- What should be logged?
-- What should NOT be logged (PII, secrets)?
--->
+- `logging::init(process, directory)` selects `<process>.jsonl`.
+- `logging::event(level, event, elapsed_ms, generation)` writes JSONL.
+- `logging::redacted_id(message)` returns a non-reversible stable id.
 
-(To be filled by the team)
+### 3. Contracts
 
----
+- Broker uses `broker.jsonl`; indexer uses `indexer.jsonl`.
+- Fields: timestamp, level, event, elapsed, generation.
+- Rotate at 2 MiB to `.jsonl.1`; never log full query/path/URL/title.
 
-## Log Levels
+### 4. Validation & Error Matrix
 
-<!-- When to use each level: debug, info, warn, error -->
+| Condition | Required behavior |
+| --- | --- |
+| Directory/open failure | Disable file log; continue |
+| Write/flush failure | Disable writer; continue |
+| Rotation failure | Disable writer; continue |
+| Service startup failure | Redacted fallback id |
 
-(To be filled by the team)
+### 5. Good / Base / Bad Cases
 
----
+- Good: `search_complete` with elapsed/generation.
+- Base: internal text becomes `message_<hash>`.
+- Bad: event fields contain query, `execute_id`, path, title, or URL.
 
-## Structured Logging
+### 6. Tests Required
 
-<!-- Log format, required fields -->
+- Sensitive tokens absent from default record.
+- Unwritable directory and forced rotation failure do not panic.
+- Broker and indexer use distinct names.
 
-(To be filled by the team)
+### 7. Wrong vs Correct
 
----
-
-## What to Log
-
-<!-- Important events to log -->
-
-(To be filled by the team)
-
----
-
-## What NOT to Log
-
-<!-- Sensitive data, PII, secrets -->
-
-(To be filled by the team)
+```rust
+// Wrong
+log(format!("opened {path}"));
+// Correct
+logging::event("info", "shell_open_complete", None, None);
+```

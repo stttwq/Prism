@@ -1,51 +1,52 @@
 # Type Safety
 
-> Type safety patterns in this project.
+## Scenario: Typed Targets And Versioned Settings
 
----
+### 1. Scope / Trigger
 
-## Overview
+Applies to Rust/WPF search results and persisted settings.
 
-<!--
-Document your project's type safety conventions here.
+### 2. Signatures
 
-Questions to answer:
-- What type system do you use?
-- How are types organized?
-- What validation library do you use?
-- How do you handle type inference?
--->
+- `ActionTarget(string Kind, string Value)`.
+- `SearchResult.Target` is optional; `ExecutionTarget` owns legacy conversion.
+- Settings schema is 1; missing legacy version is 0.
+- `ExcludedPaths` contains at most 32 absolute paths.
 
-(To be filled by the team)
+### 3. Contracts
 
----
+- Wire names are lowercase `kind` and `value`.
+- Unknown result kinds stay `Unknown`; broker rejects unknown target kinds.
+- Readers default missing fields, normalize null collections, and reject future schemas.
+- Writers validate before atomic replacement.
 
-## Type Organization
+### 4. Validation & Error Matrix
 
-<!-- Where types are defined, shared types vs local types -->
+| Condition | Result |
+| --- | --- |
+| Missing target | One legacy conversion |
+| Unknown target | Broker `unsupported` |
+| >32 exclusions | `InvalidDataException` |
+| Relative/control/oversized exclusion | `InvalidDataException` |
+| Future schema | Safe defaults |
 
-(To be filled by the team)
+### 5. Good / Base / Bad Cases
 
----
+- Good: `{kind:"file",value:"C:\\..."}` end to end.
+- Base: old result falls back through `ExecutionTarget`.
+- Bad: commands independently guess from `ExecuteId`.
 
-## Validation
+### 6. Tests Required
 
-<!-- Runtime validation patterns (Zod, Yup, io-ts, etc.) -->
+- Old optional shape, unknown result kind, typed target precedence.
+- Missing/null/future settings and validated writes.
+- WPF Release build and C# tests.
 
-(To be filled by the team)
+### 7. Wrong vs Correct
 
----
-
-## Common Patterns
-
-<!-- Type utilities, generics, type guards -->
-
-(To be filled by the team)
-
----
-
-## Forbidden Patterns
-
-<!-- any, type assertions, etc. -->
-
-(To be filled by the team)
+```csharp
+// Wrong: PascalCase wire fields
+new { type = "execute", target };
+// Correct
+new { type = "execute", target = new { kind = target.Kind, value = target.Value } };
+```

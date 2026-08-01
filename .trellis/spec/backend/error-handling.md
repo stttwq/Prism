@@ -1,51 +1,53 @@
 # Error Handling
 
-> How errors are handled in this project.
+## Scenario: Broker-Owned Shell Boundary
 
----
+### 1. Scope / Trigger
 
-## Overview
+All user-session Shell, clipboard, shortcut-resolution, and COM work belongs to
+the normal-user broker. The LocalSystem indexer remains read-only.
 
-<!--
-Document your project's error handling conventions here.
+### 2. Signatures
 
-Questions to answer:
-- What error types do you define?
-- How are errors propagated?
-- How are errors logged?
-- How are errors returned to clients?
--->
+- `ActionTarget { kind, value }`: `file|directory|application|window|web`.
+- `ShellExecutor::execute(ShellOperation) -> Result<ShellOutcome, ShellError>`.
+- Error kinds: `access_denied`, `target_invalid`, `conflict`,
+  `elevation_required`, `unsupported`, and `system`.
 
-(To be filled by the team)
+### 3. Contracts
 
----
+- New results contain typed `target`; `execute_id` is legacy-reader compatibility.
+- A bounded queue feeds one `prism-shell-sta` thread that owns COM lifecycle.
+- Indexer IPC exposes only hello, status, bounded search, and generation wait.
 
-## Error Types
+### 4. Validation & Error Matrix
 
-<!-- Custom error classes/types -->
+| Condition | Result |
+| --- | --- |
+| Unknown kind | `unsupported`, no execution |
+| Empty/control/relative path | `target_invalid` |
+| Non-http(s) web target | `target_invalid` |
+| Permission denial | `access_denied` |
+| User cancellation | status with `cancelled=true` |
+| Worker failure | `system` |
 
-(To be filled by the team)
+### 5. Good / Base / Bad Cases
 
----
+- Good: WPF sends `{target:{kind:"web",value:"https://..."}}`.
+- Base: legacy `id` converts once at the broker edge.
+- Bad: infer URL/path throughout handlers or initialize COM on Tokio workers.
 
-## Error Handling Patterns
+### 6. Tests Required
 
-<!-- Try-catch patterns, error propagation -->
+- Typed/legacy decoding, target serialization, unknown/incompatible rejection.
+- STA startup, pre-queue cancellation, clean shutdown.
+- Indexer decoder rejection for write/action commands.
 
-(To be filled by the team)
+### 7. Wrong vs Correct
 
----
-
-## API Error Responses
-
-<!-- Standard error response format -->
-
-(To be filled by the team)
-
----
-
-## Common Mistakes
-
-<!-- Error handling mistakes your team has made -->
-
-(To be filled by the team)
+```rust
+// Wrong
+execute_id(id);
+// Correct
+shell.execute(ShellOperation::Open(target)).await;
+```

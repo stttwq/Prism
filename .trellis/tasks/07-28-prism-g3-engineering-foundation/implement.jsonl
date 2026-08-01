@@ -3,3 +3,6 @@
 {"file":"src/prism-core/src/index.rs","reason":"待审计的旧索引测试链"}
 {"file":"src/prism-core/src/indexer_runtime.rs","reason":"LocalSystem 服务职责与命令边界"}
 {"file":"src/prism-core/src/config.rs","reason":"设置、排除和持久化现状"}
+{"file":"src/prism-core/src/lib.rs","reason":"pub mod index 未 cfg，lib target 仍编译旧链"}
+{"file":"src/prism-core/src/index_cache.rs","reason":"machine_data_dir 决定卸载需清理的目录"}
+{"file":"dist/prism.iss","reason":"真实安装脚本；补 %ProgramData%\\Prism 卸载清理"}
