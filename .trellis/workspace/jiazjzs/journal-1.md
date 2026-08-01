@@ -582,3 +582,38 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: 完成 Prism G2 历史与拼音
+
+**Date**: 2026-08-02
+**Task**: 完成 Prism G2 历史与拼音
+**Branch**: `feature`
+
+### Summary
+
+完成版本化历史、拼音 matcher/sidecar、WPF 设置与卸载修复；112 Rust tests、15 C# tests、Clippy 和 Release build 通过；安装态搜索、内存、故障降级与严格卸载验收通过；已推送 origin/feature。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b950d89` | (see git log) |
+| `52d0445` | (see git log) |
+| `4f8900d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
