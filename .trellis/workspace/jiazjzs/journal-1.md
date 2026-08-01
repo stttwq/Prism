@@ -546,3 +546,39 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 17: 完成 G3 工程地基与权限边界
+
+**Date**: 2026-08-01
+**Task**: 完成 G3 工程地基与权限边界
+**Branch**: `feature`
+
+### Summary
+
+完成 Shell/COM STA worker、typed target、版本化持久化、Top-K 前用户排除、脱敏滚动日志、旧链清理与安装卸载验收；Rust 91 项和 C# 14 项测试及全部质量门通过。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `23dbad4` | (see git log) |
+| `2fdf8d3` | (see git log) |
+| `9aee7d5` | (see git log) |
+| `a8c000a` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

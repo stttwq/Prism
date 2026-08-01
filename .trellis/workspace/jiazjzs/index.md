@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
-- **Last Active**: 2026-07-31
+- **Total Sessions**: 17
+- **Last Active**: 2026-08-01
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~548 | Active |
+| `journal-1.md` | ~584 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-08-01 | 完成 G3 工程地基与权限边界 | `23dbad4`, `2fdf8d3`, `9aee7d5`, `a8c000a` | `feature` |
 | 16 | 2026-07-31 | 完成 Prism G9 首建可用性与进度 | `bc01766` | `feature` |
 | 15 | 2026-07-30 | 完成 Prism G1 搜索正确性与协议演进 | `974dee9`, `3993200`, `d84581a`, `f5eed7f` | `feature` |
 | 14 | 2026-07-29 | 完成 Prism G0 可复现基线 | `19408bb` | `feature` |
