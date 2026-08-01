@@ -114,8 +114,21 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 items.Add(ParseResult(el));
         }
         return new SearchResponse(
-            echo, items, indexing, indexError, truncated, generation, ParseProgress(resp));
+            echo,
+            items,
+            indexing,
+            indexError,
+            truncated,
+            generation,
+            ParseProgress(resp),
+            ReadOptionalString(resp, "pinyin_status"),
+            ReadOptionalString(resp, "history_status"));
     }
+
+    private static string? ReadOptionalString(JsonElement owner, string name) =>
+        owner.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     /// <summary>
     /// 解析可选的 index_progress。整体缺失或字段缺失都不报错：旧后端不发这个字段，
@@ -176,6 +189,24 @@ public sealed class PipeClient : ISearchClient, IDisposable
             UrlTemplate = e.UrlTemplate,
         }).ToArray();
         await SendAsync(new { type = "reload_engines", engines = payload }, ct).ConfigureAwait(false);
+    }
+
+    public async Task UpdatePreferencesAsync(
+        bool historyEnabled,
+        bool pinyinEnabled,
+        CancellationToken ct = default)
+    {
+        await SendAsync(new
+        {
+            type = "update_preferences",
+            history_enabled = historyEnabled,
+            pinyin_enabled = pinyinEnabled,
+        }, ct).ConfigureAwait(false);
+    }
+
+    public async Task ClearHistoryAsync(CancellationToken ct = default)
+    {
+        await SendAsync(new { type = "clear_history" }, ct).ConfigureAwait(false);
     }
 
     /// <summary>请求某文件/文件夹的动作列表（→ 键动作面板）。</summary>
@@ -446,4 +477,6 @@ public sealed record SearchResponse(
     string? IndexError,
     bool IsTruncated = false,
     ulong? IndexGeneration = null,
-    IndexProgress? IndexProgress = null);
+    IndexProgress? IndexProgress = null,
+    string? PinyinStatus = null,
+    string? HistoryStatus = null);

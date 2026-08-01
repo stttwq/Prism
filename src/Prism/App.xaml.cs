@@ -133,7 +133,9 @@ public partial class App : Application
             _store,
             _autoStart,
             onApplied: ApplySettings,
-            onEnginesChanged: ReloadBackendEnginesAsync);
+            onEnginesChanged: ReloadBackendEnginesAsync,
+            onPreferencesChanged: UpdateBackendPreferencesAsync,
+            onClearHistory: ClearBackendHistoryAsync);
         _settingsWindow = new SettingsWindow(vm);
         _settingsWindow.Closed += (_, _) =>
         {
@@ -178,6 +180,20 @@ public partial class App : Application
         Log($"后端引擎已热重载（{engines.Count} 个）");
     }
 
+    private async Task UpdateBackendPreferencesAsync(bool historyEnabled, bool pinyinEnabled)
+    {
+        if (_pipe is null || !_pipe.IsConnected)
+            throw new InvalidOperationException("后端未连接，设置将在下次启动时生效");
+        await _pipe.UpdatePreferencesAsync(historyEnabled, pinyinEnabled).ConfigureAwait(true);
+    }
+
+    private async Task ClearBackendHistoryAsync()
+    {
+        if (_pipe is null || !_pipe.IsConnected)
+            throw new InvalidOperationException("后端未连接");
+        await _pipe.ClearHistoryAsync().ConfigureAwait(true);
+    }
+
     private void OnRebuildIndex()
     {
         MessageBox.Show(
@@ -194,6 +210,13 @@ public partial class App : Application
         {
             await _pipe.StartAsync();
             _state.IsBackendConnected = true;
+            if (_store is not null)
+            {
+                var settings = _store.Load();
+                await _pipe.UpdatePreferencesAsync(
+                    settings.HistoryEnabled,
+                    settings.PinyinEnabled).ConfigureAwait(true);
+            }
             try
             {
                 var ver = await _pipe.PingAsync();

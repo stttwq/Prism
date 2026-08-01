@@ -44,15 +44,43 @@ impl<T: VersionedData + Default> VersionedEnvelope<T> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryData {
     #[serde(default)]
-    pub entries: Vec<serde_json::Value>,
+    pub entries: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub kind: String,
+    pub target: String,
+    #[serde(default)]
+    pub execute_count: u32,
+    #[serde(default)]
+    pub reveal_count: u32,
+    #[serde(default)]
+    pub destination_count: u32,
+    #[serde(default)]
+    pub last_used_utc: u64,
 }
 
 impl VersionedData for HistoryData {
     const SCHEMA_VERSION: u32 = HISTORY_SCHEMA_VERSION;
 
     fn validate(&self) -> Result<(), String> {
-        if self.entries.len() > 10_000 {
-            return Err("history contains more than 10000 entries".into());
+        if self.entries.len() > 500 {
+            return Err("history contains more than 500 entries".into());
+        }
+        for entry in &self.entries {
+            if !matches!(
+                entry.kind.as_str(),
+                "file" | "directory" | "application" | "window"
+            ) {
+                return Err("history contains an unsupported target kind".into());
+            }
+            if entry.target.is_empty()
+                || entry.target.contains('\0')
+                || entry.target.len() > 32 * 1024
+            {
+                return Err("history contains an invalid target".into());
+            }
         }
         Ok(())
     }
@@ -97,7 +125,7 @@ mod tests {
     #[test]
     fn writer_validates_before_serializing_new_shape() {
         let data = HistoryData {
-            entries: vec![serde_json::Value::Null; 10_001],
+            entries: vec![HistoryEntry::default(); 501],
         };
         assert!(VersionedEnvelope::new(data).is_err());
     }

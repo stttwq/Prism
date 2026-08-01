@@ -1,6 +1,6 @@
 //! User-session broker entry point.
 
-use prism_core::{apps, config, ipc, log, logging, shell, PIPE_NAME, VERSION};
+use prism_core::{apps, config, history, ipc, log, logging, shell, PIPE_NAME, VERSION};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
@@ -10,6 +10,8 @@ async fn main() {
     let cfg = config::Config::load(&data_dir);
     let apps: apps::SharedApps = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
     let engines = std::sync::Arc::new(std::sync::RwLock::new(cfg.web_engines));
+    let history = std::sync::Arc::new(history::HistoryStore::load(&data_dir, cfg.history_enabled));
+    let preferences = std::sync::Arc::new(ipc::BrokerPreferences::new(cfg.pinyin_enabled));
 
     let shell = match shell::ShellExecutor::start() {
         Ok(shell) => shell,
@@ -26,7 +28,7 @@ async fn main() {
     }
 
     log(format!("broker pipe listening at {PIPE_NAME}"));
-    if let Err(error) = ipc::serve(PIPE_NAME, apps, engines, shell).await {
+    if let Err(error) = ipc::serve(PIPE_NAME, apps, engines, shell, history, preferences).await {
         log(format!("broker pipe failed: {error}"));
         std::process::exit(1);
     }

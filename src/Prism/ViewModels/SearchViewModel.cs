@@ -492,6 +492,7 @@ public sealed class SearchViewModel
             && string.IsNullOrWhiteSpace(resp.IndexError)
             && !resp.IsTruncated
             && resp.IndexGeneration.HasValue
+            && (resp.PinyinStatus is null or "disabled")
             && resp.Items.All(item => item.ResultKind != SearchResultKind.Web))
         {
             _completeCache = new SearchCacheEntry(resp, _searchContext);
@@ -522,6 +523,14 @@ public sealed class SearchViewModel
         else if (!string.IsNullOrWhiteSpace(resp.IndexError))
         {
             _state.StatusMessage = "文件索引不可用：" + ShortMsg(new IOException(resp.IndexError));
+        }
+        else if (resp.PinyinStatus is "corrupt" or "version_mismatch" or "index_mismatch" or "missing")
+        {
+            _state.StatusMessage = "拼音索引不可用，已使用字面搜索";
+        }
+        else if (!string.IsNullOrWhiteSpace(resp.HistoryStatus))
+        {
+            _state.StatusMessage = "使用历史已重置";
         }
         else if (list.Count > 0)
         {

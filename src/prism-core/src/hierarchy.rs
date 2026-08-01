@@ -48,11 +48,49 @@ pub struct IndexHit {
     pub match_metadata: MatchMetadata,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchKind {
+    #[default]
+    Literal,
+    FullPinyin,
+    Initials,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatchMetadata {
+    #[serde(default, skip_serializing_if = "is_literal")]
+    pub kind: MatchKind,
     pub class: u8,
     pub position: u32,
     pub score: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub history_score: u32,
+}
+
+fn is_literal(value: &MatchKind) -> bool {
+    *value == MatchKind::Literal
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+impl Ord for MatchMetadata {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.kind
+            .cmp(&other.kind)
+            .then(self.class.cmp(&other.class))
+            .then(self.position.cmp(&other.position))
+            .then(other.history_score.cmp(&self.history_score))
+            .then(self.score.cmp(&other.score))
+    }
+}
+
+impl PartialOrd for MatchMetadata {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,7 +448,7 @@ impl VolumeIndex {
         Ok(offset)
     }
 
-    fn name_at(&self, offset: u32) -> Result<&str, String> {
+    pub(crate) fn name_at(&self, offset: u32) -> Result<&str, String> {
         if offset == NO_NAME {
             return Ok("");
         }
@@ -486,9 +524,11 @@ fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
     };
     let position = normalized[..byte_position].encode_utf16().count() as u32;
     Some(MatchMetadata {
+        kind: MatchKind::Literal,
         class,
         position,
         score: name.encode_utf16().count() as u32,
+        history_score: 0,
     })
 }
 
@@ -505,6 +545,10 @@ fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
     } else {
         name.to_lowercase().find(query_lower)
     }
+}
+
+pub(crate) fn is_literal_match(name: &str, query: &str) -> bool {
+    find_case_insensitive(name, &query.to_lowercase()).is_some()
 }
 
 fn search_volumes(
@@ -604,6 +648,25 @@ fn search_volumes(
 struct NormalizedExclusion {
     root: String,
     components: Vec<String>,
+}
+
+pub(crate) struct ExclusionMatcher(Vec<NormalizedExclusion>);
+
+impl ExclusionMatcher {
+    pub(crate) fn new(paths: &[String]) -> Self {
+        Self(
+            paths
+                .iter()
+                .filter_map(|path| NormalizedExclusion::parse(path))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn matches(&self, volume: &VolumeIndex, record: u32) -> bool {
+        self.0
+            .iter()
+            .any(|exclusion| exclusion.matches(volume, record))
+    }
 }
 
 impl NormalizedExclusion {
@@ -922,5 +985,29 @@ mod tests {
             .map(|item| item.name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["xa", "xb"]);
+    }
+
+    #[test]
+    fn match_tiers_and_history_cannot_cross_locked_boundaries() {
+        let rank = |kind, class, position, history_score| MatchMetadata {
+            kind,
+            class,
+            position,
+            score: 10,
+            history_score,
+        };
+        let literal_contains = rank(MatchKind::Literal, 2, 9, 0);
+        let full_exact_with_history = rank(MatchKind::FullPinyin, 0, 0, u32::MAX);
+        let initials_exact_with_history = rank(MatchKind::Initials, 0, 0, u32::MAX);
+        assert!(literal_contains < full_exact_with_history);
+        assert!(full_exact_with_history < initials_exact_with_history);
+
+        let prefix_without_history = rank(MatchKind::Literal, 1, 0, 0);
+        let contains_with_history = rank(MatchKind::Literal, 2, 0, u32::MAX);
+        assert!(prefix_without_history < contains_with_history);
+
+        let same_tier_without_history = rank(MatchKind::FullPinyin, 1, 0, 0);
+        let same_tier_with_history = rank(MatchKind::FullPinyin, 1, 0, 20);
+        assert!(same_tier_with_history < same_tier_without_history);
     }
 }

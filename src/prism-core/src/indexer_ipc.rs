@@ -22,6 +22,8 @@ pub enum IndexerRequest {
         max: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filters: Option<Vec<SearchFilter>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinyin_enabled: Option<bool>,
     },
     WaitGeneration {
         after: u64,
@@ -52,6 +54,8 @@ pub enum IndexerResponse {
         entered_top_k: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path_constructions: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinyin_status: Option<PinyinStatus>,
     },
     Generation {
         generation: u64,
@@ -81,6 +85,20 @@ pub struct IndexerStatus {
     /// when a figure is unknown, so older readers keep their previous behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_progress: Option<BuildProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinyin_status: Option<PinyinStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PinyinStatus {
+    Disabled,
+    Ready,
+    Building,
+    Missing,
+    Corrupt,
+    VersionMismatch,
+    IndexMismatch,
 }
 
 /// Per-volume first-build progress. Every field beyond the volume counts is optional:
@@ -104,6 +122,8 @@ pub struct IndexerItem {
     pub is_directory: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_metadata: Option<MatchMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_spans: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,6 +266,7 @@ mod tests {
             memory_bytes: 0,
             message: None,
             build_progress: None,
+            pinyin_status: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("build_progress"), "{json}");
@@ -268,6 +289,7 @@ mod tests {
                 records_scanned: Some(1_234),
                 records_estimate: None,
             }),
+            pinyin_status: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("records_estimate"), "{json}");

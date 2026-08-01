@@ -1,6 +1,7 @@
 //! Long-running indexer service state, IPC, checkpointing, and rebuild coordination.
 
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -13,9 +14,10 @@ use crate::hierarchy::{ApplyOutcome, IndexState, VolumeIndex};
 use crate::index_cache;
 use crate::indexer_ipc::{
     validate_search_request, BuildProgress, IndexerItem, IndexerRequest, IndexerResponse,
-    IndexerStatus, SearchFilter,
+    IndexerStatus, PinyinStatus, SearchFilter,
 };
 use crate::ntfs::{self, VolumeDescriptor};
+use crate::pinyin_sidecar::{LoadErrorKind, PinyinSidecar};
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 
 pub struct Shutdown {
@@ -140,6 +142,11 @@ pub struct ServiceState {
     /// R2 persistence gate. Cleared while a first build is in flight so that no exit
     /// path can write a partial index that would later look like a complete cache.
     first_build_complete: AtomicBool,
+    pinyin: RwLock<Option<PinyinSidecar>>,
+    pinyin_status: RwLock<PinyinStatus>,
+    pinyin_data_dir: RwLock<Option<PathBuf>>,
+    pinyin_needs_rebuild: AtomicBool,
+    pinyin_enabled: AtomicBool,
 }
 
 impl ServiceState {
@@ -152,7 +159,204 @@ impl ServiceState {
             generation_notify: Notify::new(),
             progress: BuildProgressCounters::default(),
             first_build_complete: AtomicBool::new(false),
+            pinyin: RwLock::new(None),
+            pinyin_status: RwLock::new(PinyinStatus::Building),
+            pinyin_data_dir: RwLock::new(None),
+            pinyin_needs_rebuild: AtomicBool::new(false),
+            pinyin_enabled: AtomicBool::new(true),
         })
+    }
+
+    fn set_pinyin_data_dir(&self, data_dir: &Path) {
+        if let Ok(mut slot) = self.pinyin_data_dir.write() {
+            *slot = Some(data_dir.to_path_buf());
+        }
+    }
+
+    fn pinyin_status(&self) -> PinyinStatus {
+        self.pinyin_status
+            .read()
+            .map(|status| *status)
+            .unwrap_or(PinyinStatus::Corrupt)
+    }
+
+    fn set_pinyin_status(&self, status: PinyinStatus) {
+        if let Ok(mut current) = self.pinyin_status.write() {
+            *current = status;
+        }
+    }
+
+    fn release_pinyin(&self) {
+        self.pinyin_enabled.store(false, Ordering::Release);
+        if let Ok(mut sidecar) = self.pinyin.write() {
+            *sidecar = None;
+        }
+        self.set_pinyin_status(PinyinStatus::Disabled);
+    }
+
+    fn begin_pinyin_rebuild(&self) {
+        if let Ok(mut sidecar) = self.pinyin.write() {
+            *sidecar = None;
+        }
+        self.set_pinyin_status(PinyinStatus::Building);
+    }
+
+    fn load_pinyin(&self, index: &IndexState) {
+        if !self.pinyin_enabled.load(Ordering::Acquire) {
+            self.release_pinyin();
+            return;
+        }
+        if self.pinyin.read().is_ok_and(|sidecar| sidecar.is_some()) {
+            self.set_pinyin_status(PinyinStatus::Ready);
+            return;
+        }
+        let data_dir = self
+            .pinyin_data_dir
+            .read()
+            .ok()
+            .and_then(|value| value.clone());
+        let Some(data_dir) = data_dir else {
+            self.set_pinyin_status(PinyinStatus::Missing);
+            return;
+        };
+        match PinyinSidecar::load(&data_dir, index) {
+            Ok(sidecar) => {
+                if !self.pinyin_enabled.load(Ordering::Acquire) {
+                    self.release_pinyin();
+                    return;
+                }
+                if let Ok(mut current) = self.pinyin.write() {
+                    *current = Some(sidecar);
+                }
+                self.set_pinyin_status(PinyinStatus::Ready);
+            }
+            Err(error) => {
+                if !self.pinyin_enabled.load(Ordering::Acquire) {
+                    self.release_pinyin();
+                    return;
+                }
+                self.set_pinyin_status(load_error_status(error.kind));
+                self.pinyin_needs_rebuild.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn ensure_pinyin_loaded(&self, index: &IndexState) {
+        if self.pinyin.read().is_ok_and(|sidecar| sidecar.is_some()) {
+            self.set_pinyin_status(PinyinStatus::Ready);
+            return;
+        }
+        if self.pinyin_status() == PinyinStatus::Building
+            || self.pinyin_needs_rebuild.load(Ordering::Acquire)
+        {
+            return;
+        }
+        self.load_pinyin(index);
+    }
+
+    fn rebuild_pinyin(&self, index: &IndexState, data_dir: &Path) {
+        if !self.pinyin_enabled.load(Ordering::Acquire) {
+            self.release_pinyin();
+            return;
+        }
+        self.begin_pinyin_rebuild();
+        match PinyinSidecar::build(index).and_then(|sidecar| {
+            sidecar.save(data_dir)?;
+            PinyinSidecar::load(data_dir, index).map_err(|error| error.message)
+        }) {
+            Ok(sidecar) => {
+                if !self.pinyin_enabled.load(Ordering::Acquire) {
+                    self.release_pinyin();
+                    return;
+                }
+                if let Ok(mut current) = self.pinyin.write() {
+                    *current = Some(sidecar);
+                }
+                self.set_pinyin_status(PinyinStatus::Ready);
+                self.pinyin_needs_rebuild.store(false, Ordering::Release);
+                log("pinyin sidecar ready");
+            }
+            Err(_) => {
+                if !self.pinyin_enabled.load(Ordering::Acquire) {
+                    self.release_pinyin();
+                    return;
+                }
+                if let Ok(mut current) = self.pinyin.write() {
+                    *current = None;
+                }
+                self.set_pinyin_status(PinyinStatus::Corrupt);
+                self.pinyin_needs_rebuild.store(true, Ordering::Release);
+                log("pinyin sidecar rebuild failed");
+            }
+        }
+    }
+
+    fn load_pinyin_from_live(&self) {
+        if let Ok(index) = self.index.read() {
+            if let Some(index) = index.as_ref() {
+                self.load_pinyin(index);
+            }
+        }
+    }
+
+    fn rebuild_pinyin_from_live(&self) {
+        let data_dir = self
+            .pinyin_data_dir
+            .read()
+            .ok()
+            .and_then(|value| value.clone());
+        let Some(data_dir) = data_dir else {
+            return;
+        };
+        if let Ok(index) = self.index.read() {
+            if let Some(index) = index.as_ref() {
+                self.rebuild_pinyin(index, &data_dir);
+            }
+        }
+    }
+
+    fn apply_pinyin_records(&self, volume: usize, records: &[ntfs::UsnRecord]) {
+        if !self.pinyin_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(mut sidecar_slot) = self.pinyin.write() else {
+            self.pinyin_needs_rebuild.store(true, Ordering::Release);
+            return;
+        };
+        let Some(sidecar) = sidecar_slot.as_mut() else {
+            self.pinyin_needs_rebuild.store(true, Ordering::Release);
+            return;
+        };
+        let mut invalidate = false;
+        for record in records {
+            let Ok((record_number, _)) = VolumeIndex::split_frn(record.frn) else {
+                invalidate = true;
+                break;
+            };
+            let name = if record.reason & ntfs::USN_REASON_FILE_DELETE != 0 {
+                None
+            } else if record.reason
+                & (ntfs::USN_REASON_FILE_CREATE | ntfs::USN_REASON_RENAME_NEW_NAME)
+                != 0
+            {
+                Some(record.name.as_str())
+            } else {
+                continue;
+            };
+            match sidecar.apply_delta(volume, record_number, name) {
+                Ok(true) | Err(_) => {
+                    invalidate = true;
+                    break;
+                }
+                Ok(false) => {}
+            }
+        }
+        if invalidate {
+            *sidecar_slot = None;
+            drop(sidecar_slot);
+            self.set_pinyin_status(PinyinStatus::Building);
+            self.pinyin_needs_rebuild.store(true, Ordering::Release);
+        }
     }
 
     pub fn status(&self) -> IndexerStatus {
@@ -164,9 +368,16 @@ impl ServiceState {
             degraded: self.degraded.load(Ordering::Acquire),
             generation: state.map(|value| value.generation).unwrap_or(0),
             volumes: state.map(|value| value.volumes.len()).unwrap_or(0),
-            memory_bytes: state.map(IndexState::memory_bytes).unwrap_or(0),
+            memory_bytes: state.map(IndexState::memory_bytes).unwrap_or(0)
+                + self
+                    .pinyin
+                    .read()
+                    .ok()
+                    .and_then(|sidecar| sidecar.as_ref().map(PinyinSidecar::resident_bytes))
+                    .unwrap_or(0),
             message: self.message.read().ok().and_then(|value| value.clone()),
             build_progress: self.progress.snapshot(),
+            pinyin_status: Some(self.pinyin_status()),
         }
     }
 
@@ -250,14 +461,34 @@ impl ServiceState {
         query: &str,
         max: usize,
         filters: Option<&[SearchFilter]>,
+        pinyin_enabled: bool,
     ) -> Result<IndexerResponse, String> {
         validate_search_request(max, filters)?;
         let guard = self.index.read().map_err(|_| "index lock is poisoned")?;
         let state = guard.as_ref().ok_or("file index is not ready")?;
+        self.pinyin_enabled.store(pinyin_enabled, Ordering::Release);
+        if pinyin_enabled {
+            self.ensure_pinyin_loaded(state);
+        } else {
+            self.release_pinyin();
+        }
         let generation = state.generation;
+        if query.is_empty() {
+            return Ok(IndexerResponse::Results {
+                generation,
+                items: Vec::new(),
+                is_truncated: false,
+                matched_count: Some(0),
+                scanned_nodes: Some(0),
+                name_candidates: Some(0),
+                entered_top_k: Some(0),
+                path_constructions: Some(0),
+                pinyin_status: Some(self.pinyin_status()),
+            });
+        }
         let exclusions = crate::indexer_ipc::exclusion_paths(filters);
         let outcome = state.search_with_exclusions(query, max, &exclusions);
-        let items = outcome
+        let mut items: Vec<_> = outcome
             .items
             .into_iter()
             .map(|hit| IndexerItem {
@@ -265,17 +496,52 @@ impl ServiceState {
                 path: hit.path,
                 is_directory: hit.is_directory,
                 match_metadata: Some(hit.match_metadata),
+                match_spans: None,
             })
             .collect();
+        let literal_count = outcome.matched_count;
+        let mut matched_count = literal_count;
+        let mut path_constructions = outcome.path_constructions;
+        if pinyin_enabled && literal_count < max as u64 {
+            if let Ok(sidecar) = self.pinyin.read() {
+                if let Some(sidecar) = sidecar.as_ref() {
+                    let pinyin = sidecar.search_with_exclusions(
+                        state,
+                        query,
+                        max.saturating_sub(items.len()),
+                        &exclusions,
+                    );
+                    matched_count = matched_count.saturating_add(pinyin.matched_count);
+                    path_constructions =
+                        path_constructions.saturating_add(pinyin.path_constructions);
+                    items.extend(pinyin.items.into_iter().map(|hit| IndexerItem {
+                        name: hit.name,
+                        path: hit.path,
+                        is_directory: hit.is_directory,
+                        match_metadata: Some(hit.match_metadata),
+                        match_spans: Some(hit.match_spans),
+                    }));
+                }
+            }
+        }
+        items.sort_by(|left, right| {
+            left.match_metadata
+                .cmp(&right.match_metadata)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.path.cmp(&right.path))
+                .then(left.is_directory.cmp(&right.is_directory))
+        });
+        items.truncate(max);
         Ok(IndexerResponse::Results {
             generation,
             items,
-            is_truncated: outcome.is_truncated,
-            matched_count: Some(outcome.matched_count),
+            is_truncated: outcome.is_truncated || matched_count > max as u64,
+            matched_count: Some(matched_count),
             scanned_nodes: Some(outcome.scanned_nodes),
             name_candidates: Some(outcome.name_candidates),
             entered_top_k: Some(outcome.entered_top_k),
-            path_constructions: Some(outcome.path_constructions),
+            path_constructions: Some(path_constructions),
+            pinyin_status: Some(self.pinyin_status()),
         })
     }
 
@@ -297,11 +563,21 @@ impl ServiceState {
     }
 }
 
+fn load_error_status(kind: LoadErrorKind) -> PinyinStatus {
+    match kind {
+        LoadErrorKind::Missing | LoadErrorKind::Io => PinyinStatus::Missing,
+        LoadErrorKind::Corrupt => PinyinStatus::Corrupt,
+        LoadErrorKind::VersionMismatch => PinyinStatus::VersionMismatch,
+        LoadErrorKind::IndexMismatch => PinyinStatus::IndexMismatch,
+    }
+}
+
 pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     let state = ServiceState::new();
     let first_pipe = create_pipe(true).map_err(|error| format!("create indexer pipe: {error}"))?;
     let mut pipe_task = tokio::spawn(serve(state.clone(), first_pipe));
     let data_dir = index_cache::machine_data_dir();
+    state.set_pinyin_data_dir(&data_dir);
 
     let epoch = Arc::new(AtomicU64::new(1));
     let (rebuild_tx, mut rebuild_rx) = mpsc::unbounded_channel::<String>();
@@ -358,7 +634,9 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 match rebuilt {
                     Ok((index, descriptors)) => {
                         index_cache::save(&index, &data_dir)?;
+                        state.set_pinyin_status(PinyinStatus::Building);
                         state.publish(index);
+                        rebuild_pinyin_from_live(state.clone()).await?;
                         start_watchers(state.clone(), descriptors, stop.clone(), epoch.clone(), rebuild_tx.clone());
                         last_checkpoint = Instant::now();
                     }
@@ -366,11 +644,16 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 }
             }
             _ = maintenance.tick() => {
+                if state.pinyin_needs_rebuild.swap(false, Ordering::AcqRel)
+                    && state.pinyin_status() != PinyinStatus::Disabled
+                {
+                    rebuild_pinyin_from_live(state.clone()).await?;
+                }
                 let checkpoint_due = state.index.read().ok().and_then(|guard| {
                     guard.as_ref().map(|index| index.events_since_checkpoint >= 100_000)
                 }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(60 * 60);
                 if checkpoint_due {
-                    checkpoint(&state, &data_dir)?;
+                    checkpoint_async(state.clone(), data_dir.clone()).await?;
                     last_checkpoint = Instant::now();
                 }
             }
@@ -378,7 +661,7 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     }
 
     epoch.fetch_add(1, Ordering::AcqRel);
-    checkpoint(&state, &data_dir)?;
+    checkpoint_async(state.clone(), data_dir.clone()).await?;
     pipe_task.abort();
     Ok(())
 }
@@ -414,7 +697,8 @@ async fn acquire_initial_index(
 
     let (descriptors, records_estimate) = match cached {
         CachedLoad::Hit { index, descriptors } => {
-            state.publish(index);
+            publish_cached_index(state, index);
+            load_pinyin_from_live(state.clone()).await?;
             return Ok(InitialIndex {
                 descriptors,
                 watchers_started: false,
@@ -477,6 +761,7 @@ async fn acquire_initial_index(
     }
 
     persist_first_build_with(state, |snapshot| index_cache::save(snapshot, data_dir))?;
+    rebuild_pinyin_from_live(state.clone()).await?;
     Ok(InitialIndex {
         descriptors,
         watchers_started: true,
@@ -497,6 +782,23 @@ where
     // exists, otherwise clients can observe a completed build that is not restart-safe.
     state.finish_first_build();
     Ok(())
+}
+
+fn publish_cached_index(state: &ServiceState, index: IndexState) {
+    state.begin_pinyin_rebuild();
+    state.publish(index);
+}
+
+async fn load_pinyin_from_live(state: Arc<ServiceState>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || state.load_pinyin_from_live())
+        .await
+        .map_err(|error| format!("pinyin load task: {error}"))
+}
+
+async fn rebuild_pinyin_from_live(state: Arc<ServiceState>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || state.rebuild_pinyin_from_live())
+        .await
+        .map_err(|error| format!("pinyin rebuild task: {error}"))
 }
 
 enum CachedLoad {
@@ -728,7 +1030,7 @@ fn watch_volume(
             continue;
         }
         let changed = records.len() as u64;
-        let rebuild_required = {
+        let (rebuild_required, volume_number) = {
             let mut guard = service
                 .index
                 .write()
@@ -737,11 +1039,12 @@ fn watch_volume(
                 return Ok(());
             }
             let index = guard.as_mut().ok_or("index is not ready")?;
-            let volume = index
+            let volume_number = index
                 .volumes
-                .iter_mut()
-                .find(|volume| volume.volume_id == descriptor.id)
+                .iter()
+                .position(|volume| volume.volume_id == descriptor.id)
                 .ok_or("volume disappeared from live index")?;
+            let volume = &mut index.volumes[volume_number];
             let rebuild_required =
                 ntfs::apply_records(volume, &records, next_usn)? == ApplyOutcome::RebuildRequired;
             let events_before = index.events_since_checkpoint;
@@ -756,9 +1059,10 @@ fn watch_volume(
             if changed > 0 {
                 index.generation = index.generation.saturating_add(1);
             }
-            rebuild_required
+            (rebuild_required, volume_number)
         };
         if changed > 0 {
+            service.apply_pinyin_records(volume_number, &records);
             service.generation_notify.notify_waiters();
         }
         if rebuild_required {
@@ -781,6 +1085,11 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         guard.as_ref().cloned().ok_or("index is not ready")?
     };
     index_cache::save(&snapshot, data_dir)?;
+    if state.pinyin_status() != PinyinStatus::Disabled {
+        // Rebuild from the live tree under its read lock. A clone taken for the v5
+        // checkpoint can be one USN batch behind by the time the sidecar is installed.
+        state.rebuild_pinyin_from_live();
+    }
     if let Ok(mut guard) = state.index.write() {
         if let Some(index) = guard.as_mut() {
             index.events_since_checkpoint = index
@@ -789,6 +1098,12 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         }
     }
     Ok(())
+}
+
+async fn checkpoint_async(state: Arc<ServiceState>, data_dir: PathBuf) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || checkpoint(&state, &data_dir))
+        .await
+        .map_err(|error| format!("checkpoint task: {error}"))?
 }
 
 async fn serve(state: Arc<ServiceState>, mut server: NamedPipeServer) -> Result<(), String> {
@@ -885,10 +1200,26 @@ pub(crate) async fn handle_connection(
                 query,
                 max,
                 filters,
-            }) => match state.search(&query, max, filters.as_deref()) {
-                Ok(response) => response,
-                Err(message) => IndexerResponse::Error { message },
-            },
+                pinyin_enabled,
+            }) => {
+                let state = state.clone();
+                match tokio::task::spawn_blocking(move || {
+                    state.search(
+                        &query,
+                        max,
+                        filters.as_deref(),
+                        pinyin_enabled.unwrap_or(false),
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(message)) => IndexerResponse::Error { message },
+                    Err(error) => IndexerResponse::Error {
+                        message: format!("index search task: {error}"),
+                    },
+                }
+            }
             Ok(IndexerRequest::WaitGeneration { after, timeout_ms }) => {
                 IndexerResponse::Generation {
                     generation: state.wait_generation(after, timeout_ms).await,
@@ -963,8 +1294,83 @@ mod tests {
         assert_eq!(status.volumes, 1);
         assert_eq!(status.generation, 1);
         assert!(state
-            .search("needle", 8, None)
+            .search("needle", 8, None, false)
             .is_ok_and(|response| matches!(response, IndexerResponse::Results { ref items, .. } if items.len() == 1)));
+    }
+
+    #[test]
+    fn disabled_missing_and_building_pinyin_states_keep_literal_search_available() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "微信"));
+
+        let literal = state.search("微信", 8, None, true).unwrap();
+        assert!(matches!(literal, IndexerResponse::Results { ref items, .. } if items.len() == 1));
+        assert_eq!(state.pinyin_status(), PinyinStatus::Building);
+
+        let pinyin_without_sidecar = state.search("wx", 8, None, true).unwrap();
+        assert!(
+            matches!(pinyin_without_sidecar, IndexerResponse::Results { ref items, .. } if items.is_empty())
+        );
+
+        let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
+        *state.pinyin.write().unwrap() = Some(PinyinSidecar::build(&snapshot).unwrap());
+        let disabled = state.search("微信", 8, None, false).unwrap();
+        assert!(matches!(disabled, IndexerResponse::Results { ref items, .. } if items.len() == 1));
+        assert!(state.pinyin.read().unwrap().is_none());
+        assert_eq!(state.pinyin_status(), PinyinStatus::Disabled);
+        assert!(
+            state.status().building,
+            "partial build status remains independent"
+        );
+    }
+
+    #[test]
+    fn cached_index_publishes_before_missing_or_corrupt_sidecar_rebuild() {
+        let dir =
+            std::env::temp_dir().join(format!("prism-g2-cache-fail-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = ServiceState::new();
+        missing.set_pinyin_data_dir(&dir);
+        publish_cached_index(
+            &missing,
+            IndexState {
+                volumes: vec![test_volume("missing", "C:\\", "微信")],
+                generation: 7,
+                events_since_checkpoint: 0,
+            },
+        );
+        assert!(matches!(
+            missing.search("微信", 8, None, true).unwrap(),
+            IndexerResponse::Results { ref items, .. } if items.len() == 1
+        ));
+        assert_eq!(missing.pinyin_status(), PinyinStatus::Building);
+        missing.load_pinyin_from_live();
+        assert_eq!(missing.pinyin_status(), PinyinStatus::Missing);
+        assert!(missing.pinyin_needs_rebuild.load(Ordering::Acquire));
+
+        std::fs::write(dir.join("pinyin-v1.bin"), b"not-a-sidecar").unwrap();
+        let corrupt = ServiceState::new();
+        corrupt.set_pinyin_data_dir(&dir);
+        publish_cached_index(
+            &corrupt,
+            IndexState {
+                volumes: vec![test_volume("corrupt", "C:\\", "微信")],
+                generation: 8,
+                events_since_checkpoint: 0,
+            },
+        );
+        assert!(matches!(
+            corrupt.search("微信", 8, None, true).unwrap(),
+            IndexerResponse::Results { ref items, .. } if items.len() == 1
+        ));
+        assert_eq!(corrupt.pinyin_status(), PinyinStatus::Building);
+        corrupt.load_pinyin_from_live();
+        assert_eq!(corrupt.pinyin_status(), PinyinStatus::Corrupt);
+        assert!(corrupt.pinyin_needs_rebuild.load(Ordering::Acquire));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

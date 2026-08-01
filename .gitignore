@@ -5,9 +5,13 @@
 **/.vs/
 *.user
 *.suo
+**/*_wpftmp.csproj
 
 # Runtime caches / data produced by prism-core
 **/data/index.bin
+**/data/history-v1.json
+**/data/history-v1.corrupt-*.json
+**/data/broker.jsonl*
 **/debug/data/
 **/release/data/
 

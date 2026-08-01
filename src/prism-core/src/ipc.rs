@@ -10,6 +10,8 @@
 //! 第八步：reload_engines 热替换引擎列表（设置页保存后立即生效）。
 //! 第九步：actions / run_action 接基础动作（打开所在文件夹/复制/剪切/复制路径）。
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -17,9 +19,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
-use crate::hierarchy::MatchMetadata;
+use crate::hierarchy::{MatchKind, MatchMetadata};
+use crate::history::{HistoryDiagnostic, HistoryStore, HistoryUse, HistoryWeight};
 use crate::indexer_client;
-use crate::indexer_ipc::{validate_search_request, BuildProgress, SearchFilter};
+use crate::indexer_ipc::{exclusion_paths, validate_search_request, BuildProgress, SearchFilter};
 use crate::shell::{
     ActionTarget, ShellError, ShellExecutor, ShellOperation, ShellOutcome, TargetKind,
 };
@@ -31,6 +34,22 @@ pub const BROKER_PROTOCOL: u32 = 1;
 /// 共享引擎列表（可热重载）。
 /// 读路径：search 持读锁；写路径：reload_engines 换整表。
 pub type SharedEngines = Arc<std::sync::RwLock<Vec<WebEngine>>>;
+
+pub struct BrokerPreferences {
+    pinyin_enabled: AtomicBool,
+}
+
+impl BrokerPreferences {
+    pub fn new(pinyin_enabled: bool) -> Self {
+        Self {
+            pinyin_enabled: AtomicBool::new(pinyin_enabled),
+        }
+    }
+
+    fn pinyin_enabled(&self) -> bool {
+        self.pinyin_enabled.load(Ordering::Acquire)
+    }
+}
 
 /// 前端发来的请求消息。`type` 字段区分类型（snake_case）。
 #[derive(Debug, Deserialize)]
@@ -82,6 +101,11 @@ pub enum Request {
     ReloadEngines {
         engines: Vec<WebEngine>,
     },
+    UpdatePreferences {
+        history_enabled: bool,
+        pinyin_enabled: bool,
+    },
+    ClearHistory,
 }
 
 fn default_max() -> usize {
@@ -130,6 +154,10 @@ pub enum Response {
         entered_top_k: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         path_constructions: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pinyin_status: Option<crate::indexer_ipc::PinyinStatus>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history_status: Option<String>,
     },
     /// 动作面板列表。
     Actions {
@@ -209,6 +237,8 @@ pub async fn serve(
     apps: SharedApps,
     engines: SharedEngines,
     shell: Arc<ShellExecutor>,
+    history: Arc<HistoryStore>,
+    preferences: Arc<BrokerPreferences>,
 ) -> std::io::Result<()> {
     // first_pipe_instance 默认 true，确保本进程是该管道名的首个持有者。
     let mut server = ServerOptions::new()
@@ -225,8 +255,12 @@ pub async fn serve(
         let apps = apps.clone();
         let engines = engines.clone();
         let shell = shell.clone();
+        let history = history.clone();
+        let preferences = preferences.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connected, apps, engines, shell).await {
+            if let Err(e) =
+                handle_connection(connected, apps, engines, shell, history, preferences).await
+            {
                 log(format!("连接处理结束：{e}"));
             }
         });
@@ -239,6 +273,8 @@ async fn handle_connection(
     apps: SharedApps,
     engines: SharedEngines,
     shell: Arc<ShellExecutor>,
+    history: Arc<HistoryStore>,
+    preferences: Arc<BrokerPreferences>,
 ) -> std::io::Result<()> {
     log("前端已连接");
     let (reader, mut writer) = tokio::io::split(pipe);
@@ -255,8 +291,19 @@ async fn handle_connection(
                 query,
                 max,
                 filters,
-            }) => search_service(&query, max, filters, &apps, &engines).await,
-            Ok(req) => dispatch_non_search(req, &engines, &shell).await,
+            }) => {
+                search_service(
+                    &query,
+                    max,
+                    filters,
+                    &apps,
+                    &engines,
+                    &history,
+                    &preferences,
+                )
+                .await
+            }
+            Ok(req) => dispatch_non_search(req, &engines, &shell, &history, &preferences).await,
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
                 category: None,
@@ -279,6 +326,8 @@ async fn dispatch_non_search(
     req: Request,
     engines: &SharedEngines,
     shell: &Arc<ShellExecutor>,
+    history: &Arc<HistoryStore>,
+    preferences: &Arc<BrokerPreferences>,
 ) -> Response {
     match req {
         Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
@@ -296,6 +345,7 @@ async fn dispatch_non_search(
             run_shell(
                 shell,
                 ShellOperation::Open(resolve_target(target, id, None)),
+                history,
             )
             .await
         }
@@ -303,6 +353,7 @@ async fn dispatch_non_search(
             run_shell(
                 shell,
                 ShellOperation::Reveal(resolve_target(target, id, Some(TargetKind::File))),
+                history,
             )
             .await
         }
@@ -316,10 +367,37 @@ async fn dispatch_non_search(
                     target: resolve_target(target, id, Some(TargetKind::File)),
                     action,
                 },
+                history,
             )
             .await
         }
         Request::ReloadEngines { engines: list } => reload_engines(list, engines),
+        Request::UpdatePreferences {
+            history_enabled,
+            pinyin_enabled,
+        } => {
+            history.set_enabled(history_enabled);
+            preferences
+                .pinyin_enabled
+                .store(pinyin_enabled, Ordering::Release);
+            // An empty read-only search applies the capability choice without scanning:
+            // disable releases the mmap/overlay, while enable loads the optional sidecar.
+            let _ = indexer_client::search_with_options("", 1, None, pinyin_enabled).await;
+            Response::Status {
+                is_indexing: false,
+                cancelled: false,
+            }
+        }
+        Request::ClearHistory => match history.clear() {
+            Ok(()) => Response::Status {
+                is_indexing: false,
+                cancelled: false,
+            },
+            Err(message) => Response::Error {
+                message,
+                category: None,
+            },
+        },
         Request::Search { .. } => Response::Error {
             message: "search must be dispatched asynchronously".into(),
             category: None,
@@ -333,6 +411,8 @@ async fn search_service(
     filters: Option<Vec<SearchFilter>>,
     apps: &SharedApps,
     engines: &SharedEngines,
+    history: &Arc<HistoryStore>,
+    preferences: &Arc<BrokerPreferences>,
 ) -> Response {
     if let Err(message) = validate_search_request(max, filters.as_deref()) {
         return Response::Error {
@@ -349,12 +429,37 @@ async fn search_service(
     }
     let result_slots = max.saturating_sub(items.len());
     let mut ranked = Vec::new();
+    let exclusions = exclusion_paths(filters.as_deref());
+    let history_weights = history.weights();
+    let history_candidates = history_file_candidates(
+        query,
+        &history_weights,
+        preferences.pinyin_enabled(),
+        &exclusions,
+    );
+    let injected_history_targets: HashSet<_> = history_candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.target.kind.clone(),
+                candidate.target.value.clone(),
+            )
+        })
+        .collect();
+    ranked.extend(history_candidates);
     let mut app_match_count = 0u64;
     if result_slots > 0 {
         if let Ok(apps_guard) = apps.read() {
             let app_matches = crate::apps::search(&apps_guard, query, usize::MAX);
             app_match_count = app_matches.len() as u64;
+            let mut literal_targets = std::collections::HashSet::new();
             for app in app_matches {
+                literal_targets.insert(app.launch_path.clone());
+                let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
+                let mut metadata = rank_title(&app.name, query);
+                if let Some(metadata) = metadata.as_mut() {
+                    metadata.history_score = history.score(&target);
+                }
                 ranked.push(SearchResult {
                     kind: SearchResultKind::App,
                     title: app.name.clone(),
@@ -364,15 +469,47 @@ async fn search_service(
                         app.launch_path.clone()
                     },
                     execute_id: app.launch_path.clone(),
-                    target: ActionTarget::new(TargetKind::Application, app.launch_path.clone()),
+                    target,
                     match_spans: match_spans(&app.name, query),
-                    match_metadata: rank_title(&app.name, query),
+                    match_metadata: metadata,
                 });
+            }
+            if preferences.pinyin_enabled() {
+                for app in apps_guard.iter() {
+                    if literal_targets.contains(&app.launch_path) {
+                        continue;
+                    }
+                    let Some(matched) = crate::pinyin::match_name(&app.name, query) else {
+                        continue;
+                    };
+                    let target =
+                        ActionTarget::new(TargetKind::Application, app.launch_path.clone());
+                    let metadata = pinyin_metadata(&matched, history.score(&target));
+                    ranked.push(SearchResult {
+                        kind: SearchResultKind::App,
+                        title: app.name.clone(),
+                        subtitle: if app.target_path != app.launch_path {
+                            app.target_path.clone()
+                        } else {
+                            app.launch_path.clone()
+                        },
+                        execute_id: app.launch_path.clone(),
+                        target: target.clone(),
+                        match_spans: matched.spans,
+                        match_metadata: Some(metadata),
+                    });
+                    app_match_count = app_match_count.saturating_add(1);
+                }
             }
         }
     }
-    let service =
-        indexer_client::search_with_filters(query, result_slots.max(1), filters.as_deref()).await;
+    let service = indexer_client::search_with_options(
+        query,
+        result_slots.max(1),
+        filters.as_deref(),
+        preferences.pinyin_enabled(),
+    )
+    .await;
     let (
         is_indexing,
         index_progress,
@@ -384,9 +521,21 @@ async fn search_service(
         name_candidates,
         entered_top_k,
         path_constructions,
+        pinyin_status,
     ) = match service {
         Ok(reply) => {
             for item in reply.items {
+                let target = ActionTarget::new(
+                    if item.is_directory {
+                        TargetKind::Directory
+                    } else {
+                        TargetKind::File
+                    },
+                    item.path.clone(),
+                );
+                if injected_history_targets.contains(&(target.kind.clone(), target.value.clone())) {
+                    continue;
+                }
                 ranked.push(SearchResult {
                     kind: if item.is_directory {
                         SearchResultKind::Folder
@@ -395,19 +544,20 @@ async fn search_service(
                     },
                     title: item.name.clone(),
                     subtitle: item.path.clone(),
-                    target: ActionTarget::new(
-                        if item.is_directory {
-                            TargetKind::Directory
-                        } else {
-                            TargetKind::File
-                        },
-                        item.path.clone(),
-                    ),
+                    target: target.clone(),
                     execute_id: item.path,
-                    match_spans: match_spans(&item.name, query),
-                    match_metadata: item
-                        .match_metadata
-                        .or_else(|| rank_title(&item.name, query)),
+                    match_spans: item
+                        .match_spans
+                        .unwrap_or_else(|| match_spans(&item.name, query)),
+                    match_metadata: {
+                        let mut metadata = item
+                            .match_metadata
+                            .or_else(|| rank_title(&item.name, query));
+                        if let Some(metadata) = metadata.as_mut() {
+                            metadata.history_score = history.score(&target);
+                        }
+                        metadata
+                    },
                 });
             }
             (
@@ -425,6 +575,7 @@ async fn search_service(
                 reply.name_candidates,
                 reply.entered_top_k,
                 reply.path_constructions,
+                reply.status.pinyin_status,
             )
         }
         Err(error) => (
@@ -433,6 +584,7 @@ async fn search_service(
             Some(error),
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -458,7 +610,93 @@ async fn search_service(
         name_candidates,
         entered_top_k,
         path_constructions,
+        pinyin_status,
+        history_status: history.take_diagnostic().map(history_status),
     }
+}
+
+fn history_file_candidates(
+    query: &str,
+    weights: &[HistoryWeight],
+    pinyin_enabled: bool,
+    exclusions: &[String],
+) -> Vec<SearchResult> {
+    let mut candidates = Vec::new();
+    for weight in weights {
+        if weight.target.kind != "file" && weight.target.kind != "directory" {
+            continue;
+        }
+        if path_is_excluded(&weight.target.value, exclusions) {
+            continue;
+        }
+        let Some(title) = std::path::Path::new(&weight.target.value)
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        let (metadata, match_spans) = if let Some(mut metadata) = rank_title(title, query) {
+            metadata.history_score = weight.score;
+            (metadata, match_spans(title, query))
+        } else if pinyin_enabled {
+            let Some(matched) = crate::pinyin::match_name(title, query) else {
+                continue;
+            };
+            (pinyin_metadata(&matched, weight.score), matched.spans)
+        } else {
+            continue;
+        };
+        candidates.push(SearchResult {
+            kind: if weight.target.kind == "directory" {
+                SearchResultKind::Folder
+            } else {
+                SearchResultKind::File
+            },
+            title: title.to_owned(),
+            subtitle: weight.target.value.clone(),
+            execute_id: weight.target.value.clone(),
+            target: weight.target.clone(),
+            match_spans,
+            match_metadata: Some(metadata),
+        });
+    }
+    candidates
+}
+
+fn path_is_excluded(path: &str, exclusions: &[String]) -> bool {
+    let normalized = path.replace('/', "\\");
+    exclusions.iter().any(|excluded| {
+        normalized.eq_ignore_ascii_case(excluded)
+            || normalized.get(excluded.len()..).is_some_and(|suffix| {
+                suffix.starts_with('\\')
+                    && normalized
+                        .get(..excluded.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(excluded))
+            })
+    })
+}
+
+fn pinyin_metadata(matched: &crate::pinyin::PinyinMatch, history_score: u32) -> MatchMetadata {
+    MatchMetadata {
+        kind: match matched.kind {
+            crate::pinyin::PinyinMatchKind::Full => MatchKind::FullPinyin,
+            crate::pinyin::PinyinMatchKind::Initials => MatchKind::Initials,
+        },
+        class: matched.class,
+        position: matched.position,
+        score: matched.score,
+        history_score,
+    }
+}
+
+fn history_status(diagnostic: HistoryDiagnostic) -> String {
+    match diagnostic {
+        HistoryDiagnostic::Corrupt => "corrupt",
+        HistoryDiagnostic::FutureSchema => "version_mismatch",
+        HistoryDiagnostic::Invalid => "invalid",
+        HistoryDiagnostic::Io => "io_error",
+    }
+    .to_owned()
 }
 
 /// 把 indexer 的逐卷进度转成前端 DTO。记录数缺失时用 0 表示"未知"，
@@ -478,6 +716,7 @@ fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
     let query_lower = query.to_lowercase();
     let byte_position = title_lower.find(&query_lower)?;
     Some(MatchMetadata {
+        kind: MatchKind::Literal,
         class: if title_lower == query_lower {
             0
         } else if byte_position == 0 {
@@ -487,6 +726,7 @@ fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
         },
         position: title_lower[..byte_position].encode_utf16().count() as u32,
         score: title.encode_utf16().count() as u32,
+        history_score: 0,
     })
 }
 
@@ -507,12 +747,38 @@ fn list_actions(target: ActionTarget) -> Response {
     }
 }
 
-async fn run_shell(shell: &Arc<ShellExecutor>, operation: ShellOperation) -> Response {
-    match shell.execute(operation).await {
-        Ok(ShellOutcome::Success) => Response::Status {
-            is_indexing: false,
-            cancelled: false,
-        },
+async fn run_shell(
+    shell: &Arc<ShellExecutor>,
+    operation: ShellOperation,
+    history: &Arc<HistoryStore>,
+) -> Response {
+    let history_record = match &operation {
+        ShellOperation::Open(target)
+        | ShellOperation::Properties(target)
+        | ShellOperation::OpenWith(target) => Some((target.clone(), HistoryUse::Execute)),
+        ShellOperation::Reveal(target) => Some((target.clone(), HistoryUse::Reveal)),
+        ShellOperation::RunAction { target, .. } => Some((target.clone(), HistoryUse::Execute)),
+    };
+    finish_shell_response(shell.execute(operation).await, history_record, history)
+}
+
+fn finish_shell_response(
+    outcome: Result<ShellOutcome, ShellError>,
+    history_record: Option<(ActionTarget, HistoryUse)>,
+    history: &HistoryStore,
+) -> Response {
+    match outcome {
+        Ok(ShellOutcome::Success) => {
+            if let Some((target, usage)) = history_record {
+                if history.record(&target, usage).is_err() {
+                    log("history write failed");
+                }
+            }
+            Response::Status {
+                is_indexing: false,
+                cancelled: false,
+            }
+        }
         Ok(ShellOutcome::Cancelled) => Response::Status {
             is_indexing: false,
             cancelled: true,
@@ -633,9 +899,135 @@ mod protocol_tests {
         assert_eq!(json["target"]["value"], r"C:\x");
     }
 
+    #[test]
+    fn file_history_candidates_survive_indexer_top_k_and_respect_exclusions() {
+        let weights = vec![HistoryWeight {
+            target: ActionTarget::new(TargetKind::File, r"C:\late\zeta.txt"),
+            score: 4,
+        }];
+        let mut candidates = history_file_candidates("ta", &weights, true, &[]);
+        candidates.push(SearchResult {
+            kind: SearchResultKind::File,
+            title: "beta.txt".into(),
+            subtitle: r"C:\beta.txt".into(),
+            execute_id: r"C:\beta.txt".into(),
+            target: ActionTarget::new(TargetKind::File, r"C:\beta.txt"),
+            match_spans: match_spans("beta.txt", "ta"),
+            match_metadata: rank_title("beta.txt", "ta"),
+        });
+        candidates.sort_by(compare_search_results);
+        assert_eq!(candidates[0].title, "zeta.txt");
+        assert_eq!(
+            candidates[0]
+                .match_metadata
+                .as_ref()
+                .map(|metadata| metadata.history_score),
+            Some(4)
+        );
+
+        assert!(history_file_candidates("ta", &weights, true, &[r"C:\late".into()]).is_empty());
+    }
+
+    #[test]
+    fn cross_type_ranking_preserves_match_tiers_and_same_tier_history() {
+        let result = |kind, title: &str, metadata| SearchResult {
+            kind,
+            title: title.into(),
+            subtitle: title.into(),
+            execute_id: title.into(),
+            target: ActionTarget::new(TargetKind::File, title),
+            match_spans: Vec::new(),
+            match_metadata: Some(metadata),
+        };
+        let rank = |kind, class, history_score| MatchMetadata {
+            kind,
+            class,
+            position: 0,
+            score: 10,
+            history_score,
+        };
+        let mut items = [
+            result(
+                SearchResultKind::Folder,
+                "initials",
+                rank(MatchKind::Initials, 0, u32::MAX),
+            ),
+            result(
+                SearchResultKind::File,
+                "full-history",
+                rank(MatchKind::FullPinyin, 0, 20),
+            ),
+            result(
+                SearchResultKind::App,
+                "literal",
+                rank(MatchKind::Literal, 2, 0),
+            ),
+            result(
+                SearchResultKind::App,
+                "full-no-history",
+                rank(MatchKind::FullPinyin, 0, 0),
+            ),
+        ];
+        items.sort_by(compare_search_results);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["literal", "full-history", "full-no-history", "initials"]
+        );
+    }
+
+    #[test]
+    fn only_successful_shell_outcomes_record_history() {
+        let dir =
+            std::env::temp_dir().join(format!("prism-ipc-history-outcomes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let history = HistoryStore::load(&dir, true);
+        let target = ActionTarget::new(TargetKind::File, r"C:\history-outcome.txt");
+        let record = || Some((target.clone(), HistoryUse::Execute));
+
+        let cancelled = finish_shell_response(Ok(ShellOutcome::Cancelled), record(), &history);
+        assert!(matches!(
+            cancelled,
+            Response::Status {
+                cancelled: true,
+                ..
+            }
+        ));
+        assert_eq!(history.score(&target), 0);
+
+        let failed = finish_shell_response(
+            Err(ShellError {
+                kind: crate::shell::ShellErrorKind::System,
+                message: "redacted failure".into(),
+            }),
+            record(),
+            &history,
+        );
+        assert!(matches!(failed, Response::Error { .. }));
+        assert_eq!(history.score(&target), 0);
+
+        let success = finish_shell_response(Ok(ShellOutcome::Success), record(), &history);
+        assert!(matches!(
+            success,
+            Response::Status {
+                cancelled: false,
+                ..
+            }
+        ));
+        assert_eq!(history.score(&target), 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn unknown_target_kind_is_rejected_without_execution() {
         let shell = ShellExecutor::start().unwrap();
+        let history = Arc::new(HistoryStore::load(
+            &std::env::temp_dir().join(format!("prism-ipc-history-{}", std::process::id())),
+            true,
+        ));
+        let preferences = Arc::new(BrokerPreferences::new(true));
         let response = dispatch_non_search(
             Request::Execute {
                 id: None,
@@ -646,6 +1038,8 @@ mod protocol_tests {
             },
             &default_engines(),
             &shell,
+            &history,
+            &preferences,
         )
         .await;
         assert!(matches!(

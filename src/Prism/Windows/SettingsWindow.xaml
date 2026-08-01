@@ -137,6 +137,24 @@
 
                     <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
 
+                    <TextBlock Text="搜索" FontSize="13" FontWeight="SemiBold"
+                               Foreground="#303237" Margin="0,0,0,8"/>
+                    <CheckBox Content="启用拼音搜索"
+                              IsChecked="{Binding PinyinEnabled, Mode=TwoWay}"
+                              FontSize="13" Foreground="#37393E"
+                              Margin="0,0,0,8"/>
+                    <CheckBox Content="使用成功操作历史优化同级排序"
+                              IsChecked="{Binding HistoryEnabled, Mode=TwoWay}"
+                              FontSize="13" Foreground="#37393E"
+                              Margin="0,0,0,10"/>
+                    <Button Content="清除使用历史"
+                            Command="{Binding ClearHistoryCommand}"
+                            Style="{StaticResource SettingsActionButton}"
+                            HorizontalAlignment="Left"
+                            Margin="0,0,0,16"/>
+
+                    <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
+
                     <TextBlock Text="数据目录" FontSize="13" FontWeight="SemiBold"
                                Foreground="#303237" Margin="0,0,0,6"/>
                     <TextBlock Text="索引与设置存放位置（安装目录不可写时自动改到用户数据夹）："

@@ -35,6 +35,12 @@ pub struct Config {
     /// 无 USN 权限时的定时全量刷新间隔（秒），默认 300（5 分钟）。
     pub index_refresh_secs: u64,
 
+    #[serde(alias = "HistoryEnabled", alias = "historyEnabled")]
+    pub history_enabled: bool,
+
+    #[serde(alias = "PinyinEnabled", alias = "pinyinEnabled")]
+    pub pinyin_enabled: bool,
+
     /// 网页快捷搜索引擎列表。
     /// 前端 JSON 属性名为 PascalCase `WebEngines`（见 SettingsStore 默认序列化）。
     /// 也接受 camelCase `webEngines` 以便手工编辑。
@@ -47,6 +53,8 @@ impl Default for Config {
         Self {
             schema_version: crate::persistence::SETTINGS_SCHEMA_VERSION,
             index_refresh_secs: 300,
+            history_enabled: true,
+            pinyin_enabled: true,
             // 缺省即带上 bi/b/g（必应优先），与前端 Settings.Default 一致。
             web_engines: WebEngine::defaults(),
         }

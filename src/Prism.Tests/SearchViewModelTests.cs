@@ -62,6 +62,27 @@ public sealed class SearchViewModelTests
     }
 
     [Fact]
+    public async Task PinyinEnabledResponseDoesNotSeedLiteralPrefixCache()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(PinyinResponse("w", 7));
+        client.Enqueue(PinyinResponse("wx", 7, Result("微信")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("w");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        vm.OnQueryChanged("wx");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2 && state.Results.Count == 1);
+
+        Assert.Equal("微信", state.Results[0].Title);
+    }
+
+    [Fact]
     public async Task GenerationInvalidatesCacheAndLateResponseCannotOverwriteNewQuery()
     {
         var client = new FakeSearchClient();
@@ -252,7 +273,7 @@ public sealed class SearchViewModelTests
     public void ProtocolReaderParsesOptionalBuildProgress()
     {
         using var document = JsonDocument.Parse(
-            """{"type":"results","query":"x","items":[],"is_indexing":true,"index_progress":{"scanned":12,"total_estimate":100,"volumes_total":3,"volumes_done":1,"current_volume":"D:\\"}}""");
+            """{"type":"results","query":"x","items":[],"is_indexing":true,"pinyin_status":"ready","history_status":"corrupt","index_progress":{"scanned":12,"total_estimate":100,"volumes_total":3,"volumes_done":1,"current_volume":"D:\\"}}""");
 
         var response = PipeClient.ParseSearchResponse(document.RootElement, "fallback");
 
@@ -262,6 +283,8 @@ public sealed class SearchViewModelTests
         Assert.Equal(3, response.IndexProgress?.VolumesTotal);
         Assert.Equal(1, response.IndexProgress?.VolumesDone);
         Assert.Equal("D:\\", response.IndexProgress?.CurrentVolume);
+        Assert.Equal("ready", response.PinyinStatus);
+        Assert.Equal("corrupt", response.HistoryStatus);
     }
 
     private static SearchResult Result(string title) =>
@@ -273,6 +296,12 @@ public sealed class SearchViewModelTests
         ulong generation,
         params SearchResult[] results) =>
         new(query, results, false, null, truncated, generation);
+
+    private static SearchResponse PinyinResponse(
+        string query,
+        ulong generation,
+        params SearchResult[] results) =>
+        new(query, results, false, null, false, generation, PinyinStatus: "ready");
 
     private static SearchResponse IndexingResponse(
         string query,

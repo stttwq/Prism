@@ -42,6 +42,10 @@ public sealed record Settings
     /// <summary>User-owned absolute directory exclusions sent as bounded search filters.</summary>
     public List<string> ExcludedPaths { get; init; } = [];
 
+    public bool HistoryEnabled { get; init; } = true;
+
+    public bool PinyinEnabled { get; init; } = true;
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
@@ -51,6 +55,8 @@ public sealed record Settings
         AutoStart = false,
         WebEngines = DefaultEngines(),
         ExcludedPaths = [],
+        HistoryEnabled = true,
+        PinyinEnabled = true,
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>

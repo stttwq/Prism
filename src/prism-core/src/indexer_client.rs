@@ -23,7 +23,7 @@ pub struct SearchReply {
 }
 
 pub async fn search(query: &str, max: usize) -> Result<SearchReply, String> {
-    search_with_filters(query, max, None).await
+    search_with_options(query, max, None, false).await
 }
 
 pub async fn search_with_filters(
@@ -31,7 +31,16 @@ pub async fn search_with_filters(
     max: usize,
     filters: Option<&[SearchFilter]>,
 ) -> Result<SearchReply, String> {
-    search_pipe(INDEXER_PIPE_NAME, query, max, filters).await
+    search_with_options(query, max, filters, false).await
+}
+
+pub async fn search_with_options(
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
+) -> Result<SearchReply, String> {
+    search_pipe(INDEXER_PIPE_NAME, query, max, filters, pinyin_enabled).await
 }
 
 async fn search_pipe(
@@ -39,10 +48,11 @@ async fn search_pipe(
     query: &str,
     max: usize,
     filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
 ) -> Result<SearchReply, String> {
     tokio::time::timeout(
         Duration::from_secs(2),
-        search_pipe_inner(pipe_name, query, max, filters),
+        search_pipe_inner(pipe_name, query, max, filters, pinyin_enabled),
     )
     .await
     .map_err(|_| "indexer service request timed out".to_string())?
@@ -53,6 +63,7 @@ async fn search_pipe_inner(
     query: &str,
     max: usize,
     filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
 ) -> Result<SearchReply, String> {
     let pipe = connect(pipe_name).await?;
     let (reader, mut writer) = tokio::io::split(pipe);
@@ -72,7 +83,7 @@ async fn search_pipe_inner(
     }
 
     write_request(&mut writer, &IndexerRequest::Status).await?;
-    let status = match read_response(&mut lines).await? {
+    let mut status = match read_response(&mut lines).await? {
         IndexerResponse::Status(status) => status,
         IndexerResponse::Error { message } => return Err(message),
         _ => return Err("indexer service returned an invalid status response".into()),
@@ -100,6 +111,7 @@ async fn search_pipe_inner(
             query: query.to_owned(),
             max,
             filters: filters.map(ToOwned::to_owned),
+            pinyin_enabled: Some(pinyin_enabled),
         },
     )
     .await?;
@@ -113,17 +125,23 @@ async fn search_pipe_inner(
             name_candidates,
             entered_top_k,
             path_constructions,
-        } => Ok(SearchReply {
-            status,
-            generation,
-            items,
-            is_truncated,
-            matched_count,
-            scanned_nodes,
-            name_candidates,
-            entered_top_k,
-            path_constructions,
-        }),
+            pinyin_status,
+        } => {
+            if pinyin_status.is_some() {
+                status.pinyin_status = pinyin_status;
+            }
+            Ok(SearchReply {
+                status,
+                generation,
+                items,
+                is_truncated,
+                matched_count,
+                scanned_nodes,
+                name_candidates,
+                entered_top_k,
+                path_constructions,
+            })
+        }
         IndexerResponse::Error { message } => Err(message),
         _ => Err("indexer service returned an invalid search response".into()),
     }
@@ -210,7 +228,9 @@ mod tests {
             handle_connection(server, state).await.unwrap();
         });
 
-        let reply = search_pipe(&pipe_name, "needle", 10, None).await.unwrap();
+        let reply = search_pipe(&pipe_name, "needle", 10, None, false)
+            .await
+            .unwrap();
         assert!(reply.status.ready);
         assert_eq!(reply.items.len(), 1);
         assert_eq!(reply.items[0].path, r"C:\needle.txt");
@@ -250,7 +270,9 @@ mod tests {
             handle_connection(server, state).await.unwrap();
         });
 
-        let reply = search_pipe(&pipe_name, "needle", 10, None).await.unwrap();
+        let reply = search_pipe(&pipe_name, "needle", 10, None, false)
+            .await
+            .unwrap();
         assert!(reply.status.ready, "a merged volume makes the index ready");
         assert!(
             reply.status.building,

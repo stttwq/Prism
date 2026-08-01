@@ -4,6 +4,7 @@ pub mod actions;
 pub mod apps;
 pub mod config;
 pub mod hierarchy;
+pub mod history;
 pub mod index_cache;
 pub mod indexer_client;
 pub mod indexer_ipc;
@@ -12,6 +13,8 @@ pub mod ipc;
 pub mod logging;
 pub mod ntfs;
 pub mod persistence;
+pub mod pinyin;
+pub mod pinyin_sidecar;
 pub mod shell;
 pub mod websearch;
 

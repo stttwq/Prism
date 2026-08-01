@@ -18,6 +18,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly AutoStartService _autoStart;
     private readonly Action<Settings>? _onApplied;
     private readonly Func<IReadOnlyList<WebEngine>, Task>? _onEnginesChanged;
+    private readonly Func<bool, bool, Task>? _onPreferencesChanged;
+    private readonly Func<Task>? _onClearHistory;
 
     private bool _autoStartEnabled;
     private HotkeyMode _hotkeyMode;
@@ -26,6 +28,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private WebEngineEditItem? _selectedEngine;
     private int _selectedTab; // 0=常规 1=网页搜索 2=关于
     private readonly List<string> _excludedPaths;
+    private bool _historyEnabled;
+    private bool _pinyinEnabled;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -33,18 +37,24 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         SettingsStore store,
         AutoStartService autoStart,
         Action<Settings>? onApplied = null,
-        Func<IReadOnlyList<WebEngine>, Task>? onEnginesChanged = null)
+        Func<IReadOnlyList<WebEngine>, Task>? onEnginesChanged = null,
+        Func<bool, bool, Task>? onPreferencesChanged = null,
+        Func<Task>? onClearHistory = null)
     {
         _store = store;
         _autoStart = autoStart;
         _onApplied = onApplied;
         _onEnginesChanged = onEnginesChanged;
+        _onPreferencesChanged = onPreferencesChanged;
+        _onClearHistory = onClearHistory;
 
         var settings = store.Load();
         _autoStartEnabled = settings.AutoStart;
         _hotkeyMode = settings.HotkeyMode;
         _comboHotkey = settings.ComboHotkey;
         _excludedPaths = settings.ExcludedPaths.ToList();
+        _historyEnabled = settings.HistoryEnabled;
+        _pinyinEnabled = settings.PinyinEnabled;
         DataDir = store.DataDir;
 
         Engines = new ObservableCollection<WebEngineEditItem>(
@@ -55,6 +65,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         RemoveEngineCommand = new RelayCommand(_ => RemoveSelectedEngine(), _ => SelectedEngine is not null);
         ResetEnginesCommand = new RelayCommand(_ => ResetEngines());
         SaveCommand = new RelayCommand(_ => Save());
+        ClearHistoryCommand = new RelayCommand(_ => _ = ClearHistoryAsync());
         SelectTabCommand = new RelayCommand(p =>
         {
             if (p is int i) SelectedTab = i;
@@ -195,6 +206,29 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public ICommand ResetEnginesCommand { get; }
     public ICommand SaveCommand { get; }
     public ICommand SelectTabCommand { get; }
+    public ICommand ClearHistoryCommand { get; }
+
+    public bool HistoryEnabled
+    {
+        get => _historyEnabled;
+        set
+        {
+            if (_historyEnabled == value) return;
+            _historyEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public bool PinyinEnabled
+    {
+        get => _pinyinEnabled;
+        set
+        {
+            if (_pinyinEnabled == value) return;
+            _pinyinEnabled = value;
+            OnPropertyChanged();
+        }
+    }
 
     private void AddEngine()
     {
@@ -296,6 +330,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             AutoStart = _autoStartEnabled,
             WebEngines = engines,
             ExcludedPaths = _excludedPaths,
+            HistoryEnabled = HistoryEnabled,
+            PinyinEnabled = PinyinEnabled,
         };
 
         try
@@ -318,23 +354,47 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             return;
         }
 
-        if (_onEnginesChanged is not null)
-            _ = ApplyEnginesAsync(engines);
+        if (_onEnginesChanged is not null || _onPreferencesChanged is not null)
+            _ = ApplyBackendAsync(engines, next.HistoryEnabled, next.PinyinEnabled);
         else
             StatusMessage = "已保存";
     }
 
-    private async Task ApplyEnginesAsync(List<WebEngine> engines)
+    private async Task ApplyBackendAsync(
+        List<WebEngine> engines,
+        bool historyEnabled,
+        bool pinyinEnabled)
     {
         try
         {
-            await _onEnginesChanged!(engines).ConfigureAwait(true);
-            StatusMessage = "已保存，快捷键与网页搜索均已生效";
+            if (_onEnginesChanged is not null)
+                await _onEnginesChanged(engines).ConfigureAwait(true);
+            if (_onPreferencesChanged is not null)
+                await _onPreferencesChanged(historyEnabled, pinyinEnabled).ConfigureAwait(true);
+            StatusMessage = "已保存并生效";
         }
         catch (Exception ex)
         {
             // 设置已落盘；后端未热重载时提示，重启后端或下次启动也会读到新配置。
-            StatusMessage = "已保存设置；后端引擎未刷新：" + ex.Message;
+            StatusMessage = "已保存设置；后端未刷新：" + ex.Message;
+        }
+    }
+
+    private async Task ClearHistoryAsync()
+    {
+        if (_onClearHistory is null)
+        {
+            StatusMessage = "后端未连接，无法清除历史";
+            return;
+        }
+        try
+        {
+            await _onClearHistory().ConfigureAwait(true);
+            StatusMessage = "使用历史已清除";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = "清除历史失败：" + ex.Message;
         }
     }
 

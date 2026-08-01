@@ -17,6 +17,8 @@ public sealed class SettingsStoreTests
             var settings = new SettingsStore(directory).Load();
             Assert.Equal(0, settings.SchemaVersion);
             Assert.Empty(settings.ExcludedPaths);
+            Assert.True(settings.HistoryEnabled);
+            Assert.True(settings.PinyinEnabled);
         }
         finally
         {
@@ -36,6 +38,8 @@ public sealed class SettingsStoreTests
             Assert.Equal(
                 Settings.CurrentSchemaVersion,
                 document.RootElement.GetProperty("SchemaVersion").GetInt32());
+            Assert.True(document.RootElement.GetProperty("HistoryEnabled").GetBoolean());
+            Assert.True(document.RootElement.GetProperty("PinyinEnabled").GetBoolean());
 
             Assert.Throws<InvalidDataException>(() =>
                 store.Save(Settings.Default with { ExcludedPaths = ["relative"] }));
