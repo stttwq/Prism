@@ -23,6 +23,15 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Persisted settings schema. Missing legacy values decode as version 0.
+    #[serde(
+        default,
+        alias = "SchemaVersion",
+        alias = "schemaVersion",
+        alias = "schema_version"
+    )]
+    pub schema_version: u32,
+
     /// 无 USN 权限时的定时全量刷新间隔（秒），默认 300（5 分钟）。
     pub index_refresh_secs: u64,
 
@@ -36,6 +45,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            schema_version: crate::persistence::SETTINGS_SCHEMA_VERSION,
             index_refresh_secs: 300,
             // 缺省即带上 bi/b/g（必应优先），与前端 Settings.Default 一致。
             web_engines: WebEngine::defaults(),
@@ -49,7 +59,14 @@ impl Config {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(SETTINGS_FILE_NAME);
         let mut cfg = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Ok(text) => match serde_json::from_str::<Self>(&text) {
+                Ok(value)
+                    if value.schema_version <= crate::persistence::SETTINGS_SCHEMA_VERSION =>
+                {
+                    value
+                }
+                _ => Self::default(),
+            },
             Err(_) => Self::default(),
         };
         if cfg.web_engines.is_empty() {
@@ -180,6 +197,38 @@ mod tests {
         let cfg = Config::load(&dir);
         assert_eq!(cfg.index_refresh_secs, 300);
         assert_eq!(cfg.web_engines.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_settings_without_schema_version_remain_compatible() {
+        let dir = std::env::temp_dir().join("prism_cfg_legacy_schema");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join(SETTINGS_FILE_NAME),
+            r#"{"WebEngines":[],"AutoStart":true}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&dir);
+        assert_eq!(cfg.schema_version, 0);
+        assert_eq!(cfg.web_engines.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn future_settings_schema_falls_back_safely() {
+        let dir = std::env::temp_dir().join("prism_cfg_future_schema");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join(SETTINGS_FILE_NAME),
+            r#"{"SchemaVersion":999,"WebEngines":[]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&dir);
+        assert_eq!(
+            cfg.schema_version,
+            crate::persistence::SETTINGS_SCHEMA_VERSION
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -255,7 +255,8 @@ impl ServiceState {
         let guard = self.index.read().map_err(|_| "index lock is poisoned")?;
         let state = guard.as_ref().ok_or("file index is not ready")?;
         let generation = state.generation;
-        let outcome = state.search(query, max);
+        let exclusions = crate::indexer_ipc::exclusion_paths(filters);
+        let outcome = state.search_with_exclusions(query, max, &exclusions);
         let items = outcome
             .items
             .into_iter()

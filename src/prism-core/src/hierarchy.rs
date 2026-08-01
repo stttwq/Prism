@@ -275,7 +275,7 @@ impl VolumeIndex {
     }
 
     pub fn search(&self, query: &str, max: usize) -> Vec<IndexHit> {
-        search_volumes(std::slice::from_ref(self), query, max).items
+        search_volumes(std::slice::from_ref(self), query, max, &[]).items
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -437,7 +437,16 @@ impl VolumeIndex {
 
 impl IndexState {
     pub fn search(&self, query: &str, max: usize) -> SearchOutcome {
-        search_volumes(&self.volumes, query, max)
+        self.search_with_exclusions(query, max, &[])
+    }
+
+    pub fn search_with_exclusions(
+        &self,
+        query: &str,
+        max: usize,
+        exclusion_paths: &[String],
+    ) -> SearchOutcome {
+        search_volumes(&self.volumes, query, max, exclusion_paths)
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -498,7 +507,12 @@ fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
     }
 }
 
-fn search_volumes(volumes: &[VolumeIndex], query: &str, max: usize) -> SearchOutcome {
+fn search_volumes(
+    volumes: &[VolumeIndex],
+    query: &str,
+    max: usize,
+    exclusion_paths: &[String],
+) -> SearchOutcome {
     if query.is_empty() || max == 0 {
         return SearchOutcome {
             items: Vec::new(),
@@ -512,6 +526,10 @@ fn search_volumes(volumes: &[VolumeIndex], query: &str, max: usize) -> SearchOut
     }
 
     let query_lower = query.to_lowercase();
+    let exclusions: Vec<_> = exclusion_paths
+        .iter()
+        .filter_map(|path| NormalizedExclusion::parse(path))
+        .collect();
     let mut heap = BinaryHeap::with_capacity(max);
     let mut scanned_nodes = 0u64;
     let mut name_candidates = 0u64;
@@ -532,6 +550,12 @@ fn search_volumes(volumes: &[VolumeIndex], query: &str, max: usize) -> SearchOut
             let Some(metadata) = match_metadata(name, &query_lower) else {
                 continue;
             };
+            if exclusions
+                .iter()
+                .any(|exclusion| exclusion.matches(volume, record as u32))
+            {
+                continue;
+            }
             matched_count = matched_count.saturating_add(1);
             let candidate = RankedCandidate {
                 volume_index,
@@ -574,6 +598,55 @@ fn search_volumes(volumes: &[VolumeIndex], query: &str, max: usize) -> SearchOut
         matched_count,
         entered_top_k,
         path_constructions,
+    }
+}
+
+struct NormalizedExclusion {
+    root: String,
+    components: Vec<String>,
+}
+
+impl NormalizedExclusion {
+    fn parse(path: &str) -> Option<Self> {
+        let normalized = path.trim().replace('/', "\\");
+        let mut parts = normalized.split('\\').filter(|part| !part.is_empty());
+        let root = parts.next()?.to_owned();
+        Some(Self {
+            root,
+            components: parts.map(ToOwned::to_owned).collect(),
+        })
+    }
+
+    fn matches(&self, volume: &VolumeIndex, record: u32) -> bool {
+        let mount = volume.mount_path.trim_end_matches(['\\', '/']);
+        if !mount.eq_ignore_ascii_case(&self.root) {
+            return false;
+        }
+        let mut current = record;
+        let mut names = Vec::new();
+        for _ in 0..MAX_PATH_DEPTH {
+            let Some(slot) = volume.nodes.get(current as usize) else {
+                return false;
+            };
+            if current == volume.root_record {
+                names.reverse();
+                return self.components.len() <= names.len()
+                    && self
+                        .components
+                        .iter()
+                        .zip(names)
+                        .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual));
+            }
+            let Ok(name) = volume.name_at(slot.name_off) else {
+                return false;
+            };
+            names.push(name);
+            if slot.parent_record == current {
+                return false;
+            }
+            current = slot.parent_record;
+        }
+        false
     }
 }
 
@@ -668,6 +741,32 @@ mod tests {
     }
 
     #[test]
+    fn search_is_case_insensitive_name_only_empty_safe_and_bounded() {
+        let mut volume = volume();
+        volume
+            .upsert(frn(10, 1), frn(5, 0), "NeedleParent", true)
+            .unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "unrelated.txt", false)
+            .unwrap();
+        volume
+            .upsert(frn(12, 1), frn(5, 0), "alpha-needle.txt", false)
+            .unwrap();
+        volume
+            .upsert(frn(13, 1), frn(5, 0), "needle-beta.txt", false)
+            .unwrap();
+
+        assert!(volume.search("", 10).is_empty());
+        let results = volume.search("NEEDLE", 1);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].name.to_lowercase().contains("needle"));
+        assert!(!volume
+            .search("needle", 10)
+            .iter()
+            .any(|item| item.name == "unrelated.txt"));
+    }
+
+    #[test]
     fn windows_installer_is_excluded_by_hierarchy_not_a_fake_flat_name() {
         let mut volume = volume();
         volume
@@ -688,6 +787,30 @@ mod tests {
             .upsert(frn(21, 1), frn(20, 1), "visible.msi", false)
             .unwrap();
         assert_eq!(volume.search("visible", 10).len(), 1);
+    }
+
+    #[test]
+    fn user_exclusion_filters_candidates_before_top_k() {
+        let mut volume = volume();
+        volume
+            .upsert(frn(10, 1), frn(5, 0), "excluded", true)
+            .unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "needle", false)
+            .unwrap();
+        volume
+            .upsert(frn(12, 1), frn(5, 0), "needle-visible", false)
+            .unwrap();
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+
+        let outcome = state.search_with_exclusions("needle", 1, &[r"C:\excluded".into()]);
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(outcome.items[0].path, r"C:\needle-visible");
+        assert_eq!(outcome.matched_count, 1);
     }
 
     #[test]

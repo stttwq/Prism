@@ -65,12 +65,15 @@ impl WebHit {
         };
         // 副标题展示最终 URL，便于用户确认将打开的地址。
         let subtitle = self.url.clone();
+        let target =
+            crate::shell::ActionTarget::new(crate::shell::TargetKind::Web, self.url.clone());
         let match_spans = match_spans_in_title(&title, &self.query_terms);
         SearchResult {
             kind: SearchResultKind::Web,
             title,
             subtitle,
             execute_id: self.url,
+            target,
             match_spans,
             match_metadata: None,
         }

@@ -50,32 +50,35 @@ pub fn search<'a>(apps: &'a [AppEntry], query: &str, max: usize) -> Vec<&'a AppE
     scored.into_iter().take(max).map(|(_, _, e)| e).collect()
 }
 
-/// 异步扫描开始菜单，结果写入 `shared`。阻塞工作走 `spawn_blocking`。
-pub async fn load(shared: SharedApps) {
-    let result = tokio::task::spawn_blocking(move || {
-        let t0 = std::time::Instant::now();
-        let apps = scan_start_menu();
-        crate::log(format!(
-            "程序清单就绪，共 {} 条，耗时 {}ms",
-            apps.len(),
-            t0.elapsed().as_millis()
-        ));
-        apps
-    })
-    .await;
-
-    match result {
+/// Scan Start Menu shortcuts on the broker-owned STA Shell worker.
+pub async fn load(shared: SharedApps, shell: std::sync::Arc<crate::shell::ShellExecutor>) {
+    let started = std::time::Instant::now();
+    match shell.scan_apps().await {
         Ok(apps) => {
+            crate::logging::event(
+                "info",
+                "app_catalog_ready",
+                Some(started.elapsed().as_millis()),
+                None,
+            );
             if let Ok(mut g) = shared.write() {
                 *g = apps;
             }
         }
-        Err(e) => crate::log(format!("程序清单扫描任务失败：{e}")),
+        Err(error) => crate::log(format!("app catalog scan failed: {}", error.message)),
     }
 }
 
 /// 扫描用户 + 公共开始菜单下全部 `.lnk`。
 pub fn scan_start_menu() -> Vec<AppEntry> {
+    scan_start_menu_with_apartment(true)
+}
+
+pub(crate) fn scan_start_menu_on_sta() -> Vec<AppEntry> {
+    scan_start_menu_with_apartment(false)
+}
+
+fn scan_start_menu_with_apartment(initialize_com: bool) -> Vec<AppEntry> {
     let mut roots = Vec::new();
     if let Some(p) = user_programs_dir() {
         roots.push(p);
@@ -83,7 +86,7 @@ pub fn scan_start_menu() -> Vec<AppEntry> {
     if let Some(p) = common_programs_dir() {
         roots.push(p);
     }
-    scan_roots(&roots)
+    scan_roots(&roots, initialize_com)
 }
 
 fn user_programs_dir() -> Option<PathBuf> {
@@ -98,14 +101,14 @@ fn common_programs_dir() -> Option<PathBuf> {
     Some(PathBuf::from(pd).join(r"Microsoft\Windows\Start Menu\Programs"))
 }
 
-fn scan_roots(roots: &[PathBuf]) -> Vec<AppEntry> {
+fn scan_roots(roots: &[PathBuf], initialize_com: bool) -> Vec<AppEntry> {
     let mut out: Vec<AppEntry> = Vec::new();
     // 去重键：小写显示名。roots 顺序应为 用户 → 公共，先到先得（用户优先）。
     let mut seen_names: HashSet<String> = HashSet::new();
 
     // COM 在整个扫描期间只初始化一次，并复用同一个 IShellLink 实例。
     #[cfg(windows)]
-    let mut resolver = LnkResolver::new();
+    let mut resolver = LnkResolver::new(initialize_com);
 
     for root in roots {
         if !root.is_dir() {
@@ -201,14 +204,15 @@ struct LnkResolver {
 
 #[cfg(windows)]
 impl LnkResolver {
-    fn new() -> Self {
+    fn new(initialize_com: bool) -> Self {
         use windows::Win32::System::Com::{
             CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
         };
         use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 
         // 失败也继续：线程可能已被其它代码初始化过。
-        let need_uninit = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+        let need_uninit =
+            initialize_com && unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
         let link: Option<IShellLinkW> =
             unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok();
         Self { link, need_uninit }

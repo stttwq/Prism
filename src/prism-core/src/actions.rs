@@ -4,11 +4,20 @@
 //! 消息合同见 frontend-spec.md §6 流程 D、§7。
 
 use crate::ipc::ActionItem;
-use crate::log;
+use crate::shell::{ActionTarget, ShellError, ShellErrorKind, TargetKind};
 
 /// 返回某路径的基础动作列表（file/folder 通用）。
-pub fn list_actions(path: &str) -> Result<Vec<ActionItem>, String> {
-    validate_path(path)?;
+pub fn list_actions(target: &ActionTarget) -> Result<Vec<ActionItem>, ShellError> {
+    let kind = target.validate()?;
+    if !matches!(
+        kind,
+        TargetKind::File | TargetKind::Directory | TargetKind::Application
+    ) {
+        return Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            "该目标不支持文件动作",
+        ));
+    }
     Ok(vec![
         ActionItem {
             id: "open_folder".into(),
@@ -43,7 +52,7 @@ pub fn list_actions(path: &str) -> Result<Vec<ActionItem>, String> {
 }
 
 /// 执行动作。`action` 为 list_actions 返回的 id。
-pub fn run_action(path: &str, action: &str) -> Result<(), String> {
+pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), String> {
     validate_path(path)?;
     match action {
         "open_folder" => reveal_in_explorer(path),
@@ -79,9 +88,7 @@ fn reveal_in_explorer(path: &str) -> Result<(), String> {
     std::process::Command::new("explorer")
         .raw_arg(arg)
         .spawn()
-        .map(|_| {
-            log(format!("动作 open_folder：{path}"));
-        })
+        .map(|_| crate::logging::event("info", "shell_reveal_complete", None, None))
         .map_err(|e| e.to_string())
 }
 
@@ -130,7 +137,7 @@ fn clipboard_set_text(text: &str) -> Result<(), String> {
             return Err("SetClipboardData 文本失败".into());
         }
         // 成功后系统接管 hmem，不要 GlobalFree。
-        log(format!("动作 copy_path：{text}"));
+        crate::logging::event("info", "clipboard_copy_path_complete", None, None);
         Ok(())
     }
 }
@@ -233,7 +240,16 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
         } else {
             "copy"
         };
-        log(format!("动作 {verb}：{path}"));
+        crate::logging::event(
+            "info",
+            if verb == "cut" {
+                "clipboard_cut_complete"
+            } else {
+                "clipboard_copy_complete"
+            },
+            None,
+            None,
+        );
         Ok(())
     }
 }
@@ -266,12 +282,14 @@ mod tests {
 
     #[test]
     fn list_actions_rejects_relative() {
-        assert!(list_actions("relative\\x.txt").is_err());
+        let target = ActionTarget::new(TargetKind::File, "relative\\x.txt");
+        assert!(list_actions(&target).is_err());
     }
 
     #[test]
     fn list_actions_has_basics() {
-        let items = list_actions(r"C:\Windows\explorer.exe").expect("ok");
+        let target = ActionTarget::new(TargetKind::File, r"C:\Windows\explorer.exe");
+        let items = list_actions(&target).expect("ok");
         let ids: Vec<_> = items.iter().map(|a| a.id.as_str()).collect();
         assert!(ids.contains(&"open_folder"));
         assert!(ids.contains(&"copy"));
@@ -283,7 +301,7 @@ mod tests {
 
     #[test]
     fn run_unknown_action_errors() {
-        let err = run_action(r"C:\Windows\explorer.exe", "nope").unwrap_err();
+        let err = run_action_direct(r"C:\Windows\explorer.exe", "nope").unwrap_err();
         assert!(err.contains("未知动作"));
     }
 }

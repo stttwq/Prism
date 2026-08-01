@@ -16,6 +16,7 @@ const SERVICE_NAME: &str = "PrismIndexer";
 define_windows_service!(ffi_service_main, service_main);
 
 fn main() {
+    prism_core::logging::init("indexer", &prism_core::index_cache::machine_data_dir());
     let result = if std::env::args_os().any(|arg| arg == "--console") {
         run_console()
     } else {
@@ -121,6 +122,7 @@ fn run_runtime(stop: Arc<prism_core::indexer_runtime::Shutdown>) -> Result<(), S
 fn log_service_error(context: &str, error: &str) {
     let message = format!("{context}: {error}");
     prism_core::log(&message);
+    prism_core::logging::event("error", "indexer_service_failure", None, None);
     let data_dir = prism_core::index_cache::machine_data_dir();
     if std::fs::create_dir_all(&data_dir).is_ok() {
         let path = data_dir.join("service.log");
@@ -129,7 +131,7 @@ fn log_service_error(context: &str, error: &str) {
             .append(true)
             .open(path)
         {
-            let _ = writeln!(file, "{message}");
+            let _ = writeln!(file, "{}", prism_core::logging::redacted_id(&message));
         }
     }
 }

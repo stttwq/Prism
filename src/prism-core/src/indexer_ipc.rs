@@ -131,8 +131,34 @@ pub fn validate_search_request(max: usize, filters: Option<&[SearchFilter]>) -> 
                 "filter value may contain at most {MAX_FILTER_VALUE_BYTES} bytes"
             ));
         }
+        if filter.field != "exclude_path" {
+            return Err(format!("unsupported filter field: {}", filter.field));
+        }
+        if filter.value.trim().is_empty()
+            || filter.value.contains('\0')
+            || filter.value.chars().any(char::is_control)
+            || !std::path::Path::new(filter.value.trim()).is_absolute()
+        {
+            return Err("exclude_path filters require an absolute path".into());
+        }
     }
     Ok(())
+}
+
+pub fn exclusion_paths(filters: Option<&[SearchFilter]>) -> Vec<String> {
+    filters
+        .unwrap_or_default()
+        .iter()
+        .filter(|filter| filter.field == "exclude_path")
+        .map(|filter| {
+            filter
+                .value
+                .trim()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_owned()
+        })
+        .collect()
 }
 
 fn default_max() -> usize {
@@ -186,6 +212,27 @@ mod tests {
         )
         .unwrap();
         assert!(status.build_progress.is_none());
+    }
+
+    #[test]
+    fn user_exclusions_are_bounded_absolute_paths() {
+        let valid = [SearchFilter {
+            field: "exclude_path".into(),
+            value: r"C:\Users\me\build".into(),
+        }];
+        validate_search_request(8, Some(&valid)).unwrap();
+        assert_eq!(exclusion_paths(Some(&valid)), vec![r"C:\Users\me\build"]);
+
+        let unknown = [SearchFilter {
+            field: "future".into(),
+            value: "x".into(),
+        }];
+        assert!(validate_search_request(8, Some(&unknown)).is_err());
+        let relative = [SearchFilter {
+            field: "exclude_path".into(),
+            value: "relative".into(),
+        }];
+        assert!(validate_search_request(8, Some(&relative)).is_err());
     }
 
     #[test]
