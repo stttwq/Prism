@@ -4,11 +4,11 @@
 
 broker 拥有用户级 `history-v1`，按 typed stable target 聚合成功操作。indexer 拥有机器级文件/文件夹拼音 sidecar；应用和瞬态窗口由 broker 使用同一版本的紧凑音节/词组规则即时编码。两侧共享生成规则和测试语料，不共享可写文件。
 
-实现第一步以原型比较 mmap sidecar、紧凑偏移表和增量 overlay；默认选择“indexer mmap 主 sidecar + 有界 rename delta”，除非同一 G0 语料证明无法满足 10MB/P95 门禁。该技术门只改变存储表示，不得改变已锁定匹配行为。
+实现第一步以原型比较 mmap sidecar、紧凑偏移表和增量 overlay；默认选择“indexer 只读映射文件 + 解码后的紧凑热查询表 + 有界 rename delta”，除非同一 G0 语料证明无法满足 10MB/P95 门禁。当前 postcard 容器不是零拷贝格式：映射负责只读文件生命周期和校验输入，搜索使用一次性解码的 heap 表。验收内存必须同时计算映射与 heap，不能把该实现描述成 mmap-primary。该技术门只改变存储表示，不得改变已锁定匹配行为。
 
 ## Pinyin Sidecar
 
-sidecar 头包含 magic、schema、字典版本、索引 generation/identity、长度和校验信息；主体保存名称记录到音节序列/首字母及汉字 span 的紧凑映射。USN 新增/改名进入有界 delta，删除进入 tombstone，达到阈值后由服务内部重建。
+sidecar 头包含 magic、schema、字典版本、索引 generation/identity、长度和校验信息；主体保存名称记录到音节序列/首字母及汉字 span 的紧凑映射。加载时保留只读文件映射并将 postcard `Vec` 解码为查询表；关闭拼音会同时释放映射、解码表和 overlay。USN 新增/改名进入有界 delta，删除进入 tombstone，达到阈值后由服务内部重建。
 
 普通客户端只能选择是否启用拼音，不暴露重建或任意写命令。关闭时释放 mmap/overlay；失败时返回字面结果并暴露脱敏状态。
 

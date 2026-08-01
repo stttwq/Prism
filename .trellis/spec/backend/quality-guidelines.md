@@ -14,6 +14,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 
 - **Cancel mid-read on the named pipe after a request was written.** Leaving an unread response desyncs the next request (UI shows wrong query highlights / stale lists). Cancellation may only drop the *business* result after the line is fully read.
 - **Blocking index/app scan on the async pipe runtime thread.** Use `spawn_blocking` + multi-thread Tokio; otherwise search returns empty / hangs.
+- **Loading or rebuilding the pinyin sidecar before publishing a valid index cache.** Publish the literal-search index first, then map/decode the optional sidecar on `spawn_blocking`; `building`/missing/corrupt sidecar states must remain literal-searchable.
 - **Per-`.lnk` `CoInitialize`/`CoCreateInstance` in a tight scan loop.** Reuse one COM `IShellLink` for the whole Start Menu scan.
 - **Forcing a full disk rebuild when a valid `index.bin` cache loads.** Cache-first; refresh on timer. Bump cache version when `IndexEntry` / pool layout changes so old files are discarded, not mis-parsed.
 - **Storing full paths without interning parent directories.** Use dir+name intern (cache v3): sibling files share one parent string; identical filenames share one name string. Reconstruct full path only when returning search hits.
@@ -49,6 +50,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
   serialized rebuild instead of silently losing a current file.
 - Path validation for file/app `execute`/`reveal`: reject empty, NUL, and relative paths.
 - Match spans: UTF-16 code unit offsets (WPF `string` indexing).
+- A pinyin rebuild drops the previous mapping before work starts. The bounded USN delta invalidates the sidecar at its threshold, and a concurrent disable must prevent a completed load/rebuild from reinstalling optional memory.
 - Web engines load at backend start from shared `settings.json`; empty/missing list falls back to defaults (Bing-first: `bi`, `b`, `g`).
 - `reload_engines` IPC replaces the in-memory list immediately (RwLock); empty list falls back to defaults. Accept PascalCase engine fields from the frontend.
 - `actions` / `run_action`: path validation same as execute/reveal (absolute only). First-version actions are exactly four: `open_folder` (explorer /select), `copy`/`cut` (CF_HDROP + Preferred DropEffect), `copy_path` (CF_UNICODETEXT). Do not ship placeholder "快捷菜单" rows that cannot run. On clipboard `SetClipboardData` failure, `GlobalFree` the unowned `HGLOBAL` (system only takes ownership after success).
@@ -68,6 +70,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 - Web-search tests: Chinese query URL-encoding; `bi` vs `b`; custom engine list; `execute` https not rejected as relative path; web row sorts before apps when keyword matches.
 - `reload_engines` tests: replace list affects subsequent search; empty list falls back to defaults; PascalCase fields parse.
 - Actions tests: list_actions rejects relative; basics present; unknown run_action errors; IPC `actions` / `run_action` wiring.
+- Pinyin lifecycle tests: cache publication precedes sidecar classification, rebuild states return literal results without stale pinyin hits, the delta cannot exceed its threshold, and disabled state releases and does not reinstall the mapping.
 - `cargo test --manifest-path src/prism-core/Cargo.toml` must stay green before calling a step done.
 
 ---
@@ -383,6 +386,73 @@ G9 acceptance on three fixed NTFS volumes is recorded under
 1.401 s, all volumes at 4.540 s, interrupted build persistence stayed absent,
 watcher operations were visible in 17.4-18.8 ms, and three-process Private
 Working Set peaked at 55,554,048 bytes (100 MiB hard gate).
+
+## Installer Uninstall Completeness Contract
+
+### 1. Scope / Trigger
+
+Apply this contract whenever the installer adds a resident process, Windows
+service, installed binary, or machine-level derived cache. Tray applications
+remain alive without a visible window, so window-close behavior is not proof
+that uninstall can remove their binaries.
+
+### 2. Signatures
+
+- `[UninstallRun]` force-terminates both process trees with
+  `taskkill /F /IM Prism.exe /T` and `taskkill /F /IM prism-core.exe /T`.
+- `CurUninstallStepChanged(usUninstall)` stops and deletes `PrismIndexer`.
+- `[UninstallDelete]` removes `{commonappdata}\Prism` and uses only
+  `Type: dirifempty; Name: "{app}"` for the installation directory.
+- Installed acceptance publishes `uninstall-residue-*.json` with exit code,
+  process, service, ProgramData, installed-binary, and install-directory state.
+
+### 3. Contracts
+
+- Force-kill tray/no-window processes before Inno deletes installed files.
+- A passing uninstall leaves no Prism processes, `PrismIndexer` service,
+  installed binaries, or `%ProgramData%\Prism` cache directory.
+- Remove `{app}` only when empty. Never recursively delete the whole install
+  directory because users may install into or add files to a shared directory.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| `Prism.exe` or `prism-core.exe` survives | Fail; installed binaries may remain locked. |
+| `PrismIndexer` still exists | Fail, including stopped or delete-pending states. |
+| `%ProgramData%\Prism` exists | Fail; sidecar/index caches are derived install state. |
+| Installed binary remains | Fail even when the uninstaller exits zero. |
+| `{app}` contains unrelated user files | Preserve the directory and those files. |
+| Uninstaller returns nonzero | Fail and retain diagnostic evidence. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: silent uninstall returns zero and all process, service, binary, and
+  machine-cache checks report absent.
+- Base: `{app}` contains a user file; product files disappear but the nonempty
+  directory remains.
+- Bad: trust exit code alone, omit the broker process, or delete `{app}` with
+  `filesandordirs` to conceal residue.
+
+### 6. Tests Required
+
+- Install the final setup executable, launch the tray frontend and broker, then
+  run silent uninstall and capture `uninstall-residue-*.json`.
+- Assert exit code zero, empty process/binary arrays, service absent,
+  `%ProgramData%\Prism` absent, and the product-only install directory absent.
+- Separately verify that an unrelated sentinel file under `{app}` survives.
+
+### 7. Wrong vs Correct
+
+```ini
+; Wrong: a tray process can survive, while recursive deletion risks user files.
+Filename: "{cmd}"; Parameters: "/C taskkill /IM Prism.exe"
+Type: filesandordirs; Name: "{app}"
+
+; Correct: terminate both process trees and remove the install dir only if empty.
+Filename: "{cmd}"; Parameters: "/C taskkill /F /IM Prism.exe /T 2>nul & taskkill /F /IM prism-core.exe /T 2>nul"
+Type: dirifempty; Name: "{app}"
+```
 
 ## Code Review Checklist
 
