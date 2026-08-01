@@ -96,6 +96,8 @@ Filename: "{cmd}"; Parameters: "/C taskkill /IM Prism.exe /T 2>nul & taskkill /I
 [UninstallDelete]
 ; 便携模式下数据落在 {app}\data，随软件卸载清理；用户级安装数据在 LocalAppData 不受影响。
 Type: filesandordirs; Name: "{app}\data"
+; LocalSystem 索引器的数据是可重建派生缓存，卸载时不得残留在 ProgramData。
+Type: filesandordirs; Name: "{commonappdata}\Prism"
 
 [Code]
 function InitializeSetup(): Boolean;
