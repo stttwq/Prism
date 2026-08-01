@@ -179,6 +179,17 @@ public sealed class SearchViewModelTests
         var future = PipeClient.ParseResult(futureDocument.RootElement);
         Assert.Equal(SearchResultKind.Unknown, future.ResultKind);
         Assert.Equal("future_kind", future.Kind);
+
+        using var typedDocument = JsonDocument.Parse(
+            """{"kind":"web","title":"x","subtitle":"","execute_id":"legacy","target":{"kind":"web","value":"https://example.com"},"match_spans":[]}""");
+        var typed = PipeClient.ParseResult(typedDocument.RootElement);
+        Assert.Equal(new ActionTarget("web", "https://example.com"), typed.ExecutionTarget);
+        Assert.Equal(new ActionTarget("file", "legacy"),
+            new SearchResult("file", "x", "", "legacy", []).ExecutionTarget);
+
+        var wire = JsonSerializer.Serialize(
+            PipeClient.TargetPayload(new ActionTarget("web", "https://example.com")));
+        Assert.Equal("""{"kind":"web","value":"https://example.com"}""", wire);
     }
 
     [Fact]
@@ -348,6 +359,7 @@ public sealed class SearchViewModelTests
         public int SearchCount { get; private set; }
         public List<int> SearchMaxima { get; } = [];
         public IReadOnlyList<ActionItem> Actions { get; init; } = [];
+        public ActionTarget? LastTarget { get; private set; }
 
         public void Enqueue(SearchResponse response) => Enqueue(Task.FromResult(response));
         public void Enqueue(Task<SearchResponse> response) => _responses.Enqueue(response);
@@ -366,14 +378,30 @@ public sealed class SearchViewModelTests
             SearchMaxima.Add(max);
             return _responses.Dequeue();
         }
-        public Task ExecuteAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
-        public Task RevealAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ExecuteAsync(ActionTarget target, CancellationToken ct = default)
+        {
+            LastTarget = target;
+            return Task.CompletedTask;
+        }
+        public Task RevealAsync(ActionTarget target, CancellationToken ct = default)
+        {
+            LastTarget = target;
+            return Task.CompletedTask;
+        }
         public Task<IReadOnlyList<ActionItem>> GetActionsAsync(
-            string id,
-            CancellationToken ct = default) => Task.FromResult(Actions);
+            ActionTarget target,
+            CancellationToken ct = default)
+        {
+            LastTarget = target;
+            return Task.FromResult(Actions);
+        }
         public Task RunActionAsync(
-            string id,
+            ActionTarget target,
             string action,
-            CancellationToken ct = default) => Task.CompletedTask;
+            CancellationToken ct = default)
+        {
+            LastTarget = target;
+            return Task.CompletedTask;
+        }
     }
 }

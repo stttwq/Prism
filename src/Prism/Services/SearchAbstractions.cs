@@ -28,10 +28,10 @@ public interface ISearchClient
         int max,
         SearchContext context,
         CancellationToken ct = default);
-    Task ExecuteAsync(string id, CancellationToken ct = default);
-    Task RevealAsync(string id, CancellationToken ct = default);
-    Task<IReadOnlyList<ActionItem>> GetActionsAsync(string id, CancellationToken ct = default);
-    Task RunActionAsync(string id, string action, CancellationToken ct = default);
+    Task ExecuteAsync(ActionTarget target, CancellationToken ct = default);
+    Task RevealAsync(ActionTarget target, CancellationToken ct = default);
+    Task<IReadOnlyList<ActionItem>> GetActionsAsync(ActionTarget target, CancellationToken ct = default);
+    Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default);
 }
 
 public interface IDebounceTimer

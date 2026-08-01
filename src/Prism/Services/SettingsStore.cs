@@ -36,6 +36,12 @@ public sealed class SettingsStore
         DataDir = ResolveDataDir();
         Directory.CreateDirectory(DataDir);
     }
+
+    internal SettingsStore(string dataDir)
+    {
+        DataDir = dataDir;
+        Directory.CreateDirectory(DataDir);
+    }
     /// <summary>从磁盘加载设置；文件不存在或损坏时返回默认值。</summary>
     public Settings Load()
     {
@@ -45,7 +51,15 @@ public sealed class SettingsStore
                 return Settings.Default;
 
             var json = File.ReadAllText(SettingsPath, Encoding.UTF8);
-            return JsonSerializer.Deserialize<Settings>(json, JsonOptions) ?? Settings.Default;
+            var settings = JsonSerializer.Deserialize<Settings>(json, JsonOptions);
+            if (settings is null || settings.SchemaVersion > Settings.CurrentSchemaVersion)
+                return Settings.Default;
+            return settings with
+            {
+                ComboHotkey = settings.ComboHotkey ?? Settings.Default.ComboHotkey,
+                WebEngines = settings.WebEngines ?? [],
+                ExcludedPaths = settings.ExcludedPaths ?? [],
+            };
         }
         catch
         {
@@ -57,10 +71,28 @@ public sealed class SettingsStore
     /// <summary>将设置持久化到磁盘（原子写：先写临时文件再替换）。</summary>
     public void Save(Settings settings)
     {
+        Validate(settings);
+        settings = settings with { SchemaVersion = Settings.CurrentSchemaVersion };
         var tmp = SettingsPath + ".tmp";
         var json = JsonSerializer.Serialize(settings, JsonOptions);
         File.WriteAllText(tmp, json, Encoding.UTF8);
         File.Move(tmp, SettingsPath, overwrite: true);
+    }
+
+    private static void Validate(Settings settings)
+    {
+        if (settings.ExcludedPaths.Count > 32)
+            throw new InvalidDataException("ExcludedPaths may contain at most 32 entries.");
+        foreach (var path in settings.ExcludedPaths)
+        {
+            if (string.IsNullOrWhiteSpace(path)
+                || path.Length > 1024
+                || path.Any(char.IsControl)
+                || !Path.IsPathFullyQualified(path))
+            {
+                throw new InvalidDataException("ExcludedPaths must contain bounded absolute paths.");
+            }
+        }
     }
 
     /// <summary>

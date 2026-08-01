@@ -12,6 +12,19 @@ public enum SearchResultKind
 
 public sealed record SearchMatchMetadata(int Class, int Position, int Score);
 
+public sealed record ActionTarget(string Kind, string Value)
+{
+    public static ActionTarget FromLegacy(string resultKind, string executeId) => new(
+        resultKind switch
+        {
+            "app" => "application",
+            "folder" => "directory",
+            "web" => "web",
+            _ => "file",
+        },
+        executeId);
+}
+
 /// <summary>单条搜索结果（frontend-spec.md §2）。</summary>
 /// <param name="Kind">"app" | "file" | "folder" | "web" | "more"</param>
 /// <param name="Title">主标题（文件名）。</param>
@@ -26,6 +39,9 @@ public sealed record SearchResult(
     int[] MatchSpans)
 {
     public SearchMatchMetadata? MatchMetadata { get; init; }
+    public ActionTarget? Target { get; init; }
+
+    public ActionTarget ExecutionTarget => Target ?? ActionTarget.FromLegacy(Kind, ExecuteId);
 
     public SearchResultKind ResultKind => Kind switch
     {

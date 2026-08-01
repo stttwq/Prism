@@ -215,7 +215,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.ExecuteAsync(item.ExecuteId).ConfigureAwait(true);
+            await _pipe.ExecuteAsync(item.ExecutionTarget).ConfigureAwait(true);
             HideRequested?.Invoke();
         }
         catch (Exception ex)
@@ -233,7 +233,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.RevealAsync(item.ExecuteId).ConfigureAwait(true);
+            await _pipe.RevealAsync(item.ExecutionTarget).ConfigureAwait(true);
             HideRequested?.Invoke();
         }
         catch (Exception ex)
@@ -291,7 +291,7 @@ public sealed class SearchViewModel
             if (!_pipe.IsConnected)
                 await _pipe.StartAsync().ConfigureAwait(true);
 
-            var actions = await _pipe.GetActionsAsync(item.ExecuteId).ConfigureAwait(true);
+            var actions = await _pipe.GetActionsAsync(item.ExecutionTarget).ConfigureAwait(true);
             if (actions.Count == 0)
                 _state.StatusMessage = "无可用动作";
             return actions;
@@ -336,7 +336,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.RunActionAsync(target.ExecuteId, action.Id).ConfigureAwait(true);
+            await _pipe.RunActionAsync(target.ExecutionTarget, action.Id).ConfigureAwait(true);
             HideRequested?.Invoke();
         }
         catch (Exception ex)

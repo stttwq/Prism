@@ -25,6 +25,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private string _statusMessage = "";
     private WebEngineEditItem? _selectedEngine;
     private int _selectedTab; // 0=常规 1=网页搜索 2=关于
+    private readonly List<string> _excludedPaths;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -43,6 +44,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _autoStartEnabled = settings.AutoStart;
         _hotkeyMode = settings.HotkeyMode;
         _comboHotkey = settings.ComboHotkey;
+        _excludedPaths = settings.ExcludedPaths.ToList();
         DataDir = store.DataDir;
 
         Engines = new ObservableCollection<WebEngineEditItem>(
@@ -288,10 +290,12 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
         var next = new Settings
         {
+            SchemaVersion = Settings.CurrentSchemaVersion,
             HotkeyMode = _hotkeyMode,
             ComboHotkey = ComboHotkey.Trim(),
             AutoStart = _autoStartEnabled,
             WebEngines = engines,
+            ExcludedPaths = _excludedPaths,
         };
 
         try

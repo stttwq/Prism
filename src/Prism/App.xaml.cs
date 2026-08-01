@@ -64,6 +64,7 @@ public partial class App : Application
         _pipe = new PipeClient();
         _icons = new IconCache();
         _vm = new SearchViewModel(_state, _pipe);
+        ApplySearchExclusions(settings);
 
         // 深浅色跟随系统（替换 App.xaml 中的 Tokens 字典）。
         _theme = new ThemeWatcher(_state);
@@ -149,6 +150,7 @@ public partial class App : Application
         try
         {
             _hotkey?.Apply(settings);
+            ApplySearchExclusions(settings);
             Log($"快捷键已应用：{settings.HotkeyMode}" +
                 (settings.HotkeyMode == HotkeyMode.Combo ? $" ({settings.ComboHotkey})" : ""));
         }
@@ -157,6 +159,14 @@ public partial class App : Application
             Log("快捷键应用失败：" + ex.Message);
             throw;
         }
+    }
+
+    private void ApplySearchExclusions(Settings settings)
+    {
+        var filters = settings.ExcludedPaths
+            .Select(path => new SearchFilterOption("exclude_path", path))
+            .ToArray();
+        _vm?.SetSearchContext(SearchContext.Default with { Filters = filters });
     }
 
     private async Task ReloadBackendEnginesAsync(IReadOnlyList<WebEngine> engines)

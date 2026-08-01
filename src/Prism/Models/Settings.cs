@@ -22,6 +22,11 @@ public sealed record WebEngine(string Keyword, string Name, string UrlTemplate);
 /// </summary>
 public sealed record Settings
 {
+    public const int CurrentSchemaVersion = 1;
+
+    /// <summary>0 denotes a legacy file that predates explicit versioning.</summary>
+    public int SchemaVersion { get; init; }
+
     /// <summary>呼出方式，默认双击 Ctrl。</summary>
     public HotkeyMode HotkeyMode { get; init; } = HotkeyMode.DoubleCtrl;
 
@@ -34,13 +39,18 @@ public sealed record Settings
     /// <summary>网页快捷搜索引擎列表。</summary>
     public List<WebEngine> WebEngines { get; init; } = [];
 
+    /// <summary>User-owned absolute directory exclusions sent as bounded search filters.</summary>
+    public List<string> ExcludedPaths { get; init; } = [];
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
+        SchemaVersion = CurrentSchemaVersion,
         HotkeyMode = HotkeyMode.DoubleCtrl,
         ComboHotkey = "Alt+Space",
         AutoStart = false,
         WebEngines = DefaultEngines(),
+        ExcludedPaths = [],
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>

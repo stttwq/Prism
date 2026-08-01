@@ -151,15 +151,15 @@ public sealed class PipeClient : ISearchClient, IDisposable
             : null;
 
     /// <summary>打开文件/文件夹/程序。</summary>
-    public async Task ExecuteAsync(string id, CancellationToken ct = default)
+    public async Task ExecuteAsync(ActionTarget target, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "execute", id }, ct).ConfigureAwait(false);
+        await SendAsync(new { type = "execute", target = TargetPayload(target) }, ct).ConfigureAwait(false);
     }
 
     /// <summary>在资源管理器中定位文件。</summary>
-    public async Task RevealAsync(string id, CancellationToken ct = default)
+    public async Task RevealAsync(ActionTarget target, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "reveal", id }, ct).ConfigureAwait(false);
+        await SendAsync(new { type = "reveal", target = TargetPayload(target) }, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -179,9 +179,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
     }
 
     /// <summary>请求某文件/文件夹的动作列表（→ 键动作面板）。</summary>
-    public async Task<IReadOnlyList<ActionItem>> GetActionsAsync(string id, CancellationToken ct = default)
+    public async Task<IReadOnlyList<ActionItem>> GetActionsAsync(ActionTarget target, CancellationToken ct = default)
     {
-        var resp = await SendAsync(new { type = "actions", id }, ct).ConfigureAwait(false);
+        var resp = await SendAsync(new { type = "actions", target = TargetPayload(target) }, ct).ConfigureAwait(false);
         var items = new List<ActionItem>();
         if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
         {
@@ -192,10 +192,18 @@ public sealed class PipeClient : ISearchClient, IDisposable
     }
 
     /// <summary>执行动作面板中的某一项。</summary>
-    public async Task RunActionAsync(string id, string action, CancellationToken ct = default)
+    public async Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "run_action", id, action }, ct).ConfigureAwait(false);
+        await SendAsync(
+            new { type = "run_action", target = TargetPayload(target), action },
+            ct).ConfigureAwait(false);
     }
+
+    internal static object TargetPayload(ActionTarget target) => new
+    {
+        kind = target.Kind,
+        value = target.Value,
+    };
 
     private static ActionItem ParseAction(JsonElement el)
     {
@@ -292,9 +300,20 @@ public sealed class PipeClient : ISearchClient, IDisposable
         {
             metadata = new SearchMatchMetadata(parsedClass, parsedPosition, parsedScore);
         }
+        ActionTarget? target = null;
+        if (el.TryGetProperty("target", out var targetValue)
+            && targetValue.ValueKind == JsonValueKind.Object
+            && targetValue.TryGetProperty("kind", out var targetKind)
+            && targetKind.ValueKind == JsonValueKind.String
+            && targetValue.TryGetProperty("value", out var targetPayload)
+            && targetPayload.ValueKind == JsonValueKind.String)
+        {
+            target = new ActionTarget(targetKind.GetString() ?? "", targetPayload.GetString() ?? "");
+        }
         return new SearchResult(kind, title, subtitle, id, spans)
         {
             MatchMetadata = metadata,
+            Target = target,
         };
     }
 
