@@ -287,6 +287,244 @@ public sealed class SearchViewModelTests
         Assert.Equal("corrupt", response.HistoryStatus);
     }
 
+    [Fact]
+    public async Task ScopeRootChangesRequeryAndKeepOtherContextDimensions()
+    {
+        var client = new FakeSearchClient();
+        for (ulong generation = 1; generation <= 3; generation++)
+            client.Enqueue(Response("x", false, generation, Result("x")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+        vm.SetSearchContext(SearchContext.Default with
+        {
+            Filters = [new SearchFilterOption("exclude_path", @"C:\build")],
+        });
+        vm.OnQueryChanged("x");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        vm.SetScopeRoot(@"C:\Users\me\Docs");
+        timers.Generation.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        Assert.Equal(@"C:\Users\me\Docs", client.LastContext?.Root);
+        Assert.Equal(
+            new SearchFilterOption("exclude_path", @"C:\build"),
+            client.LastContext?.Filters.Single());
+
+        // 回到全局：root 清空同样触发一次重查。
+        vm.SetScopeRoot(null);
+        timers.Generation.Fire();
+        await Eventually(() => client.SearchCount == 3);
+        Assert.Null(client.LastContext?.Root);
+        Assert.Single(client.LastContext!.Filters);
+    }
+
+    /// <summary>
+    /// G4 §4.4 A: empty input under a host root must request the broker recent-under-root
+    /// list instead of collapsing to Idle.
+    /// </summary>
+    [Fact]
+    public async Task EmptyQueryWithHostRootRequestsRecentUnderRoot()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(new SearchResponse(
+            "",
+            [Result("recent")],
+            false,
+            null,
+            false,
+            null));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+        vm.SetScopeRoot(@"C:\Users\me\Docs");
+
+        // Capturing a host root with an empty box schedules one empty search.
+        Assert.Equal(PanelMode.Results, state.Mode);
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        Assert.Equal("", client.LastQuery);
+        Assert.Equal(@"C:\Users\me\Docs", client.LastContext?.Root);
+        Assert.Equal("recent", state.Results[0].Title);
+
+        // Re-clearing the box while still scoped must search again, not collapse to Idle.
+        client.Enqueue(new SearchResponse(
+            "",
+            [Result("again")],
+            false,
+            null,
+            false,
+            null));
+        vm.OnQueryChanged("x");
+        // Do not fire the non-empty debounce — jump straight back to empty.
+        vm.OnQueryChanged("");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        Assert.Equal("", client.LastQuery);
+        Assert.Equal(PanelMode.Results, state.Mode);
+        Assert.Equal("again", state.Results[0].Title);
+    }
+
+    /// <summary>
+    /// G4 §4.4 B (deferred to G5): empty input without a root stays Idle and never hits
+    /// the broker — avoids a meaningless full-index scan for "recent windows".
+    /// </summary>
+    [Fact]
+    public async Task EmptyQueryWithoutRootStaysIdleAndDoesNotSearch()
+    {
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("x");
+        // Do not fire debounce — switch back to empty without a root.
+        vm.OnQueryChanged("");
+        timers.Input.Fire();
+        await Task.Delay(20);
+
+        Assert.Equal(0, client.SearchCount);
+        Assert.Equal(PanelMode.Idle, state.Mode);
+        Assert.Empty(state.Results);
+
+        // Explicitly clearing a previous root with an empty box also returns to Idle
+        // without issuing a second broker call for "recent windows" (G5).
+        client.Enqueue(new SearchResponse("", [], false, null, false, null));
+        vm.SetScopeRoot(@"C:\Users\me\Docs");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        vm.SetScopeRoot(null);
+        timers.Input.Fire();
+        await Task.Delay(20);
+        Assert.Equal(1, client.SearchCount);
+        Assert.Equal(PanelMode.Idle, state.Mode);
+        Assert.Empty(state.Results);
+    }
+
+    /// <summary>
+    /// Empty-query host responses must never seed the literal prefix cache: a later typed
+    /// query still hits the broker even when the empty reply had a generation and no items.
+    /// </summary>
+    [Fact]
+    public async Task EmptyHostRootResponseDoesNotSeedPrefixCache()
+    {
+        var client = new FakeSearchClient();
+        // Empty recent-under-root reply with a generation — still must not become a cache seed.
+        client.Enqueue(new SearchResponse(
+            "",
+            [],
+            false,
+            null,
+            false,
+            9));
+        client.Enqueue(Response("doc", false, 9, Result("docs")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.SetScopeRoot(@"C:\Users\me\Docs");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        Assert.Equal(PanelMode.Results, state.Mode);
+        Assert.Empty(state.Results);
+        Assert.Equal("", state.StatusMessage);
+
+        vm.OnQueryChanged("doc");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        Assert.Equal("docs", state.Results[0].Title);
+    }
+
+    [Fact]
+    public void SearchPayloadCarriesRootOnlyWhileTheScopeIsCurrentDirectory()
+    {
+        var global = JsonSerializer.Serialize(
+            PipeClient.SearchPayload("x", 8, SearchContext.Default));
+        // 全局搜索的线上格式必须与加入 root 之前完全一致（旧 broker 也能解析）。
+        Assert.Equal("""{"type":"search","query":"x","max":8}""", global);
+
+        var blank = JsonSerializer.Serialize(
+            PipeClient.SearchPayload("x", 8, SearchContext.Default with { Root = "   " }));
+        Assert.DoesNotContain("root", blank);
+
+        var scoped = JsonSerializer.Serialize(PipeClient.SearchPayload("x", 1000, new SearchContext(
+            "all",
+            @"C:\Users\me\Docs",
+            [new SearchFilterOption("exclude_path", @"C:\build")],
+            1)));
+        Assert.Equal(
+            """{"type":"search","query":"x","max":1000,"filters":[{"field":"exclude_path","value":"C:\\build"}],"root":"C:\\Users\\me\\Docs"}""",
+            scoped);
+    }
+
+    [Fact]
+    public void ProtocolReaderMapsRootRejectionToTheStructuredEnum()
+    {
+        using var rejected = JsonDocument.Parse(
+            """{"type":"results","query":"x","items":[],"is_indexing":false,"root_rejection":"volume_not_indexed","root_message":"root volume is not indexed"}""");
+        var response = PipeClient.ParseSearchResponse(rejected.RootElement, "fallback");
+        Assert.Equal(RootRejection.VolumeNotIndexed, response.RootRejection);
+        Assert.Equal("root volume is not indexed", response.RootMessage);
+
+        // 每个后端稳定字符串都要能解析回来，未知值退化为「无结构原因」而不是异常。
+        foreach (var rejection in Enum.GetValues<RootRejection>())
+            Assert.Equal(rejection, RootRejectionCodes.Parse(RootRejectionCodes.ToCode(rejection)));
+        Assert.Null(RootRejectionCodes.Parse("future_reason"));
+
+        using var ordinary = JsonDocument.Parse(
+            """{"type":"results","query":"x","items":[],"is_indexing":false}""");
+        Assert.Null(PipeClient.ParseSearchResponse(ordinary.RootElement, "fallback").RootRejection);
+    }
+
+    /// <summary>
+    /// 后端拒绝 root 时：结果已是全局的，范围状态必须同步回到全局并给出提示，
+    /// 之后的请求不再带 root —— 不允许出现「UI 说当前目录，实际搜全局」。
+    /// </summary>
+    [Fact]
+    public async Task BackendRootRejectionFallsBackToGlobalAndStopsSendingTheRoot()
+    {
+        var window = new IntPtr(0x4321);
+        var scope = new HostScopeController(
+            [new StubHostAdapter(window, @"C:\Users\me\Docs")],
+            new AcceptingRootValidator(),
+            new AliveWindowProbe());
+        scope.Capture(window);
+        Assert.Equal(@"C:\Users\me\Docs", scope.Root);
+
+        var client = new FakeSearchClient();
+        client.Enqueue(new SearchResponse(
+            "x",
+            [Result("global-hit")],
+            false,
+            null,
+            false,
+            5,
+            RootRejection: RootRejection.VolumeNotIndexed,
+            RootMessage: "root volume is not indexed"));
+        client.Enqueue(Response("x", false, 5, Result("global-hit")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+        vm.RootRejected += rejection => scope.Invalidate(rejection);
+        scope.Changed += () => vm.SetScopeRoot(scope.Root);
+        vm.SetScopeRoot(scope.Root);
+
+        vm.OnQueryChanged("x");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        Assert.Equal(@"C:\Users\me\Docs", client.LastContext?.Root);
+        Assert.Equal(SearchScope.Global, scope.Scope);
+        Assert.Null(scope.Root);
+        Assert.Contains("不在索引中", scope.Notice);
+
+        // 降级触发的重查必须是纯全局请求。
+        timers.Generation.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        Assert.Null(client.LastContext?.Root);
+        Assert.Equal("global-hit", state.Results[0].Title);
+    }
+
     private static SearchResult Result(string title) =>
         new("file", title, $"C:\\{title}", $"C:\\{title}", []);
 
@@ -389,6 +627,8 @@ public sealed class SearchViewModelTests
         public List<int> SearchMaxima { get; } = [];
         public IReadOnlyList<ActionItem> Actions { get; init; } = [];
         public ActionTarget? LastTarget { get; private set; }
+        public SearchContext? LastContext { get; private set; }
+        public string? LastQuery { get; private set; }
 
         public void Enqueue(SearchResponse response) => Enqueue(Task.FromResult(response));
         public void Enqueue(Task<SearchResponse> response) => _responses.Enqueue(response);
@@ -405,6 +645,8 @@ public sealed class SearchViewModelTests
         {
             SearchCount++;
             SearchMaxima.Add(max);
+            LastContext = context;
+            LastQuery = query;
             return _responses.Dequeue();
         }
         public Task ExecuteAsync(ActionTarget target, CancellationToken ct = default)
@@ -432,5 +674,37 @@ public sealed class SearchViewModelTests
             LastTarget = target;
             return Task.CompletedTask;
         }
+    }
+
+    /// <summary>只识别一个窗口的 Explorer 占位 adapter，用于把范围状态推到「当前目录」。</summary>
+    private sealed class StubHostAdapter(IntPtr window, string folder) : IHostAdapter
+    {
+        public HostKind Kind => HostKind.Explorer;
+        public bool IsEnabled => true;
+
+        public HostDetection Detect(IntPtr foregroundWindow) =>
+            foregroundWindow == window
+                ? HostDetection.Host(Kind, HostCapability.ReadFolder)
+                : HostDetection.NotHost(Kind, HostFailureReason.NotThisHost);
+
+        public HostFolder GetFolder(IntPtr hostWindow) => HostFolder.Success(folder);
+
+        public HostNavigation NavigateOrFill(IntPtr hostWindow, HostNavigationRequest request) =>
+            HostNavigation.Success;
+    }
+
+    /// <summary>本地校验通过：「是否在索引里」只有后端知道，正是本测试要覆盖的路径。</summary>
+    private sealed class AcceptingRootValidator : IRootValidator
+    {
+        public RootRejection? Validate(string? path, out string normalized)
+        {
+            normalized = path ?? "";
+            return null;
+        }
+    }
+
+    private sealed class AliveWindowProbe : IHostWindowProbe
+    {
+        public bool IsAlive(IntPtr window) => window != IntPtr.Zero;
     }
 }

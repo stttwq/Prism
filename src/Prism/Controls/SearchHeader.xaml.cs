@@ -37,6 +37,24 @@ public partial class SearchHeader : UserControl
     /// <summary>方向键 / Enter / Esc / ←/→ / Ctrl+1..9 等按键上抛。</summary>
     public event Action<KeyEventArgs>? QueryKeyDown;
 
+    /// <summary>范围标签被点击（与 Ctrl+G 等价）。</summary>
+    public event Action? ScopeToggleRequested;
+
+    /// <summary>刷新范围标签：不可见时隐藏，可见时显示当前目录或全局。</summary>
+    public void SetScope(bool visible, string label, string tooltip)
+    {
+        ScopeChip.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        ScopeChip.Content = label;
+        ScopeChip.ToolTip = string.IsNullOrEmpty(tooltip) ? null : tooltip;
+        // 无障碍：屏幕阅读器读到的是完整范围说明，而不是截断的目录名。
+        System.Windows.Automation.AutomationProperties.SetName(
+            ScopeChip,
+            string.IsNullOrEmpty(tooltip) ? label : $"{label}。{tooltip}");
+    }
+
+    private void OnScopeChipClick(object sender, RoutedEventArgs e) =>
+        ScopeToggleRequested?.Invoke();
+
     public void FocusQuery()
     {
         QueryBox.Focusable = true;

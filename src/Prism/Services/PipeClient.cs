@@ -82,15 +82,33 @@ public sealed class PipeClient : ISearchClient, IDisposable
         SearchContext context,
         CancellationToken ct = default)
     {
-        var filters = context.Filters.Count == 0
-            ? null
-            : context.Filters.Select(filter => new
+        var resp = await SendAsync(SearchPayload(query, max, context), ct).ConfigureAwait(false);
+        return ParseSearchResponse(resp, query);
+    }
+
+    /// <summary>
+    /// 组装 search 请求。`root` 只在真正限定当前目录时出现：范围为全局时字段整体缺失，
+    /// 与加入 root 之前的线上格式逐字节一致，也保证「UI 说全局」与「后端搜全局」不会背离。
+    /// </summary>
+    internal static Dictionary<string, object?> SearchPayload(string query, int max, SearchContext context)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["type"] = "search",
+            ["query"] = query,
+            ["max"] = max,
+        };
+        if (context.Filters.Count > 0)
+        {
+            payload["filters"] = context.Filters.Select(filter => new
             {
                 field = filter.Field,
                 value = filter.Value,
             }).ToArray();
-        var resp = await SendAsync(new { type = "search", query, max, filters }, ct).ConfigureAwait(false);
-        return ParseSearchResponse(resp, query);
+        }
+        if (!string.IsNullOrWhiteSpace(context.Root))
+            payload["root"] = context.Root;
+        return payload;
     }
 
     internal static SearchResponse ParseSearchResponse(JsonElement resp, string query)
@@ -122,7 +140,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
             generation,
             ParseProgress(resp),
             ReadOptionalString(resp, "pinyin_status"),
-            ReadOptionalString(resp, "history_status"));
+            ReadOptionalString(resp, "history_status"),
+            RootRejectionCodes.Parse(ReadOptionalString(resp, "root_rejection")),
+            ReadOptionalString(resp, "root_message"));
     }
 
     private static string? ReadOptionalString(JsonElement owner, string name) =>
@@ -470,6 +490,10 @@ public sealed record IndexProgress(
 /// 也可能部分就绪（已有结果但仍在补充，G9 的 ready &amp;&amp; building）。它与
 /// <paramref name="IsTruncated"/> 是两种不同的"不完整"：后者只表示"命中数超过 max"。
 /// </summary>
+/// <param name="RootRejection">
+/// 后端拒绝了本次请求携带的 root：<paramref name="Items"/> 已经是全局搜索结果，
+/// 前端据此回到全局范围并提示。为 null 表示本次搜索没有 root 问题。
+/// </param>
 public sealed record SearchResponse(
     string Query,
     IReadOnlyList<SearchResult> Items,
@@ -479,4 +503,6 @@ public sealed record SearchResponse(
     ulong? IndexGeneration = null,
     IndexProgress? IndexProgress = null,
     string? PinyinStatus = null,
-    string? HistoryStatus = null);
+    string? HistoryStatus = null,
+    RootRejection? RootRejection = null,
+    string? RootMessage = null);

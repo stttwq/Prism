@@ -27,6 +27,14 @@
             </Border.Clip>
             <StackPanel>
                 <controls:SearchHeader x:Name="Header"/>
+                <!-- 范围降级提示（识别失败 / 宿主关闭 / 路径无效时说明已回到全局） -->
+                <TextBlock x:Name="ScopeNotice"
+                           Margin="20,0,20,8"
+                           FontSize="13"
+                           FontFamily="{DynamicResource AppFontFamily}"
+                           Foreground="{DynamicResource TextSubtitle}"
+                           TextWrapping="Wrap"
+                           Visibility="Collapsed"/>
                 <Border x:Name="Divider"
                         Height="1"
                         Background="{DynamicResource Divider}"

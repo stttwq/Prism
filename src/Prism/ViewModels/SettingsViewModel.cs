@@ -30,6 +30,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly List<string> _excludedPaths;
     private bool _historyEnabled;
     private bool _pinyinEnabled;
+    private bool _currentDirectorySearchEnabled;
+    private bool _explorerHostIntegrationEnabled;
+    private bool _directoryOpusHostIntegrationEnabled;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -55,6 +58,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _excludedPaths = settings.ExcludedPaths.ToList();
         _historyEnabled = settings.HistoryEnabled;
         _pinyinEnabled = settings.PinyinEnabled;
+        _currentDirectorySearchEnabled = settings.CurrentDirectorySearchEnabled;
+        _explorerHostIntegrationEnabled = settings.ExplorerHostIntegrationEnabled;
+        _directoryOpusHostIntegrationEnabled = settings.DirectoryOpusHostIntegrationEnabled;
         DataDir = store.DataDir;
 
         Engines = new ObservableCollection<WebEngineEditItem>(
@@ -230,6 +236,42 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    /// <summary>当前目录搜索总开关（G4）；保存后由 App 同步给范围状态机。</summary>
+    public bool CurrentDirectorySearchEnabled
+    {
+        get => _currentDirectorySearchEnabled;
+        set
+        {
+            if (_currentDirectorySearchEnabled == value) return;
+            _currentDirectorySearchEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>Explorer 宿主联动（实验性，默认关；需兼容矩阵验收后才建议打开）。</summary>
+    public bool ExplorerHostIntegrationEnabled
+    {
+        get => _explorerHostIntegrationEnabled;
+        set
+        {
+            if (_explorerHostIntegrationEnabled == value) return;
+            _explorerHostIntegrationEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>Directory Opus 宿主联动（实验性，默认关）。</summary>
+    public bool DirectoryOpusHostIntegrationEnabled
+    {
+        get => _directoryOpusHostIntegrationEnabled;
+        set
+        {
+            if (_directoryOpusHostIntegrationEnabled == value) return;
+            _directoryOpusHostIntegrationEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
     private void AddEngine()
     {
         var item = new WebEngineEditItem
@@ -332,6 +374,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             ExcludedPaths = _excludedPaths,
             HistoryEnabled = HistoryEnabled,
             PinyinEnabled = PinyinEnabled,
+            CurrentDirectorySearchEnabled = CurrentDirectorySearchEnabled,
+            ExplorerHostIntegrationEnabled = ExplorerHostIntegrationEnabled,
+            DirectoryOpusHostIntegrationEnabled = DirectoryOpusHostIntegrationEnabled,
         };
 
         try

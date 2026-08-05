@@ -38,6 +38,9 @@ public partial class App : Application
     private SettingsWindow? _settingsWindow;
     private TrayService? _tray;
     private ThemeWatcher? _theme;
+    private bool _currentDirectorySearchEnabled = true;
+    /// <summary>宿主 adapter 读取的设置快照；保存设置后更新，adapter 的 IsEnabled 委托读这里。</summary>
+    private Settings _hostSettings = Settings.Default;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -49,6 +52,7 @@ public partial class App : Application
 
         _store = new SettingsStore();
         var settings = _store.Load();
+        _hostSettings = settings;
 
         _autoStart = new AutoStartService();
         try
@@ -87,7 +91,7 @@ public partial class App : Application
         Log("  · 双击 Ctrl 呼出搜索框，Esc 或点别处隐藏");
         Log("  · 托盘图标：左键呼出，右键打开设置 / 重建索引 / 退出");
         Log("  · 设置页可改快捷键、网页搜索引擎、开机自启");
-        Log("  · 输入文件名即时搜索；回车打开，Ctrl+Enter 打开所在文件夹");
+        Log("  · 输入文件名即时搜索；回车打开，Ctrl+Enter 在原宿主中定位（无宿主时打开所在文件夹）");
         Log("  · 选中文件后按 → 打开动作面板（打开所在文件夹/复制/剪切/复制路径）");
         Log($"  · 当前主题：{(_state.Theme == AppTheme.Dark ? "深色" : "浅色")}（跟随系统）");
 
@@ -105,8 +109,12 @@ public partial class App : Application
         if (_vm is null || _icons is null)
             throw new InvalidOperationException("SearchViewModel / IconCache 尚未初始化");
 
-        _searchWindow = new SearchWindow();
+        // 注入带设置驱动开关的真实 adapter 矩阵；SystemFileDialog 仍是占位。
+        var scope = new HostScopeController(HostAdapterCatalog.Create(() => _hostSettings));
+        _searchWindow = new SearchWindow(new IndexerGenerationClient(), scope);
         _searchWindow.Attach(_vm, _icons, _theme);
+        // 窗口是懒创建的，创建时补上设置里的当前目录搜索总开关。
+        _searchWindow.Scope.SetCurrentDirectoryEnabled(_currentDirectorySearchEnabled);
         return _searchWindow;
     }
 
@@ -165,10 +173,16 @@ public partial class App : Application
 
     private void ApplySearchExclusions(Settings settings)
     {
+        _hostSettings = settings;
         var filters = settings.ExcludedPaths
             .Select(path => new SearchFilterOption("exclude_path", path))
             .ToArray();
-        _vm?.SetSearchContext(SearchContext.Default with { Filters = filters });
+        // 只改 Filters，保留当前范围（root）等其他上下文维度。
+        _vm?.SetSearchContext(_vm.SearchContext with { Filters = filters });
+        _searchWindow?.Scope.SetCurrentDirectoryEnabled(settings.CurrentDirectorySearchEnabled);
+        _currentDirectorySearchEnabled = settings.CurrentDirectorySearchEnabled;
+        // adapter.IsEnabled 读 _hostSettings；已捕获的 root 不在设置变更时复用旧目录——
+        // 下次呼出 Capture 会先清空。此处不必 Invalidate。
     }
 
     private async Task ReloadBackendEnginesAsync(IReadOnlyList<WebEngine> engines)

@@ -37,6 +37,12 @@ public sealed class SearchViewModel
     /// <summary>执行成功后请求隐藏窗口（由 SearchWindow 订阅）。</summary>
     public event Action? HideRequested;
 
+    /// <summary>
+    /// 后端拒绝了本次请求携带的 root（结构化原因）。结果集已经是全局搜索，
+    /// 订阅方负责把范围状态切回全局并提示，避免 UI 与实际搜索范围背离。
+    /// </summary>
+    public event Action<RootRejection>? RootRejected;
+
     private sealed record SearchCacheEntry(SearchResponse Response, SearchContext Context);
 
     public SearchViewModel(
@@ -70,14 +76,57 @@ public sealed class SearchViewModel
         if (_searchContext.IsEquivalentTo(context)) return;
         _searchContext = context;
         _completeCache = null;
-        if (_state.Mode == PanelMode.Results && !string.IsNullOrWhiteSpace(_state.Query))
-            _generationDebounce.Restart();
+        if (_state.Mode == PanelMode.Actions)
+            return;
+
+        if (!string.IsNullOrWhiteSpace(_state.Query))
+        {
+            if (_state.Mode == PanelMode.Results)
+                _generationDebounce.Restart();
+            return;
+        }
+
+        // Empty box: a host root means "show recent under root"; clearing root
+        // (or never having one) returns to Idle — recent windows wait on G5.
+        if (!string.IsNullOrWhiteSpace(_searchContext.Root))
+        {
+            _pendingQuery = _state.Query;
+            _resultLimit = InitialResultLimit;
+            _state.Mode = PanelMode.Results;
+            SetSearchingStatus();
+            _debounce.Restart();
+        }
+        else
+        {
+            _debounce.Stop();
+            _generationDebounce.Stop();
+            _searchSeq++;
+            CancelSearch();
+            _state.Results = Array.Empty<SearchResult>();
+            _state.SelectedIndex = -1;
+            _state.Mode = PanelMode.Idle;
+            _state.IsIndexing = false;
+            _state.StatusMessage = "";
+        }
     }
+
+    /// <summary>当前搜索上下文，供调用方在保留其他字段的前提下改单个维度。</summary>
+    public SearchContext SearchContext => _searchContext;
+
+    /// <summary>
+    /// 切换搜索范围（G4）：root 为 null 表示全局。其余上下文字段（排除路径等）保持不变，
+    /// 变化会像其他上下文维度一样触发一次重查。
+    /// </summary>
+    public void SetScopeRoot(string? root) =>
+        SetSearchContext(_searchContext with { Root = root });
 
     private async Task OnGenerationDebounceTickAsync()
     {
         _generationDebounce.Stop();
-        if (_state.Mode != PanelMode.Results || string.IsNullOrWhiteSpace(_state.Query))
+        if (_state.Mode != PanelMode.Results)
+            return;
+        if (string.IsNullOrWhiteSpace(_state.Query)
+            && string.IsNullOrWhiteSpace(_searchContext.Root))
             return;
 
         try
@@ -154,6 +203,17 @@ public sealed class SearchViewModel
 
         if (string.IsNullOrWhiteSpace(text))
         {
+            // G4 §4.4: host context (valid root) + empty input → recent items under root
+            // via the normal search path. Without a root, recent windows wait on G5;
+            // keep Idle and do not ask the indexer for a full scan.
+            if (!string.IsNullOrWhiteSpace(_searchContext.Root))
+            {
+                _state.Mode = PanelMode.Results;
+                SetSearchingStatus();
+                _debounce.Restart();
+                return;
+            }
+
             _debounce.Stop();
             _generationDebounce.Stop();
             _searchSeq++;
@@ -395,11 +455,15 @@ public sealed class SearchViewModel
 
     private async Task RunSearchAsync(string query, int max)
     {
-        if (string.IsNullOrWhiteSpace(query)) return;
+        // Empty query is only meaningful with a host root (recent under root). Without a
+        // root the UI stays Idle and never reaches here; still guard for context changes.
+        var isEmptyQuery = string.IsNullOrWhiteSpace(query);
+        if (isEmptyQuery && string.IsNullOrWhiteSpace(_searchContext.Root))
+            return;
 
         var seq = ++_searchSeq;
         CancelSearch();
-        if (TryFilterCompleteCache(query, out var cached))
+        if (!isEmptyQuery && TryFilterCompleteCache(query, out var cached))
         {
             ApplySearchResponse(cached, query, max, seq, startPoll: false, updateCache: false);
             return;
@@ -434,7 +498,9 @@ public sealed class SearchViewModel
             if (seq != _searchSeq) return;
             if (cts.IsCancellationRequested) return;
             if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
-            if (!string.Equals(resp.Query, query, StringComparison.Ordinal)) return;
+            // Broker echoes the request query; for empty input accept either "" or the
+            // whitespace the box still holds, as long as both sides trim empty.
+            if (!QueryMatchesResponse(query, resp.Query)) return;
 
             ApplySearchResponse(resp, query, max, seq);
         }
@@ -488,10 +554,12 @@ public sealed class SearchViewModel
             list.Add(SearchResult.More(query));
 
         if (updateCache
+            && !string.IsNullOrWhiteSpace(query)
             && !resp.IsIndexing
             && string.IsNullOrWhiteSpace(resp.IndexError)
             && !resp.IsTruncated
             && resp.IndexGeneration.HasValue
+            && resp.RootRejection is null
             && (resp.PinyinStatus is null or "disabled")
             && resp.Items.All(item => item.ResultKind != SearchResultKind.Web))
         {
@@ -536,9 +604,23 @@ public sealed class SearchViewModel
         {
             _state.StatusMessage = "";
         }
+        else if (string.IsNullOrWhiteSpace(query)
+                 && !string.IsNullOrWhiteSpace(_searchContext.Root))
+        {
+            // Host empty input with no recent-under-root hits: keep the panel open
+            // without the generic "无匹配结果" copy used for typed searches.
+            _state.StatusMessage = "";
+        }
         else
         {
             _state.StatusMessage = "无匹配结果";
+        }
+
+        if (resp.RootRejection is not null)
+        {
+            // 结果已经是全局的，范围状态必须立刻跟上，绝不能停留在「当前目录」。
+            _completeCache = null;
+            RootRejected?.Invoke(resp.RootRejection.Value);
         }
     }
 
@@ -622,6 +704,14 @@ public sealed class SearchViewModel
         try { _searchCts?.Cancel(); } catch { /* ignore */ }
         _searchCts?.Dispose();
         _searchCts = null;
+    }
+
+    private static bool QueryMatchesResponse(string requested, string echoed)
+    {
+        if (string.Equals(requested, echoed, StringComparison.Ordinal))
+            return true;
+        // Empty-query recent list: both sides are blank after trim.
+        return string.IsNullOrWhiteSpace(requested) && string.IsNullOrWhiteSpace(echoed);
     }
 
     private bool TryFilterCompleteCache(string query, out SearchResponse response)

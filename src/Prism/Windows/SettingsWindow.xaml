@@ -146,6 +146,18 @@
                     <CheckBox Content="使用成功操作历史优化同级排序"
                               IsChecked="{Binding HistoryEnabled, Mode=TwoWay}"
                               FontSize="13" Foreground="#37393E"
+                              Margin="0,0,0,8"/>
+                    <CheckBox Content="从文件管理器呼出时限定当前目录（含子目录，Ctrl+G 切换）"
+                              IsChecked="{Binding CurrentDirectorySearchEnabled, Mode=TwoWay}"
+                              FontSize="13" Foreground="#37393E"
+                              Margin="0,0,0,8"/>
+                    <CheckBox Content="识别 Windows 资源管理器当前目录（实验性 / 需兼容矩阵验收）"
+                              IsChecked="{Binding ExplorerHostIntegrationEnabled, Mode=TwoWay}"
+                              FontSize="13" Foreground="#37393E"
+                              Margin="0,0,0,8"/>
+                    <CheckBox Content="识别 Directory Opus 当前目录（实验性 / 需兼容矩阵验收）"
+                              IsChecked="{Binding DirectoryOpusHostIntegrationEnabled, Mode=TwoWay}"
+                              FontSize="13" Foreground="#37393E"
                               Margin="0,0,0,10"/>
                     <Button Content="清除使用历史"
                             Command="{Binding ClearHistoryCommand}"

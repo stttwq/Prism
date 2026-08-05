@@ -46,6 +46,20 @@ public sealed record Settings
 
     public bool PinyinEnabled { get; init; } = true;
 
+    /// <summary>当前目录搜索总开关（G4）：默认开启，关闭后呼出一律全局搜索。</summary>
+    public bool CurrentDirectorySearchEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Explorer Shell COM 宿主联动（G4）。默认关闭：兼容矩阵未全部通过前不发布该宿主支持。
+    /// 旧 settings.json 缺字段时反序列化为 false。
+    /// </summary>
+    public bool ExplorerHostIntegrationEnabled { get; init; } = false;
+
+    /// <summary>
+    /// Directory Opus 13.23 官方外部命令联动（G4）。默认关闭，理由同 Explorer。
+    /// </summary>
+    public bool DirectoryOpusHostIntegrationEnabled { get; init; } = false;
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
@@ -57,6 +71,9 @@ public sealed record Settings
         ExcludedPaths = [],
         HistoryEnabled = true,
         PinyinEnabled = true,
+        CurrentDirectorySearchEnabled = true,
+        ExplorerHostIntegrationEnabled = false,
+        DirectoryOpusHostIntegrationEnabled = false,
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>

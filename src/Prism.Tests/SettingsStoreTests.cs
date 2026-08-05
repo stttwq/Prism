@@ -19,6 +19,40 @@ public sealed class SettingsStoreTests
             Assert.Empty(settings.ExcludedPaths);
             Assert.True(settings.HistoryEnabled);
             Assert.True(settings.PinyinEnabled);
+            // 当前目录搜索总开关默认开启，旧设置文件缺字段时也一样。
+            Assert.True(settings.CurrentDirectorySearchEnabled);
+            // 两个宿主 adapter 开关默认关闭，旧文件缺字段也必须是 false。
+            Assert.False(settings.ExplorerHostIntegrationEnabled);
+            Assert.False(settings.DirectoryOpusHostIntegrationEnabled);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HostIntegrationSwitchesRoundTripAndDefaultFalse()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            var store = new SettingsStore(directory);
+            Assert.False(Settings.Default.ExplorerHostIntegrationEnabled);
+            Assert.False(Settings.Default.DirectoryOpusHostIntegrationEnabled);
+
+            store.Save(Settings.Default with
+            {
+                ExplorerHostIntegrationEnabled = true,
+                DirectoryOpusHostIntegrationEnabled = true,
+            });
+            var loaded = store.Load();
+            Assert.True(loaded.ExplorerHostIntegrationEnabled);
+            Assert.True(loaded.DirectoryOpusHostIntegrationEnabled);
+
+            using var document = JsonDocument.Parse(File.ReadAllText(store.SettingsPath));
+            Assert.True(document.RootElement.GetProperty("ExplorerHostIntegrationEnabled").GetBoolean());
+            Assert.True(document.RootElement.GetProperty("DirectoryOpusHostIntegrationEnabled").GetBoolean());
         }
         finally
         {
@@ -40,6 +74,8 @@ public sealed class SettingsStoreTests
                 document.RootElement.GetProperty("SchemaVersion").GetInt32());
             Assert.True(document.RootElement.GetProperty("HistoryEnabled").GetBoolean());
             Assert.True(document.RootElement.GetProperty("PinyinEnabled").GetBoolean());
+            Assert.True(document.RootElement
+                .GetProperty("CurrentDirectorySearchEnabled").GetBoolean());
 
             Assert.Throws<InvalidDataException>(() =>
                 store.Save(Settings.Default with { ExcludedPaths = ["relative"] }));

@@ -26,6 +26,7 @@ public partial class SearchWindow : Window
     private const double PanelExpandMs = 100;
 
     private readonly IIndexGenerationClient _generationClient;
+    private readonly HostScopeController _scope;
     private SearchViewModel? _vm;
     private IconCache? _icons;
     private ThemeWatcher? _theme;
@@ -53,8 +54,14 @@ public partial class SearchWindow : Window
     }
 
     public SearchWindow(IIndexGenerationClient generationClient)
+        : this(generationClient, new HostScopeController())
+    {
+    }
+
+    public SearchWindow(IIndexGenerationClient generationClient, HostScopeController scope)
     {
         _generationClient = generationClient;
+        _scope = scope;
         InitializeComponent();
         PreviewKeyDown += OnWindowPreviewKeyDown;
         Deactivated += OnDeactivated;
@@ -72,6 +79,8 @@ public partial class SearchWindow : Window
 
         Header.QueryChanged += OnHeaderQueryChanged;
         Header.QueryKeyDown += OnHeaderKeyDown;
+        Header.ScopeToggleRequested += ToggleSearchScope;
+        _scope.Changed += OnScopeChanged;
         Results.SelectedIndexChanged += OnResultsSelected;
         Results.ContextMenuRequested += OnContextMenuRequested;
         Results.ItemInvoked += async r =>
@@ -119,6 +128,11 @@ public partial class SearchWindow : Window
             else Dispatcher.Invoke(HideAnimated);
         };
         vm.State.PropertyChanged += OnStateChanged;
+        vm.RootRejected += rejection =>
+        {
+            if (Dispatcher.CheckAccess()) _scope.Invalidate(rejection);
+            else Dispatcher.Invoke(() => _scope.Invalidate(rejection));
+        };
         if (_theme is not null)
             _theme.ThemeApplied += OnThemeApplied;
         Pin.IsPinned = vm.State.IsPinned;
@@ -137,6 +151,9 @@ public partial class SearchWindow : Window
     /// <summary>呼出：重置状态、定位、淡入、焦点到输入框。</summary>
     public void ShowAndFocus()
     {
+        // 必须在 Show/Activate 之前取前台窗口，之后前台就是 Prism 自己了。
+        var foreground = GetForegroundWindow();
+
         _hiding = false;
         _ignoreDeactivate = true;
         BeginAnimation(OpacityProperty, null);
@@ -146,6 +163,9 @@ public partial class SearchWindow : Window
         Header.ClearQuery();
         Header.SetMode(PanelMode.Idle);
         _suppressQueryEvent = false;
+        // 每次呼出重新识别宿主，绝不沿用上一次目录。
+        _scope.Capture(foreground);
+        ApplyScopeUi();
         ApplyState(_vm?.State, animatePanel: false);
 
         PositionWindow();
@@ -404,6 +424,33 @@ public partial class SearchWindow : Window
         timer.Start();
     }
 
+    /// <summary>当前目录 / 全局 范围状态机，供 App 同步设置里的总开关。</summary>
+    public HostScopeController Scope => _scope;
+
+    /// <summary>范围标签点击或 `Ctrl+G`：在当前目录与全局之间切换。</summary>
+    private void ToggleSearchScope() => _scope.ToggleScope();
+
+    private void OnScopeChanged()
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(OnScopeChanged);
+            return;
+        }
+        ApplyScopeUi();
+    }
+
+    private void ApplyScopeUi()
+    {
+        Header.SetScope(_scope.IsScopeLabelVisible, _scope.ScopeLabel, _scope.ScopeTooltip);
+        ScopeNotice.Text = _scope.Notice;
+        ScopeNotice.Visibility = string.IsNullOrEmpty(_scope.Notice)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        _vm?.SetScopeRoot(_scope.Root);
+        UpdateCardClip();
+    }
+
     private void PositionWindow()
     {
         var screen = SystemParameters.WorkArea;
@@ -442,10 +489,12 @@ public partial class SearchWindow : Window
                 }
                 else if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
                 {
-                    await _vm.RevealSelectedAsync();
+                    // G4：Ctrl+Enter 优先在原宿主定位；无宿主时保持 broker reveal。
+                    await RevealSelectedPreferringHostAsync();
                 }
                 else
                 {
+                    // 普通 Enter 始终走 broker 打开，绝不自动导航宿主或确认对话框。
                     await _vm.ExecuteSelectedAsync();
                 }
                 e.Handled = true;
@@ -472,6 +521,13 @@ public partial class SearchWindow : Window
                     e.Handled = true;
                 }
                 break;
+            case Key.G:
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+                {
+                    ToggleSearchScope();
+                    e.Handled = true;
+                }
+                break;
             case Key.D1: case Key.NumPad1: await CtrlNumber(1, e); break;
             case Key.D2: case Key.NumPad2: await CtrlNumber(2, e); break;
             case Key.D3: case Key.NumPad3: await CtrlNumber(3, e); break;
@@ -486,6 +542,55 @@ public partial class SearchWindow : Window
 
     private static bool IsActionableSelection(SearchResult? item) =>
         item is { Kind: "file" or "folder" } && !string.IsNullOrEmpty(item.ExecuteId);
+
+    /// <summary>
+    /// Ctrl+Enter：有可用原宿主时交回 <see cref="IHostAdapter.NavigateOrFill"/>；
+    /// 否则沿用 broker <c>explorer /select</c>。定位失败保留 Prism 结果，不清空 root
+    /// （除非宿主已消失/提权，由 <see cref="HostScopeController.TryRevealInHost"/> 处理）。
+    /// </summary>
+    private async Task RevealSelectedPreferringHostAsync()
+    {
+        if (_vm is null) return;
+        if (_vm.State.Mode == PanelMode.Actions) return;
+
+        var item = _vm.State.SelectedResult;
+        if (item is null
+            || item.Kind is not ("file" or "folder")
+            || string.IsNullOrWhiteSpace(item.ExecuteId))
+        {
+            await _vm.RevealSelectedAsync().ConfigureAwait(true);
+            return;
+        }
+
+        var path = item.ExecutionTarget.Value;
+        if (string.IsNullOrWhiteSpace(path))
+            path = item.ExecuteId;
+
+        var reveal = _scope.TryRevealInHost(path, isDirectory: item.Kind == "folder");
+        if (!reveal.Attempted)
+        {
+            await _vm.RevealSelectedAsync().ConfigureAwait(true);
+            return;
+        }
+
+        if (reveal.Succeeded)
+        {
+            HideAnimated();
+            return;
+        }
+
+        // 失败：保留结果列表；HostGone/Elevated 已由 controller Invalidate。
+        _vm.State.StatusMessage = HostRevealStatusMessage(reveal.Reason);
+    }
+
+    private static string HostRevealStatusMessage(HostFailureReason reason) => reason switch
+    {
+        HostFailureReason.HostGone => "原窗口已关闭，宿主定位失败",
+        HostFailureReason.HostElevated => "无法控制提权宿主，宿主定位失败",
+        HostFailureReason.AccessDenied => "宿主定位失败：访问被拒绝",
+        HostFailureReason.Unsupported => "当前宿主不支持定位该结果",
+        _ => "宿主定位失败",
+    };
 
     private async Task EnterActionsUiAsync()
     {
