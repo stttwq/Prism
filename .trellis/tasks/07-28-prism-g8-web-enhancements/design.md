@@ -20,4 +20,4 @@ WPF WebSearchService 拥有单例 HTTP client、per-query cancellation token 和
 
 ## Privacy, Compatibility And Rollback
 
-设置分别保存 `suggestions_enabled` 与 origin favicon grant。日志只记 provider、状态码类别、耗时和错误类别，不记 query/URL。功能关闭立即取消请求。回滚可删除 HTTP service 和缓存 reader；内置直接网页搜索保持可用，缓存文件可作为无害孤立数据后续清理。
+设置分别保存 `suggestions_enabled` 与 origin favicon grant。日志只记 provider、状态码类别、耗时和错误类别，不记 query/URL。功能关闭立即取消请求。回滚可删除 HTTP service 和缓存 reader；内置直接网页搜索保持可用。favicon 缓存目录必须进入 `dist/prism.iss` 的卸载清单——它是本阶段新增的持久文件，不得留成孤立数据等后续清理。

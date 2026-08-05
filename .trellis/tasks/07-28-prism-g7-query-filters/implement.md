@@ -21,5 +21,5 @@ dotnet build src/Prism/Prism.csproj -c Release
 ## Review Gates And Rollback
 
 - parser 与执行器必须共享结构化 FilterSet，不允许字符串二次解析产生偏差。
-- 协议 reader 兼容先提交；启用 writer 后旧后端不得收到已剥离名称的半过滤请求。
+- filters 复用 G1 预留的可选字段，旧 reader 缺失时等同空集合；不要求 reader 与 writer 分两次发布。任何情况下后端都不得收到已剥离名称但未应用过滤的半过滤请求。
 - parser、协议、indexer 执行、WPF 缓存分别提交，功能开关可恢复普通文本行为。

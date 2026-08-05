@@ -19,17 +19,18 @@
 
 | 顺序 | 子任务 | 交付目标 | 强依赖 |
 | --- | --- | --- | --- |
-| G0 | `07-28-prism-g0-baseline` | 可复现搜索与三进程内存基线 | 无 |
-| G1 | `07-28-prism-g1-search-foundation` | 全局 Top-K、协议截断语义、正确缓存、C# 测试地基 | G0 |
-| G2 | `07-28-prism-g2-history-pinyin` | 版本化使用历史与可卸载拼音 sidecar | G1 |
-| G3 | `07-28-prism-g3-engineering-foundation` | Shell/COM、协议类型、日志、排除规则与旧链清理 | G1 |
+| G0 | `07-28-prism-g0-baseline` | 可复现搜索与三进程内存基线，并把 spec 的内存门槛口径改写为三进程 | 无 |
+| G1 | `07-28-prism-g1-search-foundation` | 全局 Top-K、协议截断语义、`filters` 字段预留、正确缓存、C# 测试地基 | G0 |
+| G9 | `07-29-prism-g9-first-build` | 逐卷增量发布首建、卷优先级、真实进度、落盘门 | G0、G1 |
+| G3 | `07-28-prism-g3-engineering-foundation` | Shell/COM、typed target、schema 版本约定、日志、排除、旧链清理、卸载清理 | G1 |
+| G2 | `07-28-prism-g2-history-pinyin` | 版本化使用历史与可卸载拼音 sidecar | G1、G3、G9 |
 | G4 | `07-28-prism-g4-host-integration` | root 搜索与 Explorer/系统对话框/Opus 联动 | G1、G2、G3 |
 | G5 | `07-28-prism-g5-window-switcher` | `>` 窗口搜索、最近窗口与可靠切换 | G2 |
 | G6 | `07-28-prism-g6-built-in-actions` | 完整、安全的单项内置动作 | G2、G3 |
 | G7 | `07-28-prism-g7-query-filters` | Top-K 前的 `ext:` / `path:` 过滤 | G1 |
 | G8 | `07-28-prism-g8-web-enhancements` | 专用网页模式、受控联想与 favicon | G1 |
 
-父子关系不替代依赖控制。启动任何子任务前必须检查其强依赖已完成并通过门禁。
+表格按**执行顺序**排列，G 编号不代表顺序。两处顺序是有依据的、不可随意调换：**G3 先于 G2**，因为 G3 定型 settings/history/favicon 的 schema 版本约定，而 G2 的历史文件是第一个使用者；**G9 紧跟 G1**，因为它是唯一直接影响首次安装体验的阶段，且 G2 的 sidecar 首建应复用 G9 的逐卷发布框架。父子关系不替代依赖控制。启动任何子任务前必须检查其强依赖已完成并通过门禁。
 
 ## Global Requirements
 
@@ -39,10 +40,11 @@
 - 不使用 DLL 注入，不提供 JSON/DLL 动作扩展；
 - 文件、文件夹、应用和窗口使用可解释匹配层级，类型只作最终稳定 tie-break；
 - 首屏 8 条、展开 1000 条行为保持兼容；
-- 三进程 Release 总内存 ≤100MB；
+- 三进程 Release 总内存 ≤100MB。注意现行已提交 spec 的门槛口径只覆盖 `Prism.exe` + `prism-core.exe` 两进程，G0 负责按三进程实测并改写该 spec；在 G0 完成前不得把“三进程 100MB”称为已提交硬门槛；
 - 暖查询 `max=8` P95 ≤100ms，`max=1000` P95 ≤300ms；
+- 新增任何持久文件（机器级或用户级）的阶段必须在同一阶段更新 `dist/prism.iss` 的安装与卸载清单；
 - 未实测数字必须标记为目标或估算，旧 38MB/43-45MB 不得当作当前事实；
-- 每个阶段独立提交、验收、更新规格和回滚，不把 G0-G8 合并为一次实现。
+- 每个阶段独立提交、验收、更新规格和回滚，不把 G0-G9 合并为一次实现。
 
 ## Out Of Scope
 
@@ -56,12 +58,13 @@
 
 ## Cross-Child Acceptance Criteria
 
-- [ ] G0-G8 每个子任务都有收敛后的 `prd.md`、`design.md`、`implement.md`，不存在 TBD 或阻塞性开放问题。
+- [ ] G0-G9 每个子任务都有收敛后的 `prd.md`、`design.md`、`implement.md`，不存在 TBD 或阻塞性开放问题。
 - [ ] 每个子任务启动前，其强依赖已归档完成，并引用依赖阶段的实测或稳定接口。
 - [ ] 每个子任务完成时 Rust tests、Clippy、C# tests、WPF Release build 按适用范围通过。
 - [ ] 涉及索引、范围、拼音或动作的任务完成 Windows 11 x64 机器验收。
-- [ ] 三进程总内存始终 ≤100MB；任何超限阶段不得合并或继续下游任务。
+- [ ] 三进程总内存始终 ≤100MB（口径以 G0 改写后的 spec 为准）；任何超限阶段不得合并或继续下游任务。
 - [ ] 8/1000 结果、管道请求/响应配对、generation 刷新和字面搜索降级无回归。
+- [ ] 卸载后 `%ProgramData%\Prism\` 与安装目录无残留派生文件。
 - [ ] 最终集成审查确认明确排除项未被重新引入，所有文档数字区分实测与估算。
 
 ## Deferred Decisions

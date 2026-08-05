@@ -3,7 +3,7 @@
   "name": "prism-g4-host-integration",
   "title": "G4 当前目录与宿主联动",
   "description": "实现 root 搜索及 Explorer、系统对话框和 Directory Opus 联动。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

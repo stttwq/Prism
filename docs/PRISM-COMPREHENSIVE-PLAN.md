@@ -60,11 +60,15 @@ Shell、COM 文件操作、剪贴板、用户设置、网页请求和应用启�
 
 | 指标 | 门槛 | 说明 |
 | --- | --- | --- |
-| 三进程 Release 总内存 | ≤100MB | 当前已提交硬门槛 |
+| 三进程 Release 总内存 | ≤100MB | **目标口径，尚未成为已提交门槛**，见下方说明 |
 | 拼音额外常驻内存 | ≤10MB | 待实现验收目标，不是当前实测 |
 | 暖查询 `max=8` | P95 ≤100ms | 端到端本地搜索 |
 | 暖查询 `max=1000` | P95 ≤300ms | 展开结果兼容 |
 | 在线联想 | 单次 800ms 超时 | 不计入本地搜索门槛，不阻塞直接网页结果 |
+
+**100MB 门槛的口径必须先修正。** 现行已提交规格 [`.trellis/spec/backend/quality-guidelines.md`](../.trellis/spec/backend/quality-guidelines.md) 的 “Memory Acceptance (≤100MB hard gate)” 一节把该门槛定义为 **`Prism.exe` + `prism-core.exe` 两个进程 Private Working Set 之和**，写于三进程拆分之前，全文未提及 `prism-indexer-service.exe`。因此本文件所说的“三进程 ≤100MB”目前是**收紧后的目标**，不是已提交门槛。G0 负责按三进程口径实测，并在 G0 收尾时把该 spec 小节改写为三进程口径；在此之前任何阶段不得引用“三进程 100MB 已是硬门槛”。
+
+**Release 构建以体积优先，与 P95 目标存在张力。** [`src/prism-core/Cargo.toml`](../src/prism-core/Cargo.toml) 的 `[profile.release]` 使用 `opt-level = "z"`（配合 100MB 内存护栏）。用体积优化的代码去追 P95 ≤100ms 会额外收紧余量，G0 必须把 profile 作为显式基线变量记录并测量 `"z"` 与 `"3"` 的差值，供 G1 判断是否需要在“体积/内存”与“延迟”之间重新取舍。该取舍属于 G1 的决策输入，G0 只提供数据。
 
 旧两进程约 38MB、未来总内存 43–45MB、拼音固定增加 1MB、搜索提升 5–10 倍等数字不得写成事实。40–45MB 只保留为完成三进程复测后的优化期望。
 
@@ -73,17 +77,18 @@ Shell、COM 文件操作、剪贴板、用户设置、网页请求和应用启�
 ```text
 G0 基线与基准
   └─ G1 搜索正确性 + 协议 + 前端测试
-       ├─ G2 历史 + 拼音
-       ├─ G3 工程地基（Shell/COM、日志、旧链、类型）
+       ├─ G9 首建可用性与进度
+       ├─ G3 工程地基（Shell/COM、日志、旧链、类型、schema 版本约定）
+       │    └─ G2 历史 + 拼音
        ├─ G7 ext/path 过滤
        └─ G8 网页图标与联想
-            
+
 G2 + G3 ──> G4 当前目录与宿主联动
 G2      ──> G5 窗口切换器
 G2 + G3 ──> G6 完整内置动作
 ```
 
-G0、G1 是所有功能阶段的强依赖。G2 与 G3 可以在 G1 验收后分别实施，但在一个阶段内仍保持单一可回滚目标。G4–G8 不得反向修改尚未稳定的基础排序和协议语义。
+G0、G1 是所有功能阶段的强依赖。**G3 排在 G2 之前**：G3 定义 settings/history/favicon 的 schema 版本与兼容默认值约定（§7.3），而 G2 的历史文件是这套约定的第一个使用者（§6.1）。若先做 G2，同一套版本化约定会被发明两次，之后还要回改历史文件格式。**G9 建议紧跟 G1**：它是唯一直接影响首次安装体验的阶段，改动面集中在 indexer 首建路径，且 G2 的 sidecar 首建可复用其逐卷发布框架。G7、G8 与 G3 可在 G1 验收后并行，但在一个阶段内仍保持单一可回滚目标。G4–G9 不得反向修改尚未稳定的基础排序和协议语义。
 
 ## 4. G0：建立可复现基线
 
@@ -93,9 +98,11 @@ G0、G1 是所有功能阶段的强依赖。G2 与 G3 可以在 G1 验收后分�
 
 ### 4.2 工作内容
 
-- 固定 Release 构建、机器、Windows build、卷数、节点数、名字池容量和缓存版本；
+- 固定 Release 构建、机器、Windows build、卷数、节点数、名字池容量和缓存版本（当前 `index-v5.bin`，见 [`index_cache.rs`](../src/prism-core/src/index_cache.rs)）；
+- 把 `[profile.release]` 的 `opt-level` 记为显式基线变量，并采集 `"z"`（现状）与 `"3"` 两组延迟数据，供 G1 决定体积/延迟取舍；
 - 建立查询集：常见 ASCII、中文、罕见词、无命中、精确/前缀/中间命中、跨卷、`max=8`、`max=1000`；
 - 记录冷/暖 P50、P95、max、扫描节点数、匹配候选数、路径构造次数和响应大小；
+- 单独测量“全量扫完所有卷所有节点”的裸耗时——G1 取消提前终止后这是每次查询的地板成本，也是判断是否必须引入并行搜索的唯一依据；
 - 分别采集三个进程的 Private Working Set、Working Set、CPU，并记录 indexer `memory_bytes`；
 - 预热后重复多轮，记录杀软、后台 I/O 和首次 JIT 等干扰；
 - 原始命令和聚合结果必须可在同一机器复跑。
@@ -105,6 +112,7 @@ G0、G1 是所有功能阶段的强依赖。G2 与 G3 可以在 G1 验收后分�
 - 一组不依赖 GUI 人工计时的搜索基准脚本；
 - 一组三进程内存采样脚本；
 - 带环境元数据的基线记录；
+- 把 [`.trellis/spec/backend/quality-guidelines.md`](../.trellis/spec/backend/quality-guidelines.md) 的 “Memory Acceptance” 小节从两进程口径改写为三进程口径（这是 G0 唯一允许的 spec 修改，且必须在 G0 收尾提交）；
 - 任何后续性能主张必须同时给出基线与变更结果，不只报告最快单次。
 
 **粗略估算：1–2 天。**
@@ -121,24 +129,25 @@ G0、G1 是所有功能阶段的强依赖。G2 与 G3 可以在 G1 验收后分�
 
 第一版评分只使用索引现有字段可以低成本提供的信号：字面精确、前缀、中间位置、名称长度和目录标记。应用、文件夹和文件进入同一评分框架；类型只作为最终平局规则。具体分值集中定义并用表驱动测试锁定，禁止散落 magic number。
 
-不得：
+不得（前三条是**当前 [`hierarchy.rs`](../src/prism-core/src/hierarchy.rs) 已有行为，必须移除**；后两条是**对旧提案的否决，当前代码并不存在**，勿误读为现状）：
 
-- 命中 `max` 后按 MFT record 顺序提前终止；
-- 每卷分别截断后简单拼接；
-- 在候选阶段构造所有完整路径；
-- 固定使用 200 条候选而破坏 `max=1000`；
+- 命中 `max` 后按 MFT record 顺序提前终止（现状：`VolumeIndex::search` 的 `hits.len() == max` 即 `break`）；
+- 每卷分别截断后简单拼接（现状：`IndexState::search` 逐卷用 `max - hits.len()` 填充）；
+- 在候选阶段构造所有完整路径（现状：每个名称命中都立即 `path_for`）；
+- 固定使用 200 条候选而破坏 `max=1000`（否决 [`PRISM-ROADMAP.md`](./PRISM-ROADMAP.md) 第 67 行“堆(容量=200)”的旧提案；当前代码无此上限，唯一的默认值是缺省 `max=100`）；
 - 为追求速度改变现有 ASCII/Unicode 大小写语义而不写兼容规格。
 
 ### 5.2 broker 与 indexer 协议
 
-broker 协议增加显式 handshake protocol number，并采用“新 reader 先兼容旧字段，再由新 writer 发新字段”的升级顺序。
+broker 协议增加显式 handshake protocol number。当前 broker 只有 `Ping`/`Pong { version }`（[`ipc.rs`](../src/prism-core/src/ipc.rs)），而 indexer 侧已有 `Hello { protocol }` 与 `INDEXER_PROTOCOL`，本阶段把 broker 对齐到同一形态。
 
-`results` 至少增加：
+`results` 需要变更的字段，区分新增与已有，避免把已实现的东西再实现一次：
 
-- `is_truncated`：后端是否因 `max` 截断；
-- `index_generation`：索引就绪时稳定返回；
-- 稳定的 `kind` 字符串枚举，C# 为未知值保留 `Unknown`；
-- 可选匹配元数据，为拼音、高亮和解释排序预留兼容字段。
+- `is_truncated`：**新增**，后端是否因 `max` 截断。定义必须**只**覆盖"因 `max` 放不下"这一种不完整；索引未就绪（`ready = false`）和索引部分就绪（G9 引入的 `ready && building`）都不算 truncated，各自用独立状态表达，见 §12.5.3；
+- 稳定的 `kind` 字符串枚举，C# 为未知值保留 `Unknown`：**新增**。现状 `SearchResult.kind` 是裸 `String`，写入处直接用 `"app"`/`"file"`/`"folder"`/`"web"` 字面量。稳定 kind 集合**只在本阶段定义一次**，G3 §7.3 不再重复定义，只负责 typed action target；
+- 可选匹配元数据，为拼音、高亮和解释排序预留兼容字段：**新增**；
+- 可选 `filters` 请求字段：**本阶段只预留形状与上限，不实现任何过滤器语义**。G3 §7.4 的用户排除规则与 G7 的 `ext:`/`path:` 共用这一条通道，若 G1 不留位，二者会各自再改一次协议；
+- `index_generation`：**已存在**，`Response::Results` 已有 `index_generation: Option<u64>`。本阶段只需把“索引就绪时稳定返回、不再为 `None`”写成契约并补测试，不要当作新字段实现。
 
 indexer 协议保留显式版本，所有新搜索选项有数量、长度和 `max` 上限。协议不兼容时返回明确错误，不静默返回不完整结果。
 
@@ -180,6 +189,8 @@ indexer 协议保留显式版本，所有新搜索选项有数量、长度和 `m
 **粗略估算：1–2 周。**
 
 ## 6. G2：使用历史与拼音
+
+> 章节按 G 编号排列便于查阅，**实施顺序不同**：G2 依赖 G3 §7.3 定型的 schema 版本约定，也应在 G9 §12.5 之后（sidecar 首建复用其逐卷发布框架），见 §3 与 §17。
 
 ### 6.1 历史
 
@@ -250,7 +261,8 @@ sidecar 的最终所有权和共享方式必须通过原型比较，避免 index
 ### 7.1 旧链与公共 Shell 层
 
 - 把 `index.rs` 旧测试链仍有价值的测试迁到当前 `hierarchy/indexer_client` 路径；
-- 删除已无生产用途的旧索引链和孤立占位文件；
+- 删除已无生产用途的旧索引链。已核实 [`index.rs`](../src/prism-core/src/index.rs)（914 行、16 个测试）的全部 5 处外部引用都在 `#[cfg(test)]` 下，`ipc.rs` 里用到它的 `dispatch` 函数本身也是 test-only，broker 生产路径走 `indexer_client`；但 `lib.rs` 的 `pub mod index;` 未加 cfg，lib target 仍会编译它，这正是本阶段要消除的；
+- 删除孤立占位文件，**点名两个**：`src/prism-core/src/search.rs`（3 行注释占位，无任何引用）和 `installer/setup.iss`（2 行占位；真实安装脚本是 `dist/prism.iss`，两者并存会误导后续改安装包的人）；
 - 抽取公共 Shell 模块，统一 reveal、属性、打开方式和外部启动；
 - Rust 测试数量不得因简单删除而无理由下降。
 
@@ -266,9 +278,9 @@ broker 建立专用 STA Shell worker：
 
 ### 7.3 协议类型与设置 schema
 
-- Rust/C# 使用同一稳定 result kind 集合；
-- action target 带类型，不再仅靠 `execute_id` 字符串猜测 URL、路径、应用或窗口；
-- settings、history、favicon cache metadata 均带 schema 版本；
+- 稳定 result kind 集合由 G1 §5.2 定义，本阶段只做**消费与落地**，不重新定义；
+- action target 带类型，不再仅靠 `execute_id` 字符串猜测 URL、路径、应用或窗口。现状 `execute_id()` 用 `websearch::is_http_url(id)` 判断是 URL 还是路径，窗口和应用没有独立表示；
+- settings、history、favicon cache metadata 均带 schema 版本。**这套版本化约定在本阶段一次定型**，G2 的 history 文件是它的第一个使用者，因此 G3 必须先于 G2 完成；
 - 读取旧配置时使用兼容默认值，写入新格式前完成验证。
 
 ### 7.4 排除规则
@@ -276,7 +288,7 @@ broker 建立专用 STA Shell worker：
 - 保留现有机器级硬排除，并写明理由；
 - `Windows\Installer` 继续保持父路径语义，不改成全局同名排除；
 - 用户过滤存于普通用户设置；
-- broker 随只读 search 请求传递有界过滤快照，由 indexer 在 Top-K 前应用；
+- broker 随只读 search 请求传递有界过滤快照，**复用 G1 §5.2 预留的 `filters` 协议字段**，不新开一条通道；G7 的 `ext:`/`path:` 之后往同一字段里加类型。由 indexer 在 Top-K 前应用；
 - 不让 LocalSystem 服务直接读取某个用户的 LocalAppData，也不开放任意写配置命令。
 
 ### 7.5 日志
@@ -349,6 +361,8 @@ UI 显示范围标签，点击或 `Ctrl+G` 切换当前目录/全局。总开关
 - 覆盖多窗口、多标签、宿主关闭、路径变化、中文路径、长路径和访问拒绝；
 - UIA/COM/Opus 失败时仍可全局搜索和普通打开；
 - 原型先形成兼容矩阵，再进入产品实现。
+
+**原型阶段必须设显式放弃点。** 兼容矩阵是本计划里唯一无法靠读代码预估的部分。进入原型时先约定一个时间盒（建议 2 周）与最低可交付集：若到期时 Explorer 之外的宿主仍无法稳定取到当前目录，则本阶段只交付 Explorer + Global 两种上下文，`SystemFileDialog` 与 `DirectoryOpus` 退回 Global 并从本阶段验收项中移除，不允许无限延长原型。
 
 **粗略估算：原型 1–2 周，产品化 1–2 周。**
 
@@ -467,7 +481,7 @@ design ext:md,pdf path:"Project Docs"
 
 ### 11.2 执行位置
 
-broker 负责解析并生成结构化过滤器；indexer 在候选进入 Top-K 前应用过滤。`path:` 可能需要祖先/路径信息，第一版在名称候选通过后做有界路径或父链验证，但仍不得先取 `max` 再过滤。
+broker 负责解析并生成结构化过滤器，**写入 G1 §5.2 预留、G3 §7.4 已开始使用的同一个 `filters` 协议字段**，不新增第二条过滤通道；indexer 在候选进入 Top-K 前应用过滤。`path:` 可能需要祖先/路径信息，第一版在名称候选通过后做有界路径或父链验证，但仍不得先取 `max` 再过滤。
 
 ### 11.3 验收
 
@@ -521,6 +535,59 @@ broker 负责解析并生成结构化过滤器；indexer 在候选进入 Top-K �
 
 **粗略估算：4–7 天。**
 
+## 12.5 G9：首建可用性与进度
+
+> G9 是后补阶段，编号取 12.5 以避免重排 §13–§18 及正文中的既有交叉引用；其地位与 G0–G8 等同，实施顺序见 §3 与 §17。
+
+`0296463` 实装 USN 实时监听后，稳态新增文件延迟已降到秒级，但**首建本身没有被加速**——watcher 只在首建完成后启动。原 spec 里"USN 快速路径把首建从分钟压到秒级"的期望并未实现，这条债务此前不在本计划任何阶段内，容易被再次遗忘。
+
+### 12.5.1 当前阻塞点
+
+`indexer_runtime.rs::run()` 用 `spawn_blocking(load_or_build).await` **等全部卷建完**才 `state.publish(index)`；在此之前 `state.index` 为 `None`，`status()` 返回 `ready: false`，`search()` 直接返回 `Err("file index is not ready")`，broker 见 `!status.ready` 便早退回空 items。`build_all()` 是串行 `for` 循环，无卷优先级、无并行。`IndexerStatus` 没有任何进度字段，前端只能显示不确定文案。
+
+首建期间应用与网页结果已可用（broker 的 `prefix_results` 在 indexer 调用之前执行），缺的只有文件/文件夹——这一点已成立，不需要重复实现，但需要测试锁定。
+
+### 12.5.2 方案
+
+核心是把"一次发布"改为"逐卷发布"：
+
+1. 系统卷（`%SystemDrive%`）显式排首位，不依赖 `discover_volumes()` 的字母序巧合；
+2. 每个卷 `build_volume` 完成即并入 live index 并发布（`generation + 1`），该卷文件立刻可搜；
+3. 该卷发布后立即启动它的 USN watcher，不等首建整体结束；
+4. 只有全部卷完成后才写 v5 缓存；
+5. `IndexerStatus` 增加可选进度结构（卷总数/已完成数/当前卷/可选记录数与估算），broker 透传，前端显示可解释进度。
+
+可行性依据是 `build_volume` 的既有顺序：先 `query_or_create_journal` 取 USN checkpoint，再 `enumerate_mft`，最后 `replay_until(current.next_usn)`。返回时 `volume.next_usn` 已推进到枚举结束时刻，watcher 从该点续读，**发布与起 watcher 之间的空档不会丢事件**。
+
+### 12.5.3 两个必须处理的正确性问题
+
+**残缺缓存。** `run()` 退出前无条件调用 `checkpoint(&state, &data_dir)`。逐卷发布后，首建中途停机会把部分索引写成 v5 缓存。现有 `validate_checkpoints` 的 `volumes.len() != descriptors.len()` 能挡住多数情况，但那是巧合式防护。必须加显式"首建完成"门。
+
+**三种"不完整"不能混用同一字段。**
+
+| 原因 | 表达 | 前端反应 |
+| --- | --- | --- |
+| 因 `max` 截断 | `is_truncated = true`（G1） | 禁止在其上本地过滤 |
+| 索引完全未就绪 | `ready = false` | 等待并轮询 |
+| 索引部分就绪（本阶段新增） | `ready = true && building = true` | 可用，但须随 generation 刷新 |
+
+第三种是本阶段引入的新组合。§5.3 的前端缓存规则要求 `is_truncated == false` 才允许本地过滤——若部分索引下返回 `is_truncated = false`，前端可能在不完整结果集上本地过滤而漏结果。逐卷发布每卷 `generation + 1`、缓存键含 generation，理论上会自然失效，但这是推理不是保证，必须写针对性测试。G1 定义 `is_truncated` 时要显式写明它不含"索引未建完"。
+
+### 12.5.4 枚举加速（数据驱动，允许为空）
+
+以 G0 基线判定，只保留有实测收益者：`enumerate_mft` 的 256KB 缓冲区上调；`build_volume` 中最多 64 遍 pending 重试循环的实际遍数（records 已按 FRN 排序，预期 1–2 遍）；系统卷先跑、其余卷并行（单物理盘上并行会互抢 IO，必须区分测量）。任一项无收益即记录"已评估、放弃"，不为凑数保留复杂度。本节允许全部落空——逐卷发布已把可感知等待从"全部卷"降到"系统卷"。
+
+### 12.5.5 验收
+
+- 系统卷建完即可搜该卷文件，其余卷仍在建索引且 `status` 如实反映；
+- 卷 A 发布、卷 B 仍在建索引期间，卷 A 的增删改可被搜到；
+- 首建中途停机后重启走完整重建，磁盘无被误认为完整的残缺缓存；
+- 部分索引下前端不会在不完整结果集上本地过滤漏结果；
+- 首建期间应用与网页结果可用（测试锁定）；
+- 与 G0 同口径报告"首建到系统卷可搜"与"到全部卷可搜"两个时间。
+
+**粗略估算：4–6 天。**
+
 ## 13. 跨阶段公开契约
 
 ### 13.1 broker IPC
@@ -550,11 +617,17 @@ broker 负责解析并生成结构化过滤器；indexer 在候选进入 Top-K �
 
 | 数据 | 所有者 | 位置/性质 | 恢复策略 |
 | --- | --- | --- | --- |
-| index-v5/后续版本 | indexer | ProgramData，机器级 | 不兼容时可解释重建 |
-| pinyin sidecar | indexer/最终设计所有者 | 只读、版本化、可卸载 | 缺失时退回字面搜索 |
+| index-v5/后续版本 | indexer | `%ProgramData%\Prism\index-v5.bin`，机器级 | 不兼容时可解释重建 |
+| pinyin sidecar | indexer/最终设计所有者 | 机器级、只读、版本化、可卸载 | 缺失时退回字面搜索 |
 | history | broker | 用户目录、版本化 | 损坏回空历史 |
 | settings | WPF/broker | 用户目录、版本化 | 缺字段使用安全默认 |
 | favicon cache | WPF | 用户目录、有界缓存 | 损坏/过期重新获取或通用图标 |
+
+**卸载清理目前有缺口，必须补上。** [`dist/prism.iss`](../dist/prism.iss) 的 `[UninstallDelete]` 只删除 `{app}\data`，而机器级索引缓存写在 `%ProgramData%\Prism\`（[`index_cache.rs`](../src/prism-core/src/index_cache.rs) 的 `machine_data_dir()`），卸载后会残留。G2 引入 pinyin sidecar 会再多一个同目录残留文件。因此：
+
+- G3 负责在安装脚本里补 `%ProgramData%\Prism\` 的卸载清理（索引缓存属于可重建的机器级派生数据，不是用户数据）；
+- G2 新增 sidecar 时必须同步更新安装/卸载清单，不得只加生成逻辑；
+- 任何后续阶段新增机器级或用户级持久文件，都要在同一阶段内更新 `dist/prism.iss`。
 
 ## 14. 统一验收矩阵
 
@@ -591,9 +664,10 @@ dotnet build src/Prism/Prism.csproj -c Release
 
 ## 15. 发布、回滚与功能开关
 
-- 每个 G 阶段单独创建任务、提交和验收；不把 G0–G8 合成一个长任务；
-- 协议变更先发布兼容 reader，再启用新 writer 字段；
+- 每个 G 阶段单独创建任务、提交和验收；不把 G0–G9 合成一个长任务；
+- 协议变更按“可选字段 + reader 安全忽略未知值”设计，但**不需要跨版本分阶段发布**：三个二进制由同一个 Inno 安装包一次替换，`dist/prism.iss` 的 `PrepareToInstall` 先 `sc stop PrismIndexer` 再覆盖文件、`ssPostInstall` 重新 `sc start`，`CloseApplications=force` 处理 WPF 与 broker，因此不存在新旧混版同时运行的窗口。真正要守的是**磁盘上的持久数据跨版本可读**（缓存、history、settings、favicon metadata），而不是线上协议的灰度顺序；
 - 索引缓存只在持久结构变化时升级版本，并保留可解释重建；
+- 新增任何持久文件的阶段必须同步更新 `dist/prism.iss` 的安装与卸载清单（见 §13.3）；
 - history、pinyin、宿主联动、在线联想分别有独立开关；
 - 拼音失败回退字面搜索；宿主识别失败回退全局搜索；联想失败回退直接网页搜索；
 - 文件 mutation 不使用“自动回滚”伪装成功，错误和用户取消必须可区分；
@@ -605,10 +679,12 @@ dotnet build src/Prism/Prism.csproj -c Release
 | 风险 | 概率/影响 | 缓解与决策门 |
 | --- | --- | --- |
 | 正确 Top-K 取消提前终止后 P95 上升 | 高/高 | G0 基准、轻候选、延迟路径构造、按 max 堆选 |
+| 全量扫描地板成本本身就吃掉大部分预算 | 中/高 | G0 单独测裸扫描耗时；若 ≥60ms，G1 必须同时引入分片并行搜索，工期按 G1a/G1b 重估 |
+| `opt-level = "z"` 使 P95 目标无法达成 | 中/中 | G0 采集 `"z"` 与 `"3"` 对照；取舍在 G1 决策，并同时复测 100MB 门槛 |
 | 拼音数据超过 10MB 或拖慢 ASCII | 中/高 | sidecar 原型、稀疏表示、可卸载、独立门禁 |
 | root/path 父链验证放大 CPU | 中/中 | 仅对名称候选验证、缓存原型必须先测内存 |
 | 前端缓存漏结果 | 高/高 | is_truncated + generation + 模式/范围键 |
-| UIA 对话框兼容性不足 | 高/中 | 只承诺系统应用、明确 fallback、不注入 |
+| UIA 对话框兼容性不足 | 高/中 | 只承诺系统应用、明确 fallback、不注入；G4 原型阶段设显式放弃点（见 §8.4） |
 | Opus 版本行为变化 | 中/中 | 固定 13.23 验收、官方接口、失败退回全局 |
 | IFileOperation apartment/取消错误 | 中/高 | 专用 STA worker、错误分类、机器测试 |
 | 永久删除误操作 | 低/极高 | 每次系统确认、无关闭设置、动作明确分组 |
@@ -616,6 +692,10 @@ dotnet build src/Prism/Prism.csproj -c Release
 | 联想泄露输入或阻塞搜索 | 中/高 | 默认关闭、专用模式、异步 800ms、零 query 日志 |
 | favicon 恶意或超大响应 | 中/中 | 单独授权、协议/MIME/大小/解码限制、有界缓存 |
 | 旧代码清理丢测试 | 中/中 | 先迁移现行链覆盖，再删除旧模块 |
+| 新增持久文件未进卸载清单 | 中/低 | §13.3 要求同阶段更新 `dist/prism.iss`，卸载后检查 `%ProgramData%\Prism\` 为空 |
+| G9 逐卷发布期间丢 USN 事件 | 中/高 | `build_volume` 先取 checkpoint 再枚举，watcher 从 `volume.next_usn` 续读；机器测试"卷 A 发布后在卷 A 增删改可见" |
+| G9 首建中途停机写出残缺缓存 | 中/高 | 显式"首建完成"落盘门，不依赖 `volumes.len()` 巧合防护；测试中途 Stop 后磁盘无缓存 |
+| 部分索引被前端当完整集缓存 | 中/高 | `ready && building` 组合 + generation 每卷递增使缓存失效；`is_truncated` 定义排除"索引未建完"，并写针对性测试 |
 
 ## 17. 建议排期
 
@@ -623,15 +703,23 @@ dotnet build src/Prism/Prism.csproj -c Release
 | --- | --- | --- | --- |
 | 1 | G0 基线 | 1–2 天 | 可复跑数据 |
 | 2 | G1 搜索/协议/测试 | 1–2 周 | 结果正确、可回归 |
-| 3 | G2 历史/拼音 | 2–3 周 | 个性化与中文搜索 |
-| 4 | G3 工程地基 | 1–2 周 | 可安全扩展 Shell/协议 |
-| 5 | G4 当前目录/联动 | 2–4 周 | Explorer/系统对话框/Opus 工作流 |
-| 6 | G5 窗口切换 | 3–5 天 | `>` 模式与最近窗口 |
-| 7 | G6 内置动作 | 2–4 周 | 完整单项文件操作 |
-| 8 | G7 ext/path | 2–4 天 | 有限高级过滤 |
-| 9 | G8 网页增强 | 4–7 天 | 图标与受控联想 |
+| 3 | G9 首建可用性 | 4–6 天 | 首次安装不再分钟级不可用 |
+| 4 | G3 工程地基 | 1–2 周 | 可安全扩展 Shell/协议，schema 版本约定定型 |
+| 5 | G2 历史/拼音 | 2–3 周 | 个性化与中文搜索 |
+| 6 | G4 当前目录/联动 | 2–4 周 | Explorer/系统对话框/Opus 工作流 |
+| 7 | G5 窗口切换 | 3–5 天 | `>` 模式与最近窗口 |
+| 8 | G6 内置动作 | 2–4 周 | 完整单项文件操作 |
+| 9 | G7 ext/path | 2–4 天 | 有限高级过滤 |
+| 10 | G8 网页增强 | 4–7 天 | 图标与受控联想 |
 
-总工期不能简单按最小值承诺。以上均为单人粗略估算，不含需求等待、兼容性研究、代码评审、真实机器问题和发布观察。G5、G7、G8 在依赖满足后可调整先后，但不得绕过 G0/G1。
+按每周 5 个工作日折算，**合计约 11–20 周单人工期**。总工期不能简单按最小值承诺。以上均为单人粗略估算，不含需求等待、兼容性研究、代码评审、真实机器问题和发布观察。
+
+两处估算需要特别提醒：
+
+- **G1 的 1–2 周偏紧。** 它同时包含 Top-K 重写、broker 协议版本化、以及从零搭建 C# 测试工程（`SearchViewModel` 目前直接 `new DispatcherTimer()`，要脱离 Dispatcher 跑测试必须先把两个 timer 和两个管道客户端抽成接口）。若 G0 的裸扫描数据显示还需并行搜索，建议拆成 G1a 排序正确性与 G1b 协议/测试地基两次交付。
+- **G4 的 UIA/Opus 兼容矩阵实际耗时普遍超估算。** §8.4 已承诺失败时退回全局搜索，但没有写放弃条件；原型阶段应先设定一个明确止损点，超过即只交付 Explorer 一种宿主。
+
+G5、G7、G8 在依赖满足后可调整先后，但不得绕过 G0/G1，也不得在 G3 之前落地任何持久化 schema。
 
 ## 18. 明确排除与文档治理
 
@@ -658,4 +746,4 @@ dotnet build src/Prism/Prism.csproj -c Release
 - 不把路线、分值、工期或目标描述为已批准实施；
 - 每次只批准一个有独立验收和回滚边界的阶段。
 
-对应 Trellis 任务树位于 `.trellis/tasks/07-28-prism-comprehensive-evolution/`。父任务只管理来源、依赖和跨阶段验收；G0-G8 子任务分别拥有 PRD、技术设计、实施清单和上下文清单。默认从 G0 开始，任何子任务都必须在依赖归档且所有者单独审批后才能启动。
+对应 Trellis 任务树位于 `.trellis/tasks/07-28-prism-comprehensive-evolution/`。父任务只管理来源、依赖和跨阶段验收；G0-G9 子任务分别拥有 PRD、技术设计、实施清单和上下文清单（G9 位于 `.trellis/tasks/07-29-prism-g9-first-build/`）。默认从 G0 开始，任何子任务都必须在依赖归档且所有者单独审批后才能启动。

@@ -9,7 +9,7 @@ raw query -> parser -> name_query + FilterSet
 FilterSet = extensions(OR) AND paths(AND) AND optional root
 ```
 
-filters 使用稳定协议对象传给 indexer，限制过滤器数、单值长度、扩展数量和总序列化大小。WPF 不自行重写语法，只负责展示输入和接收解析结果。
+filters 使用 G1 预留的稳定可选协议字段传给 indexer（与 G3 的用户排除快照共用同一字段，只增加类型不新开通道），限制过滤器数、单值长度、扩展数量和总序列化大小。WPF 不自行重写语法，只负责展示输入和接收解析结果。
 
 ## Execution
 
