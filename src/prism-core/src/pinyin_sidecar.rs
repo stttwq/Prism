@@ -11,7 +11,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::hierarchy::{
-    ExclusionMatcher, IndexState, MatchKind, MatchMetadata, FLAG_DIRECTORY, FLAG_PRESENT,
+    ExclusionMatcher, IndexState, MatchKind, MatchMetadata, RootBound, RootFilter, FLAG_DIRECTORY,
+    FLAG_PRESENT,
 };
 use crate::pinyin::{
     encode_compact, match_compact_normalized, normalize_query, PinyinMatch, PinyinMatchKind,
@@ -336,6 +337,19 @@ impl PinyinSidecar {
         max: usize,
         exclusion_paths: &[String],
     ) -> PinyinSearchOutcome {
+        self.search_in_root(index, query, max, exclusion_paths, None)
+    }
+
+    /// Pinyin candidates are filtered by the same root rule as the literal path, before
+    /// the Top-K heap, so a current-directory search never leaks matches from elsewhere.
+    pub fn search_in_root(
+        &self,
+        index: &IndexState,
+        query: &str,
+        max: usize,
+        exclusion_paths: &[String],
+        root: Option<RootBound>,
+    ) -> PinyinSearchOutcome {
         let Some(normalized) = normalize_query(query) else {
             return PinyinSearchOutcome {
                 items: Vec::new(),
@@ -344,6 +358,7 @@ impl PinyinSidecar {
             };
         };
         let exclusions = ExclusionMatcher::new(exclusion_paths);
+        let mut root_filter = root.map(RootFilter::new);
         let mut heap = BinaryHeap::with_capacity(max);
         let mut matched_count = 0u64;
         for record in &self.disk.records {
@@ -351,6 +366,9 @@ impl PinyinSidecar {
                 continue;
             }
             if key_is_excluded(index, record.key, &exclusions) {
+                continue;
+            }
+            if !key_is_in_root(index, record.key, root_filter.as_mut()) {
                 continue;
             }
             let start = record.offset as usize;
@@ -371,6 +389,9 @@ impl PinyinSidecar {
                 continue;
             };
             if key_is_excluded(index, *key, &exclusions) {
+                continue;
+            }
+            if !key_is_in_root(index, *key, root_filter.as_mut()) {
                 continue;
             }
             if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
@@ -516,6 +537,20 @@ fn key_is_excluded(index: &IndexState, key: RecordKey, exclusions: &ExclusionMat
         .volumes
         .get(key.volume as usize)
         .is_none_or(|volume| exclusions.matches(volume, key.record))
+}
+
+fn key_is_in_root(
+    index: &IndexState,
+    key: RecordKey,
+    root_filter: Option<&mut RootFilter>,
+) -> bool {
+    let Some(filter) = root_filter else {
+        return true;
+    };
+    index
+        .volumes
+        .get(key.volume as usize)
+        .is_some_and(|volume| filter.accepts(key.volume as usize, volume, key.record))
 }
 
 pub fn path(data_dir: &Path) -> PathBuf {
@@ -767,6 +802,54 @@ mod tests {
         assert_eq!(outcome.items[0].path, "C:\\微信2026");
         assert_eq!(outcome.items[0].match_spans, [0, 6]);
         assert_eq!(outcome.items[0].match_metadata.kind, MatchKind::Initials);
+    }
+
+    #[test]
+    fn root_scope_filters_pinyin_hits_from_outside_the_root() {
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "volume".into(),
+                serial: 7,
+            },
+            "C:\\".into(),
+            10,
+            20,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "项目", true).unwrap();
+        volume.upsert(11, 10, "微信", false).unwrap();
+        volume.upsert(12, 5, "微信", false).unwrap();
+        volume.upsert(13, 5, "别处", true).unwrap();
+        volume.upsert(14, 13, "微信", false).unwrap();
+        let index = IndexState {
+            volumes: vec![volume],
+            generation: 9,
+            events_since_checkpoint: 0,
+        };
+        let mut sidecar = PinyinSidecar::build(&index).unwrap();
+        let root = Some(RootBound {
+            volume_index: 0,
+            root_record: 10,
+        });
+
+        assert_eq!(sidecar.search(&index, "wx", 8).items.len(), 3);
+        let scoped = sidecar.search_in_root(&index, "wx", 8, &[], root);
+        assert_eq!(scoped.items.len(), 1, "{:?}", scoped.items);
+        assert_eq!(scoped.items[0].path, "C:\\项目\\微信");
+        assert_eq!(
+            scoped.matched_count, 1,
+            "out-of-root candidates never enter Top-K accounting"
+        );
+
+        // The delta path applies the same rule: a rename inside the root stays visible and
+        // a rename outside it does not leak in.
+        sidecar.apply_delta(0, 11, Some("支付宝")).unwrap();
+        sidecar.apply_delta(0, 12, Some("支付宝")).unwrap();
+        let delta_scoped = sidecar.search_in_root(&index, "zfb", 8, &[], root);
+        assert_eq!(delta_scoped.items.len(), 1, "{:?}", delta_scoped.items);
+        assert_eq!(delta_scoped.items[0].path, "C:\\项目\\微信");
+        assert_eq!(delta_scoped.matched_count, 1);
     }
 
     #[test]

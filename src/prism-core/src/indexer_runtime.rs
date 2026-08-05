@@ -13,11 +13,12 @@ use tokio::sync::{mpsc, Notify};
 use crate::hierarchy::{ApplyOutcome, IndexState, VolumeIndex};
 use crate::index_cache;
 use crate::indexer_ipc::{
-    validate_search_request, BuildProgress, IndexerItem, IndexerRequest, IndexerResponse,
-    IndexerStatus, PinyinStatus, SearchFilter,
+    requested_root, validate_search_request, BuildProgress, IndexerItem, IndexerRequest,
+    IndexerResponse, IndexerStatus, PinyinStatus, SearchFilter,
 };
 use crate::ntfs::{self, VolumeDescriptor};
 use crate::pinyin_sidecar::{LoadErrorKind, PinyinSidecar};
+use crate::root_scope::RootScope;
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 
 pub struct Shutdown {
@@ -462,8 +463,18 @@ impl ServiceState {
         max: usize,
         filters: Option<&[SearchFilter]>,
         pinyin_enabled: bool,
+        root: Option<&str>,
     ) -> Result<IndexerResponse, String> {
         validate_search_request(max, filters)?;
+        let root = match requested_root(root) {
+            Ok(root) => root,
+            Err(rejection) => {
+                return Ok(IndexerResponse::RootUnavailable {
+                    reason: rejection,
+                    message: rejection.message().to_owned(),
+                })
+            }
+        };
         let guard = self.index.read().map_err(|_| "index lock is poisoned")?;
         let state = guard.as_ref().ok_or("file index is not ready")?;
         self.pinyin_enabled.store(pinyin_enabled, Ordering::Release);
@@ -472,6 +483,19 @@ impl ServiceState {
         } else {
             self.release_pinyin();
         }
+        let root_bound = match root {
+            Some(root) => match RootScope::resolve(state, root) {
+                Ok(scope) => Some(scope.bound()),
+                Err(rejection) => {
+                    // The caller falls back to a global search; the reason stays explicit.
+                    return Ok(IndexerResponse::RootUnavailable {
+                        reason: rejection,
+                        message: rejection.message().to_owned(),
+                    });
+                }
+            },
+            None => None,
+        };
         let generation = state.generation;
         if query.is_empty() {
             return Ok(IndexerResponse::Results {
@@ -487,7 +511,7 @@ impl ServiceState {
             });
         }
         let exclusions = crate::indexer_ipc::exclusion_paths(filters);
-        let outcome = state.search_with_exclusions(query, max, &exclusions);
+        let outcome = state.search_in_root(query, max, &exclusions, root_bound);
         let mut items: Vec<_> = outcome
             .items
             .into_iter()
@@ -505,11 +529,12 @@ impl ServiceState {
         if pinyin_enabled && literal_count < max as u64 {
             if let Ok(sidecar) = self.pinyin.read() {
                 if let Some(sidecar) = sidecar.as_ref() {
-                    let pinyin = sidecar.search_with_exclusions(
+                    let pinyin = sidecar.search_in_root(
                         state,
                         query,
                         max.saturating_sub(items.len()),
                         &exclusions,
+                        root_bound,
                     );
                     matched_count = matched_count.saturating_add(pinyin.matched_count);
                     path_constructions =
@@ -1201,6 +1226,7 @@ pub(crate) async fn handle_connection(
                 max,
                 filters,
                 pinyin_enabled,
+                root,
             }) => {
                 let state = state.clone();
                 match tokio::task::spawn_blocking(move || {
@@ -1209,6 +1235,7 @@ pub(crate) async fn handle_connection(
                         max,
                         filters.as_deref(),
                         pinyin_enabled.unwrap_or(false),
+                        root.as_deref(),
                     )
                 })
                 .await
@@ -1252,6 +1279,7 @@ mod tests {
     use super::*;
     use crate::hierarchy::VolumeId;
     use crate::indexer_ipc::{MAX_FILTERS, MAX_FILTER_VALUE_BYTES, MAX_SEARCH_RESULTS};
+    use crate::root_scope::RootRejection;
 
     fn test_volume(guid: &str, mount_path: &str, name: &str) -> VolumeIndex {
         let mut volume = VolumeIndex::new(
@@ -1294,7 +1322,7 @@ mod tests {
         assert_eq!(status.volumes, 1);
         assert_eq!(status.generation, 1);
         assert!(state
-            .search("needle", 8, None, false)
+            .search("needle", 8, None, false, None)
             .is_ok_and(|response| matches!(response, IndexerResponse::Results { ref items, .. } if items.len() == 1)));
     }
 
@@ -1303,18 +1331,18 @@ mod tests {
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "微信"));
 
-        let literal = state.search("微信", 8, None, true).unwrap();
+        let literal = state.search("微信", 8, None, true, None).unwrap();
         assert!(matches!(literal, IndexerResponse::Results { ref items, .. } if items.len() == 1));
         assert_eq!(state.pinyin_status(), PinyinStatus::Building);
 
-        let pinyin_without_sidecar = state.search("wx", 8, None, true).unwrap();
+        let pinyin_without_sidecar = state.search("wx", 8, None, true, None).unwrap();
         assert!(
             matches!(pinyin_without_sidecar, IndexerResponse::Results { ref items, .. } if items.is_empty())
         );
 
         let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
         *state.pinyin.write().unwrap() = Some(PinyinSidecar::build(&snapshot).unwrap());
-        let disabled = state.search("微信", 8, None, false).unwrap();
+        let disabled = state.search("微信", 8, None, false, None).unwrap();
         assert!(matches!(disabled, IndexerResponse::Results { ref items, .. } if items.len() == 1));
         assert!(state.pinyin.read().unwrap().is_none());
         assert_eq!(state.pinyin_status(), PinyinStatus::Disabled);
@@ -1342,7 +1370,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            missing.search("微信", 8, None, true).unwrap(),
+            missing.search("微信", 8, None, true, None).unwrap(),
             IndexerResponse::Results { ref items, .. } if items.len() == 1
         ));
         assert_eq!(missing.pinyin_status(), PinyinStatus::Building);
@@ -1362,7 +1390,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            corrupt.search("微信", 8, None, true).unwrap(),
+            corrupt.search("微信", 8, None, true, None).unwrap(),
             IndexerResponse::Results { ref items, .. } if items.len() == 1
         ));
         assert_eq!(corrupt.pinyin_status(), PinyinStatus::Building);
@@ -1666,5 +1694,69 @@ mod tests {
             value: "x".repeat(MAX_FILTER_VALUE_BYTES + 1),
         };
         assert!(validate_search_request(8, Some(&[long_value])).is_err());
+    }
+
+    #[test]
+    fn requested_root_scopes_the_service_search_and_blank_root_stays_global() {
+        let state = ServiceState::new();
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "root".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "项目", true).unwrap();
+        volume.upsert(11, 10, "needle-inside.txt", false).unwrap();
+        volume.upsert(20, 5, "needle-outside.txt", false).unwrap();
+        state.publish(IndexState {
+            volumes: vec![volume],
+            generation: 3,
+            events_since_checkpoint: 0,
+        });
+
+        let scoped = state
+            .search("needle", 8, None, false, Some(r"c:/项目/"))
+            .unwrap();
+        let IndexerResponse::Results { items, .. } = scoped else {
+            panic!("expected results for a valid root");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, r"C:\项目\needle-inside.txt");
+
+        // Absent and blank roots must behave identically to the pre-root protocol.
+        for root in [None, Some(""), Some("   ")] {
+            let global = state.search("needle", 8, None, false, root).unwrap();
+            let IndexerResponse::Results { items, .. } = global else {
+                panic!("expected results for {root:?}");
+            };
+            assert_eq!(items.len(), 2, "root {root:?} must not restrict anything");
+        }
+    }
+
+    #[test]
+    fn unusable_root_is_reported_as_a_structured_degradation() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
+
+        for (root, expected) in [
+            (r"E:\somewhere", RootRejection::VolumeNotIndexed),
+            (r"C:\missing", RootRejection::NotFound),
+            ("relative", RootRejection::NotAbsolute),
+            (r"\\server\share", RootRejection::Unsupported),
+        ] {
+            let response = state.search("needle", 8, None, false, Some(root)).unwrap();
+            match response {
+                IndexerResponse::RootUnavailable { reason, message } => {
+                    assert_eq!(reason, expected, "unexpected reason for {root}");
+                    assert!(!message.is_empty());
+                }
+                other => panic!("expected RootUnavailable for {root}, got {other:?}"),
+            }
+        }
     }
 }

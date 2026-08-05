@@ -15,6 +15,7 @@ pub mod ntfs;
 pub mod persistence;
 pub mod pinyin;
 pub mod pinyin_sidecar;
+pub mod root_scope;
 pub mod shell;
 pub mod websearch;
 

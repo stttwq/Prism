@@ -22,7 +22,10 @@ use crate::apps::SharedApps;
 use crate::hierarchy::{MatchKind, MatchMetadata};
 use crate::history::{HistoryDiagnostic, HistoryStore, HistoryUse, HistoryWeight};
 use crate::indexer_client;
-use crate::indexer_ipc::{exclusion_paths, validate_search_request, BuildProgress, SearchFilter};
+use crate::indexer_ipc::{
+    exclusion_paths, requested_root, validate_search_request, BuildProgress, SearchFilter,
+};
+use crate::root_scope::RootRejection;
 use crate::shell::{
     ActionTarget, ShellError, ShellExecutor, ShellOperation, ShellOutcome, TargetKind,
 };
@@ -67,6 +70,9 @@ pub enum Request {
         max: usize,
         #[serde(default)]
         filters: Option<Vec<SearchFilter>>,
+        /// 可选的当前目录范围（G4）。缺失或空白等于全局搜索，所以旧前端逐字节兼容。
+        #[serde(default)]
+        root: Option<String>,
     },
     /// 执行选中项（打开文件 / 启动程序 / 打开网址）。
     Execute {
@@ -158,6 +164,12 @@ pub enum Response {
         pinyin_status: Option<crate::indexer_ipc::PinyinStatus>,
         #[serde(skip_serializing_if = "Option::is_none")]
         history_status: Option<String>,
+        /// 请求带了 root 但无法使用时的结构化降级原因（值与 `root_scope::RootRejection`
+        /// 的稳定字符串一致）。此时 items 已经是全局搜索结果，前端据此回到全局并提示。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root_rejection: Option<crate::root_scope::RootRejection>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root_message: Option<String>,
     },
     /// 动作面板列表。
     Actions {
@@ -291,11 +303,15 @@ async fn handle_connection(
                 query,
                 max,
                 filters,
+                root,
             }) => {
                 search_service(
-                    &query,
-                    max,
-                    filters,
+                    SearchArgs {
+                        query: &query,
+                        max,
+                        filters,
+                        root: root.as_deref(),
+                    },
                     &apps,
                     &engines,
                     &history,
@@ -405,15 +421,27 @@ async fn dispatch_non_search(
     }
 }
 
-async fn search_service(
-    query: &str,
+/// 一次搜索请求的查询部分（与共享状态分开传递，避免参数表无限膨胀）。
+struct SearchArgs<'a> {
+    query: &'a str,
     max: usize,
     filters: Option<Vec<SearchFilter>>,
+    root: Option<&'a str>,
+}
+
+async fn search_service(
+    args: SearchArgs<'_>,
     apps: &SharedApps,
     engines: &SharedEngines,
     history: &Arc<HistoryStore>,
     preferences: &Arc<BrokerPreferences>,
 ) -> Response {
+    let SearchArgs {
+        query,
+        max,
+        filters,
+        root,
+    } = args;
     if let Err(message) = validate_search_request(max, filters.as_deref()) {
         return Response::Error {
             message,
@@ -421,6 +449,12 @@ async fn search_service(
         };
     }
     let filters = filters.filter(|values| !values.is_empty());
+    // G4 empty input: host context shows recent file/dir under root from history only.
+    // No apps, web, or full-index scan — empty indexer queries are meaningless and expensive.
+    // Non-host empty input (recent windows) is deferred to G5; keep an empty Results reply.
+    if query.trim().is_empty() {
+        return empty_query_results(query, max, filters.as_deref(), root, history);
+    }
     let mut items = Vec::with_capacity(max.min(128));
     if let Ok(guard) = engines.read() {
         if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
@@ -436,6 +470,7 @@ async fn search_service(
         &history_weights,
         preferences.pinyin_enabled(),
         &exclusions,
+        None,
     );
     let injected_history_targets: HashSet<_> = history_candidates
         .iter()
@@ -503,11 +538,12 @@ async fn search_service(
             }
         }
     }
-    let service = indexer_client::search_with_options(
+    let (service, root_rejection, root_message) = search_index_with_root_fallback(
         query,
         result_slots.max(1),
         filters.as_deref(),
         preferences.pinyin_enabled(),
+        root,
     )
     .await;
     let (
@@ -612,15 +648,127 @@ async fn search_service(
         path_constructions,
         pinyin_status,
         history_status: history.take_diagnostic().map(history_status),
+        root_rejection,
+        root_message,
     }
 }
 
+/// Empty-query search path for G4 §4.4.
+///
+/// * With a usable `root` and history on: recent existing file/directory entries under that
+///   root, capped at `max`, no indexer round-trip.
+/// * Root rejected locally: empty items + structured rejection (UI falls back to global).
+/// * No root / history off: empty items. Recent-window listing waits on G5.
+fn empty_query_results(
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    root: Option<&str>,
+    history: &Arc<HistoryStore>,
+) -> Response {
+    let exclusions = exclusion_paths(filters);
+    let (root, root_rejection, root_message) = match requested_root(root) {
+        Ok(root) => (root, None, None),
+        Err(reason) => (None, Some(reason), Some(reason.message().to_owned())),
+    };
+
+    let items = match root {
+        Some(root) if history.is_enabled() => {
+            let mut items =
+                history_file_candidates("", &history.weights(), false, &exclusions, Some(root));
+            // Rank by history first; compare_search_results already prefers higher
+            // history_score within the same match tier, which empty-query items share.
+            items.sort_by(compare_search_results);
+            items.truncate(max);
+            items
+        }
+        _ => Vec::new(),
+    };
+
+    Response::Results {
+        // Echo the client query unchanged (may be "" or whitespace) so the frontend
+        // sequence check still accepts the reply.
+        query: query.to_owned(),
+        items,
+        is_indexing: false,
+        index_progress: None,
+        index_error: None,
+        index_generation: None,
+        is_truncated: false,
+        matched_count: None,
+        scanned_nodes: None,
+        name_candidates: None,
+        entered_top_k: None,
+        path_constructions: None,
+        pinyin_status: None,
+        history_status: history.take_diagnostic().map(history_status),
+        root_rejection,
+        root_message,
+    }
+}
+
+/// Runs the indexer search for an optional current-directory root.
+///
+/// A root the service cannot use never fails the whole search: the request is reissued
+/// globally and the rejection is returned as a value, so the response can carry both the
+/// global results and the exact reason the scope was dropped. Callers never see the
+/// reason flattened into an error string.
+async fn search_index_with_root_fallback(
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
+    root: Option<&str>,
+) -> (
+    Result<indexer_client::SearchReply, String>,
+    Option<RootRejection>,
+    Option<String>,
+) {
+    // Blank roots mean "global" on both sides of the pipe; only a bounded, non-empty root
+    // reaches the service. A locally detectable rejection is reported without a round trip.
+    let root = match requested_root(root) {
+        Ok(root) => root,
+        Err(reason) => {
+            let reply =
+                indexer_client::search_in_root(query, max, filters, pinyin_enabled, None).await;
+            return (
+                reply.map_err(|failure| failure.message),
+                Some(reason),
+                Some(reason.message().to_owned()),
+            );
+        }
+    };
+
+    let reply = indexer_client::search_in_root(query, max, filters, pinyin_enabled, root).await;
+    match reply {
+        Err(failure) if failure.root_rejection.is_some() && root.is_some() => {
+            let reason = failure.root_rejection.expect("checked above");
+            let retried =
+                indexer_client::search_in_root(query, max, filters, pinyin_enabled, None).await;
+            (
+                retried.map_err(|failure| failure.message),
+                Some(reason),
+                Some(failure.message),
+            )
+        }
+        other => (other.map_err(|failure| failure.message), None, None),
+    }
+}
+
+/// History file/directory injection.
+///
+/// When `root` is set (empty-query host context), only paths under that root survive and
+/// the path must still exist on disk. Non-empty query search leaves `root` as `None` so
+/// the G2 title-match injection path is unchanged.
 fn history_file_candidates(
     query: &str,
     weights: &[HistoryWeight],
     pinyin_enabled: bool,
     exclusions: &[String],
+    root: Option<&str>,
 ) -> Vec<SearchResult> {
+    let empty_query = query.is_empty();
+    let root_normalized = root.map(normalize_path_prefix);
     let mut candidates = Vec::new();
     for weight in weights {
         if weight.target.kind != "file" && weight.target.kind != "directory" {
@@ -629,13 +777,36 @@ fn history_file_candidates(
         if path_is_excluded(&weight.target.value, exclusions) {
             continue;
         }
+        if let Some(root) = root_normalized.as_deref() {
+            // Prefix boundary: `root` and `root\child` match, `rootOther` does not.
+            if !path_is_under_root(&weight.target.value, root) {
+                continue;
+            }
+        }
+        // Empty-query recent list only shows paths that still exist (file or directory).
+        if empty_query && !std::path::Path::new(&weight.target.value).exists() {
+            continue;
+        }
         let Some(title) = std::path::Path::new(&weight.target.value)
             .file_name()
             .and_then(|name| name.to_str())
         else {
             continue;
         };
-        let (metadata, match_spans) = if let Some(mut metadata) = rank_title(title, query) {
+        let (metadata, match_spans) = if empty_query {
+            // No literal query to rank against: same match tier for every row so history
+            // score alone decides order (see MatchMetadata::cmp).
+            (
+                MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: title.encode_utf16().count() as u32,
+                    history_score: weight.score,
+                },
+                Vec::new(),
+            )
+        } else if let Some(mut metadata) = rank_title(title, query) {
             metadata.history_score = weight.score;
             (metadata, match_spans(title, query))
         } else if pinyin_enabled {
@@ -663,17 +834,35 @@ fn history_file_candidates(
     candidates
 }
 
+fn normalize_path_prefix(value: &str) -> String {
+    value
+        .trim()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_owned()
+}
+
+/// True when `path` is `root` itself or a descendant (`root\...`), case-insensitive.
+/// Sibling prefixes such as `C:\rootOther` must not match `C:\root`.
+fn path_is_under_root(path: &str, root: &str) -> bool {
+    let normalized = normalize_path_prefix(path);
+    let root = normalize_path_prefix(root);
+    if root.is_empty() {
+        return false;
+    }
+    normalized.eq_ignore_ascii_case(&root)
+        || normalized.get(root.len()..).is_some_and(|suffix| {
+            suffix.starts_with('\\')
+                && normalized
+                    .get(..root.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&root))
+        })
+}
+
 fn path_is_excluded(path: &str, exclusions: &[String]) -> bool {
-    let normalized = path.replace('/', "\\");
-    exclusions.iter().any(|excluded| {
-        normalized.eq_ignore_ascii_case(excluded)
-            || normalized.get(excluded.len()..).is_some_and(|suffix| {
-                suffix.starts_with('\\')
-                    && normalized
-                        .get(..excluded.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(excluded))
-            })
-    })
+    exclusions
+        .iter()
+        .any(|excluded| path_is_under_root(path, excluded))
 }
 
 fn pinyin_metadata(matched: &crate::pinyin::PinyinMatch, history_score: u32) -> MatchMetadata {
@@ -905,7 +1094,7 @@ mod protocol_tests {
             target: ActionTarget::new(TargetKind::File, r"C:\late\zeta.txt"),
             score: 4,
         }];
-        let mut candidates = history_file_candidates("ta", &weights, true, &[]);
+        let mut candidates = history_file_candidates("ta", &weights, true, &[], None);
         candidates.push(SearchResult {
             kind: SearchResultKind::File,
             title: "beta.txt".into(),
@@ -925,7 +1114,185 @@ mod protocol_tests {
             Some(4)
         );
 
-        assert!(history_file_candidates("ta", &weights, true, &[r"C:\late".into()]).is_empty());
+        assert!(
+            history_file_candidates("ta", &weights, true, &[r"C:\late".into()], None).is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_query_history_under_root_keeps_existing_descendants_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-empty-query-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = dir.join("project");
+        let nested = root.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let inside = nested.join("inside.txt");
+        let sibling_dir = dir.join("other");
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        let outside = sibling_dir.join("outside.txt");
+        std::fs::write(&inside, b"in").unwrap();
+        std::fs::write(&outside, b"out").unwrap();
+        // Same basename as an inside hit, but under a different tree — must be dropped.
+        let outside_same_name = sibling_dir.join("inside.txt");
+        std::fs::write(&outside_same_name, b"nope").unwrap();
+        // Prefix-boundary trap: `projectX` shares the `project` text prefix but is not a
+        // descendant of `project\`. It must stay out of the empty-query root list.
+        let root_other = dir.join("projectX");
+        std::fs::create_dir_all(&root_other).unwrap();
+        let root_other_file = root_other.join("trap.txt");
+        std::fs::write(&root_other_file, b"trap").unwrap();
+
+        let root_str = root.to_string_lossy().replace('/', "\\");
+        let inside_str = inside.to_string_lossy().replace('/', "\\");
+        let outside_str = outside.to_string_lossy().replace('/', "\\");
+        let outside_same_str = outside_same_name.to_string_lossy().replace('/', "\\");
+        let gone_str = nested.join("gone.txt").to_string_lossy().replace('/', "\\");
+        let folder_str = nested.to_string_lossy().replace('/', "\\");
+        let root_other_str = root_other_file.to_string_lossy().replace('/', "\\");
+        let root_self_str = root_str.clone();
+
+        let weights = vec![
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &outside_str),
+                score: 40,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &outside_same_str),
+                score: 30,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &gone_str),
+                score: 20,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &root_other_str),
+                score: 18,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &inside_str),
+                score: 8,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::Directory, &folder_str),
+                score: 12,
+            },
+            // The root directory itself is a valid empty-query hit.
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::Directory, &root_self_str),
+                score: 6,
+            },
+            // Window history must never surface on the empty-query file path.
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::Window, "12345"),
+                score: 99,
+            },
+        ];
+
+        let mut candidates =
+            history_file_candidates("", &weights, false, &[], Some(root_str.as_str()));
+        candidates.sort_by(compare_search_results);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| item.execute_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                folder_str.as_str(),
+                inside_str.as_str(),
+                root_self_str.as_str()
+            ]
+        );
+        assert_eq!(
+            candidates[0].kind,
+            SearchResultKind::Folder,
+            "higher history score wins among empty-query rows"
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|item| item.execute_id.eq_ignore_ascii_case(&root_other_str)),
+            "prefix-boundary: rootOther must not match root"
+        );
+
+        // Non-empty query must still use title matching and ignore the root filter arg
+        // when callers pass None (G2 injection path).
+        let named = history_file_candidates("inside", &weights, false, &[], None);
+        assert!(named.iter().any(|item| item.execute_id == inside_str));
+        assert!(
+            named.iter().any(|item| item.execute_id == outside_same_str),
+            "without a root filter, sibling trees still inject on title match"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_query_results_require_root_and_enabled_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-empty-query-response-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let file_str = file.to_string_lossy().replace('/', "\\");
+        let root_str = dir.to_string_lossy().replace('/', "\\");
+
+        let history_dir = std::env::temp_dir().join(format!(
+            "prism-empty-query-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+        history
+            .record(
+                &ActionTarget::new(TargetKind::File, &file_str),
+                HistoryUse::Execute,
+            )
+            .unwrap();
+
+        let with_root = empty_query_results("", 8, None, Some(root_str.as_str()), &history);
+        match with_root {
+            Response::Results { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].execute_id, file_str);
+            }
+            other => panic!("expected results, got {other:?}"),
+        }
+
+        let no_root = empty_query_results("", 8, None, None, &history);
+        match no_root {
+            Response::Results { items, .. } => {
+                assert!(
+                    items.is_empty(),
+                    "non-host empty input defers recent windows to G5"
+                );
+            }
+            other => panic!("expected results, got {other:?}"),
+        }
+
+        history.set_enabled(false);
+        let disabled = empty_query_results("", 8, None, Some(root_str.as_str()), &history);
+        match disabled {
+            Response::Results { items, .. } => assert!(items.is_empty()),
+            other => panic!("expected results, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(history_dir);
     }
 
     #[test]
@@ -1053,5 +1420,102 @@ mod protocol_tests {
 
     fn default_engines() -> SharedEngines {
         Arc::new(std::sync::RwLock::new(WebEngine::defaults()))
+    }
+
+    /// The broker protocol gained `root` without a version bump, so an old frontend that
+    /// never sends the field has to decode byte-for-byte as before.
+    #[test]
+    fn broker_search_root_is_optional_and_backward_compatible() {
+        let legacy: Request =
+            serde_json::from_str(r#"{"type":"search","query":"x","max":8}"#).unwrap();
+        assert!(matches!(legacy, Request::Search { root: None, .. }));
+
+        let explicit_null: Request =
+            serde_json::from_str(r#"{"type":"search","query":"x","max":8,"root":null}"#).unwrap();
+        assert!(matches!(explicit_null, Request::Search { root: None, .. }));
+
+        let scoped: Request = serde_json::from_str(
+            r#"{"type":"search","query":"x","max":8,"root":"C:\\Users\\me\\docs"}"#,
+        )
+        .unwrap();
+        let Request::Search { root, .. } = scoped else {
+            panic!("expected a search request");
+        };
+        assert_eq!(root.as_deref(), Some(r"C:\Users\me\docs"));
+        // A blank root is a cleared scope, not an error: it must behave like no root.
+        assert_eq!(requested_root(Some("   ")).unwrap(), None);
+        assert_eq!(
+            requested_root(root.as_deref()).unwrap(),
+            Some(r"C:\Users\me\docs")
+        );
+    }
+
+    /// Every rejection reaches the frontend as a value whose string form matches
+    /// `root_scope::RootRejection`, and is omitted entirely for ordinary searches.
+    #[test]
+    fn root_rejection_is_reported_as_a_structured_field() {
+        let results = |rejection: Option<RootRejection>| Response::Results {
+            query: "x".into(),
+            items: Vec::new(),
+            is_indexing: false,
+            index_progress: None,
+            index_error: None,
+            index_generation: Some(3),
+            is_truncated: false,
+            matched_count: None,
+            scanned_nodes: None,
+            name_candidates: None,
+            entered_top_k: None,
+            path_constructions: None,
+            pinyin_status: None,
+            history_status: None,
+            root_message: rejection.map(|reason| reason.message().to_owned()),
+            root_rejection: rejection,
+        };
+
+        let global = serde_json::to_value(results(None)).unwrap();
+        assert!(global.get("root_rejection").is_none(), "{global}");
+        assert!(global.get("root_message").is_none(), "{global}");
+
+        for reason in [
+            RootRejection::NotAbsolute,
+            RootRejection::Unsupported,
+            RootRejection::TooLong,
+            RootRejection::TooDeep,
+            RootRejection::VolumeNotIndexed,
+            RootRejection::NotFound,
+            RootRejection::NotADirectory,
+            RootRejection::AccessDenied,
+        ] {
+            let json = serde_json::to_value(results(Some(reason))).unwrap();
+            assert_eq!(
+                json["root_rejection"].as_str(),
+                Some(reason.reason()),
+                "reason strings must stay identical to root_scope"
+            );
+            assert_eq!(json["root_message"].as_str(), Some(reason.message()));
+        }
+    }
+
+    /// A root the indexer refuses degrades to a global search. The reply must still be a
+    /// normal `results` response — never an `error` — so the frontend keeps working.
+    #[tokio::test]
+    async fn unusable_root_degrades_to_a_global_search_with_a_reason() {
+        // No indexer service is running in tests, so the index part fails; what matters is
+        // that a locally detectable rejection is reported as a field, not as an error.
+        let too_long = format!("C:\\{}", "a".repeat(crate::root_scope::MAX_ROOT_PATH_BYTES));
+        let (_, rejection, message) =
+            search_index_with_root_fallback("needle", 8, None, false, Some(&too_long)).await;
+        assert_eq!(rejection, Some(RootRejection::TooLong));
+        assert_eq!(message.as_deref(), Some(RootRejection::TooLong.message()));
+
+        let (_, rejection, message) =
+            search_index_with_root_fallback("needle", 8, None, false, None).await;
+        assert_eq!(rejection, None, "a global search reports no rejection");
+        assert_eq!(message, None);
+
+        let (_, rejection, _) =
+            search_index_with_root_fallback("needle", 8, None, false, Some("   ")).await;
+        assert_eq!(rejection, None, "a blank root is a global search");
     }
 }

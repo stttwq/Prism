@@ -1,7 +1,7 @@
 //! Compact FRN-indexed hierarchy shared by MFT construction and USN replay.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,21 @@ pub const FLAG_EXCLUDED: u16 = 0x0004;
 const MAX_RECORD_NUMBER: usize = 2_000_000;
 const MAX_PATH_DEPTH: usize = 64;
 const NO_NAME: u32 = u32::MAX;
+
+/// Deepest record [`VolumeIndex::path_for`] can still render, counted in hops above the
+/// volume root: the walk spends one iteration per component plus one for the root itself.
+pub const MAX_RECORD_DEPTH: usize = MAX_PATH_DEPTH - 1;
+
+/// Upper bound for one ancestor walk: how far below the requested root a candidate may
+/// sit. Equal to [`MAX_RECORD_DEPTH`], so a root placed at the volume root accepts exactly
+/// the records whose path can be constructed. A root nested `r` hops below the volume root
+/// still only guarantees `r + depth <= MAX_RECORD_DEPTH` records get a path; deeper hits
+/// are dropped by path construction, exactly as in an unscoped search.
+pub const MAX_ANCESTOR_DEPTH: usize = MAX_RECORD_DEPTH;
+
+/// Per-request memo ceiling for [`RootFilter`]. Bounded so a root search cannot grow
+/// resident memory; the memo lives and dies with a single search request.
+const MAX_ANCESTOR_MEMO: usize = 4_096;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +159,133 @@ impl PartialOrd for RankedCandidate<'_> {
 pub enum ApplyOutcome {
     Applied,
     RebuildRequired,
+}
+
+/// A resolved current-directory scope: which volume, and which directory record every
+/// candidate must descend from. Deliberately a search-time value, not node state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootBound {
+    pub volume_index: usize,
+    pub root_record: u32,
+}
+
+/// Bounded ancestor verification for one search request.
+///
+/// Candidates are accepted only when the existing `parent_record` chain reaches
+/// `root_record` within [`MAX_ANCESTOR_DEPTH`] hops. The *distance* of every record walked
+/// on the way up is memoized, which makes repeated hits inside the same directory cheap
+/// without storing anything in [`NodeSlot`]. The memo is dropped with the request.
+#[derive(Debug)]
+pub struct RootFilter {
+    bound: RootBound,
+    /// Hops from a record up to `bound.root_record`, or `None` when the record provably
+    /// does not descend from it. Distances are absolute, so a verdict never depends on
+    /// which candidate happened to be scanned first.
+    memo: HashMap<u32, Option<u32>>,
+    trail: Vec<u32>,
+}
+
+impl RootFilter {
+    pub fn new(bound: RootBound) -> Self {
+        Self {
+            bound,
+            memo: HashMap::new(),
+            trail: Vec::new(),
+        }
+    }
+
+    pub fn bound(&self) -> RootBound {
+        self.bound
+    }
+
+    /// Returns true when `record` on `volume_index` is the root itself or below it.
+    /// Cross-volume candidates, tombstones, missing parents and cycles are all rejected.
+    pub fn accepts(&mut self, volume_index: usize, volume: &VolumeIndex, record: u32) -> bool {
+        if volume_index != self.bound.volume_index {
+            return false;
+        }
+        if let Some(known) = self.memo.get(&record) {
+            return depth_is_in_scope(*known);
+        }
+        let Some(depth) = ancestor_depth(
+            volume,
+            record,
+            self.bound.root_record,
+            &self.memo,
+            &mut self.trail,
+        ) else {
+            // The ceiling was reached without a verdict: the records walked past may well
+            // be inside the root, so nothing is memoized and nothing gets poisoned.
+            self.trail.clear();
+            return false;
+        };
+        // `trail[0]` is `record` itself and each further entry sits one hop closer to the
+        // root, so distances are exact for the whole walk.
+        for (hop, visited) in self.trail.drain(..).enumerate() {
+            if self.memo.len() >= MAX_ANCESTOR_MEMO {
+                break;
+            }
+            self.memo
+                .insert(visited, depth.map(|depth| depth.saturating_sub(hop as u32)));
+        }
+        if self.memo.len() < MAX_ANCESTOR_MEMO {
+            self.memo.entry(record).or_insert(depth);
+        }
+        depth_is_in_scope(depth)
+    }
+}
+
+/// A record is in scope when it descends from the root within the depth ceiling.
+fn depth_is_in_scope(depth: Option<u32>) -> bool {
+    depth.is_some_and(|depth| depth as usize <= MAX_ANCESTOR_DEPTH)
+}
+
+/// Walks up the parent chain and reports how far `record` sits below `root_record`.
+///
+/// * `Some(Some(depth))` — `record` descends from the root after `depth` hops.
+/// * `Some(None)` — provably outside: dead root, tombstone, missing slot or cycle.
+/// * `None` — undetermined because [`MAX_ANCESTOR_DEPTH`] hops were spent first. The
+///   caller must treat this as a rejection *and* memoize nothing.
+///
+/// On return, `trail` holds the records walked, starting at `record`.
+fn ancestor_depth(
+    volume: &VolumeIndex,
+    record: u32,
+    root_record: u32,
+    memo: &HashMap<u32, Option<u32>>,
+    trail: &mut Vec<u32>,
+) -> Option<Option<u32>> {
+    trail.clear();
+    let root_is_live = volume.nodes.get(root_record as usize).is_some_and(|slot| {
+        slot.flags & (FLAG_PRESENT | FLAG_DIRECTORY) == FLAG_PRESENT | FLAG_DIRECTORY
+    });
+    if !root_is_live {
+        // The root directory itself went away; the whole scope is stale.
+        return Some(None);
+    }
+    let mut current = record;
+    loop {
+        if current == root_record {
+            return Some(Some(trail.len() as u32));
+        }
+        if let Some(known) = memo.get(&current) {
+            return Some(known.map(|depth| depth.saturating_add(trail.len() as u32)));
+        }
+        if trail.len() >= MAX_ANCESTOR_DEPTH {
+            return None;
+        }
+        let Some(slot) = volume.nodes.get(current as usize) else {
+            return Some(None);
+        };
+        if slot.flags & FLAG_PRESENT == 0 {
+            return Some(None);
+        }
+        if slot.parent_record == current || trail.contains(&current) {
+            return Some(None);
+        }
+        trail.push(current);
+        current = slot.parent_record;
+    }
 }
 
 pub(crate) struct MutationSnapshot {
@@ -313,7 +455,15 @@ impl VolumeIndex {
     }
 
     pub fn search(&self, query: &str, max: usize) -> Vec<IndexHit> {
-        search_volumes(std::slice::from_ref(self), query, max, &[]).items
+        search_volumes(std::slice::from_ref(self), query, max, &[], None).items
+    }
+
+    /// Bounded, memo-free descendant check. Use [`RootFilter`] when many records are
+    /// verified against the same root inside one request.
+    pub fn is_descendant_or_self(&self, record: u32, root_record: u32) -> bool {
+        let memo = HashMap::new();
+        let mut trail = Vec::new();
+        depth_is_in_scope(ancestor_depth(self, record, root_record, &memo, &mut trail).flatten())
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -484,7 +634,20 @@ impl IndexState {
         max: usize,
         exclusion_paths: &[String],
     ) -> SearchOutcome {
-        search_volumes(&self.volumes, query, max, exclusion_paths)
+        search_volumes(&self.volumes, query, max, exclusion_paths, None)
+    }
+
+    /// Same ranking as [`Self::search_with_exclusions`], but candidates outside `root`
+    /// are dropped *before* the global Top-K heap, so truncation and ordering describe
+    /// the root-scoped result set only. `None` means an unrestricted global search.
+    pub fn search_in_root(
+        &self,
+        query: &str,
+        max: usize,
+        exclusion_paths: &[String],
+        root: Option<RootBound>,
+    ) -> SearchOutcome {
+        search_volumes(&self.volumes, query, max, exclusion_paths, root)
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -551,11 +714,21 @@ pub(crate) fn is_literal_match(name: &str, query: &str) -> bool {
     find_case_insensitive(name, &query.to_lowercase()).is_some()
 }
 
+/// Case-insensitive whole-name comparison that also works for non-ASCII names.
+pub(crate) fn name_eq_ignore_case(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left.to_lowercase() == right.to_lowercase()
+    }
+}
+
 fn search_volumes(
     volumes: &[VolumeIndex],
     query: &str,
     max: usize,
     exclusion_paths: &[String],
+    root: Option<RootBound>,
 ) -> SearchOutcome {
     if query.is_empty() || max == 0 {
         return SearchOutcome {
@@ -575,6 +748,7 @@ fn search_volumes(
         .filter_map(|path| NormalizedExclusion::parse(path))
         .collect();
     let mut heap = BinaryHeap::with_capacity(max);
+    let mut root_filter = root.map(RootFilter::new);
     let mut scanned_nodes = 0u64;
     let mut name_candidates = 0u64;
     let mut matched_count = 0u64;
@@ -594,6 +768,12 @@ fn search_volumes(
             let Some(metadata) = match_metadata(name, &query_lower) else {
                 continue;
             };
+            if root_filter
+                .as_mut()
+                .is_some_and(|filter| !filter.accepts(volume_index, volume, record as u32))
+            {
+                continue;
+            }
             if exclusions
                 .iter()
                 .any(|exclusion| exclusion.matches(volume, record as u32))
@@ -1009,5 +1189,392 @@ mod tests {
         let same_tier_without_history = rank(MatchKind::FullPinyin, 1, 0, 0);
         let same_tier_with_history = rank(MatchKind::FullPinyin, 1, 0, 20);
         assert!(same_tier_with_history < same_tier_without_history);
+    }
+
+    /// C:\project\{sub\deep.txt, near.txt} plus C:\other\deep.txt, and D:\project\deep.txt.
+    fn root_fixture() -> IndexState {
+        let mut first = volume();
+        first
+            .upsert(frn(10, 1), frn(5, 0), "project", true)
+            .unwrap();
+        first.upsert(frn(11, 1), frn(10, 1), "sub", true).unwrap();
+        first
+            .upsert(frn(12, 1), frn(11, 1), "deep.txt", false)
+            .unwrap();
+        first
+            .upsert(frn(13, 1), frn(10, 1), "near.txt", false)
+            .unwrap();
+        first.upsert(frn(20, 1), frn(5, 0), "other", true).unwrap();
+        first
+            .upsert(frn(21, 1), frn(20, 1), "deep.txt", false)
+            .unwrap();
+        let mut second = VolumeIndex::new(
+            VolumeId {
+                guid: "second".into(),
+                serial: 8,
+            },
+            "D:\\".into(),
+            10,
+            11,
+            5,
+        )
+        .unwrap();
+        second
+            .upsert(frn(10, 1), frn(5, 0), "project", true)
+            .unwrap();
+        second
+            .upsert(frn(11, 1), frn(10, 1), "deep.txt", false)
+            .unwrap();
+        IndexState {
+            volumes: vec![first, second],
+            generation: 1,
+            events_since_checkpoint: 0,
+        }
+    }
+
+    #[test]
+    fn root_scope_matches_self_and_descendants_only() {
+        let state = root_fixture();
+        let volume = &state.volumes[0];
+        assert!(
+            volume.is_descendant_or_self(10, 10),
+            "root is its own scope"
+        );
+        assert!(volume.is_descendant_or_self(12, 10), "grandchild is inside");
+        assert!(!volume.is_descendant_or_self(21, 10), "sibling tree is out");
+        assert!(
+            volume.is_descendant_or_self(12, volume.root_record),
+            "volume root contains everything"
+        );
+    }
+
+    #[test]
+    fn root_search_is_recursive_and_filters_before_top_k() {
+        let state = root_fixture();
+        let root = RootBound {
+            volume_index: 0,
+            root_record: 10,
+        };
+
+        let scoped = state.search_in_root("deep", 8, &[], Some(root));
+        assert_eq!(scoped.items.len(), 1, "only the in-root file survives");
+        assert_eq!(scoped.items[0].path, r"C:\project\sub\deep.txt");
+        // matched_count is the root-scoped total, so truncation cannot describe records
+        // that were never in scope.
+        assert_eq!(scoped.matched_count, 1);
+        assert!(!scoped.is_truncated);
+        assert_eq!(scoped.path_constructions, 1);
+
+        let global = state.search_in_root("deep", 8, &[], None);
+        assert_eq!(global.items.len(), 3, "no root means global search");
+        assert_eq!(global.matched_count, 3);
+    }
+
+    #[test]
+    fn root_scope_never_crosses_volumes() {
+        let state = root_fixture();
+        let root = RootBound {
+            volume_index: 1,
+            root_record: 10,
+        };
+        let outcome = state.search_in_root("deep", 8, &[], Some(root));
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(outcome.items[0].path, r"D:\project\deep.txt");
+
+        // The same record number on the other volume must not be accepted.
+        let mut filter = RootFilter::new(root);
+        assert!(!filter.accepts(0, &state.volumes[0], 12));
+        assert!(filter.accepts(1, &state.volumes[1], 11));
+    }
+
+    #[test]
+    fn root_top_k_holds_at_eight_and_one_thousand() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "root", true).unwrap();
+        for record in 11..1012 {
+            volume
+                .upsert(
+                    frn(record, 1),
+                    frn(10, 1),
+                    &format!("item-{record:04}"),
+                    false,
+                )
+                .unwrap();
+        }
+        // Outside the root, and lexicographically ahead of every in-root name.
+        for record in 2000..2100 {
+            volume
+                .upsert(
+                    frn(record, 1),
+                    frn(5, 0),
+                    &format!("item-0000-{record}"),
+                    false,
+                )
+                .unwrap();
+        }
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+        let root = Some(RootBound {
+            volume_index: 0,
+            root_record: 10,
+        });
+
+        let first_page = state.search_in_root("item", 8, &[], root);
+        assert_eq!(first_page.items.len(), 8);
+        assert_eq!(first_page.matched_count, 1001);
+        assert!(first_page.is_truncated);
+        assert_eq!(first_page.path_constructions, 8);
+        assert!(first_page
+            .items
+            .iter()
+            .all(|item| item.path.starts_with(r"C:\root\")));
+
+        let expanded = state.search_in_root("item", 1000, &[], root);
+        assert_eq!(expanded.items.len(), 1000);
+        assert_eq!(expanded.matched_count, 1001);
+        assert!(expanded.is_truncated);
+        assert!(expanded
+            .items
+            .iter()
+            .all(|item| item.path.starts_with(r"C:\root\")));
+    }
+
+    #[test]
+    fn root_verification_survives_cycles_missing_parents_and_tombstones() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "root", true).unwrap();
+        volume.upsert(frn(11, 1), frn(10, 1), "mid", true).unwrap();
+        volume
+            .upsert(frn(12, 1), frn(11, 1), "needle-cycle.txt", false)
+            .unwrap();
+        volume.upsert(frn(20, 1), frn(5, 0), "away", true).unwrap();
+        volume
+            .upsert(frn(21, 1), frn(20, 1), "needle-missing.txt", false)
+            .unwrap();
+        volume
+            .upsert(frn(22, 1), frn(20, 1), "needle-tombstone.txt", false)
+            .unwrap();
+
+        // A cycle above the candidate must reject instead of looping.
+        volume.nodes[11].parent_record = 12;
+        // A parent record outside the node table is a broken chain.
+        volume.nodes[21].parent_record = 999_999;
+        // A tombstoned parent is not a usable ancestor.
+        volume.nodes[20].flags &= !FLAG_PRESENT;
+
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+        let outcome = state.search_in_root(
+            "needle",
+            8,
+            &[],
+            Some(RootBound {
+                volume_index: 0,
+                root_record: 10,
+            }),
+        );
+        assert!(
+            outcome.items.is_empty(),
+            "broken chains never count as descendants: {:?}",
+            outcome.items
+        );
+        assert_eq!(outcome.matched_count, 0);
+    }
+
+    #[test]
+    fn root_verification_rejects_chains_deeper_than_the_limit() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "root", true).unwrap();
+        let mut parent = 10u32;
+        // The deepest directory sits exactly at the limit; its child is one hop too far.
+        let deepest = 10 + MAX_ANCESTOR_DEPTH as u32;
+        for record in 11..=deepest {
+            volume
+                .upsert(frn(record, 1), frn(parent, 1), &format!("d{record}"), true)
+                .unwrap();
+            parent = record;
+        }
+        let leaf = deepest + 1;
+        volume
+            .upsert(frn(leaf, 1), frn(parent, 1), "needle.txt", false)
+            .unwrap();
+
+        assert!(
+            volume.is_descendant_or_self(deepest, 10),
+            "exactly {MAX_ANCESTOR_DEPTH} hops below the root is still inside"
+        );
+        assert!(
+            !volume.is_descendant_or_self(leaf, 10),
+            "one hop past the ceiling is rejected"
+        );
+    }
+
+    #[test]
+    fn ancestor_depth_limit_matches_the_path_construction_budget() {
+        // MAX_ANCESTOR_DEPTH is the deepest record `path_for` can still render, so a root
+        // at the volume root accepts exactly the records that can produce a path.
+        let mut volume = volume();
+        let mut parent = volume.root_record;
+        for hop in 1..=MAX_ANCESTOR_DEPTH as u32 + 1 {
+            let record = 9 + hop;
+            volume
+                .upsert(
+                    frn(record, 1),
+                    frn(parent, if parent == volume.root_record { 0 } else { 1 }),
+                    &format!("d{hop}"),
+                    true,
+                )
+                .unwrap();
+            parent = record;
+        }
+        let deepest_renderable = 9 + MAX_ANCESTOR_DEPTH as u32;
+        assert!(volume.path_for(deepest_renderable).is_ok());
+        assert!(volume.path_for(deepest_renderable + 1).is_err());
+        assert!(volume.is_descendant_or_self(deepest_renderable, volume.root_record));
+        assert!(!volume.is_descendant_or_self(deepest_renderable + 1, volume.root_record));
+    }
+
+    #[test]
+    fn deep_candidate_does_not_poison_the_memo_for_shallower_siblings() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "root", true).unwrap();
+        // A chain that runs past the ceiling, built before the candidate files so the
+        // deep file gets the *lower* record number and is therefore scanned first.
+        let mut parent = 10u32;
+        let chain_len = MAX_ANCESTOR_DEPTH as u32 + 6;
+        for hop in 1..=chain_len {
+            let record = 99 + hop;
+            volume
+                .upsert(frn(record, 1), frn(parent, 1), &format!("d{hop}"), true)
+                .unwrap();
+            parent = record;
+        }
+        volume
+            .upsert(frn(11, 1), frn(parent, 1), "needle-too-deep.txt", false)
+            .unwrap();
+        // Sits under a directory the too-deep walk passes through, but within the ceiling.
+        let shallow_parent = 99 + MAX_ANCESTOR_DEPTH as u32 - 4;
+        volume
+            .upsert(
+                frn(12, 1),
+                frn(shallow_parent, 1),
+                "needle-in-range.txt",
+                false,
+            )
+            .unwrap();
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+
+        let outcome = state.search_in_root(
+            "needle",
+            8,
+            &[],
+            Some(RootBound {
+                volume_index: 0,
+                root_record: 10,
+            }),
+        );
+        assert_eq!(
+            outcome.items.len(),
+            1,
+            "the in-range file must survive the earlier too-deep walk: {:?}",
+            outcome.items
+        );
+        assert!(outcome.items[0].name == "needle-in-range.txt");
+        assert_eq!(outcome.matched_count, 1);
+    }
+
+    #[test]
+    fn root_scope_handles_unicode_and_long_names() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "项目", true).unwrap();
+        let long_name = "长".repeat(80);
+        volume
+            .upsert(frn(11, 1), frn(10, 1), &long_name, true)
+            .unwrap();
+        volume
+            .upsert(frn(12, 1), frn(11, 1), "报告.txt", false)
+            .unwrap();
+        volume.upsert(frn(20, 1), frn(5, 0), "别处", true).unwrap();
+        volume
+            .upsert(frn(21, 1), frn(20, 1), "报告.txt", false)
+            .unwrap();
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+
+        let outcome = state.search_in_root(
+            "报告",
+            8,
+            &[],
+            Some(RootBound {
+                volume_index: 0,
+                root_record: 10,
+            }),
+        );
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(
+            outcome.items[0].path,
+            format!(r"C:\项目\{long_name}\报告.txt")
+        );
+    }
+
+    #[test]
+    fn stale_root_record_yields_no_results_instead_of_everything() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "root", true).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "needle.txt", false)
+            .unwrap();
+        // The root directory was deleted between resolve and search.
+        volume.delete(frn(10, 1)).unwrap();
+        let state = IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        };
+
+        let outcome = state.search_in_root(
+            "needle",
+            8,
+            &[],
+            Some(RootBound {
+                volume_index: 0,
+                root_record: 10,
+            }),
+        );
+        assert!(outcome.items.is_empty());
+        assert_eq!(outcome.matched_count, 0);
+    }
+
+    #[test]
+    fn root_memo_does_not_grow_the_node_slot() {
+        // The memo is request-scoped state on RootFilter, never per-node state.
+        assert_eq!(std::mem::size_of::<NodeSlot>(), 12);
+        let state = root_fixture();
+        let mut filter = RootFilter::new(RootBound {
+            volume_index: 0,
+            root_record: 10,
+        });
+        assert!(filter.accepts(0, &state.volumes[0], 12));
+        assert!(filter.accepts(0, &state.volumes[0], 12), "memo hit repeats");
+        assert!(filter.accepts(0, &state.volumes[0], 13));
+        assert!(!filter.accepts(0, &state.volumes[0], 21));
+        assert!(
+            !filter.accepts(0, &state.volumes[0], 21),
+            "negative memo too"
+        );
+        assert_eq!(filter.bound().root_record, 10);
     }
 }

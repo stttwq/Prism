@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::hierarchy::MatchMetadata;
+use crate::root_scope::{RootRejection, MAX_ROOT_PATH_BYTES};
 
 pub const MAX_SEARCH_RESULTS: usize = 1000;
 pub const MAX_FILTERS: usize = 32;
@@ -24,6 +25,10 @@ pub enum IndexerRequest {
         filters: Option<Vec<SearchFilter>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pinyin_enabled: Option<bool>,
+        /// Optional current-directory scope. Absent (older clients) or blank means an
+        /// unrestricted global search, so a reader that ignores the field stays correct.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
     },
     WaitGeneration {
         after: u64,
@@ -59,6 +64,12 @@ pub enum IndexerResponse {
     },
     Generation {
         generation: u64,
+    },
+    /// A requested root could not be used. Only ever sent in reply to a request that
+    /// carried `root`, so clients that never send one cannot receive an unknown variant.
+    RootUnavailable {
+        reason: RootRejection,
+        message: String,
     },
     Error {
         message: String,
@@ -163,6 +174,20 @@ pub fn validate_search_request(max: usize, filters: Option<&[SearchFilter]>) -> 
         }
     }
     Ok(())
+}
+
+/// Bounds a requested root before any index work happens.
+///
+/// A missing *or* blank root means "search globally": a client that clears its scope must
+/// not get an error, and an older client that never sends the field behaves as before.
+pub fn requested_root(root: Option<&str>) -> Result<Option<&str>, RootRejection> {
+    let Some(value) = root.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > MAX_ROOT_PATH_BYTES {
+        return Err(RootRejection::TooLong);
+    }
+    Ok(Some(value))
 }
 
 pub fn exclusion_paths(filters: Option<&[SearchFilter]>) -> Vec<String> {
@@ -315,6 +340,58 @@ mod tests {
                 is_truncated: false,
                 matched_count: None,
                 path_constructions: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn search_without_root_field_decodes_and_serializes_as_global() {
+        let request: IndexerRequest =
+            serde_json::from_str(r#"{"type":"search","query":"x","max":8}"#).unwrap();
+        assert!(matches!(request, IndexerRequest::Search { root: None, .. }));
+        // An old reader must not see a field it cannot interpret.
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("root"), "{json}");
+
+        let scoped: IndexerRequest =
+            serde_json::from_str(r#"{"type":"search","query":"x","max":8,"root":"C:\\Users\\me"}"#)
+                .unwrap();
+        assert!(matches!(
+            scoped,
+            IndexerRequest::Search { root: Some(ref value), .. } if value == r"C:\Users\me"
+        ));
+    }
+
+    #[test]
+    fn requested_root_treats_blank_as_global_and_bounds_length() {
+        assert_eq!(requested_root(None).unwrap(), None);
+        assert_eq!(requested_root(Some("   ")).unwrap(), None);
+        assert_eq!(
+            requested_root(Some("  C:\\dir  ")).unwrap(),
+            Some(r"C:\dir")
+        );
+        let too_long = "C:\\".to_owned() + &"a".repeat(MAX_ROOT_PATH_BYTES);
+        assert_eq!(
+            requested_root(Some(&too_long)).unwrap_err(),
+            RootRejection::TooLong
+        );
+    }
+
+    #[test]
+    fn root_unavailable_round_trips_with_a_machine_readable_reason() {
+        let response = IndexerResponse::RootUnavailable {
+            reason: RootRejection::NotFound,
+            message: RootRejection::NotFound.message().to_owned(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""type":"root_unavailable""#), "{json}");
+        assert!(json.contains(r#""reason":"not_found""#), "{json}");
+        let decoded: IndexerResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            IndexerResponse::RootUnavailable {
+                reason: RootRejection::NotFound,
                 ..
             }
         ));
