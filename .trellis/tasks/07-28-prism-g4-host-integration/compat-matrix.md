@@ -27,19 +27,29 @@
 ## 1. Windows Explorer（Shell COM）
 
 **实现路径**：`Shell.Application` / shell windows 按 **捕获的 HWND** 匹配 → `Document.Folder.Self.Path`；导航用同一窗口 `Navigate` / `SelectItem`。  
-**已知限制**：Windows 11 多标签若 COM 无法区分活动标签 → 返回 `FolderUnavailable`（**禁止**猜错标签路径）。不把「新开 Explorer 窗口」当作导航成功。
+**已知限制**：不把「新开 Explorer 窗口」当作导航成功。
+
+**活动标签判据（实测确定，勿改回）**：取视图所属 `ShellTabWindowClass` 在兄弟中的
+Z 序，最前者即活动标签。`IsWindowVisible` / `DWMWA_CLOAKED` **判不出来**——实测多标签
+下所有视图窗口恒为 `visible=true`、`cloaked=0`、矩形相同；键盘焦点归属多数时候一致但
+存在焦点滞留在非活动标签的瞬间，不可作主判据。详见 `ShellBrowserInterop` 注释。
+
+**本机环境注意**：Directory Opus 已接管默认文件管理器，`explorer.exe <path>` 与
+`explorer.exe shell:MyComputerFolder` 打开的都是 Opus Lister。测 Explorer 项必须用
+**Win+E** 打开真资源管理器（窗口类 `CabinetWClass`）。另外 Opus 会把自己的 Lister 注册进
+`ShellWindows`，但读 HWND/Document 会抛 `COMException`（已被 catch 兜住，属预期）。
 
 | # | 场景 | 步骤 | 期望 | 通过 |
 | --- | --- | --- | --- | --- |
-| E1 | 单窗口取目录 | 打开一个 Explorer 到 `C:\Users\<you>\Documents`，从该窗口呼出 Prism | 范围标签「当前目录：Documents」，搜索仅限该树 | ☐ |
-| E2 | 多窗口按 HWND | 再开一个 Explorer 到 `D:\`，分别从两个窗口呼出 | 每次 root 对应当前前台窗口，不串路径 | ☐ |
-| E3 | 标签（若可测） | 同一窗口多个标签；能区分则取活动标签，不能则降级全局并提示 | 绝不显示错误标签的路径 | ☐ |
-| E4 | 导航文件夹 | 在当前目录范围内选中一文件夹，触发宿主导航（adapter API / 后续 Ctrl+Enter） | **同一** Explorer 窗口导航到该文件夹；不新开无关窗口 | ☐ |
-| E5 | 定位文件 | 选中一文件 RevealInHost | 同一窗口进入父目录并选中该文件；失败 → ActionFailed，保留 Prism 结果 | ☐ |
-| E6 | 取消 / Esc | 呼出后 Esc 隐藏 | 宿主窗口状态不变 | ☐ |
-| E7 | 宿主关闭竞态 | 呼出前关掉 Explorer，或捕获后立刻关 | 全局搜索；提示「原窗口已关闭」类文案；root 为空 | ☐ |
-| E8 | 路径变化 | 在 Explorer 中进入子目录后再呼出 | 新 root 为新路径，不复用旧目录 | ☐ |
-| E9 | 中文路径 | 目录名含中文 | 识别与搜索正常 | ☐ |
+| E1 | 单窗口取目录 | 打开一个 Explorer 到 `C:\Users\<you>\Documents`，从该窗口呼出 Prism | 范围标签「当前目录：Documents」，搜索仅限该树 | ☑ |
+| E2 | 多窗口按 HWND | 再开一个 Explorer 到 `D:\`，分别从两个窗口呼出 | 每次 root 对应当前前台窗口，不串路径 | ☑ |
+| E3 | 标签（若可测） | 同一窗口多个标签；能区分则取活动标签，不能则降级全局并提示 | 绝不显示错误标签的路径 | ☑ |
+| E4 | 导航文件夹 | 在当前目录范围内选中一文件夹，触发宿主导航（adapter API / 后续 Ctrl+Enter） | **同一** Explorer 窗口导航到该文件夹；不新开无关窗口 | ☑ |
+| E5 | 定位文件 | 选中一文件 RevealInHost | 同一窗口进入父目录并选中该文件；失败 → ActionFailed，保留 Prism 结果 | ☑ |
+| E6 | 取消 / Esc | 呼出后 Esc 隐藏 | 宿主窗口状态不变 | ☑ |
+| E7 | 宿主关闭竞态 | 呼出前关掉 Explorer，或捕获后立刻关 | 全局搜索；提示「原窗口已关闭」类文案；root 为空 | ☐ 待测 |
+| E8 | 路径变化 | 在 Explorer 中进入子目录后再呼出 | 新 root 为新路径，不复用旧目录 | ☐ 待测 |
+| E9 | 中文路径 | 目录名含中文 | 识别与搜索正常 | ☑ |
 | E10 | 长路径 | 接近 MAX_PATH 或已启用长路径的深目录 | 可识别则限定；过长/过深 → 降级全局并提示 | ☐ |
 | E11 | 访问拒绝 | 对无权限目录（或模拟） | AccessDenied → 全局 + 提示 | ☐ |
 | E12 | 提权宿主 | 以管理员开 Explorer（若可），普通权限 Prism 呼出 | `HostElevated`，不控制，全局搜索 | ☐ |
@@ -54,14 +64,20 @@
 ## 2. Directory Opus 13.23（官方外部命令）
 
 **实现路径**：进程名 `dopus` 识别主窗口；`dopusrt.exe /info <file>,paths` 取路径；`dopusrt /cmd Go <path> NEWTAB=no` 导航。参数一律 `ProcessStartInfo.ArgumentList`，**禁止** `cmd /c` 字符串拼接。  
-**已知限制**：多 Lister 时若窗口标题无法消歧 → `FolderUnavailable`，不猜。本机无 `dopusrt` → 降级，不抛到 UI。
+**已知限制**：多 Lister/多面板时若无法消歧 → `FolderUnavailable`，不猜。本机无 `dopusrt` → 降级，不抛到 UI。
+
+**`/info paths` 输出是 XML（实测确定，勿改回按行解析）**：形如
+`<path active_lister="1" active_tab="1" lister="0x1f087e" side="1" tab="0x1a08d2">C:\Windows</path>`。
+`lister` 即窗口句柄，可直接与捕获的 HWND 比对，无需靠标题猜；`side`（1 左 / 2 右）与
+`active_tab` 用于双面板和多标签消歧。`dopusrt` 路径优先取运行中 `dopus.exe` 的同目录，
+以支持非默认安装位置（本机在 `D:\效率工具\DOpus\`）。
 
 | # | 场景 | 步骤 | 期望 | 通过 |
 | --- | --- | --- | --- | --- |
-| O1 | 识别 | 前台为 Opus 主窗口，打开 Opus 开关后呼出 | Detect 成功，能力位含 Read/Navigate/Reveal | ☐ |
-| O2 | 取目录 | Lister 停在已知文件夹 | root 正确，范围标签显示叶名 | ☐ |
+| O1 | 识别 | 前台为 Opus 主窗口，打开 Opus 开关后呼出 | Detect 成功，能力位含 Read/Navigate/Reveal | ☑ |
+| O2 | 取目录 | Lister 停在已知文件夹 | root 正确，范围标签显示叶名 | ☑ |
 | O3 | 导航 / 定位 | NavigateFolder / RevealInHost | Opus 复用现有窗口（NEWTAB=no）打开路径；失败结构化 ActionFailed | ☐ |
-| O4 | 多窗口 / 标签 | 两个 Lister 不同路径 | 能消歧则对；不能则全局，不串路径 | ☐ |
+| O4 | 多窗口 / 标签 | 两个 Lister 不同路径 | 能消歧则对；不能则全局，不串路径 | ☑ 双面板+标签已过 |
 | O5 | 关闭竞态 | 呼出前后关闭 Opus | 全局 + HostGone/FolderUnavailable 提示 | ☐ |
 | O6 | 中文 / 空格路径 | `C:\Users\...\项目 Docs` | `/info` 与 `Go` 参数不因空格/中文断裂 | ☐ |
 | O7 | 长路径 | 深目录 | 与 Explorer 相同的本地校验与降级 | ☐ |
@@ -103,3 +119,30 @@
 | --- | --- | --- | --- |
 | Explorer | ☐ | | |
 | Directory Opus 13.23 | ☐ | | |
+
+
+E1：仍未未通过，显示在当前目录搜索，但实际搜索结果仍然是全局文件，并且在未搜索情况下，输入框下面多了一个C:\Users\jia\AppData\Roaming\CherryStudio\Partitions\webview\File System\000\t目录
+
+E2：确认通过，没有串路径
+
+E3：未通过，同一窗口只有一个标签页A会显示A，但新开窗口B后，显示未能识别当前目录，再次回到A标签页同样会显示未能识别当前目录
+
+E4：确认通过，子文件夹能正常在当前窗口显示
+
+E5：未通过，能进入子文件目录，但未高亮显示
+
+E6：确认通过
+
+E7：未能测试，呼出prism后，点击其他地方prism直接隐藏
+
+E8：未能测试，原因同E7
+
+E9：确认正常，中文目录能够搜索
+
+E10-E15：未测试
+
+O1：无法识别dopus目录
+
+O2-O11：未测试
+
+S1-S5：未测试
