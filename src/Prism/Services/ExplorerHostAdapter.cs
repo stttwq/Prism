@@ -9,10 +9,17 @@ namespace Prism.Services;
 /// 一个 Explorer shell 窗口的只读快照。路径已尽量解析为文件系统绝对路径；
 /// 无法区分标签时由上层返回 <see cref="HostFailureReason.FolderUnavailable"/>，禁止猜错标签。
 /// </summary>
+/// <param name="IsActiveTab">
+/// Windows 11 标签页 Explorer 里这一条是否属于活动标签。
+/// <see langword="null"/> = 无法判定（旧系统、接口不可用或调用失败），
+/// 调用方必须按「无法区分」保守处理，不能当成「不是活动标签」。
+/// 单标签窗口只有一条记录，此值无关紧要。
+/// </param>
 public sealed record ExplorerShellWindow(
     IntPtr Hwnd,
     string? FolderPath,
-    bool IsFileSystemFolder);
+    bool IsFileSystemFolder,
+    bool? IsActiveTab = null);
 
 /// <summary>
 /// Explorer Shell COM 访问面。生产实现走 <c>Shell.Application</c> /
@@ -127,9 +134,15 @@ public sealed class ExplorerHostAdapter : IHostAdapter
             if (matches.Length == 0)
                 return HostFolder.Failure(HostFailureReason.FolderUnavailable);
 
-            // 同一 HWND 多条记录通常来自无法区分的标签视图：禁止猜路径。
+            // Windows 11 标签页 Explorer：一个顶层 HWND 下每个标签各一条记录。
+            // 只有活动标签的视图窗口可见，据此消歧；判不出来才拒绝猜路径。
             if (matches.Length > 1)
-                return HostFolder.Failure(HostFailureReason.FolderUnavailable);
+            {
+                var activeTabs = matches.Where(m => m.IsActiveTab == true).ToArray();
+                if (activeTabs.Length != 1)
+                    return HostFolder.Failure(HostFailureReason.FolderUnavailable);
+                matches = activeTabs;
+            }
 
             var match = matches[0];
             if (!match.IsFileSystemFolder || string.IsNullOrWhiteSpace(match.FolderPath))
@@ -329,6 +342,12 @@ public sealed class ComExplorerShellAccess : IExplorerShellAccess
                     if (item is null) continue;
                     if (!TryGetHwnd(item, out var itemHwnd) || itemHwnd != hwnd)
                         continue;
+
+                    // Windows 11 标签页：多个同 HWND 条目，只有活动标签可见。
+                    var tabVisibility = ShellBrowserInterop.GetTabVisibility(item);
+                    if (tabVisibility.Known && !tabVisibility.IsVisible)
+                        continue;
+
                     target = item;
                     item = null; // ownership transferred
                     break;
@@ -374,6 +393,15 @@ public sealed class ComExplorerShellAccess : IExplorerShellAccess
                 null,
                 target,
                 [parent]);
+
+            // Navigate 是异步的：Explorer 先返回，之后才换掉 Document.Folder。
+            // 立刻 SelectItem 会打在旧文件夹上，表现为「跳转了但没选中」。
+            // 轮询直到 Folder 指向目标父目录，最多等 2 秒。
+            if (!WaitForFolder(target, parent))
+            {
+                reason = HostFailureReason.ActionFailed;
+                return false;
+            }
 
             var document = target.GetType().InvokeMember(
                 "Document",
@@ -462,6 +490,73 @@ public sealed class ComExplorerShellAccess : IExplorerShellAccess
         }
     }
 
+    /// <summary>
+    /// <c>Navigate</c> 是异步的：Explorer 先返回，之后才把 <c>Document.Folder</c> 换成新目录。
+    /// 立刻 <c>SelectItem</c> 会打在旧文件夹上，表现为「跳过去了但文件没选中」。
+    /// 轮询当前文件夹直到等于目标父目录，最多等 2 秒；超时返回 false 交给上层降级。
+    /// </summary>
+    private static bool WaitForFolder(object target, string expectedParent)
+    {
+        var expected = NormalizeForCompare(expectedParent);
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (true)
+        {
+            var current = TryReadCurrentFolderPath(target);
+            if (current is not null && NormalizeForCompare(current) == expected)
+                return true;
+            if (DateTime.UtcNow >= deadline)
+                return false;
+            System.Threading.Thread.Sleep(50);
+        }
+    }
+
+    /// <summary>读取窗口当前文件夹路径；导航中或非文件系统位置时返回 null。</summary>
+    private static string? TryReadCurrentFolderPath(object target)
+    {
+        object? document = null;
+        object? folder = null;
+        object? self = null;
+        try
+        {
+            document = GetProperty(target, "Document");
+            if (document is null) return null;
+            folder = GetProperty(document, "Folder");
+            if (folder is null) return null;
+            self = GetProperty(folder, "Self");
+            if (self is null) return null;
+            var value = Convert.ToString(GetProperty(self, "Path"), CultureInfo.InvariantCulture);
+            return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+        catch
+        {
+            // 导航过程中 shell 可能短暂拒绝调用，视为「还没到位」继续轮询。
+            return null;
+        }
+        finally
+        {
+            ReleaseComObject(self);
+            ReleaseComObject(folder);
+            ReleaseComObject(document);
+        }
+    }
+
+    private static object? GetProperty(object instance, string name) =>
+        instance.GetType().InvokeMember(
+            name,
+            System.Reflection.BindingFlags.GetProperty,
+            null,
+            instance,
+            null);
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is not null && Marshal.IsComObject(value))
+            Marshal.FinalReleaseComObject(value);
+    }
+
+    private static string NormalizeForCompare(string path) =>
+        path.Trim().Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
+
     private static bool TryCreateShellApplication(out object? shell)
     {
         shell = null;
@@ -481,9 +576,11 @@ public sealed class ComExplorerShellAccess : IExplorerShellAccess
 
     private static bool TryReadShellWindow(object item, out ExplorerShellWindow snapshot)
     {
-        snapshot = new ExplorerShellWindow(IntPtr.Zero, null, false);
+        snapshot = new ExplorerShellWindow(IntPtr.Zero, null, false, null);
         if (!TryGetHwnd(item, out var hwnd) || hwnd == IntPtr.Zero)
             return false;
+
+        var tabVisibility = ShellBrowserInterop.GetTabVisibility(item);
 
         string? path = null;
         var isFs = false;
@@ -585,7 +682,11 @@ public sealed class ComExplorerShellAccess : IExplorerShellAccess
             isFs = path is not null;
         }
 
-        snapshot = new ExplorerShellWindow(hwnd, path, isFs);
+        snapshot = new ExplorerShellWindow(
+            hwnd,
+            path,
+            isFs,
+            tabVisibility.Known ? tabVisibility.IsVisible : null);
         return true;
     }
 
