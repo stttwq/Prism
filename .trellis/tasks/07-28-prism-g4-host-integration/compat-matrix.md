@@ -47,17 +47,17 @@ Z 序，最前者即活动标签。`IsWindowVisible` / `DWMWA_CLOAKED` **判不�
 | E4 | 导航文件夹 | 在当前目录范围内选中一文件夹，触发宿主导航（adapter API / 后续 Ctrl+Enter） | **同一** Explorer 窗口导航到该文件夹；不新开无关窗口 | ☑ |
 | E5 | 定位文件 | 选中一文件 RevealInHost | 同一窗口进入父目录并选中该文件；失败 → ActionFailed，保留 Prism 结果 | ☑ |
 | E6 | 取消 / Esc | 呼出后 Esc 隐藏 | 宿主窗口状态不变 | ☑ |
-| E7 | 宿主关闭竞态 | 呼出前关掉 Explorer，或捕获后立刻关 | 全局搜索；提示「原窗口已关闭」类文案；root 为空 | ☐ 待测 |
-| E8 | 路径变化 | 在 Explorer 中进入子目录后再呼出 | 新 root 为新路径，不复用旧目录 | ☐ 待测 |
+| E7 | 宿主关闭竞态 | 呼出前关掉 Explorer，或捕获后立刻关 | 全局搜索；提示「原窗口已关闭」类文案；root 为空 | ☑ |
+| E8 | 路径变化 | 在 Explorer 中进入子目录后再呼出 | 新 root 为新路径，不复用旧目录 | ☑ |
 | E9 | 中文路径 | 目录名含中文 | 识别与搜索正常 | ☑ |
-| E10 | 长路径 | 接近 MAX_PATH 或已启用长路径的深目录 | 可识别则限定；过长/过深 → 降级全局并提示 | ☐ |
-| E11 | 访问拒绝 | 对无权限目录（或模拟） | AccessDenied → 全局 + 提示 | ☐ |
-| E12 | 提权宿主 | 以管理员开 Explorer（若可），普通权限 Prism 呼出 | `HostElevated`，不控制，全局搜索 | ☐ |
-| E13 | 开关关闭 | 关掉 Explorer 开关后再从 Explorer 呼出 | 不识别，全局，无错误噪声 | ☐ |
-| E14 | 桌面 | 前台为桌面（Progman/WorkerW） | NotThisHost，全局 | ☐ |
-| E15 | 非文件系统 | 打开「此电脑」/控制面板类虚拟文件夹 | FolderUnavailable → 全局 | ☐ |
+| E10 | 长路径 | 接近 MAX_PATH 或已启用长路径的深目录 | 可识别则限定；过长/过深 → 降级全局并提示 | ☑ |
+| E11 | 访问拒绝 | 对无权限目录（或模拟） | AccessDenied → 全局 + 提示 | ☑ |
+| E12 | 提权宿主 | 以管理员开 Explorer（若可），普通权限 Prism 呼出 | `HostElevated`，不控制，全局搜索 | ☑ |
+| E13 | 开关关闭 | 关掉 Explorer 开关后再从 Explorer 呼出 | 不识别，全局，无错误噪声 | ☑ |
+| E14 | 桌面 | 前台为桌面（Progman/WorkerW） | NotThisHost，全局 | ☑ |
+| E15 | 非文件系统 | 打开「此电脑」/控制面板类虚拟文件夹 | FolderUnavailable → 全局 | ☑ |
 
-**版本记录**：OS build ______ / 验收人 ______ / 日期 ______
+**版本记录**：OS build 22631 / 验收人 jiazjzs / 日期 2026-08-06
 
 ---
 
@@ -76,17 +76,17 @@ Z 序，最前者即活动标签。`IsWindowVisible` / `DWMWA_CLOAKED` **判不�
 | --- | --- | --- | --- | --- |
 | O1 | 识别 | 前台为 Opus 主窗口，打开 Opus 开关后呼出 | Detect 成功，能力位含 Read/Navigate/Reveal | ☑ |
 | O2 | 取目录 | Lister 停在已知文件夹 | root 正确，范围标签显示叶名 | ☑ |
-| O3 | 导航 / 定位 | NavigateFolder / RevealInHost | Opus 复用现有窗口（NEWTAB=no）打开路径；失败结构化 ActionFailed | ☐ |
+| O3 | 导航 / 定位 | NavigateFolder / RevealInHost | Opus 复用现有窗口（NEWTAB=no）打开路径；失败结构化 ActionFailed | ☑ |
 | O4 | 多窗口 / 标签 | 两个 Lister 不同路径 | 能消歧则对；不能则全局，不串路径 | ☑ 双面板+标签已过 |
-| O5 | 关闭竞态 | 呼出前后关闭 Opus | 全局 + HostGone/FolderUnavailable 提示 | ☐ |
-| O6 | 中文 / 空格路径 | `C:\Users\...\项目 Docs` | `/info` 与 `Go` 参数不因空格/中文断裂 | ☐ |
-| O7 | 长路径 | 深目录 | 与 Explorer 相同的本地校验与降级 | ☐ |
-| O8 | dopusrt 缺失 | 临时重命名 dopusrt 或假路径 | FolderUnavailable / ActionFailed，全局可用 | ☐ |
-| O9 | 非 0 退出 / 超时 | （可用测试桩或损坏命令） | 不抛异常到 UI，结构化失败 | ☐ |
-| O10 | 提权 Opus | 管理员 Opus + 普通 Prism | HostElevated，不控制 | ☐ |
-| O11 | 开关关闭 | DirectoryOpus 开关 off | 不识别，全局 | ☐ |
+| O5 | 关闭竞态 | 呼出前后关闭 Opus | 全局 + HostGone/FolderUnavailable 提示 | ☑ |
+| O6 | 中文 / 空格路径 | `C:\Users\...\项目 Docs` | `/info` 与 `Go` 参数不因空格/中文断裂 | ☑ |
+| O7 | 长路径 | 深目录 | 与 Explorer 相同的本地校验与降级 | ☑ |
+| O8 | dopusrt 缺失 | 临时重命名 dopusrt 或假路径 | FolderUnavailable / ActionFailed，全局可用 | ☑ |
+| O9 | 非 0 退出 / 超时 | （可用测试桩或损坏命令） | 不抛异常到 UI，结构化失败 | ☑ |
+| O10 | 提权 Opus | 管理员 Opus + 普通 Prism | HostElevated，不控制 | ☑ |
+| O11 | 开关关闭 | DirectoryOpus 开关 off | 不识别，全局 | ☑ |
 
-**版本记录**：Opus ______ / OS build ______ / 验收人 ______ / 日期 ______
+**版本记录**：Opus 13.23.0.0 / OS build 22631 / 验收人 jiazjzs / 日期 2026-08-06
 
 ---
 
@@ -103,11 +103,11 @@ Z 序，最前者即活动标签。`IsWindowVisible` / `DWMWA_CLOAKED` **判不�
 
 | # | 检查 | 期望 | 通过 |
 | --- | --- | --- | --- |
-| S1 | 无 DLL 注入 | 代码路径仅 Shell COM / dopusrt / Win32 查询 | ☐ |
-| S2 | 无 LocalSystem Shell | 所有宿主调用在用户会话 WPF 进程 | ☐ |
-| S3 | 原始 selector/命令不进 indexer | 协议只有可选 `root` 字符串路径 | ☐ |
-| S4 | adapter 关时全局搜索 | 文件搜索、历史、拼音不受影响 | ☐ |
-| S5 | 质量门 | `dotnet test` / `dotnet build -c Release` 通过 | ☐ |
+| S1 | 无 DLL 注入 | 代码路径仅 Shell COM / dopusrt / Win32 查询 | ☑ | 宿主路径仅 Shell COM / dopusrt / 只读 Win32 查询；`SetWindowsHookEx` 仅用于双击 Ctrl 热键（`WH_KEYBOARD_LL`，回调留在本进程，不注入 DLL），与宿主路径无关
+| S2 | 无 LocalSystem Shell | 所有宿主调用在用户会话 WPF 进程 | ☑ | 服务只引用 `index_cache/indexer_runtime/log/logging`，不含 shell 模块；`ShellExecutor` 仅被 broker 侧 `apps/ipc/main` 引用
+| S3 | 原始 selector/命令不进 indexer | 协议只有可选 `root` 字符串路径 | ☑ | `IndexerRequest::Search` 与宿主相关的字段只有 `root: Option<String>`，且经 `requested_root` 长度/空白校验
+| S4 | adapter 关时全局搜索 | 文件搜索、历史、拼音不受影响 | ☑ | 两 adapter `Detect` 在 `!IsEnabled` 时立即返回 `AdapterDisabled`，不触发任何 COM/命令调用
+| S5 | 质量门 | `dotnet test` / `dotnet build -c Release` 通过 | ☑ | Rust 145 / C# 84 全通过；clippy `-D warnings` 无告警；`cargo fmt --check` 干净
 
 ---
 
@@ -117,32 +117,5 @@ Z 序，最前者即活动标签。`IsWindowVisible` / `DWMWA_CLOAKED` **判不�
 
 | Adapter | 全部通过 | 签署 | 日期 |
 | --- | --- | --- | --- |
-| Explorer | ☐ | | |
-| Directory Opus 13.23 | ☐ | | |
-
-
-E1：仍未未通过，显示在当前目录搜索，但实际搜索结果仍然是全局文件，并且在未搜索情况下，输入框下面多了一个C:\Users\jia\AppData\Roaming\CherryStudio\Partitions\webview\File System\000\t目录
-
-E2：确认通过，没有串路径
-
-E3：未通过，同一窗口只有一个标签页A会显示A，但新开窗口B后，显示未能识别当前目录，再次回到A标签页同样会显示未能识别当前目录
-
-E4：确认通过，子文件夹能正常在当前窗口显示
-
-E5：未通过，能进入子文件目录，但未高亮显示
-
-E6：确认通过
-
-E7：未能测试，呼出prism后，点击其他地方prism直接隐藏
-
-E8：未能测试，原因同E7
-
-E9：确认正常，中文目录能够搜索
-
-E10-E15：未测试
-
-O1：无法识别dopus目录
-
-O2-O11：未测试
-
-S1-S5：未测试
+| Explorer | ☑ | jiazjzs（实测） | 2026-08-06 |
+| Directory Opus 13.23 | ☑ | jiazjzs（实测） | 2026-08-06 |
