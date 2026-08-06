@@ -128,11 +128,12 @@ pub enum Response {
     Hello {
         protocol: u32,
         version: String,
+        /// 构建指纹（`0.1.0+release.<mtime>`），用于确认跑的是刚编出来的那份。
+        /// 纯新增字段，旧前端忽略即可。
+        build_id: String,
     },
     /// ping 的回应，附带后端版本供前端自检。
-    Pong {
-        version: String,
-    },
+    Pong { version: String, build_id: String },
     /// 搜索结果列表（"展示更多"行由前端追加）。
     /// `is_indexing=true` 表示索引尚未就绪，items 可能为空。
     Results {
@@ -172,9 +173,7 @@ pub enum Response {
         root_message: Option<String>,
     },
     /// 动作面板列表。
-    Actions {
-        items: Vec<ActionItem>,
-    },
+    Actions { items: Vec<ActionItem> },
     /// 后端状态推送（如索引进行中）。
     Status {
         is_indexing: bool,
@@ -349,6 +348,7 @@ async fn dispatch_non_search(
         Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
             protocol,
             version: VERSION.to_string(),
+            build_id: crate::build_id(),
         },
         Request::Hello { protocol } => Response::Error {
             message: format!("broker protocol {protocol} is incompatible with {BROKER_PROTOCOL}"),
@@ -356,6 +356,7 @@ async fn dispatch_non_search(
         },
         Request::Ping => Response::Pong {
             version: VERSION.to_string(),
+            build_id: crate::build_id(),
         },
         Request::Execute { id, target } => {
             run_shell(
@@ -470,7 +471,7 @@ async fn search_service(
         &history_weights,
         preferences.pinyin_enabled(),
         &exclusions,
-        None,
+        root,
     );
     let injected_history_targets: HashSet<_> = history_candidates
         .iter()
@@ -483,7 +484,10 @@ async fn search_service(
         .collect();
     ranked.extend(history_candidates);
     let mut app_match_count = 0u64;
-    if result_slots > 0 {
+    // G4: a current-directory scope means "files under this root". Applications are not
+    // scoped to a directory, so a root suppresses them entirely rather than leaking
+    // global hits (e.g. Start Menu .lnk) into a scoped result list.
+    if result_slots > 0 && root.is_none() {
         if let Ok(apps_guard) = apps.read() {
             let app_matches = crate::apps::search(&apps_guard, query, usize::MAX);
             app_match_count = app_matches.len() as u64;

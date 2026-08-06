@@ -1,0 +1,393 @@
+# Prism build + install, in one step, with hash verification.
+#
+# WHY THIS EXISTS
+# ---------------
+# During G4 a bug was chased for hours because the running code was not the
+# code being edited. Three separate copies of the backend existed at once:
+#
+#   src/prism-core/target/debug/prism-core.exe    Aug 5  <- what the app loaded
+#   src/prism-core/target/release/prism-core.exe  Aug 6  <- where edits went
+#   C:\Program Files\Prism\prism-core.exe         Aug 1  <- what was installed
+#
+# Nothing reported a mismatch. Builds silently no-op'd ("Finished in 0.37s"),
+# and the frontend preferred target\debug unconditionally, so a stale binary
+# masked every change. This script makes that class of failure impossible:
+# it builds from source, installs, then verifies by SHA-256 that the bytes on
+# disk match the bytes just built. Any drift is a hard error.
+#
+# ASCII only on purpose: PowerShell 5.1 under a Chinese locale reads BOM-less
+# UTF-8 scripts as GBK, which corrupts non-ASCII literals and breaks parsing.
+#
+# USAGE
+#   .\scripts\prism-build.ps1              # build + install + verify (needs admin)
+#   .\scripts\prism-build.ps1 -VerifyOnly  # just check for drift, changes nothing
+#   .\scripts\prism-build.ps1 -SkipInstall # build + verify build outputs only
+#   .\scripts\prism-build.ps1 -Clean       # force full rebuild first
+
+[CmdletBinding()]
+param(
+    [switch]$VerifyOnly,
+    [switch]$SkipInstall,
+    [switch]$Clean
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$RepoRoot    = Split-Path -Parent $PSScriptRoot
+$CoreManifest = Join-Path $RepoRoot 'src\prism-core\Cargo.toml'
+$CoreOut     = Join-Path $RepoRoot 'src\prism-core\target\release'
+$CoreDebug   = Join-Path $RepoRoot 'src\prism-core\target\debug'
+$AppProject  = Join-Path $RepoRoot 'src\Prism\Prism.csproj'
+$AppOut      = Join-Path $RepoRoot 'src\Prism\bin\Release\net8.0-windows'
+$InstallDir  = 'C:\Program Files\Prism'
+$ServiceName = 'PrismIndexer'
+
+# name -> @{ Built = <path>; Installed = <path> }
+$Artifacts = [ordered]@{
+    'prism-core.exe' = @{
+        Built     = Join-Path $CoreOut 'prism-core.exe'
+        Installed = Join-Path $InstallDir 'prism-core.exe'
+    }
+    'prism-indexer-service.exe' = @{
+        Built     = Join-Path $CoreOut 'prism-indexer-service.exe'
+        Installed = Join-Path $InstallDir 'prism-indexer-service.exe'
+    }
+    'Prism.exe' = @{
+        Built     = Join-Path $AppOut 'Prism.exe'
+        Installed = Join-Path $InstallDir 'Prism.exe'
+    }
+}
+
+# cargo and dotnet write progress to stderr. With $ErrorActionPreference='Stop'
+# PowerShell turns any native stderr line into a terminating NativeCommandError,
+# so a perfectly healthy build blows up. Run externals with stderr merged into
+# stdout and judge success solely by the exit code.
+function Invoke-Native([string]$what, [scriptblock]$command) {
+    $global:LASTEXITCODE = 0
+    & {
+        $ErrorActionPreference = 'Continue'
+        & $command 2>&1 | ForEach-Object { Write-Host "    $_" }
+    }
+    if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LASTEXITCODE)" }
+}
+
+function Write-Step([string]$text) {
+    Write-Host ''
+    Write-Host "==> $text" -ForegroundColor Cyan
+}
+
+function Write-Ok([string]$text)   { Write-Host "    OK   $text" -ForegroundColor Green }
+function Write-Warn2([string]$text) { Write-Host "    WARN $text" -ForegroundColor Yellow }
+function Write-Bad([string]$text)  { Write-Host "    FAIL $text" -ForegroundColor Red }
+
+function Get-Sha([string]$path) {
+    if (-not (Test-Path $path)) { return $null }
+    return (Get-FileHash -Path $path -Algorithm SHA256).Hash
+}
+
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]$id).IsInRole(
+        [Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+# ---------------------------------------------------------------- build ----
+
+# A running Prism.exe locks its own build output, so dotnet build fails with
+# MSB3027 ("being used by another process"). Must happen BEFORE building, not
+# just before copying: otherwise the build dies and, worse, a partially written
+# output could look like a success.
+function Stop-PrismProcesses {
+    $stopped = @()
+    foreach ($procName in @('Prism', 'prism-core')) {
+        $running = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        if ($null -ne $running) {
+            $running | Stop-Process -Force
+            $stopped += $procName
+        }
+    }
+    if ($stopped.Count -gt 0) {
+        Start-Sleep -Milliseconds 800
+        Write-Ok "stopped: $($stopped -join ', ')"
+    } else {
+        Write-Ok 'no Prism processes running'
+    }
+}
+
+function Invoke-Build {
+    Write-Step 'Releasing file locks'
+    Stop-PrismProcesses
+
+    if ($Clean) {
+        Write-Step 'Cleaning previous build output'
+        Invoke-Native 'cargo clean' { cargo clean --manifest-path $CoreManifest --release }
+        Remove-Item -Recurse -Force (Join-Path $RepoRoot 'src\Prism\obj\Release') -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force (Join-Path $RepoRoot 'src\Prism\bin\Release') -ErrorAction SilentlyContinue
+        Write-Ok 'clean done'
+    }
+
+    Write-Step 'Building Rust backend (release)'
+    Invoke-Native 'cargo build' { cargo build --manifest-path $CoreManifest --release }
+    Write-Ok 'cargo build done'
+
+    Write-Step 'Building WPF frontend (Release)'
+    Invoke-Native 'dotnet build' { dotnet build $AppProject -c Release --nologo -v minimal }
+    Write-Ok 'dotnet build done'
+
+    Assert-OutputsFresh
+}
+
+# A no-op build is the exact failure this script exists to prevent: cargo and
+# dotnet happily print "Finished in 0.37s" / "up to date" and exit 0 while
+# leaving a stale binary in place. Existence is not enough - the output must be
+# at least as new as the newest source file feeding it.
+function Assert-OutputsFresh {
+    Write-Step 'Checking build outputs are newer than sources'
+
+    $sourceSets = @{
+        'prism-core.exe'            = @((Join-Path $RepoRoot 'src\prism-core\src'), (Join-Path $RepoRoot 'src\prism-core\Cargo.toml'))
+        'prism-indexer-service.exe' = @((Join-Path $RepoRoot 'src\prism-core\src'), (Join-Path $RepoRoot 'src\prism-core\Cargo.toml'))
+        'Prism.exe'                 = @((Join-Path $RepoRoot 'src\Prism'))
+    }
+
+    $missing = @()
+    $stale   = @()
+    foreach ($name in $Artifacts.Keys) {
+        $path = $Artifacts[$name].Built
+        if (-not (Test-Path $path)) {
+            Write-Bad "$name missing at $path"
+            $missing += $name
+            continue
+        }
+
+        $builtAt  = (Get-Item $path).LastWriteTime
+        $newestSrc = Get-NewestSourceTime $sourceSets[$name]
+
+        if ($null -ne $newestSrc -and $builtAt -lt $newestSrc) {
+            Write-Bad "$name is OLDER than its sources"
+            Write-Host "         built  $($builtAt.ToString('MM-dd HH:mm:ss'))" -ForegroundColor Red
+            Write-Host "         source $($newestSrc.ToString('MM-dd HH:mm:ss'))" -ForegroundColor Red
+            $stale += $name
+        } else {
+            Write-Ok "$name  ($($builtAt.ToString('yyyy-MM-dd HH:mm:ss')))"
+        }
+    }
+
+    if ($missing.Count -gt 0) { throw "build produced no output for: $($missing -join ', ')" }
+    if ($stale.Count -gt 0) {
+        throw "build silently did nothing for: $($stale -join ', ') - rerun with -Clean"
+    }
+}
+
+# Newest LastWriteTime across the given files/directories, ignoring build
+# output dirs so bin/obj/target do not mask a genuinely stale artifact.
+function Get-NewestSourceTime([string[]]$paths) {
+    $newest = $null
+    foreach ($path in $paths) {
+        if (-not (Test-Path $path)) { continue }
+        $item = Get-Item $path
+        if (-not $item.PSIsContainer) {
+            if ($null -eq $newest -or $item.LastWriteTime -gt $newest) { $newest = $item.LastWriteTime }
+            continue
+        }
+        Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\(bin|obj|target)\\' } |
+            ForEach-Object {
+                if ($null -eq $newest -or $_.LastWriteTime -gt $newest) { $newest = $_.LastWriteTime }
+            }
+    }
+    return $newest
+}
+
+# ------------------------------------------------------- stale debug ----
+
+# The frontend now prefers the profile it was built with, but a leftover debug
+# broker is still a trap for anyone running a Debug build of the app.
+function Test-StaleDebug {
+    $debugExe = Join-Path $CoreDebug 'prism-core.exe'
+    if (-not (Test-Path $debugExe)) { return }
+
+    $debugTime   = (Get-Item $debugExe).LastWriteTime
+    $releaseExe  = $Artifacts['prism-core.exe'].Built
+    if (-not (Test-Path $releaseExe)) { return }
+    $releaseTime = (Get-Item $releaseExe).LastWriteTime
+
+    if ($debugTime -lt $releaseTime) {
+        Write-Warn2 "target\debug\prism-core.exe is older than release ($($debugTime.ToString('MM-dd HH:mm')) vs $($releaseTime.ToString('MM-dd HH:mm')))"
+        Write-Warn2 'A Debug build of Prism.exe would load that stale broker.'
+        Write-Warn2 'Remove it with:  cargo clean --manifest-path src\prism-core\Cargo.toml'
+    }
+}
+
+# -------------------------------------------------------------- install ----
+
+function Invoke-Install {
+    if (-not (Test-Admin)) {
+        Write-Bad 'Installing needs an elevated shell.'
+        Write-Host ''
+        Write-Host '    Right-click PowerShell -> Run as administrator, then:' -ForegroundColor Yellow
+        Write-Host "      cd $RepoRoot" -ForegroundColor Yellow
+        Write-Host '      .\scripts\prism-build.ps1' -ForegroundColor Yellow
+        throw 'not elevated'
+    }
+
+    if (-not (Test-Path $InstallDir)) {
+        throw "install dir not found: $InstallDir (run the installer once first)"
+    }
+
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+    Write-Step 'Stopping service and running processes'
+    if ($null -ne $svc -and $svc.Status -ne 'Stopped') {
+        Stop-Service -Name $ServiceName -Force
+        # Stop-Service returns before the process actually exits; the file stays
+        # locked meanwhile and Copy-Item would fail (or silently no-op earlier).
+        $waited = 0
+        while ((Get-Service -Name $ServiceName).Status -ne 'Stopped' -and $waited -lt 30) {
+            Start-Sleep -Milliseconds 500
+            $waited++
+        }
+        Write-Ok "service stopped"
+    } else {
+        Write-Ok 'service already stopped (or not installed)'
+    }
+
+    Stop-PrismProcesses
+
+    # The service host may linger even after the service reports Stopped.
+    $orphan = Get-Process -Name 'prism-indexer-service' -ErrorAction SilentlyContinue
+    if ($null -ne $orphan) {
+        $orphan | Stop-Process -Force
+        Start-Sleep -Milliseconds 500
+        Write-Ok 'stopped orphaned prism-indexer-service'
+    }
+
+    Write-Step 'Copying binaries'
+    foreach ($name in $Artifacts.Keys) {
+        $src = $Artifacts[$name].Built
+        $dst = $Artifacts[$name].Installed
+        Copy-Item -Path $src -Destination $dst -Force
+        Write-Ok "$name -> $dst"
+    }
+
+    # The frontend also needs its managed assemblies, not just the exe.
+    Write-Step 'Copying frontend assemblies'
+    $copied = 0
+    Get-ChildItem -Path $AppOut -Filter '*.dll' | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination (Join-Path $InstallDir $_.Name) -Force
+        $copied++
+    }
+    foreach ($extra in @('Prism.runtimeconfig.json', 'Prism.deps.json')) {
+        $path = Join-Path $AppOut $extra
+        if (Test-Path $path) {
+            Copy-Item -Path $path -Destination (Join-Path $InstallDir $extra) -Force
+            $copied++
+        }
+    }
+    Write-Ok "$copied support files"
+
+    Write-Step 'Starting service'
+    if ($null -ne $svc) {
+        Start-Service -Name $ServiceName
+        $status = (Get-Service -Name $ServiceName).Status
+        if ($status -ne 'Running') { throw "service did not start (status: $status)" }
+        Write-Ok "service running"
+    } else {
+        Write-Warn2 "service $ServiceName is not installed; skipped start"
+    }
+}
+
+# --------------------------------------------------------------- verify ----
+
+function Invoke-Verify {
+    Write-Step 'Verifying installed bytes match built bytes (SHA-256)'
+
+    $drift = @()
+    foreach ($name in $Artifacts.Keys) {
+        $builtPath     = $Artifacts[$name].Built
+        $installedPath = $Artifacts[$name].Installed
+
+        $builtHash     = Get-Sha $builtPath
+        $installedHash = Get-Sha $installedPath
+
+        if ($null -eq $builtHash) {
+            Write-Warn2 "$name not built yet - skipped"
+            continue
+        }
+        if ($null -eq $installedHash) {
+            Write-Bad "$name is not installed"
+            $drift += $name
+            continue
+        }
+
+        if ($builtHash -eq $installedHash) {
+            Write-Ok "$name  $($builtHash.Substring(0,12))"
+        } else {
+            Write-Bad "$name DIFFERS"
+            Write-Host "         built     $($builtHash.Substring(0,12))  $((Get-Item $builtPath).LastWriteTime.ToString('MM-dd HH:mm'))" -ForegroundColor Red
+            Write-Host "         installed $($installedHash.Substring(0,12))  $((Get-Item $installedPath).LastWriteTime.ToString('MM-dd HH:mm'))" -ForegroundColor Red
+            $drift += $name
+        }
+    }
+
+    # Cross-check that the service really points at the file we verified.
+    $svcWmi = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+    if ($null -ne $svcWmi) {
+        $svcPath = $svcWmi.PathName.Trim('"')
+        $expected = $Artifacts['prism-indexer-service.exe'].Installed
+        if ($svcPath -ieq $expected) {
+            Write-Ok "service binary path matches"
+        } else {
+            Write-Bad "service points at $svcPath, expected $expected"
+            $drift += 'service path'
+        }
+    }
+
+    Test-StaleDebug
+
+    Write-Host ''
+    if ($drift.Count -gt 0) {
+        Write-Host "DRIFT DETECTED: $($drift -join ', ')" -ForegroundColor Red
+        Write-Host 'The running code is NOT the code you just built.' -ForegroundColor Red
+        Write-Host 'Fix with:  .\scripts\prism-build.ps1   (in an elevated shell)' -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host 'All good: installed binaries match the current build.' -ForegroundColor Green
+    return $true
+}
+
+# ----------------------------------------------------------------- main ----
+
+Write-Host "Prism build/install  ($RepoRoot)" -ForegroundColor White
+
+if ($VerifyOnly) {
+    # Answers both drift questions without changing anything:
+    #   1. is the build current with the sources?   (Assert-OutputsFresh)
+    #   2. does what is installed match the build?  (Invoke-Verify)
+    $fresh = $true
+    try { Assert-OutputsFresh } catch { Write-Bad $_.Exception.Message; $fresh = $false }
+    $ok = Invoke-Verify
+    if (-not $fresh -or -not $ok) { exit 1 }
+    exit 0
+}
+
+Invoke-Build
+
+if ($SkipInstall) {
+    Write-Step 'Skipping install (-SkipInstall)'
+    Test-StaleDebug
+    Write-Host ''
+    Write-Host 'Build complete. Nothing was installed.' -ForegroundColor Green
+    exit 0
+}
+
+Invoke-Install
+$ok = Invoke-Verify
+if (-not $ok) { exit 1 }
+
+Write-Host ''
+Write-Host 'Done. Launch Prism from the Start menu or:' -ForegroundColor White
+Write-Host "  & '$InstallDir\Prism.exe'" -ForegroundColor White
+exit 0

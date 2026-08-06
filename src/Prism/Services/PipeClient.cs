@@ -392,8 +392,15 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>
     /// 定位后端可执行文件：
     /// 1) 环境变量 PRISM_CORE_EXE；
-    /// 2) 与 Prism.exe 同目录；
-    /// 3) 从输出目录向上找 prism-core/target/{debug,release}。
+    /// 2) 与 Prism.exe 同目录（发布形态）；
+    /// 3) 开发期回退到 prism-core/target/&lt;profile&gt;。
+    ///
+    /// 开发期的 profile **跟随本程序的构建配置**（Release 构建找 release，
+    /// Debug 构建找 debug），不再固定 debug 优先。历史上这里是
+    /// `{ "debug", "release" }` 且只判存在性，导致 target\debug 里一个陈旧的
+    /// exe 会永久遮蔽刚编出来的 release，症状是「改了代码却跑的是旧二进制」。
+    /// 同 profile 找不到时才回退另一个，并且此时取 **更新的那个**，避免再次
+    /// 被过期产物钉住。
     /// </summary>
     private static string? LocateBackend()
     {
@@ -408,23 +415,31 @@ public sealed class PipeClient : ISearchClient, IDisposable
         if (File.Exists(sideBySide))
             return sideBySide;
 
+#if DEBUG
+        const string preferred = "debug";
+        const string fallback = "release";
+#else
+        const string preferred = "release";
+        const string fallback = "debug";
+#endif
+
         var dir = new DirectoryInfo(baseDir);
         while (dir is not null)
         {
-            foreach (var cfg in new[] { "debug", "release" })
+            // 同一层里既可能是 <dir>/prism-core/target，也可能是 <dir>/src/prism-core/target。
+            foreach (var root in new[]
+                     {
+                         Path.Combine(dir.FullName, "prism-core", "target"),
+                         Path.Combine(dir.FullName, "src", "prism-core", "target"),
+                     })
             {
-                var candidate = Path.Combine(
-                    dir.FullName, "prism-core", "target", cfg, exeName);
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-            // 兼容从 src/Prism/bin/... 向上到 src/ 再进 prism-core
-            var sibling = Path.Combine(dir.FullName, "src", "prism-core", "target");
-            foreach (var cfg in new[] { "debug", "release" })
-            {
-                var candidate = Path.Combine(sibling, cfg, exeName);
-                if (File.Exists(candidate))
-                    return candidate;
+                var preferredPath = Path.Combine(root, preferred, exeName);
+                if (File.Exists(preferredPath))
+                    return preferredPath;
+
+                var fallbackPath = Path.Combine(root, fallback, exeName);
+                if (File.Exists(fallbackPath))
+                    return fallbackPath;
             }
             dir = dir.Parent;
         }
