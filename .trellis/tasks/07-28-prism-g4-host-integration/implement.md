@@ -18,8 +18,41 @@
 7. [~] 覆盖 Enter/`Ctrl+Enter`、标准对话框用户确认和不支持/提权宿主拒绝。
    - [x] Ctrl+Enter → 原宿主 `NavigateOrFill`（`HostScopeController.TryRevealInHost` + SearchWindow 分支）；Enter 仍 broker 打开；无宿主 fallback broker reveal；ActionFailed 不清 root，HostGone/Elevated 才 Invalidate；C# 单测
    - [ ] 标准对话框用户确认语义（SystemFileDialog 未产品化，本轮不做 Fill）
-   - [ ] 不支持/提权宿主拒绝的端到端机器验收
-8. [ ] 运行 Windows 11 x64 机器矩阵、G0 基准和全套质量门，更新 spec。
+   - [x] 不支持/提权宿主拒绝的端到端机器验收（矩阵 E12 / E14 / E15 / O10 实测通过）
+8. [~] 运行 Windows 11 x64 机器矩阵、G0 基准和全套质量门，更新 spec。
+   - [x] 兼容矩阵全部通过并签署（`compat-matrix.md`，E1-E15 / O1-O11 / S1-S5，
+         OS 22631，Opus 13.23.0.0，2026-08-06）
+   - [x] 全套质量门：Rust 145 / C# 84 通过，clippy `-D warnings` 无告警，
+         `cargo fmt --check` 干净，`tools/bench/Test-Bench.ps1` 通过
+   - [x] 基准工具支持 root 维度：`queries.json` 新增 5 条 root 夹具；
+         `Invoke-SearchBaseline.ps1` 透传 root 并记录 `root` / `root_rejection`；
+         聚合新增 `workload`（含 `path_constructions`）——耗时本身无法回答
+         PRD 第 15 行的问题，必须看祖先验证次数
+   - [ ] **G0 root 基准正式数据未采集**：机器不满足前提，见下方「步骤 8 采集受阻」
+
+### 步骤 8 采集受阻（2026-08-07）
+
+`Invoke-SearchBaseline.ps1` 按设计在索引世代移动时中止——绝对延迟只有在安静
+机器上才可跨轮比较。当天 Windows 更新（`SetupHost`，累计 CPU 1380s）持续重写
+磁盘，索引 6 秒推进 2059 个世代，正式基准无法采集。
+
+期间暴露两个独立缺陷，已单列 `08-07-prism-ipc-resilience`（P1）：
+indexer 管道在 USN 洪峰下大量返回 `ERROR_PIPE_BUSY`（800 请求 69% 失败），
+以及 broker 静默崩溃且无日志。二者都不属于 G4 范围。
+
+**已有的方向性证据**（`artifacts/bench/g4-root-20260807/`，配对法，
+仅 31% 请求干净、每组 10-14 样本，**不足以签署**）：
+
+- 配对延迟差中位数 +2.0ms，最坏 +28.7ms，无数量级恶化
+- `path_constructions` 证明剪枝生效：`deep_system32` 1000 → 441，
+  `shallow_small` 624 → 246
+
+即 root 减少祖先验证工作量，代价是每候选一次前缀比较，净效果基本持平。
+按 PRD 第 15 行，当前证据**不支持**引入祖先/子树缓存，但该结论需干净数据才能签署。
+
+**补采条件**：`SetupHost` 结束、`Get-IndexerStatus` 世代在 `GenerationStableSeconds`
+内不动、Prism 前端与 Opus 关闭。命令见 `tools/bench/README.md`；
+`Invoke-RootScopeComparison.ps1` 是配对对照工具，**不能**替代正式基准。
 
 ## Validation Commands
 

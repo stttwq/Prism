@@ -66,21 +66,38 @@ $brokerStartup = [Diagnostics.Stopwatch]::StartNew()
 $session = $null
 $samples = [Collections.Generic.List[object]]::new()
 
+# Build a search request, adding `root` only when the fixture declares one.
+# Omitting the key entirely (rather than sending null) keeps global fixtures
+# byte-identical to the pre-G4 wire format, so historical runs stay comparable.
+function New-SearchRequest {
+    param($Fixture, [int]$Max)
+    $request = [ordered]@{ type = 'search'; query = [string]$Fixture.query; max = $Max }
+    if ($Fixture.PSObject.Properties['root']) {
+        $root = [string]$Fixture.root
+        if (-not [string]::IsNullOrWhiteSpace($root)) { $request['root'] = $root }
+    }
+    return $request
+}
+
 function Assert-SearchResponse {
-    param($Result, [string]$ExpectedQuery)
+    param($Result, [string]$ExpectedQuery, [string]$Context = '')
     $response = $Result.Response
-    if ($response.type -ne 'results') { throw "Expected results, got $($response.type)." }
-    if ([string]$response.query -ne $ExpectedQuery) { throw 'Broker response/query pairing failed.' }
+    $where = if ($Context) { " [$Context]" } else { '' }
+    if ($response.type -ne 'results') { throw "Expected results, got $($response.type).$where" }
+    if ([string]$response.query -ne $ExpectedQuery) { throw "Broker response/query pairing failed.$where" }
     $errorProperty = $response.PSObject.Properties['index_error']
     if ($null -ne $errorProperty -and $errorProperty.Value) {
-        throw "Indexer reported an error: $($errorProperty.Value)"
+        # Context matters: without it an aborted run only says "request timed out"
+        # with no way to tell which fixture, phase, or iteration caused it.
+        throw "Indexer reported an error: $($errorProperty.Value).$where elapsed=$([Math]::Round($Result.ElapsedMs,1))ms"
     }
     return $response
 }
 
 function New-SearchSample {
     param($Fixture, [int]$Max, [string]$Phase, [int]$Iteration, $Result)
-    $response = Assert-SearchResponse -Result $Result -ExpectedQuery ([string]$Fixture.query)
+    $context = '{0} max={1} phase={2} iter={3}' -f $Fixture.id, $Max, $Phase, $Iteration
+    $response = Assert-SearchResponse -Result $Result -ExpectedQuery ([string]$Fixture.query) -Context $context
     $items = @($response.items)
     if ($null -eq $response.PSObject.Properties['index_generation']) {
         throw 'Broker response did not include an index generation.'
@@ -102,6 +119,13 @@ function New-SearchSample {
         query_id = [string]$Fixture.id
         categories = @($Fixture.categories)
         volume_scope = @($Fixture.volume_scope)
+        # G4: null for global fixtures, so root and non-root rows stay comparable
+        # in one run. root_rejection surfaces a root the indexer refused, which
+        # would otherwise look like a suspiciously fast query.
+        root = if ($Fixture.PSObject.Properties['root']) { [string]$Fixture.root } else { $null }
+        root_rejection = if ($response.PSObject.Properties['root_rejection']) {
+            [string]$response.root_rejection
+        } else { $null }
         max = $Max
         phase = $Phase
         iteration = $Iteration
@@ -163,7 +187,7 @@ try {
     do {
         $readyStatus = Get-IndexerStatus -PipeName $IndexerPipeName
         $probe = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'search'; query = $readyProbe.query; max = 8 }) -RequestTimeoutMs $RequestTimeoutMs
-        $probeResponse = Assert-SearchResponse -Result $probe -ExpectedQuery $readyProbe.query
+        $probeResponse = Assert-SearchResponse -Result $probe -ExpectedQuery $readyProbe.query -Context 'readiness_probe'
         $probeGeneration = if ($null -ne $probeResponse.PSObject.Properties['index_generation']) { [UInt64]$probeResponse.index_generation } else { 0 }
         $isReady = [bool]$readyStatus.ready -and -not [bool]$readyStatus.building -and
             -not [bool]$readyStatus.degraded -and -not [bool]$probeResponse.is_indexing -and
@@ -187,7 +211,7 @@ try {
     $readyGeneration = $stableGeneration
 
     foreach ($max in $MaxValues) {
-        $first = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'search'; query = $queries[0].query; max = $max }) -RequestTimeoutMs $RequestTimeoutMs
+        $first = Send-PipeRequest -Session $session -Request (New-SearchRequest -Fixture $queries[0] -Max $max) -RequestTimeoutMs $RequestTimeoutMs
         $sample = New-SearchSample -Fixture $queries[0] -Max $max -Phase 'first_ready' -Iteration 0 -Result $first
         $samples.Add($sample)
     }
@@ -195,8 +219,9 @@ try {
     for ($cycle = 1; $cycle -le $WarmupCycles; $cycle++) {
         foreach ($max in $MaxValues) {
             foreach ($query in $queries) {
-                $warmup = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'search'; query = $query.query; max = $max }) -RequestTimeoutMs $RequestTimeoutMs
-                $warmupResponse = Assert-SearchResponse -Result $warmup -ExpectedQuery $query.query
+                $warmup = Send-PipeRequest -Session $session -Request (New-SearchRequest -Fixture $query -Max $max) -RequestTimeoutMs $RequestTimeoutMs
+                $warmupResponse = Assert-SearchResponse -Result $warmup -ExpectedQuery $query.query `
+                    -Context ('{0} max={1} phase=warmup cycle={2}' -f $query.id, $max, $cycle)
                 if ($warmupResponse.is_indexing) { throw 'Index returned to an indexing state during warmup.' }
             }
         }
@@ -205,7 +230,7 @@ try {
     for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
         foreach ($max in $MaxValues) {
             foreach ($query in $queries) {
-                $result = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'search'; query = $query.query; max = $max }) -RequestTimeoutMs $RequestTimeoutMs
+                $result = Send-PipeRequest -Session $session -Request (New-SearchRequest -Fixture $query -Max $max) -RequestTimeoutMs $RequestTimeoutMs
                 $sample = New-SearchSample -Fixture $query -Max $max -Phase 'warm' -Iteration $iteration -Result $result
                 if ($sample.is_indexing) { throw 'Index returned to an indexing state during formal sampling.' }
                 $samples.Add($sample)

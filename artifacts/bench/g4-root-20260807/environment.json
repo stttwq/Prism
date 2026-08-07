@@ -1,0 +1,96 @@
+{
+    "schema_version":  1,
+    "run_id":  "g0-20260807T050643Z",
+    "captured_at_utc":  "2026-08-07T05:06:44.3443493Z",
+    "git":  {
+                "commit":  "c40edeac23cda764e6683fc577ec3bc0f4883bcf",
+                "branch":  "feature",
+                "dirty":  true
+            },
+    "build":  {
+                  "commands":  [
+                                   "cargo build --release --manifest-path src/prism-core/Cargo.toml",
+                                   "dotnet publish src/Prism -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true"
+                               ],
+                  "release_profile":  {
+                                          "committed_opt_level":  "z",
+                                          "effective_opt_level":  "z",
+                                          "effective_value_source":  "required benchmark argument",
+                                          "lto":  true,
+                                          "codegen_units":  1,
+                                          "panic":  "abort",
+                                          "strip":  true
+                                      },
+                  "binaries":  [
+                                   {
+                                       "name":  "Prism.exe",
+                                       "bytes":  406159,
+                                       "sha256":  "439d84a377b662b4ea43a3265f60fe94432d4c34e167eeaacbce3041086f534f",
+                                       "last_write_utc":  "2026-08-07T04:36:28.5024454Z"
+                                   },
+                                   {
+                                       "name":  "prism-core.exe",
+                                       "bytes":  822272,
+                                       "sha256":  "33b5d131623495f1d79efa4ec4c94b53c59c2588d7e2590939a2a2efb35a3d34",
+                                       "last_write_utc":  "2026-08-07T04:36:09.9365382Z"
+                                   },
+                                   {
+                                       "name":  "prism-indexer-service.exe",
+                                       "bytes":  683008,
+                                       "sha256":  "fb11b6b2e7b61814ecbf2af201107e4eee28a5f8489d370bc517543c126631d0",
+                                       "last_write_utc":  "2026-08-07T04:36:09.9395572Z"
+                                   }
+                               ],
+                  "indexer_service":  {
+                                          "service_name":  "PrismIndexer",
+                                          "binary_sha256":  "fb11b6b2e7b61814ecbf2af201107e4eee28a5f8489d370bc517543c126631d0",
+                                          "matches_release_directory":  true
+                                      }
+              },
+    "machine":  {
+                    "windows_product":  "Windows 10 Pro",
+                    "windows_display_version":  "23H2",
+                    "windows_build":  "22631.5696",
+                    "cpu":  "AMD Ryzen 7 5800H with Radeon Graphics",
+                    "logical_processors":  16,
+                    "physical_memory_bytes":  17024741376,
+                    "security_software_notes":  "Windows Defender real-time protection on, no active scan",
+                    "background_io_notes":  "Idle desktop; Directory Opus and Explorer closed; no indexing in progress"
+                },
+    "volumes":  [
+                    {
+                        "name":  "C:\\",
+                        "format":  "NTFS",
+                        "total_bytes":  214351831040,
+                        "free_bytes":  135924330496
+                    },
+                    {
+                        "name":  "D:\\",
+                        "format":  "NTFS",
+                        "total_bytes":  294533627904,
+                        "free_bytes":  256791076864
+                    },
+                    {
+                        "name":  "E:\\",
+                        "format":  "NTFS",
+                        "total_bytes":  1024192409600,
+                        "free_bytes":  672368480256
+                    }
+                ],
+    "index_contract":  {
+                           "ready_rule":  "indexer status ready=true and building=false; broker search is_indexing=false",
+                           "cache_version":  {
+                                                 "value":  null,
+                                                 "status":  "g1_pending_runtime_protocol",
+                                                 "source_expected":  5
+                                             },
+                           "node_count":  {
+                                              "value":  null,
+                                              "status":  "g1_pending"
+                                          },
+                           "name_pool_capacity_bytes":  {
+                                                            "value":  null,
+                                                            "status":  "g1_pending"
+                                                        }
+                       }
+}

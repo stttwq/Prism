@@ -123,6 +123,43 @@ directory, then run the same query fixture, iteration count, machine state, and
 run notes with `-StartBroker`. Build and run `scan-floor` the same way for the
 full-scan comparison. Keep both raw datasets; do not remove outliers.
 
+## Root-scoped queries (G4)
+
+`queries.json` carries five root-scoped fixtures alongside the global ones. A
+fixture with a `root` field makes the driver add `root` to the search request;
+fixtures without one stay byte-identical to the pre-G4 wire format, so old runs
+remain comparable. Each sample records `root` and `root_rejection`, and each
+aggregate additionally reports `workload` percentiles.
+
+`workload.path_constructions` is the metric that answers the G4 PRD question
+("can the parent-chain approach meet P95, or is an ancestor cache required?").
+Latency alone cannot: it hides whether a fast query did little work or a slow one
+walked many ancestors. A non-empty `root_rejections` on an aggregate means the
+indexer refused that root and answered globally — such a row must never be read
+as evidence that scoping is fast.
+
+### Paired comparison (not a baseline)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Invoke-RootScopeComparison.ps1 `
+  -OutputDirectory artifacts\bench\g4-root-YYYYMMDD `
+  -Iterations 40 `
+  -Notes 'State machine conditions here'
+```
+
+`Invoke-SearchBaseline.ps1` aborts when the index generation moves, because
+absolute numbers are only comparable across runs on a quiet machine. That is
+correct and must not be relaxed. `Invoke-RootScopeComparison.ps1` answers a
+narrower question — *is the scoped arm slower than the global arm* — by running
+both arms interleaved inside each iteration, so background I/O hits them equally.
+It tolerates churn and records generation movement instead of hiding it.
+
+It is **not** a substitute for the formal baseline: its absolute latencies are
+inflated and cross-run comparison is invalid. Check `sample_count` against
+`errors` before drawing any conclusion; a run where most requests failed proves
+nothing. See `08-07-prism-ipc-resilience` for the pipe-busy failures observed
+under a USN flood.
+
 ## Protocol counters
 
 The G1 broker/indexer protocol exposes generation, truncation, scanned node

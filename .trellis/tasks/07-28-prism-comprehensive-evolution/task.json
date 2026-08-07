@@ -28,7 +28,8 @@
     "07-28-prism-g6-built-in-actions",
     "07-28-prism-g7-query-filters",
     "07-28-prism-g8-web-enhancements",
-    "07-29-prism-g9-first-build"
+    "07-29-prism-g9-first-build",
+    "08-07-prism-ipc-resilience"
   ],
   "parent": null,
   "relatedFiles": [],

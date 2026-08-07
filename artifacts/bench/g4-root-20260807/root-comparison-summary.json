@@ -1,0 +1,1087 @@
+{
+    "schema_version":  1,
+    "kind":  "g4_root_scope_paired_comparison",
+    "not_a_formal_g0_baseline":  true,
+    "comparability_note":  "Absolute latencies are inflated by background I/O and are NOT comparable to formal G0 runs. Root and global arms are interleaved within each iteration, so the paired delta remains valid.",
+    "generated_at_utc":  "2026-08-07T05:30:38.7530946Z",
+    "broker_build_id":  "0.1.0+release.1786023761",
+    "percentile_method":  "nearest_rank",
+    "iterations":  40,
+    "warmup_cycles":  3,
+    "sample_count":  800,
+    "notes":  "Collected while Windows Update SetupHost was active; index generation churning. Paired comparison only.",
+    "index_stability":  {
+                            "generation_start":  1338611,
+                            "generation_end":  1340721,
+                            "generation_distinct":  237,
+                            "generation_moved":  true,
+                            "is_indexing_responses":  0,
+                            "volumes":  3,
+                            "memory_bytes":  170499024
+                        },
+    "errors":  [
+                   "deep_system32/global max=8 iter=1: indexer service request timed out",
+                   "shallow_small/root max=8 iter=1: indexer service request timed out",
+                   "shallow_small/global max=8 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=1: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=2: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=3: indexer service request timed out",
+                   "deep_system32/global max=8 iter=3: indexer service request timed out",
+                   "shallow_small/root max=8 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=3: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=4: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=5: indexer service request timed out",
+                   "drive_root/root max=1000 iter=5: indexer service request timed out",
+                   "drive_root/global max=1000 iter=5: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=6: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=7: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=8: indexer service request timed out",
+                   "deep_high_candidate/global max=8 iter=8: indexer service request timed out",
+                   "deep_system32/root max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=8: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=9: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=10: indexer service request timed out",
+                   "deep_high_candidate/root max=1000 iter=10: indexer service request timed out",
+                   "deep_high_candidate/global max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=10: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=11: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=12: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=12: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=12: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=13: indexer service request timed out",
+                   "drive_root/root max=8 iter=13: indexer service request timed out",
+                   "drive_root/global max=8 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=13: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=14: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=15: indexer service request timed out",
+                   "deep_high_candidate/global max=1000 iter=15: indexer service request timed out",
+                   "deep_system32/root max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=15: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=16: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=17: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=17: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=17: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=17: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=17: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=18: indexer service request timed out",
+                   "shallow_small/root max=8 iter=18: indexer service request timed out",
+                   "shallow_small/global max=8 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=18: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=19: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=20: indexer service request timed out",
+                   "drive_root/global max=8 iter=20: indexer service request timed out",
+                   "deep_high_candidate/root max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=20: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=21: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=22: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=22: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=22: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=22: indexer service request timed out",
+                   "deep_high_candidate/root max=8 iter=23: indexer service request timed out",
+                   "deep_high_candidate/global max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=23: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=24: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=25: indexer service request timed out",
+                   "drive_root/global max=1000 iter=25: indexer service request timed out",
+                   "deep_high_candidate/root max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=26: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=27: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=27: indexer service request timed out",
+                   "deep_high_candidate/root max=8 iter=28: indexer service request timed out",
+                   "deep_high_candidate/global max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=28: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=29: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=30: indexer service request timed out",
+                   "shallow_small/global max=1000 iter=30: indexer service request timed out",
+                   "no_hit/root max=1000 iter=30: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=30: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=30: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=30: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=31: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=32: indexer service request timed out",
+                   "deep_system32/global max=1000 iter=32: indexer service request timed out",
+                   "shallow_small/root max=1000 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=32: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=33: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=34: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=35: indexer service request timed out",
+                   "no_hit/global max=8 iter=35: indexer service request timed out",
+                   "drive_root/root max=8 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=35: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=36: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=37: indexer service request timed out",
+                   "no_hit/global max=8 iter=37: indexer service request timed out",
+                   "drive_root/root max=8 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=37: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=8 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=38: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=8 iter=39: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=8 iter=40: indexer service request timed out",
+                   "drive_root/root max=8 iter=40: indexer service request timed out",
+                   "drive_root/global max=8 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/root max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_high_candidate/global max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/root max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "deep_system32/global max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/root max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "shallow_small/global max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/root max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "no_hit/global max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/root max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)",
+                   "drive_root/global max=1000 iter=40: indexer service is unavailable: 所有的管道范例都在使用中。 (os error 231)"
+               ],
+    "comparisons":  [
+                        {
+                            "pair":  "deep_high_candidate",
+                            "query":  "e",
+                            "root":  "E:\\YX",
+                            "max":  8,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  153.6,
+                                                            "p95":  2002.8,
+                                                            "max":  2015.4
+                                                        },
+                                               "global":  {
+                                                              "p50":  157.2,
+                                                              "p95":  321.4,
+                                                              "max":  2006.5
+                                                          },
+                                               "p95_delta":  1681.4
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  8,
+                                                                    "p95":  8,
+                                                                    "max":  8
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  8,
+                                                                      "p95":  8,
+                                                                      "max":  8
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  68,
+                                                               "p95":  68,
+                                                               "max":  68
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  78,
+                                                                 "p95":  78,
+                                                                 "max":  78
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  8,
+                                                 "global_max":  8
+                                             }
+                        },
+                        {
+                            "pair":  "deep_high_candidate",
+                            "query":  "e",
+                            "root":  "E:\\YX",
+                            "max":  1000,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  155.6,
+                                                            "p95":  459.6,
+                                                            "max":  2015.5
+                                                        },
+                                               "global":  {
+                                                              "p50":  157.2,
+                                                              "p95":  419.9,
+                                                              "max":  2012
+                                                          },
+                                               "p95_delta":  39.7
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  1000,
+                                                                    "p95":  1000,
+                                                                    "max":  1000
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  1000,
+                                                                      "p95":  1000,
+                                                                      "max":  1000
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  5749,
+                                                               "p95":  5749,
+                                                               "max":  5749
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  6810,
+                                                                 "p95":  6810,
+                                                                 "max":  6810
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  1000,
+                                                 "global_max":  1000
+                                             }
+                        },
+                        {
+                            "pair":  "deep_system32",
+                            "query":  "win",
+                            "root":  "C:\\Windows\\System32",
+                            "max":  8,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  157.1,
+                                                            "p95":  269.8,
+                                                            "max":  2014.4
+                                                        },
+                                               "global":  {
+                                                              "p50":  156.9,
+                                                              "p95":  2010.2,
+                                                              "max":  2014.6
+                                                          },
+                                               "p95_delta":  -1740.4
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  8,
+                                                                    "p95":  8,
+                                                                    "max":  8
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  8,
+                                                                      "p95":  8,
+                                                                      "max":  8
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  61,
+                                                               "p95":  61,
+                                                               "max":  61
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  71,
+                                                                 "p95":  71,
+                                                                 "max":  71
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  8,
+                                                 "global_max":  8
+                                             }
+                        },
+                        {
+                            "pair":  "deep_system32",
+                            "query":  "win",
+                            "root":  "C:\\Windows\\System32",
+                            "max":  1000,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  153.2,
+                                                            "p95":  340.4,
+                                                            "max":  2013.9
+                                                        },
+                                               "global":  {
+                                                              "p50":  157.4,
+                                                              "p95":  279.5,
+                                                              "max":  2015.5
+                                                          },
+                                               "p95_delta":  60.9
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  441,
+                                                                    "p95":  441,
+                                                                    "max":  441
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  1000,
+                                                                      "p95":  1000,
+                                                                      "max":  1000
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  441,
+                                                               "p95":  441,
+                                                               "max":  441
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  4589,
+                                                                 "p95":  4589,
+                                                                 "max":  4589
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  441,
+                                                 "global_max":  1000
+                                             }
+                        },
+                        {
+                            "pair":  "shallow_small",
+                            "query":  "prism",
+                            "root":  "E:\\LS\\DM\\listary\\src",
+                            "max":  8,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  155,
+                                                            "p95":  181.3,
+                                                            "max":  2011.4
+                                                        },
+                                               "global":  {
+                                                              "p50":  155.6,
+                                                              "p95":  181.4,
+                                                              "max":  263
+                                                          },
+                                               "p95_delta":  -0.1
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  8,
+                                                                    "p95":  8,
+                                                                    "max":  8
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  8,
+                                                                      "p95":  8,
+                                                                      "max":  8
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  24,
+                                                               "p95":  24,
+                                                               "max":  24
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  41,
+                                                                 "p95":  41,
+                                                                 "max":  41
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  8,
+                                                 "global_max":  8
+                                             }
+                        },
+                        {
+                            "pair":  "shallow_small",
+                            "query":  "prism",
+                            "root":  "E:\\LS\\DM\\listary\\src",
+                            "max":  1000,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  155.1,
+                                                            "p95":  192.3,
+                                                            "max":  2015.3
+                                                        },
+                                               "global":  {
+                                                              "p50":  156.1,
+                                                              "p95":  186.5,
+                                                              "max":  2002.5
+                                                          },
+                                               "p95_delta":  5.8
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  246,
+                                                                    "p95":  246,
+                                                                    "max":  246
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  624,
+                                                                      "p95":  624,
+                                                                      "max":  624
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  246,
+                                                               "p95":  246,
+                                                               "max":  246
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  624,
+                                                                 "p95":  624,
+                                                                 "max":  624
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  246,
+                                                 "global_max":  626
+                                             }
+                        },
+                        {
+                            "pair":  "no_hit",
+                            "query":  "prism-g0-no-hit-019fabfb9808",
+                            "root":  "E:\\YX",
+                            "max":  8,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  155.5,
+                                                            "p95":  210.5,
+                                                            "max":  2010.7
+                                                        },
+                                               "global":  {
+                                                              "p50":  155.9,
+                                                              "p95":  2012.4,
+                                                              "max":  2015.7
+                                                          },
+                                               "p95_delta":  -1801.9
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  0,
+                                                                    "p95":  0,
+                                                                    "max":  0
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  0,
+                                                                      "p95":  0,
+                                                                      "max":  0
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  0,
+                                                               "p95":  0,
+                                                               "max":  0
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  0,
+                                                                 "p95":  0,
+                                                                 "max":  0
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  0,
+                                                 "global_max":  0
+                                             }
+                        },
+                        {
+                            "pair":  "no_hit",
+                            "query":  "prism-g0-no-hit-019fabfb9808",
+                            "root":  "E:\\YX",
+                            "max":  1000,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  155.1,
+                                                            "p95":  157.3,
+                                                            "max":  158.9
+                                                        },
+                                               "global":  {
+                                                              "p50":  154.5,
+                                                              "p95":  158.7,
+                                                              "max":  2008.8
+                                                          },
+                                               "p95_delta":  -1.4
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  0,
+                                                                    "p95":  0,
+                                                                    "max":  0
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  0,
+                                                                      "p95":  0,
+                                                                      "max":  0
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  0,
+                                                               "p95":  0,
+                                                               "max":  0
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  0,
+                                                                 "p95":  0,
+                                                                 "max":  0
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  0,
+                                                 "global_max":  0
+                                             }
+                        },
+                        {
+                            "pair":  "drive_root",
+                            "query":  "e",
+                            "root":  "E:\\",
+                            "max":  8,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  156.6,
+                                                            "p95":  2003.4,
+                                                            "max":  2015.3
+                                                        },
+                                               "global":  {
+                                                              "p50":  156.5,
+                                                              "p95":  373.8,
+                                                              "max":  2012
+                                                          },
+                                               "p95_delta":  1629.6
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  8,
+                                                                    "p95":  8,
+                                                                    "max":  8
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  8,
+                                                                      "p95":  8,
+                                                                      "max":  8
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  78,
+                                                               "p95":  78,
+                                                               "max":  78
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  78,
+                                                                 "p95":  78,
+                                                                 "max":  78
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  8,
+                                                 "global_max":  8
+                                             }
+                        },
+                        {
+                            "pair":  "drive_root",
+                            "query":  "e",
+                            "root":  "E:\\",
+                            "max":  1000,
+                            "sample_count":  40,
+                            "root_rejections":  [
+
+                                                ],
+                            "latency_ms":  {
+                                               "root":  {
+                                                            "p50":  156.6,
+                                                            "p95":  387.2,
+                                                            "max":  2015.7
+                                                        },
+                                               "global":  {
+                                                              "p50":  157,
+                                                              "p95":  2003.3,
+                                                              "max":  2015.8
+                                                          },
+                                               "p95_delta":  -1616.1
+                                           },
+                            "path_constructions":  {
+                                                       "root":  {
+                                                                    "p50":  1000,
+                                                                    "p95":  1000,
+                                                                    "max":  1000
+                                                                },
+                                                       "global":  {
+                                                                      "p50":  1000,
+                                                                      "p95":  1000,
+                                                                      "max":  1000
+                                                                  }
+                                                   },
+                            "entered_top_k":  {
+                                                  "root":  {
+                                                               "p50":  6229,
+                                                               "p95":  6229,
+                                                               "max":  6229
+                                                           },
+                                                  "global":  {
+                                                                 "p50":  6810,
+                                                                 "p95":  6810,
+                                                                 "max":  6810
+                                                             }
+                                              },
+                            "result_count":  {
+                                                 "root_max":  1000,
+                                                 "global_max":  1000
+                                             }
+                        }
+                    ]
+}

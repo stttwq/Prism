@@ -95,6 +95,65 @@ function Assert-MemoryAcceptance {
     }
 }
 
+# Read one field from a sample regardless of how it reached us: samples built in
+# this process are ordered hashtables, while samples re-read from JSONL are
+# PSCustomObjects. StrictMode turns a wrong-shape access into a hard error, and
+# PSObject.Properties silently misses hashtable keys - which is how the first
+# G4 root run recorded every row as "(global)" despite root being on the wire.
+function Get-SampleField {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Sample, [Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $Sample) { return $null }
+    if ($Sample -is [Collections.IDictionary]) {
+        if ($Sample.Contains($Name)) { return $Sample[$Name] }
+        return $null
+    }
+    $property = $Sample.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+# Aggregate the per-sample workload counters. Each counter is recorded as
+# @{ value; status } where status is 'measured' or 'g1_pending'; a counter the
+# broker never reported stays null rather than being silently treated as zero,
+# so a missing metric can never be mistaken for "did no work".
+function New-WorkloadAggregate {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object[]]$Items)
+
+    $counters = @('scanned_nodes', 'name_candidates', 'matching_names', 'entered_top_k', 'path_constructions')
+    $result = [ordered]@{}
+    foreach ($counter in $counters) {
+        $values = [double[]]@(
+            $Items | ForEach-Object {
+                $workload = Get-SampleField -Sample $_ -Name 'workload'
+                if ($null -eq $workload) { return }
+                $entry = Get-SampleField -Sample $workload -Name $counter
+                if ($null -eq $entry) { return }
+                # Only 'measured' counts; 'g1_pending' means the broker never
+                # reported it and must not be folded in as a real value.
+                if ([string](Get-SampleField -Sample $entry -Name 'status') -ne 'measured') { return }
+                $raw = Get-SampleField -Sample $entry -Name 'value'
+                if ($null -ne $raw) { [double]$raw }
+            }
+        )
+
+        if ($values.Count -eq 0) {
+            $result[$counter] = [ordered]@{ status = 'not_reported' }
+            continue
+        }
+        $result[$counter] = [ordered]@{
+            status = 'measured'
+            sample_count = $values.Count
+            p50 = [Math]::Round((Get-NearestRankPercentile -Values $values -Percentile 0.50), 1)
+            p95 = [Math]::Round((Get-NearestRankPercentile -Values $values -Percentile 0.95), 1)
+            max = [Math]::Round(($values | Measure-Object -Maximum).Maximum, 1)
+        }
+    }
+    return $result
+}
+
 function New-SearchSummary {
     [CmdletBinding()]
     param(
@@ -127,15 +186,35 @@ function New-SearchSummary {
             throw "Warm sample iterations must be unique and contiguous for $($group.Name)."
         }
         $elapsed = [double[]]@($items | ForEach-Object { [double]$_.elapsed_ms })
+        # Carry root into the aggregate so a summary reader can separate
+        # root-scoped rows from global ones without re-reading the raw JSONL.
+        $rootValues = @($items | ForEach-Object { [string](Get-SampleField -Sample $_ -Name 'root') } |
+            Select-Object -Unique)
+        if ($rootValues.Count -ne 1) {
+            throw "Warm samples for $($group.Name) mix different roots."
+        }
+        $rejections = @($items | ForEach-Object { [string](Get-SampleField -Sample $_ -Name 'root_rejection') } |
+            Where-Object { $_ -ne '' } | Select-Object -Unique)
+
         [ordered]@{
             query_id = [string]$items[0].query_id
             max = [int]$items[0].max
+            root = if ([string]::IsNullOrEmpty($rootValues[0])) { $null } else { $rootValues[0] }
+            # Non-empty means the indexer refused the root and answered globally;
+            # such a row must not be read as evidence that scoping is fast.
+            root_rejections = $rejections
             sample_count = $items.Count
             p50_ms = [Math]::Round((Get-NearestRankPercentile -Values $elapsed -Percentile 0.50), 3)
             p95_ms = [Math]::Round((Get-NearestRankPercentile -Values $elapsed -Percentile 0.95), 3)
             max_ms = [Math]::Round(($elapsed | Measure-Object -Maximum).Maximum, 3)
             result_count_min = [int](($items.result_count | Measure-Object -Minimum).Minimum)
             result_count_max = [int](($items.result_count | Measure-Object -Maximum).Maximum)
+            # Workload counters decide the G4 PRD question ("can the parent-chain
+            # approach meet P95, or is an ancestor cache required?"). Elapsed time
+            # alone cannot: it hides whether a fast query did little work or a slow
+            # one walked many ancestors. path_constructions is the direct proxy for
+            # ancestor validation volume.
+            workload = New-WorkloadAggregate -Items $items
         }
     }
 
@@ -405,7 +484,8 @@ function Get-BenchmarkEnvironment {
 
 Export-ModuleMember -Function @(
     'Resolve-BenchmarkOutputDirectory', 'Write-Utf8NoBom', 'Write-JsonLine', 'Write-JsonLines',
-    'Get-NearestRankPercentile', 'Assert-MemoryAcceptance', 'New-SearchSummary', 'New-PipeSession',
+    'Get-NearestRankPercentile', 'Assert-MemoryAcceptance', 'New-SearchSummary',
+    'New-WorkloadAggregate', 'Get-SampleField', 'New-PipeSession',
     'Close-PipeSession', 'Send-PipeRequest', 'Get-IndexerStatus',
     'Assert-ReleaseDirectory', 'Assert-IndexerServiceReleaseBinary',
     'Get-BenchmarkEnvironment'
