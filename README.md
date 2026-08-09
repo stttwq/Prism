@@ -56,3 +56,20 @@ Listary 替代品：全盘文件名即时搜索 / 启动软件 / 网页快捷搜
 - `src/prism-core`：Rust 后端（索引 / 搜索 / 程序清单 / 网页关键词，命名管道 JSON 服务）。
 - `src/Prism`：C# WPF 前端（搜索窗口 / 设置 / 托盘 / 全局快捷键）。
 - `dist/`：安装源与 Inno Setup 脚本。
+
+## 开发构建
+
+用一条命令完成「构建 → 安装 → 校验」，管理员权限运行：
+
+```powershell
+.\scripts\prism-build.ps1              # 常规
+.\scripts\prism-build.ps1 -Bootstrap   # 新机器（目录/服务都还没有）
+.\scripts\prism-build.ps1 -VerifyOnly  # 只查漂移，不改任何东西
+```
+
+装完会用 SHA-256 逐个比对安装字节与构建字节，不一致就报 `DRIFT DETECTED`。
+**行为不符预期时先跑 `-VerifyOnly`**：「跑的不是你改的代码」是本项目最常见的
+时间黑洞，成因和排查方法见 [`docs/排查踩坑记录.md`](docs/排查踩坑记录.md)。
+
+从 Git Bash 手工构建前先 `source scripts/msvc-env.sh`，否则 Git 自带的
+coreutils `link` 会被 rustc 当链接器用（只在产出 `.exe` 时才报错）。
