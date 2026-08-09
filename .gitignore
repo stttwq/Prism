@@ -55,3 +55,18 @@ $null
 !.trellis/workspace/*/
 !.trellis/workspace/*/journal*.md
 !.trellis/workspace/*/index.md
+
+# Diagnostic probe scratch: the reusable .ps1 probes are tracked, but their
+# build output and run logs are not. Committing binaries here once let a stale
+# copy shadow a fresh build for days (see docs/排查踩坑记录.md).
+artifacts/*/TabProbe/bin/
+artifacts/*/TabProbe/obj/
+artifacts/**/*.log
+artifacts/**/probe-output.txt
+artifacts/g4-test-build/*.exe
+artifacts/g4-test-build/*.dll
+artifacts/g4-test-build/*.pdb
+artifacts/g4-test-build/Prism.*.json
+
+# Debug symbols never ship with the installer payload.
+dist/*.pdb
