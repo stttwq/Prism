@@ -28,7 +28,9 @@
          `Invoke-SearchBaseline.ps1` 透传 root 并记录 `root` / `root_rejection`；
          聚合新增 `workload`（含 `path_constructions`）——耗时本身无法回答
          PRD 第 15 行的问题，必须看祖先验证次数
-   - [ ] **G0 root 基准正式数据未采集**：机器不满足前提，见下方「步骤 8 采集受阻」
+   - [ ] **G0 root 基准正式数据未采集** → 已移交 `08-09-prism-g4-root-baseline`（P3）。
+         机器不满足前提，原因见下方「步骤 8 采集受阻」。该任务承接补采前提、
+         执行命令与验收标准；G4 本身不再等待它。
 
 ### 步骤 8 采集受阻（2026-08-07）
 
