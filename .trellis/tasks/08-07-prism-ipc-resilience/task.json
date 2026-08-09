@@ -3,7 +3,7 @@
   "name": "prism-ipc-resilience",
   "title": "IPC 韧性：broker 静默崩溃与 indexer 单实例管道饱和",
   "description": "高索引流失下 broker 静默退出、indexer 管道返回 ERROR_PIPE_BUSY 导致搜索失败。两者均在 G4 步骤 8 基准采集时实测复现。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
@@ -25,6 +25,6 @@
     "src/prism-core/src/indexer_client.rs",
     "src/prism-core/src/logging.rs"
   ],
-  "notes": "由 G4 步骤 8 基准采集暴露，不属于 G4 范围，单独立项。",
+  "notes": "由 G4 步骤 8 基准采集暴露，不属于 G4 范围，单独立项。2026-08-09：缺陷 B（panic 无日志）已修复并确证；缺陷 A（ERROR_PIPE_BUSY）代码缺陷已修但 A/B 对照未能复现原始故障，因果链未证明，详见 prd.md 进展一节。",
   "meta": {}
 }

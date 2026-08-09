@@ -6,6 +6,10 @@ use prism_core::{apps, config, history, ipc, log, logging, shell, PIPE_NAME, VER
 async fn main() {
     let data_dir = config::resolve_data_dir();
     logging::init("broker", &data_dir);
+    // `panic = "abort"` kills the process without unwinding, so without this hook a
+    // panic leaves no trace at all: the frontend silently relaunches the broker and
+    // the crash is unattributable afterwards.
+    logging::install_panic_hook();
     log(format!("prism-core starting, version {VERSION}"));
     let cfg = config::Config::load(&data_dir);
     let apps: apps::SharedApps = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));

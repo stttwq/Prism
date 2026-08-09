@@ -44,6 +44,47 @@ pub fn redacted_message(message: &str) {
     event("info", &redacted_id(message), None, None);
 }
 
+/// Records a panic before the process dies.
+///
+/// The release profile uses `panic = "abort"`, so without this hook a panic
+/// terminates the process leaving nothing behind: the frontend silently relaunches
+/// the broker and the incident is unreconstructable. That is exactly what happened
+/// on 2026-08-07 - `prism-core.exe` vanished under load and `broker.jsonl` held no
+/// entry for that day.
+///
+/// The panic *location* comes from source code, so it is logged verbatim. The panic
+/// *message* may embed a path or query and is hashed, matching [`redacted_message`].
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()));
+        // `panic!("{path} missing")` would otherwise leak the path into the log.
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|text| text.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned());
+
+        event(
+            "error",
+            &panic_event(location.as_deref(), payload.as_deref()),
+            None,
+            None,
+        );
+        previous(info);
+    }));
+}
+
+/// Event text for a panic. Split out from the hook so the redaction contract is
+/// testable without installing a process-global hook.
+fn panic_event(location: Option<&str>, payload: Option<&str>) -> String {
+    let location = location.unwrap_or("unknown");
+    let detail = payload.map_or_else(|| "no_payload".to_owned(), redacted_id);
+    format!("panic at {location} {detail}")
+}
+
 pub fn redacted_id(message: &str) -> String {
     format!("message_{:016x}", stable_hash(message))
 }
@@ -132,6 +173,27 @@ mod tests {
         std::fs::write(&file, b"not a directory").unwrap();
         assert!(RollingLogger::open("broker", &file).is_err());
         let _ = std::fs::remove_file(file);
+    }
+
+    /// A panic message can embed a path or query, so only the source location is
+    /// logged verbatim. Regression guard for the silent-crash defect: `panic = "abort"`
+    /// plus no hook left `broker.jsonl` with no entry at all for the crash day.
+    #[test]
+    fn panic_event_keeps_location_and_hashes_the_message() {
+        let text = panic_event(
+            Some("src/prism-core/src/ipc.rs:412"),
+            Some(r"C:\Users\me\secret.txt is missing"),
+        );
+        assert!(text.contains("src/prism-core/src/ipc.rs:412"), "{text}");
+        assert!(!text.contains("secret.txt"), "{text}");
+        assert!(!text.contains(r"C:\Users"), "{text}");
+        assert!(text.contains("message_"), "{text}");
+    }
+
+    #[test]
+    fn panic_event_survives_a_missing_location_or_payload() {
+        let text = panic_event(None, None);
+        assert_eq!(text, "panic at unknown no_payload");
     }
 
     #[test]

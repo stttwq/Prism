@@ -17,6 +17,9 @@ define_windows_service!(ffi_service_main, service_main);
 
 fn main() {
     prism_core::logging::init("indexer", &prism_core::index_cache::machine_data_dir());
+    // Under `panic = "abort"` a panicking worker takes the whole service down with no
+    // log line; the SCM restart then looks like a spontaneous reboot.
+    prism_core::logging::install_panic_hook();
     let result = if std::env::args_os().any(|arg| arg == "--console") {
         run_console()
     } else {

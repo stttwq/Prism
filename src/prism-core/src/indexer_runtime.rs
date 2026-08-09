@@ -360,6 +360,21 @@ impl ServiceState {
         }
     }
 
+    /// Just the generation number, without `status()`'s memory accounting.
+    ///
+    /// `status()` walks the index and the pinyin sidecar to total `memory_bytes`,
+    /// which is far more work than a readiness poll needs. Still takes the read
+    /// lock, so callers on the async runtime must go through `spawn_blocking`.
+    pub fn generation(&self) -> u64 {
+        self.index
+            .read()
+            .ok()
+            .as_deref()
+            .and_then(Option::as_ref)
+            .map(|state| state.generation)
+            .unwrap_or(0)
+    }
+
     pub fn status(&self) -> IndexerStatus {
         let index = self.index.read().ok();
         let state = index.as_deref().and_then(Option::as_ref);
@@ -570,21 +585,37 @@ impl ServiceState {
         })
     }
 
-    async fn wait_generation(&self, after: u64, timeout_ms: u64) -> u64 {
+    /// Wait until the index generation passes `after`, or the timeout expires.
+    ///
+    /// Reads the generation off the runtime via `spawn_blocking`: it needs
+    /// `index.read()`, and during a USN flood the watcher holds `index.write()`
+    /// in tight batches. Blocking here used to stall a worker thread on every
+    /// loop iteration, which with 2 workers starved the pipe accept loop and
+    /// surfaced to clients as ERROR_PIPE_BUSY.
+    async fn wait_generation(self: &Arc<Self>, after: u64, timeout_ms: u64) -> u64 {
         let timeout = Duration::from_millis(timeout_ms.min(30_000));
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.generation_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let generation = self.status().generation;
+            let generation = self.generation_off_runtime().await;
             if generation > after {
                 return generation;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return self.status().generation;
+                return self.generation_off_runtime().await;
             }
         }
+    }
+
+    /// `generation()` on the blocking pool. Falls back to 0 only if the task
+    /// itself fails, which is indistinguishable from "no index yet" to callers.
+    async fn generation_off_runtime(self: &Arc<Self>) -> u64 {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.generation())
+            .await
+            .unwrap_or(0)
     }
 }
 
@@ -1131,7 +1162,48 @@ async fn checkpoint_async(state: Arc<ServiceState>, data_dir: PathBuf) -> Result
         .map_err(|error| format!("checkpoint task: {error}"))?
 }
 
-async fn serve(state: Arc<ServiceState>, mut server: NamedPipeServer) -> Result<(), String> {
+/// Number of concurrently armed pipe listeners.
+///
+/// A single listener has an unavoidable gap: after `connect()` returns, nothing
+/// is listening until `create_pipe` re-arms. Clients arriving in that gap get
+/// `ERROR_PIPE_BUSY` (os error 231). The gap is microseconds when idle, but the
+/// runtime only has 2 worker threads, so under load the re-arm can be delayed
+/// past the client's retry budget (5 x 20ms in `indexer_client::connect`).
+///
+/// Measured 2026-08-07 during a USN flood (index advancing ~340 generations/s
+/// while Windows Update rewrote the disk): 517 of 800 searches failed with
+/// ERROR_PIPE_BUSY. Sequential single-client load never reproduced it, which is
+/// what ruled out a fixed capacity limit and pointed at scheduling delay.
+///
+/// Keeping several listeners armed means a sibling is still accepting while any
+/// one of them re-arms.
+const PIPE_LISTENERS: usize = 4;
+
+async fn serve(state: Arc<ServiceState>, first_pipe: NamedPipeServer) -> Result<(), String> {
+    let mut listeners = tokio::task::JoinSet::new();
+    listeners.spawn(accept_loop(state.clone(), first_pipe));
+    for _ in 1..PIPE_LISTENERS {
+        // `first_pipe_instance` must only be set on the very first instance;
+        // the caller already created that one.
+        let pipe = create_pipe(false).map_err(|error| error.to_string())?;
+        listeners.spawn(accept_loop(state.clone(), pipe));
+    }
+
+    // Any loop exiting means we can no longer guarantee an armed listener, which
+    // the caller treats as fatal rather than silently degrading to fewer slots.
+    let first = listeners.join_next().await;
+    listeners.abort_all();
+    match first {
+        Some(Ok(Ok(()))) => Err("indexer pipe listener exited".into()),
+        Some(Ok(Err(error))) => Err(error),
+        Some(Err(error)) => Err(format!("indexer pipe listener task: {error}")),
+        None => Err("no indexer pipe listeners were started".into()),
+    }
+}
+
+/// One listener's accept loop: wait for a client, hand the connection to a task,
+/// then immediately re-arm this slot.
+async fn accept_loop(state: Arc<ServiceState>, mut server: NamedPipeServer) -> Result<(), String> {
     loop {
         server.connect().await.map_err(|error| error.to_string())?;
         let connected = server;
@@ -1220,7 +1292,20 @@ pub(crate) async fn handle_connection(
     }
     while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
         let response = match serde_json::from_str::<IndexerRequest>(&line) {
-            Ok(IndexerRequest::Status) => IndexerResponse::Status(state.status()),
+            // `status()` takes `index.read()` synchronously. Calling it directly
+            // on a worker thread lets a USN flood (watcher holding `index.write()`)
+            // block the whole runtime: with 2 workers, two concurrent Status
+            // requests starve the accept loop and new clients get
+            // ERROR_PIPE_BUSY. Same reason Search already uses spawn_blocking.
+            Ok(IndexerRequest::Status) => {
+                let state = state.clone();
+                match tokio::task::spawn_blocking(move || state.status()).await {
+                    Ok(status) => IndexerResponse::Status(status),
+                    Err(error) => IndexerResponse::Error {
+                        message: format!("status task: {error}"),
+                    },
+                }
+            }
             Ok(IndexerRequest::Search {
                 query,
                 max,

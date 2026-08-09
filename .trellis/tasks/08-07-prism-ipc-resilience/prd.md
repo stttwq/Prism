@@ -9,6 +9,50 @@ G4 步骤 8 采集 root 作用域性能基准时实测暴露。两个缺陷都�
 索引在 6 秒内推进 2059 个世代。这是真实用户会遇到的场景——系统更新、
 大批量解压、Git 检出大仓库都会产生同级别的 USN 洪峰。
 
+## 进展（2026-08-09）
+
+**缺陷 B 已修复并确证。** 缺陷 A 的**代码缺陷已修，但因果链未证明**——A/B 对照
+显示未修复的旧二进制在更猛的洪峰下同样零失败，即当前探针**复现不了**原始故障。
+
+| | 状态 | 依据 |
+| --- | --- | --- |
+| B panic 无日志 | **已修复** | 探针触发 panic，日志得到 `panic at tools/panic-probe.rs:23 message_e395…`；位置明文、路径已哈希 |
+| A ERROR_PIPE_BUSY | **未证明** | A/B：旧二进制 5831 世代/秒下 150 轮零失败；新二进制 5513 世代/秒下同样零失败 |
+
+### 为什么复现不了
+
+合成洪峰与 8月7日的现场有两处关键差异，都指向「CPU 与索引规模」而非 USN 速率：
+
+1. **CPU 未饱和**。8月7日是 Windows 更新（`SetupHost`，累计 CPU 1380s）在解压安装，
+   CPU 与磁盘同时打满。合成洪峰只产生 USN 记录，CPU 有大量余量——而工作线程饥饿
+   恰恰需要 CPU 竞争。
+2. **索引规模差一半**。8月7日 `memory_bytes` 是 171MB；重装抹掉 `C:\ProgramData\Prism`
+   后重建只有 66MB。索引更小 → 搜索更快 → 持锁更短 → 竞争更弱。
+
+USN 速率反而不是瓶颈：合成洪峰 5800/秒远超当时的 340/秒，仍不触发。
+
+### 代码缺陷本身是真实的
+
+与能否复现无关，以下三处在 async 运行时里持锁阻塞，客观上是错的：
+
+- `IndexerRequest::Status` 曾直接在工作线程调 `state.status()`，而 `status()` 第一行
+  就是 `index.read()`，还要遍历索引与拼音侧车累加 `memory_bytes`。`Search` 早已用
+  `spawn_blocking`，Status 没有，属遗漏。
+- `wait_generation` 是 async 函数，却在循环里两次同步调 `self.status()`。
+- accept 循环只保留 1 个监听实例，`connect()` 返回到 `create_pipe` 之间无人监听。
+
+已分别改为 `spawn_blocking`、新增只读世代的 `generation()`、监听池扩到 4
+（`JoinSet`）。这些改动可独立辩护，但**不得标记为「已修复 ERROR_PIPE_BUSY」**。
+
+### 复现条件（下次遇到时按此采集）
+
+真实触发需要同时满足：完整规模索引（`memory_bytes` ≥ 150MB）、CPU 接近饱和的
+外部负载（系统更新 / 大批量解压 / 编译）、以及并发的 Status 轮询 + 重查询。
+探针见 `artifacts/g4-test-build/probe-under-flood.ps1` 与 `ab-compare.ps1`
+（后者需提权，会换服务二进制并在 `finally` 里恢复）。
+
+---
+
 ## 缺陷 A：indexer 管道在高流失下返回 ERROR_PIPE_BUSY
 
 **现象**：800 次搜索请求中 517 次失败于

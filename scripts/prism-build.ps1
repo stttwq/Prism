@@ -20,15 +20,30 @@
 #
 # USAGE
 #   .\scripts\prism-build.ps1              # build + install + verify (needs admin)
+#   .\scripts\prism-build.ps1 -Bootstrap   # same, on a machine with no install yet
 #   .\scripts\prism-build.ps1 -VerifyOnly  # just check for drift, changes nothing
 #   .\scripts\prism-build.ps1 -SkipInstall # build + verify build outputs only
 #   .\scripts\prism-build.ps1 -Clean       # force full rebuild first
+#
+# TOOLCHAIN
+#   Located automatically by Initialize-Toolchain; install with winget if absent:
+#     winget install --id Microsoft.DotNet.SDK.8
+#     winget install --id Microsoft.VisualStudio.2022.BuildTools --override
+#       "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+#   The MSVC linker is needed even for pure Rust. Without it rustc uses whatever
+#   `link` is on PATH - Git ships a coreutils one - and fails with
+#   "link: extra operand". Library-only builds still succeed, so the breakage only
+#   surfaces when producing an .exe, which lets it hide for a long time.
+#   From Git Bash, `source scripts/msvc-env.sh` sets up cargo/dotnet/link the same way.
 
 [CmdletBinding()]
 param(
     [switch]$VerifyOnly,
     [switch]$SkipInstall,
-    [switch]$Clean
+    [switch]$Clean,
+    # Create the install directory and register the service when they are absent
+    # (fresh machine / after an OS reinstall).
+    [switch]$Bootstrap
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,9 +96,20 @@ function Write-Ok([string]$text)   { Write-Host "    OK   $text" -ForegroundColo
 function Write-Warn2([string]$text) { Write-Host "    WARN $text" -ForegroundColor Yellow }
 function Write-Bad([string]$text)  { Write-Host "    FAIL $text" -ForegroundColor Red }
 
+# A PowerShell 7 install can inject its Modules directory into PSModulePath,
+# shadowing 5.1's built-in Microsoft.PowerShell.Utility so that Get-FileHash is
+# reported as "not recognized". Importing explicitly restores it; without this
+# the whole verification step fails on an otherwise healthy machine.
+Import-Module Microsoft.PowerShell.Utility -ErrorAction SilentlyContinue
+
 function Get-Sha([string]$path) {
     if (-not (Test-Path $path)) { return $null }
-    return (Get-FileHash -Path $path -Algorithm SHA256).Hash
+    if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -Path $path -Algorithm SHA256).Hash
+    }
+    # Last resort: certutil is always present and needs no modules.
+    $line = (& certutil.exe -hashfile $path SHA256 | Select-Object -Skip 1 -First 1)
+    return ($line -replace '\s', '').ToUpperInvariant()
 }
 
 function Test-Admin {
@@ -115,7 +141,65 @@ function Stop-PrismProcesses {
     }
 }
 
+# Make cargo, dotnet and the MSVC linker reachable regardless of how this shell
+# was started. An elevated PowerShell often lacks the user's PATH entries, and
+# Git Bash puts its own coreutils `link` ahead of MSVC's link.exe - which makes
+# rustc fail with "link: extra operand" only when producing an .exe.
+function Initialize-Toolchain {
+    Write-Step 'Locating toolchain'
+
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+        if (Test-Path (Join-Path $cargoBin 'cargo.exe')) {
+            $env:PATH = "$cargoBin;$env:PATH"
+        } else {
+            throw 'cargo not found (install Rust via rustup)'
+        }
+    }
+    Write-Ok "cargo  $((Get-Command cargo).Source)"
+
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        $dotnetDir = 'C:\Program Files\dotnet'
+        if (Test-Path (Join-Path $dotnetDir 'dotnet.exe')) {
+            $env:PATH = "$dotnetDir;$env:PATH"
+        } else {
+            throw 'dotnet not found (winget install --id Microsoft.DotNet.SDK.8)'
+        }
+    }
+    Write-Ok "dotnet $((Get-Command dotnet).Source)"
+
+    # Prepend MSVC so its link.exe wins over any coreutils `link` on PATH.
+    $vsRoot = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
+    $msvcRoot = Join-Path $vsRoot 'VC\Tools\MSVC'
+    if (-not (Test-Path $msvcRoot)) {
+        throw "MSVC toolset not found under $msvcRoot (winget install --id Microsoft.VisualStudio.2022.BuildTools --override `"--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`")"
+    }
+    $msvcVer = (Get-ChildItem $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1).Name
+    $msvcBin = Join-Path $msvcRoot "$msvcVer\bin\Hostx64\x64"
+    if (-not (Test-Path (Join-Path $msvcBin 'link.exe'))) {
+        throw "link.exe not found in $msvcBin"
+    }
+    $env:PATH = "$msvcBin;$env:PATH"
+
+    # Highest SDK that actually ships the x64 import libraries we link against.
+    $kitsLib = 'C:\Program Files (x86)\Windows Kits\10\Lib'
+    $sdkVer = Get-ChildItem $kitsLib -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Where-Object { Test-Path (Join-Path $_.FullName 'um\x64\kernel32.lib') } |
+        Select-Object -First 1
+    if ($null -eq $sdkVer) { throw "no Windows SDK with um\x64\kernel32.lib under $kitsLib" }
+
+    $env:LIB = @(
+        (Join-Path $msvcRoot "$msvcVer\lib\x64")
+        (Join-Path $sdkVer.FullName 'ucrt\x64')
+        (Join-Path $sdkVer.FullName 'um\x64')
+    ) -join ';'
+    Write-Ok "MSVC   $msvcVer / SDK $($sdkVer.Name)"
+}
+
 function Invoke-Build {
+    Initialize-Toolchain
+
     Write-Step 'Releasing file locks'
     Stop-PrismProcesses
 
@@ -232,8 +316,16 @@ function Invoke-Install {
         throw 'not elevated'
     }
 
+    # A wiped machine (OS reinstall) has neither the directory nor the service.
+    # Refusing to run there would defeat the point of this script, so -Bootstrap
+    # creates both. Without the switch we still refuse, to avoid silently
+    # scattering binaries on a machine that was never meant to host them.
     if (-not (Test-Path $InstallDir)) {
-        throw "install dir not found: $InstallDir (run the installer once first)"
+        if (-not $Bootstrap) {
+            throw "install dir not found: $InstallDir (pass -Bootstrap to create it and register the service)"
+        }
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        Write-Ok "created $InstallDir"
     }
 
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -288,13 +380,25 @@ function Invoke-Install {
     Write-Ok "$copied support files"
 
     Write-Step 'Starting service'
+    if ($null -eq $svc -and $Bootstrap) {
+        # Matches the original installer's registration: own-process, auto-start,
+        # LocalSystem. Quoting the path matters - "Program Files" contains a space
+        # and sc.exe would otherwise treat the tail as arguments.
+        $binPath = '"' + $Artifacts['prism-indexer-service.exe'].Installed + '"'
+        & sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= 'Prism Indexer' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed (exit $LASTEXITCODE)" }
+        & sc.exe description $ServiceName 'Maintains the Prism file index.' | Out-Null
+        Write-Ok "registered service $ServiceName"
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    }
+
     if ($null -ne $svc) {
         Start-Service -Name $ServiceName
         $status = (Get-Service -Name $ServiceName).Status
         if ($status -ne 'Running') { throw "service did not start (status: $status)" }
         Write-Ok "service running"
     } else {
-        Write-Warn2 "service $ServiceName is not installed; skipped start"
+        Write-Warn2 "service $ServiceName is not installed; skipped start (use -Bootstrap to register)"
     }
 }
 
