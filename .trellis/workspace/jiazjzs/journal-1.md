@@ -617,3 +617,110 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 19: G4 宿主联动收尾：矩阵签署、三个实机缺陷、构建链路统一
+
+**Date**: 2026-08-09
+**Task**: G4 宿主联动收尾：矩阵签署、三个实机缺陷、构建链路统一
+**Branch**: `feature`
+
+### Summary
+
+G4 矩阵全部通过并归档；修复 E1/E3/O1 三个实机缺陷；统一构建安装脚本根治旧二进制问题；panic 落盘已确证，ERROR_PIPE_BUSY 因果链未证明。
+
+### Main Changes
+
+## 本轮做完的事
+
+**G4 收尾并归档。** 兼容矩阵 E1–E15 / O1–O11 / S1–S5 全部通过并签署
+（OS 22631、Opus 13.23.0.0）。S1–S5 是逐条查代码核实的，不是勾选了事：
+宿主路径的 P/Invoke 全是只读查询；索引服务只引用 `index_cache` /
+`indexer_runtime` / `log` / `logging`，不含 shell 模块，LocalSystem 侧没有执行
+shell 的能力；协议与宿主相关的字段只有 `root: Option<String>`。
+
+两个 adapter 的默认值按产品决策**保持 false**，签署只表示矩阵通过。
+
+**修掉三个实机缺陷。** 都不是设计问题，而是判据选错或格式假设错，共同点是
+单测全绿但前提是假的：
+
+- **E1**（范围标签正确但结果是全局）：broker 跑的是 `target\debug` 里 8月5日的
+  旧二进制，而所有改动都编到了 release。代码本身早就是对的。
+- **E3**（多标签 Explorer 认不出活动标签）：`IsWindowVisible` 判不出来——实测
+  所有标签的视图窗口恒为 `visible=true`、`cloaked=0`、矩形相同。改用视图所属
+  `ShellTabWindowClass` 的兄弟 Z 序，活动标签恒在最前，实机 18 次切换验证。
+- **O1**（Opus 无法识别目录）：`dopusrt /info paths` 输出的是 XML，解析器却在
+  按行找盘符开头的路径。原单测喂的是我们自己编的纯文本格式，Opus 从不产出
+  那种格式。
+
+**统一构建安装链路。** 「跑的不是你改的代码」是本轮最大的时间黑洞，三个独立
+成因：前端 `LocateBackend` 写死 debug 优先且只判存在性；cargo/dotnet 的静默
+no-op（`Finished in 0.37s` + 退出码 0）；服务安装手工、文件锁导致 `Copy-Item`
+静默失败。新增 `scripts/prism-build.ps1` 串起构建到安装，装完用 SHA-256 逐个
+比对，并校验产物不早于源码最新改动；握手回传 `build_id` 让进程能自报身份。
+
+**IPC 韧性（部分）。** panic 无日志已确证修复：`panic = "abort"` 且无 hook，
+崩溃不留任何痕迹——探针实测现在能拿到
+`panic at tools/panic-probe.rs:23 message_e395…`，位置明文、路径已哈希。
+`ERROR_PIPE_BUSY` 的三处运行时阻塞已修（Status 走 `spawn_blocking`、
+新增只读 `generation()`、监听池扩到 4），但 **A/B 对照否证了因果链**：
+未修复的旧二进制在 5831 世代/秒下同样零失败。任务保持 `in_progress`。
+
+## 判断失误与纠正
+
+- **删掉了唯一一份干净基准数据。** 第一轮 root 基准实际采集成功，只是聚合有
+  bug，我清目录重采而没有对已有原始 JSONL 重跑聚合。之后机器环境变了
+  （Windows 更新、重装系统、索引从 171MB 掉到 66MB），再也采不到。
+- **采信 5 天前未核实的记忆。** 依据一条过期记忆在测试文档里写了「不要重新
+  编译」，直接导致用户用旧服务测 E1 而失败。记忆里关于文件是否存在的断言，
+  引用前必须核实。
+- **没先问环境就自动化。** Opus 接管了默认文件管理器，我用 `explorer.exe`
+  反复自动化测 E3，打开的一直是 Opus Lister，白跑好几轮。
+- **写了一个会死锁的测试。** 为缺陷 A 补回归测试时用 `worker_threads = 1`，
+  服务端与客户端争同一线程，`cargo test` 直接挂住。已删除。缺陷 A 因此**没有**
+  回归测试兜底，只有代码论证。
+
+## 沉淀
+
+- `docs/排查踩坑记录.md`（314 行）：五节，环境陷阱 + 验证方法上的错误 +
+  我犯的流程错误 + 下次开工检查清单。无法从磁盘复核的数字标注了来源。
+- Forbidden Patterns 从「不得阻塞**扫描**」放宽到「不得取 index/pinyin/history
+  锁」——原措辞只提扫描，`Status` 大概正因此漏掉。另加「abort 模式必须装
+  panic hook」。
+- 保留 6 个可复用探针 + TabProbe 源码（三份已提交文档引用它们，此前整个目录
+  没被跟踪，clone 下来会找不到文件）。提交前修掉硬编码的仓库绝对路径。
+
+## 遗留
+
+- `08-09-prism-g4-root-baseline`（P3，新建）：承接 G4 步骤 8 未采到的正式基准。
+  补采前提是索引 ≥150MB、机器安静。
+- `08-07-prism-ipc-resilience`（P1，open）：`ERROR_PIPE_BUSY` 因果链未证明。
+- broker 的 `ipc.rs` 还有两处同类违规未改（`run_shell` → `history.record()`
+  持写锁 + 同步写文件；`ClearHistory` 同步删文件），严重度低于 Status，
+  超出本轮范围。
+- `dist/` 里的产物是 8月1日的，出新版本时需要更新。
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `18a4c0e` | (see git log) |
+| `c40edea` | (see git log) |
+| `06dc747` | (see git log) |
+| `3475ff2` | (see git log) |
+| `b284bf9` | (see git log) |
+| `3dee8f9` | (see git log) |
+| `0733ad3` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
