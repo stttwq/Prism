@@ -1,8 +1,33 @@
-# Prism 代码质量修复清单
+# Prism 代码质量修复清单（已结项 / 仅供审计）
 
-> 配套文档：`PRISM-ROADMAP.md`
-> 制定日期：2026-07-27
-> 范围：现有代码库的技术债与质量问题，按严重程度分级，逐项给修复方案与归属批次。
+> **状态：Q1–Q13 已逐项处理，本文不再是待办清单——但 Q5 只部分解决，见下表。**
+> 制定日期：2026-07-27；结项标注：2026-08-09
+> 配套文档 `PRISM-ROADMAP.md` 已废止；现行入口是
+> [`PRISM-COMPREHENSIVE-PLAN.md`](./PRISM-COMPREHENSIVE-PLAN.md)。
+> 本文的批次划分（R1–R4）从未按原样执行，实际是在 G1/G3 两个阶段里完成的。
+>
+> **注意本文若干判断在编制时就是错的**，逐项审计见
+> [`PRISM-OPTIMIZATION-REPORT.md`](./PRISM-OPTIMIZATION-REPORT.md) §3。下表是最终落点：
+>
+> | 项 | 结论 | 落点 |
+> | --- | --- | --- |
+> | Q1 随机前 N 条 | **已修复** | G1 全局 Top-K，跨卷统一排序 + 稳定 tie-break |
+> | Q2 `path_for` 性能 | **已修复**（原文把未来风险写成了当时事实） | G1 只为最终候选构造路径 |
+> | Q3 O(N) 全扫 | **按另一路解决** | 未引入 `memchr`（大小写语义不符）；靠轻量候选 + 延迟路径构造 |
+> | Q4 死代码 | **已删除** | `index.rs`、`search.rs` 均已删；`installer/setup.iss` 也已删 |
+> | Q5 reveal 重复 | **只部分解决** | `ipc.rs` 那一份已删，两条路径都收敛到 broker 的 STA worker（`ShellExecutor`）。但 `explorer /select` 的参数构造**至今仍有两份**：`shell.rs::reveal`（走 `ShellOperation::Reveal`）和 `actions.rs::reveal_in_explorer`（走 `RunAction` → `run_action_direct` 的 `open_folder`）。两者都在生产路径上，`normalized` / `arg` 构造逐字相同，只有错误类型不同。**原始风险「改一处忘改另一处」依然存在。** |
+> | Q6 排除目录硬编码 | **改用协议通道** | 7 项机器级硬排除保持在服务侧；用户过滤走 `filters` 的 `exclude_path`。原文的 `Arc<Arc<Vec<T>>>` atomic swap 方案是错的，未采用 |
+> | Q7 协议类型偏弱 | **已修复** | `SearchResultKind` serde 枚举 + broker `Hello { protocol }` 显式协商；C# 未知值映射 `Unknown` |
+> | Q8 前端零测试 | **已修复** | `src/Prism.Tests` 84 个测试；`ISearchClient` / `IDebounceTimerFactory` / `ISearchScheduler` 已抽接口 |
+> | Q9a 日志粗糙 | **已修复，但未用 `tracing`** | 自建 `logging.rs`，broker 与 indexer 各写 JSONL；原文的 `tracing-appender` 1MB 大小轮转是能力误判 |
+> | Q9b 校验职责混乱 | **已修复** | typed action target 取代字符串推断 |
+> | Q10 `.lnk` 名称清洗 | **判断被推翻，未按原文修** | `&`、`(x86)` 不是控制字符，影响被夸大；无真实异常样本 |
+> | Q11 `IndexHit` 缺元数据 | **已修复** | 候选阶段持轻量元数据，最终才生成完整结果 |
+> | Q12 `Installer` 特判 | **保持父路径语义** | 未按原文移入全局 `is_excluded_name`——那会排除所有同名目录，属真实功能变化 |
+> | Q13 COM 边界 | **原因判断有误** | apartment 是线程级，indexer 是另一进程，不存在原文所说的跨进程冲突 |
+>
+> 本文末尾「待办」里的 `.csproj` 手工复制问题也已解决：
+> `scripts/prism-build.ps1` 统一构建、安装并做 SHA-256 漂移校验。
 
 ---
 

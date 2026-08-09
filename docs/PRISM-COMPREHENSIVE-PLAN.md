@@ -1,10 +1,79 @@
 # Prism 综合优化与功能演进计划
 
-> 状态：**Draft / Trellis 规划任务已建立，待逐阶段审批**  
-> 编制日期：2026-07-28  
-> 代码基线：`main` / `c0de808`  
+> 状态：**执行中 / G0–G4 与 G9 已交付归档，G5–G8 未启动**  
+> 编制日期：2026-07-28；进度更新：2026-08-09  
+> 编制时代码基线：`main` / `c0de808`；当前分支：`feature`  
 > 输入文档：[`PRISM-OPTIMIZATION-REPORT.md`](./PRISM-OPTIMIZATION-REPORT.md)、[`POST-ROADMAP-REVISED.md`](./POST-ROADMAP-REVISED.md)  
-> 性质：跨阶段实施蓝图；**不构成实施授权，当前任务均为 `planning`，尚未启动实施**
+> 性质：跨阶段实施蓝图。**已完成阶段的实际结论见 §0 与各阶段归档任务，本文正文保留编制时的
+> 计划原文**——正文里的"当前""现状"均指 2026-07-28，不是今天的代码。
+
+## 0. 进度快照（2026-08-09）
+
+| 阶段 | 状态 | 归档位置 / 说明 |
+| --- | --- | --- |
+| G0 基线与基准 | **已交付** | `archive/2026-07/07-28-prism-g0-baseline`；`tools/bench/` 全套脚本 |
+| G1 搜索正确性 + 协议 + 前端测试 | **已交付** | `archive/2026-07/07-28-prism-g1-search-foundation` |
+| G9 首建可用性与进度 | **已交付** | `archive/2026-07/07-29-prism-g9-first-build` |
+| G3 工程地基与权限边界 | **已交付** | `archive/2026-08/07-28-prism-g3-engineering-foundation` |
+| G2 历史 + 拼音 | **已交付** | `archive/2026-08/07-28-prism-g2-history-pinyin` |
+| G4 当前目录与宿主联动 | **已交付**（两个 adapter 默认关闭） | `archive/2026-08/07-28-prism-g4-host-integration`；兼容矩阵已签署 |
+| G5 窗口切换器 | 未启动（planning，P2） | `tasks/07-28-prism-g5-window-switcher` |
+| G6 完整内置动作 | 未启动（planning，P2） | `tasks/07-28-prism-g6-built-in-actions` |
+| G7 `ext:` / `path:` 过滤 | 未启动（planning，P3） | `tasks/07-28-prism-g7-query-filters` |
+| G8 网页图标与在线联想 | 未启动（planning，P3） | `tasks/07-28-prism-g8-web-enhancements` |
+
+**两个从实测中分出来的在办任务**（不在原 G 编号内）：
+
+- `tasks/08-07-prism-ipc-resilience`（P1，in_progress）——G4 步骤 8 采集时暴露的两个缺陷。
+  broker panic 不落盘**已修复并确证**；`ERROR_PIPE_BUSY` 的三处运行时阻塞已改正，但
+  **因果链未证明**（A/B 对照显示未修复的旧二进制在更猛的合成洪峰下同样零失败），
+  故不得标记为已修复。复现条件见该任务 PRD。
+- `tasks/08-09-prism-g4-root-baseline`（P3，planning）——G4 步骤 8 唯一未完成项：G0 root
+  作用域正式基准。需要安静机器 + `memory_bytes` ≥150MB 的完整规模索引。已有方向性证据
+  （配对延迟差中位数 +2.0ms、`path_constructions` 因剪枝下降）不支持引入祖先缓存，但
+  样本量（每组 10–14，目标 40）不足以签署。
+
+### 未立项的已知代码问题
+
+**`explorer /select` 的参数构造仍有两份（原 Q5，只部分解决）。** 2026-08-09 文档审计
+时核实：
+
+| 位置 | 触发路径 |
+| --- | --- |
+| `shell.rs::reveal` | `ShellOperation::Reveal` |
+| `actions.rs::reveal_in_explorer` | `ShellOperation::RunAction` → `run_action_direct` 的 `open_folder` |
+
+两者都在生产路径上，`normalized` / `arg` 的构造逐字相同，只有错误类型不同
+（前者 `ShellError`，后者 `Result<(), String>`）。G3 删掉了 `ipc.rs` 里的第三份、
+并把两条路径都收敛到 broker 的 STA worker，但**没有合并这段参数构造**。
+
+原始风险「改一处忘改另一处」因此依然存在：同一个「打开所在文件夹」功能，
+会因为走哪条入口而表现不一致。这不是用户当前能观察到的故障，是维护隐患。
+
+未单独立项，因为改动面极小（抽一个共用函数），适合在下一次碰到 `shell.rs`
+或 `actions.rs` 的任务里顺手做。[`CODE-QUALITY-FIXES.md`](./CODE-QUALITY-FIXES.md)
+的 Q5 行已按此更正，不再写作「已抽取」。
+
+### 已被实测推翻或修正的计划内容
+
+正文相应位置保留原文，此处集中列出结论差异：
+
+- **§2.3 的 100MB 口径已落地。** `.trellis/spec/backend/quality-guidelines.md` 的
+  "Memory Acceptance" 已按三进程口径改写（G0 收尾完成）。2026-08-01 实测三进程私有工作集
+  合计 55.2 MiB（拼音开启），拼音额外常驻约 0.7MB，均在门槛内。
+- **§2.3 的 `opt-level` 取舍已决策：保留 `"z"`。** G0 采集的对照是 `z` 合计 31.1 MiB
+  对 `3` 合计 51.1 MiB，`3` 几乎翻倍内存却未换来必要的延迟收益，`Cargo.toml` 未改。
+- **§5.1「必须移除」的四条已全部移除。** 全局 Top-K、延迟路径构造、跨卷统一排序均已实现。
+- **§7.1 的清理已完成。** `index.rs`、`search.rs` 已删；`installer/setup.iss` 已删（目录留空），
+  真实安装脚本只有 `dist/prism.iss` 一处。
+- **§13.3 的卸载缺口已补。** `dist/prism.iss` 的 `[UninstallDelete]` 现在包含
+  `{commonappdata}\Prism`，索引缓存与拼音 sidecar 卸载后不残留。
+- **§8.4 的放弃点未被触发。** Explorer 与 Opus 两个宿主都在时间盒内跑通并签署矩阵；
+  `SystemFileDialog` 按计划**未实现**，由 `DisabledHostAdapter` 占位。
+- **§14.3 的质量门当前实测**：Rust 147 通过、C# 84 通过、clippy `-D warnings` 无告警、
+  WPF Release build 通过（2026-08-09）。§14.3 里的 `dotnet test` 目标是
+  `src/Prism.Tests/Prism.Tests.csproj`。
+- **§18 的审批约束已按阶段逐个满足**，不再适用于 G0–G4/G9；G5–G8 仍需单独审批后启动。
 
 ## 1. 目标与结论
 
@@ -261,7 +330,7 @@ sidecar 的最终所有权和共享方式必须通过原型比较，避免 index
 ### 7.1 旧链与公共 Shell 层
 
 - 把 `index.rs` 旧测试链仍有价值的测试迁到当前 `hierarchy/indexer_client` 路径；
-- 删除已无生产用途的旧索引链。已核实 [`index.rs`](../src/prism-core/src/index.rs)（914 行、16 个测试）的全部 5 处外部引用都在 `#[cfg(test)]` 下，`ipc.rs` 里用到它的 `dispatch` 函数本身也是 test-only，broker 生产路径走 `indexer_client`；但 `lib.rs` 的 `pub mod index;` 未加 cfg，lib target 仍会编译它，这正是本阶段要消除的；
+- 删除已无生产用途的旧索引链。已核实 `src/prism-core/src/index.rs`（914 行、16 个测试；**已于 G3 的 `23dbad4` 删除，故此处不再链接**）的全部 5 处外部引用都在 `#[cfg(test)]` 下，`ipc.rs` 里用到它的 `dispatch` 函数本身也是 test-only，broker 生产路径走 `indexer_client`；但 `lib.rs` 的 `pub mod index;` 未加 cfg，lib target 仍会编译它，这正是本阶段要消除的；
 - 删除孤立占位文件，**点名两个**：`src/prism-core/src/search.rs`（3 行注释占位，无任何引用）和 `installer/setup.iss`（2 行占位；真实安装脚本是 `dist/prism.iss`，两者并存会误导后续改安装包的人）；
 - 抽取公共 Shell 模块，统一 reveal、属性、打开方式和外部启动；
 - Rust 测试数量不得因简单删除而无理由下降。

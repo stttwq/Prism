@@ -170,7 +170,27 @@ Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
 
 ---
 
-## Indexing: Known Gaps (post-step-11 review)
+## Indexing: Known Gaps (post-step-11 review) — BOTH RESOLVED, HISTORICAL
+
+> **Status 2026-08-09: both gaps are closed. This section is kept for the
+> reasoning trail only; do not treat it as current state or as open work.**
+>
+> - **Gap B** (no real-time USN watch) was fixed by R1 — see
+>   "R1 USN Service Contract (supersedes Gap B above)" further down, which is the
+>   authoritative contract. Healthy operation replays `FSCTL_READ_USN_JOURNAL`
+>   incrementally and **periodic full-volume scans are forbidden**.
+> - **Gap A** (first-install wait) was fixed by G9 (`07-29-prism-g9-first-build`):
+>   volumes publish one at a time, the system volume goes first, each volume's
+>   watcher starts as soon as that volume publishes, and `IndexerStatus` carries a
+>   `BuildProgress` structure the frontend renders as explainable progress. Route
+>   A1 (surface `is_indexing`) and A2 (progress) both shipped; A3 folded into R1.
+>
+> **Identifiers below are dead.** `index.rs`, `build_or_load`, and
+> `build_full_index` were deleted (G3 / G9); the cache is `index-v5.bin` under
+> `%ProgramData%\Prism`, not `data\index.bin`. `index_refresh_secs` (default 300)
+> still exists but **only as the degraded fallback when USN is unavailable** — its
+> doc comment reads 「无 USN 权限时的定时全量刷新间隔」. Gap B's description of it
+> as the *sole* freshness mechanism no longer holds.
 
 Two user-observed issues found after the step-11 install acceptance. Deferred to a follow-up task (no code change yet — recorded here so the next task picks them up).
 
@@ -220,6 +240,16 @@ One follow-up task covers both gaps coherently because A3 and B2 are the same US
 ---
 
 ## Installer / Packaging (step 11)
+
+> **Stale in three places as of 2026-08-09 — the ISS is authoritative, not this
+> section.** (1) Privileges: the ISS is `PrivilegesRequired=admin` (a one-time UAC
+> prompt to register the LocalSystem `PrismIndexer` service), **not** `lowest` +
+> `PrivilegesRequiredOverridesAllowed=dialog` as written below. (2) There are
+> **three** shipped binaries — steps 1–2 below omit
+> `prism-indexer-service.exe`. (3) `[UninstallDelete]` now also removes
+> `{commonappdata}\Prism`, so the machine-level `index-v5.bin` / `pinyin-v1.bin`
+> do not survive uninstall. Prefer `.\scripts\prism-build.ps1` over the manual
+> copy steps below; it builds, installs, and SHA-256 verifies in one pass.
 
 Executable layout after build lives in **`dist/`** at repo root (the installer source — Inno Setup pulls from there):
 

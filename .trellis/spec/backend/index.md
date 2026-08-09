@@ -6,7 +6,19 @@
 
 ## Overview
 
-This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
+The backend is **Rust** (`src/prism-core`), one crate producing two binaries:
+
+- `prism-core.exe` — broker, runs as the ordinary user. Owns app inventory, web
+  keywords, usage history, Shell/COM actions, user settings, and forwards file
+  search to the indexer.
+- `prism-indexer-service.exe` — Windows service running as LocalSystem. Owns
+  MFT/USN indexing, the v5 disk cache, the pinyin sidecar, and a versioned
+  **read-only** search protocol. It must never execute Shell verbs, touch the
+  clipboard, run user commands, or make network requests.
+
+Several files here were generated from a web-service template. The table states
+which carry real project content; ignore template prompts about ORMs, migrations,
+or HTTP endpoints — this project has none of those.
 
 ---
 
@@ -14,11 +26,11 @@ This directory contains guidelines for backend development. Fill in each file wi
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
-| [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
-| [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
-| [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
-| [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
+| [Quality Guidelines](./quality-guidelines.md) | Forbidden patterns, memory acceptance gate, indexing known gaps | **Filled — authoritative** |
+| [Error Handling](./error-handling.md) | Broker-owned Shell boundary, `ShellError` kinds, STA worker | **Filled — authoritative** |
+| [Logging Guidelines](./logging-guidelines.md) | Per-process JSONL, redaction, panic hook under `panic = "abort"` | **Filled — authoritative** |
+| [Directory Structure](./directory-structure.md) | Module layout and process ownership | **Filled** |
+| [Database Guidelines](./database-guidelines.md) | Not applicable | **Not applicable** — no database; see persistence table in directory-structure |
 
 ---
 

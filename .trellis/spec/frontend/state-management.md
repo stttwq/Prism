@@ -1,22 +1,36 @@
 # State Management
 
-> How state is managed in this project.
+> How state is managed in `src/Prism` (C# / .NET 8 / WPF).
 
 ---
 
 ## Overview
 
-<!--
-Document your project's state management conventions here.
+No state-management library. Plain `INotifyPropertyChanged` — `AppState` is a
+sealed class implementing it by hand, deliberately **without** a CommunityToolkit
+dependency. One `AppState` instance is created in `App.xaml.cs` and passed down; it
+is not a static singleton and not a service-locator lookup.
 
-Questions to answer:
-- What state management solution do you use?
-- How is local vs global state decided?
-- How do you handle server state?
-- What are the patterns for derived state?
--->
+State is split three ways:
 
-(To be filled by the team)
+| Kind | Owner | Lifetime |
+| --- | --- | --- |
+| UI state (`PanelMode` Idle/Results/Actions, query, results, selected index, theme) | `AppState` | Process; reset on hide |
+| Search-pipeline state (in-flight sequence, debounce, prefix cache, generation) | `SearchViewModel` | Per query burst |
+| Scope state (host kind, root, scope label) | `HostScopeController` | Per summon; never carried across summons |
+| Persisted state (settings, history) | `SettingsStore` / broker | Disk, schema-versioned |
+
+Two rules that are easy to get wrong:
+
+- **Never reuse the previous summon's host root.** If host detection fails, fall
+  back to global and clear `root`. A stale root silently searches the wrong tree,
+  which is the one G4 failure mode that produces confidently wrong results rather
+  than an obvious error.
+- **Derived state is computed, not stored.** The scope label text is derived from
+  `HostContext`; caching it invites showing a path that no longer applies.
+
+The sections below are the committed contracts. They are authoritative — do not
+relax them without a corresponding test change.
 
 ## Prism Search State
 
@@ -43,32 +57,33 @@ Questions to answer:
 
 ---
 
-## State Categories
+## Backend State (there is no "server")
 
-<!-- Local state, global state, server state, URL state -->
+The broker is the only source of search results; there is no HTTP layer and no
+generic response cache. Synchronization is by **index generation**, not by TTL:
 
-(To be filled by the team)
-
----
-
-## When to Use Global State
-
-<!-- Criteria for promoting state to global -->
-
-(To be filled by the team)
-
----
-
-## Server State
-
-<!-- How server data is cached and synchronized -->
-
-(To be filled by the team)
-
----
+- `index_generation` on a response identifies the index snapshot it came from.
+- `IndexerGenerationClient` notifies on change; a change invalidates the prefix
+  cache and re-issues the visible query.
+- During first build, each volume publishing advances the generation, so partial
+  results are replaced rather than expiring on a timer.
+- The frontend must never infer freshness from elapsed time.
 
 ## Common Mistakes
 
-<!-- State management mistakes your team has made -->
+These have all actually happened in this codebase:
 
-(To be filled by the team)
+- **Seeding the prefix cache from an incomplete response.** `is_indexing=true` and
+  `is_truncated=true` are *independent* reasons a result set is incomplete;
+  checking only one lets the frontend locally filter a partial set and drop hits.
+- **Inferring truncation from `items.Count == max`.** A search that legitimately has
+  exactly `max` hits is not truncated. Only trust `is_truncated`.
+- **Cancelling a pipe read after the request line was written.** That desynchronizes
+  the transport for every later request. Cancel by discarding the response via the
+  search sequence number, after the paired line is consumed.
+- **Dropping poll responses with empty `Items`.** They can carry newer volume
+  progress or the terminal `is_indexing=false`, and ignoring them strands the UI on
+  a stale progress message.
+- **Letting a late response overwrite a newer query's results.** Every response must
+  match on sequence, current `Query`, and `resp.Query` before being applied.
+- **Reusing the last known host root after a failed detection.** See Overview.

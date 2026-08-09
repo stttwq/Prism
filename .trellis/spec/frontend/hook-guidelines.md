@@ -1,51 +1,18 @@
-# Hook Guidelines
+# Hook Guidelines — Not Applicable
 
-> How hooks are used in this project.
+This file came from a web/React-oriented template. **This project has no hooks.**
+The frontend is C# / .NET 8 / WPF (`src/Prism`); there is no React, no
+`useSomething`, and no React Query / SWR data fetching.
 
----
+Do not fill this file in with invented conventions, and do not treat the former
+template prompts ("What custom hooks do you have?", "How do you handle data
+fetching?") as project requirements.
 
-## Overview
+## Where the equivalent concerns actually live
 
-<!--
-Document your project's hook conventions here.
-
-Questions to answer:
-- What custom hooks do you have?
-- How do you handle data fetching?
-- What are the naming conventions?
-- How do you share stateful logic?
--->
-
-(To be filled by the team)
-
----
-
-## Custom Hook Patterns
-
-<!-- How to create and structure custom hooks -->
-
-(To be filled by the team)
-
----
-
-## Data Fetching
-
-<!-- How data fetching is handled (React Query, SWR, etc.) -->
-
-(To be filled by the team)
-
----
-
-## Naming Conventions
-
-<!-- Hook naming rules (use*, etc.) -->
-
-(To be filled by the team)
-
----
-
-## Common Mistakes
-
-<!-- Hook-related mistakes your team has made -->
-
-(To be filled by the team)
+| Web concept | Prism equivalent | Documented in |
+| --- | --- | --- |
+| Custom hooks / shared stateful logic | View models plus injected service interfaces (`ISearchClient`, `IDebounceTimerFactory`, `ISearchScheduler`, `IIndexGenerationClient`) | [`index.md`](./index.md), [`state-management.md`](./state-management.md) |
+| Data fetching | Named-pipe request/response via `PipeClient`; one written request always consumes its paired response line | [`quality-guidelines.md`](./quality-guidelines.md) |
+| Caching / revalidation | Prefix cache gated on `is_truncated`, `is_indexing`, index generation, and scope; generation change invalidates it | [`state-management.md`](./state-management.md) |
+| Debounced input | `DispatcherDebounceTimer` behind `IDebounceTimerFactory`; handler bound once, controlled by Restart/Stop | [`quality-guidelines.md`](./quality-guidelines.md) |

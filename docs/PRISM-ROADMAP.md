@@ -1,8 +1,29 @@
-# Prism 项目规划总纲 v1
+# Prism 项目规划总纲 v1（已废止 / 仅供审计）
 
-> Listary 替代品 · Rust 后端 + C# WPF 前端双进程架构
-> 制定日期：2026-07-27
-> 内存基线：38MB（红线 40MB，可接受小幅上浮至 ~45MB）
+> **状态：已被取代，不要照此实施。** 现行入口是
+> [`PRISM-COMPREHENSIVE-PLAN.md`](./PRISM-COMPREHENSIVE-PLAN.md)。
+> 本文保留原文供审计对照，其中多项事实与技术方案已被
+> [`PRISM-OPTIMIZATION-REPORT.md`](./PRISM-OPTIMIZATION-REPORT.md) 的审计推翻。
+> 制定日期：2026-07-27；废止标注：2026-08-09
+>
+> 与当前代码的主要差异：
+>
+> | 本文主张 | 实际结果 |
+> | --- | --- |
+> | 双进程架构 | **三进程**：WPF → broker → LocalSystem 索引服务 |
+> | 内存红线 40MB、终态 41–43MB | 从未成为已提交门槛。现行门槛是三进程私有工作集 ≤100MiB；2026-08-01 实测 55.2 MiB |
+> | 38MB 基线 | 旧两进程数据，独立索引服务加入后不再可比 |
+> | P2 DLL 注入（Rust cdylib + MinHook） | **已排除**。宿主联动只走 Shell COM / `dopusrt` / 只读 Win32 查询，代码中无注入路径 |
+> | 拼音只做首字母、+1MB | 已实现**首字母 + 全拼**，走版本化 sidecar `pinyin-v1.bin`；实测额外常驻约 0.7MB |
+> | `memchr::memmem` 换来 ASCII 查询 5–10× | **未采用**：它是大小写敏感的，语义不符。`memchr` 至今不在依赖里 |
+> | Top-K 堆容量固定 200 | **已否决**：容量由请求 `max` 决定，必须同时支持 8 与 1000 |
+> | 排除目录配置化（`config.rs` 加 `exclude_dirs`） | **改用另一条路**：7 项机器级硬排除保持写死在服务侧，用户过滤走协议的 `filters` 字段（`exclude_path`），不让 LocalSystem 读用户目录 |
+> | 日志用 `tracing` + 1MB 大小轮转 | **未采用该依赖**：自建 `logging.rs`，broker 与 indexer 各写各的 JSONL |
+> | 前端零测试、无测试工程 | 已有 `src/Prism.Tests`，84 个测试 |
+> | 剪贴板历史、文件预览、收藏夹 | **已明确排除**，见综合计划 §18 |
+>
+> 仍然成立的部分：Everything 式 MFT/USN 索引路线、不做 n-gram 倒排、仅 x64、
+> 使用历史落盘、以低内存为差异化壁垒。
 
 ---
 

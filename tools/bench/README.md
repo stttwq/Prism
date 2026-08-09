@@ -1,11 +1,27 @@
-# Prism G0 baseline tools
+# Prism benchmark and acceptance tools
 
-These tools measure the existing three-process Release build without changing
-search behavior, product configuration, the index, or user files. Every result
-directory is explicit. Product data directories under `%ProgramData%\Prism`,
+Originally the G0 baseline harness; now also carries the G1 protocol counters, the
+G4 root-scope comparison, and the G9 first-build acceptance.
+
+Most of these tools measure the existing three-process Release build **without**
+changing search behavior, product configuration, the index, or user files. Every
+result directory is explicit. Product data directories under `%ProgramData%\Prism`,
 `%LocalAppData%\Prism`, and `%AppData%\Prism` are rejected as outputs.
 The selected Release directory is also rejected, covering portable installs
 whose product `data` directory lives beside the executables.
+
+**The one exception is `Invoke-G9FirstBuildAcceptance.ps1`, which is destructive
+by design** — it deletes the live index cache to force a cold build. See its
+section below before running it.
+
+| Script | Purpose | Elevation | Destructive |
+| --- | --- | --- | --- |
+| `Invoke-SearchBaseline.ps1` | Formal latency baseline; aborts if generation moves | No (must not) | No |
+| `Measure-ProcessMemory.ps1` | Three-process private working set gate | No | No |
+| `scan-floor/` | Full-scan floor cost, read-only over the v5 cache | No | No |
+| `Invoke-RootScopeComparison.ps1` | G4 paired root-vs-global delta; tolerates churn | No | No |
+| `Invoke-G9FirstBuildAcceptance.ps1` | G9 per-volume publish + interrupted-build acceptance | **Yes** | **Yes — deletes the index cache** |
+| `Test-Bench.ps1` | Self-test for the harness | No | No |
 
 ## Prerequisites
 
@@ -159,6 +175,46 @@ inflated and cross-run comparison is invalid. Check `sample_count` against
 `errors` before drawing any conclusion; a run where most requests failed proves
 nothing. See `08-07-prism-ipc-resilience` for the pipe-busy failures observed
 under a USN flood.
+
+## First-build acceptance (G9)
+
+> **Destructive and elevated.** This deletes `%ProgramData%\Prism\index-v5.bin`
+> and forces **two** full rebuilds of every fixed NTFS volume. Expect the machine
+> to be busy for minutes. Do not run it while collecting any other measurement,
+> and do not run it on a machine whose index state you need to preserve.
+
+```powershell
+# Elevated shell:
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Invoke-G9FirstBuildAcceptance.ps1 `
+  -OutputDirectory artifacts\bench\g9-YYYYMMDD `
+  -RunId 'g9-YYYYMMDD'
+```
+
+The cache is copied to `index-v5-before.bin` in the output directory first. **That
+backup is only restored if the acceptance fails.** On success the script leaves the
+freshly built cache in place, which is intentional — it is a valid complete cache,
+just newer than the one you started with.
+
+It asserts the five things G9 promised, and throws rather than reporting a pass if
+any fails:
+
+- `first_build.first_searchable_ms` — the system-volume probe file is findable
+  **before** the whole build finishes. The probe is written to the system drive
+  root and removed afterward.
+- `first_build.all_ready_ms` — when every volume is done. Reporting both numbers
+  is the point: the gap is the wait G9 removed.
+- `first_build.watcher` — during the `ready && building` window, a create, a
+  rename, and a delete on an already-published volume all become visible. This is
+  what proves no USN events are lost between a volume publishing and its watcher
+  starting.
+- `interrupted_cache_exists` must be `false` — a first build killed midway must
+  **not** leave a partial v5 cache on disk.
+- `restart_build` — after that interruption, the next start completes a full
+  rebuild and does write the cache.
+
+`build_progress` (`volumes_total`, `volumes_done`, `current_volume`) is recorded
+into `first-build-events.jsonl` only when one of those fields changes, so the
+timeline stays small and each line is a real state transition.
 
 ## Protocol counters
 
