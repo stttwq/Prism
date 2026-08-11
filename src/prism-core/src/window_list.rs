@@ -634,6 +634,135 @@ mod tests {
         assert!(!entry().history_key().contains("1234"));
     }
 
+    /// Live-desktop probe for the Win32 half of this module.
+    ///
+    /// Every other test here feeds hand-built `RawWindow` fixtures to the pure filter, so
+    /// `platform::enumerate` / `platform::collect` — EnumWindows, the DWM cloaked query,
+    /// QueryFullProcessImageNameW — are otherwise compiled but never executed. This is the
+    /// only test that runs them.
+    ///
+    /// `#[ignore]` because it asserts against whatever the developer's desktop happens to
+    /// be, which is not a stable fixture. Run explicitly:
+    ///
+    /// ```text
+    /// cargo test --manifest-path src/prism-core/Cargo.toml \
+    ///   window_list::tests::live_enumeration_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "live desktop probe; run explicitly with --ignored"]
+    fn live_enumeration_probe() {
+        let store = WindowSnapshotStore::new();
+        let self_pids = [std::process::id()];
+        let published = enumerate_and_publish(&store, &self_pids);
+
+        println!("enumerated {} switchable window(s)", published.len());
+        for (token, entry) in &published {
+            // Titles carry user data, so print a bounded prefix only.
+            let title: String = entry.title.chars().take(24).collect();
+            println!(
+                "  token={token:<8} pid={:<6} app={:<20} min={} title={title:?}",
+                entry.pid, entry.app_name, entry.is_minimized
+            );
+        }
+
+        // Invariants that must hold against a real desktop, not a fixture.
+        for (token, entry) in &published {
+            assert!(
+                token.parse::<u64>().is_ok(),
+                "token must stay numeric for TargetKind::Window validation"
+            );
+            assert!(!entry.title.trim().is_empty(), "untitled window leaked through");
+            assert_ne!(entry.pid, std::process::id(), "own window leaked through");
+            assert_ne!(entry.handle, 0, "null handle leaked through");
+        }
+        assert!(published.len() <= MAX_WINDOWS, "cap not enforced");
+
+        let tokens: std::collections::HashSet<_> =
+            published.iter().map(|(token, _)| token.clone()).collect();
+        assert_eq!(tokens.len(), published.len(), "tokens must be unique");
+
+        // A desktop running a test has at least one switchable window; zero means the
+        // filter is rejecting everything, which is the failure this probe exists to catch.
+        #[cfg(windows)]
+        assert!(
+            !published.is_empty(),
+            "no switchable windows found on a live desktop — filter is over-rejecting"
+        );
+
+        // Round-trip one token through the real probe to prove resolve works end to end.
+        #[cfg(windows)]
+        if let Some((token, entry)) = published.first() {
+            let resolved = store
+                .resolve(token, &SystemWindowProbe)
+                .expect("freshly minted token must resolve against a live window");
+            assert_eq!(resolved.handle, entry.handle);
+            assert_eq!(resolved.pid, entry.pid);
+            println!("resolve round-trip ok for token={token}");
+        }
+    }
+
+    /// Rejection breakdown for the live desktop. Exists because "enumerated N windows" can
+    /// look like a pass while the filter is quietly dropping windows the user expects to
+    /// switch to. Prints why each candidate was rejected so over-rejection is visible.
+    ///
+    /// ```text
+    /// cargo test --manifest-path src/prism-core/Cargo.toml \
+    ///   window_list::tests::live_rejection_breakdown -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "live desktop probe; run explicitly with --ignored"]
+    fn live_rejection_breakdown() {
+        #[cfg(not(windows))]
+        println!("not windows; nothing to enumerate");
+
+        #[cfg(windows)]
+        {
+            let raw = platform::enumerate();
+            let self_pid = std::process::id();
+            println!("EnumWindows returned {} top-level window(s)", raw.len());
+
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            // Windows with a title but rejected: the interesting set. An untitled window is
+            // almost always genuine plumbing, but a *titled* rejection may be a real window
+            // the user wanted.
+            let mut titled_rejects: Vec<(String, String)> = Vec::new();
+
+            for window in &raw {
+                let reason = if window.handle == 0 {
+                    "null_handle"
+                } else if !window.is_visible {
+                    "invisible"
+                } else if window.title.trim().is_empty() {
+                    "untitled"
+                } else if window.is_tool_window {
+                    "tool_window"
+                } else if window.is_cloaked {
+                    "cloaked"
+                } else if window.has_owner {
+                    "has_owner"
+                } else if window.pid == self_pid {
+                    "own_process"
+                } else {
+                    "KEPT"
+                };
+                *counts.entry(reason).or_default() += 1;
+                if reason != "KEPT" && !window.title.trim().is_empty() {
+                    let title: String = window.title.chars().take(36).collect();
+                    titled_rejects.push((reason.to_string(), format!("{} {title:?}", window.app_name)));
+                }
+            }
+
+            for (reason, count) in &counts {
+                println!("  {reason:<12} {count}");
+            }
+            println!("titled-but-rejected ({}):", titled_rejects.len());
+            for (reason, what) in &titled_rejects {
+                println!("  {reason:<12} {what}");
+            }
+        }
+    }
+
     #[test]
     fn publishing_replaces_rather_than_accumulates() {
         let store = WindowSnapshotStore::new();

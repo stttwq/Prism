@@ -40,21 +40,40 @@ dotnet build src/Prism/Prism.csproj -c Release
 - 协议、provider、WPF mode 分开提交；任一层可关掉窗口模式而不影响文件搜索。
 - 无持续内存增长、历史过滤测试通过后方可归档。
 
-## 步骤 7 / 8 的未完成项（2026-08-11）
+## 实机探针结果（2026-08-11）
 
-代码已完整落地并通过四道质量门（Rust 194、C# 101、clippy、Release build 全绿），
-但下面两项属于**实机验收**，静态测试无法收口，所以 7、8 保持未勾选：
+发现原先「四道门全绿」掩盖了一个更大的空洞：两条 `cfg(windows)` 路径**从未执行过**
+——所有窗口测试都注入 fake。补了两组实机探针（默认 ignore/skip，不进常规 gate）。
 
-- **真实前台切换未在实机验证。** 单测覆盖的是接缝内分支：resolve 失败、激活被拒、
-  最小化状态、失败不写历史。`SetForegroundWindow` 真正是否夺到前台，只有实机能证。
-- **激活被拒路径需要 A/B。** 按 `verify-before-claiming-fixed`，这类偶发路径要拿
-  未修版本做对照；跑一次干净不构成证据。
-- **长时间反复查询的内存表现未测。** 枚举有 512 上限且 snapshot 整表替换（
-  `publishing_replaces_rather_than_accumulates` 覆盖了逻辑层面不累积），但
-  `Measure-ProcessMemory.ps1` 的 ≤100MB 同步采样门未跑。
+**枚举（`window_list::tests::live_enumeration_probe`）—— 已验证真实执行。**
+`EnumWindows` 返回 227 个顶层窗口 → 保留 2 个（Terminal、Firefox，与桌面实况一致；
+Opus 常驻托盘所以只有隐藏窗口）。token 数值化、自身进程被排除、resolve 往返成功。
 
-已用 mutation 反验过的两条断言：把「先激活再隐藏」对调 → 两条测试转红（有效）；
-把前缀缓存 guard 删掉 → 测试仍通过（无效，已改写为只断言可观察行为并留注释）。
+`live_rejection_breakdown` 的分类结果证明过滤规则没有过度拒绝：
+205 个 invisible 全是 `Default IME` / `MSCTFIME UI` / `DDE Server Window` /
+`GDI+ Window` 这类管道窗口，`Program Manager`（桌面）被 tool_window 正确拦下。
+
+**激活（`WindowActivatorLiveTests`）—— 已验证真实夺到前台。**
+第一次跑是假绿：探针选中的窗口本来就在前台，`TryActivate` 走早返回分支，
+`AttachThreadInput` 回退根本没执行。加 `excludeForeground` 后重跑：
+`before=0x2C0980 → after=0x40079C`，前台确实从非前台调用方切走了。
+死句柄与 pid 不匹配两条也验证了：拒绝且不动前台。
+
+## 仍未完成（2026-08-11）
+
+- **激活被拒路径未做 A/B。** 上面证明的是「能切成功」；Windows 拒绝时是否正确降级，
+  仍需按 `verify-before-claiming-fixed` 拿未修版本做对照，跑一次干净不算证据。
+- **端到端未走过一次。** 没有装 Prism、按 `>`、看列表、按 Enter。协议两端与 UI 状态
+  机都只在单测里对过，没有一次真实的 pipe 往返。
+- **≤100MB 同步采样门未跑**（`Measure-ProcessMemory.ps1`）。
+- **cloaked 过滤会漏掉挂起的 UWP。** 实机看到 `SystemSettings "设置"` 与
+  `ApplicationFrameHost "设置"` 被判 cloaked 而排除，但 Alt-Tab 会显示它。
+  `DWMWA_CLOAKED` 对「本桌面挂起的 UWP」和「其他虚拟桌面的窗口」返回同一个
+  `DWM_CLOAKED_SHELL`，当前代码无法区分。行为与 design.md 写的一致，但这是个
+  真实的可用性缺口，需要单独决策（可能要配合 `IVirtualDesktopManager`）。
+
+已用 mutation 反验过的断言：把「先激活再隐藏」对调 → 两条测试转红（有效）；
+把前缀缓存 guard 删掉 → 测试仍通过（无效，已改写为只断言可观察行为并加对照组）。
 
 ## Open Question Carried Into Phase 2
 
