@@ -724,3 +724,36 @@ no-op（`Finished in 0.37s` + 退出码 0）；服务安装手工、文件锁导
 ### Next Steps
 
 - None - task complete
+
+
+## Session 20: G5 窗口切换器：枚举/协议/前台激活落地，激活归属修正
+
+**Date**: 2026-08-11
+**Task**: G5 窗口切换器：枚举/协议/前台激活落地，激活归属修正
+**Branch**: `feature`
+
+### Summary
+
+按规范推进 G5（G4 补采按要求留到后面）。Phase 1 已有产物，先按实际代码校准：design.md 原稿把激活放在 broker，与 Windows 前台规则冲突——SetForegroundWindow 只对前台进程生效，broker 是后台进程，调用会被静默降级成任务栏闪烁；已验证可用的 ForceActivate 本来就在 WPF。改为 broker 枚举/排序/持 token 与历史、WPF 负责激活，并把该例外写回 backend/error-handling。另修 implement.jsonl 里的代码文件与 G3 已删的 search.rs。实现：新增 window_list（六条过滤规则各有单测、有界 snapshot、generation<<10|index 的十进制 token 使既有数字校验仍成立、HWND 不出边界）；ipc 加 mode（缺失=all，旧前端逐字节兼容）、Window kind、ResolveWindow/RecordWindowSwitch、复用 G2 拼音与历史等级、空输入改为历史∩当前枚举；WPF 加 > 前缀解析（只认首字符）、Win32WindowActivator 在 App.xaml.cs 装配、先激活再隐藏。用 mutation 反验断言有效性：对调激活/隐藏顺序→两条测试转红（有效）；删掉前缀缓存 guard→测试仍通过（无效，已改写为只断言可观察行为并加对照组）。该教训已并入 verify-before-claiming-fixed 记忆。四道门全绿：Rust 194、C# 101、clippy -D warnings、Release build 0 警告。步骤 7/8 保持未完成：真实前台切换、激活被拒的 A/B、≤100MB 采样门都需实机，非代码缺口，任务不归档。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3e72402` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

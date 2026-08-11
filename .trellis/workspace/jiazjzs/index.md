@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 19
-- **Last Active**: 2026-08-09
+- **Total Sessions**: 20
+- **Last Active**: 2026-08-11
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~726 | Active |
+| `journal-1.md` | ~759 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 20 | 2026-08-11 | G5 窗口切换器：枚举/协议/前台激活落地，激活归属修正 | `3e72402` | `feature` |
 | 19 | 2026-08-09 | G4 宿主联动收尾：矩阵签署、三个实机缺陷、构建链路统一 | `18a4c0e`, `c40edea`, `06dc747`, `3475ff2`, `b284bf9`, `3dee8f9`, `0733ad3` | `feature` |
 | 18 | 2026-08-02 | 完成 Prism G2 历史与拼音 | `b950d89`, `52d0445`, `4f8900d` | `feature` |
 | 17 | 2026-08-01 | 完成 G3 工程地基与权限边界 | `23dbad4`, `2fdf8d3`, `9aee7d5`, `a8c000a` | `feature` |
