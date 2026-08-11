@@ -1,4 +1,9 @@
-{"file":"docs/POST-ROADMAP-REVISED.md","reason":"窗口模式、范围、历史和明确排除能力"}
-{"file":"src/prism-core/src/ipc.rs","reason":"稳定 window kind、typed target 与 execute 协议"}
-{"file":"src/prism-core/src/ipc.rs","reason":"跨类型匹配等级与 broker provider 合并（search.rs 是占位文件，G3 已删）"}
-{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"窗口模式、迟到响应和历史展示状态"}
+{"file":".trellis/spec/backend/index.md","reason":"broker 与 LocalSystem indexer 的职责边界，窗口枚举/激活必须落在 broker 一侧"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"ActionTarget window kind 与 ShellError 分类；窗口激活是该边界的显式例外"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"禁用模式与内存验收门，约束枚举上限和无常驻窗口列表"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"枚举截断与激活失败的日志脱敏要求（窗口标题含用户数据）"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"Window mode 与成功/失败 UI 转换，显式 mode 而非堆布尔"}
+{"file":".trellis/spec/frontend/type-safety.md","reason":"新增 window kind 的映射与旧值兜底"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"枚举 → opaque token → 复核 → 激活 → 历史的跨层数据流"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"复用 ForceActivate、INativeWindowQuery、pinyin/history，不新造一套"}
+{"file":"docs/POST-ROADMAP-REVISED.md","reason":"窗口模式范围与明确排除的能力清单"}

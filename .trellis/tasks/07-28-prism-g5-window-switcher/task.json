@@ -3,7 +3,7 @@
   "name": "prism-g5-window-switcher",
   "title": "G5 窗口切换器",
   "description": "实现窗口搜索、拼音匹配、最近窗口与可靠切换。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

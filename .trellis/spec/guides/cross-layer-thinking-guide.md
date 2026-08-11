@@ -288,6 +288,39 @@ When a CLI auto-detects a mode by probing a remote resource (e.g., checking if `
 
 ---
 
+## OS-Constrained Capability Placement
+
+Some capabilities cannot live wherever the architecture would prefer, because the OS grants
+the right to only one process. Deciding this by layer purity produces code that compiles,
+passes review, and silently does nothing at runtime.
+
+### Checklist: Before Assigning A Privileged OS Call To A Layer
+
+- [ ] Ask which process the OS actually grants the right to — foreground status, clipboard
+      ownership, UI thread affinity, elevation, session attachment
+- [ ] Check whether the target process is a background service; if so, assume it cannot
+      hold that right
+- [ ] Look for an existing working implementation in the repo before designing a new home
+      for it — the right process usually already does something similar
+- [ ] Ask what the failure looks like when the wrong process makes the call. Silent
+      degradation (nothing happens, no error) is far worse than a hard failure and must be
+      designed against
+- [ ] If the capability must split, name the exception in the owning layer's spec rather
+      than letting it read as a violation
+- [ ] Check whether call **order** is load-bearing — some rights are lost by an earlier
+      step in the same handler
+
+**Real-world example**: G5 window switching. `design.md` placed activation in a "bounded
+window service" inside the broker. But `SetForegroundWindow` only works from the foreground
+process, which is the WPF app at the moment Enter is pressed; the broker is a background
+process, so its call would have been downgraded to a taskbar flash — no switch, no error.
+The proven activation path (`AttachThreadInput` fallback included) already existed in
+`SearchWindow.ForceActivate`. Correct split: broker enumerates, ranks, owns tokens and
+history; WPF activates. Order matters too — hiding the panel before activating gives up the
+foreground right that makes activation possible.
+
+---
+
 ## When to Create Flow Documentation
 
 Create detailed flow docs when:

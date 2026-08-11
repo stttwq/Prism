@@ -55,6 +55,91 @@ relax them without a corresponding test change.
 - Protocol kinds are retained as raw strings and projected to
   `SearchResultKind`; unknown strings map to `Unknown` without throwing.
 
+## Window Mode (G5)
+
+### 1. Scope / Trigger
+
+Cross-layer contract: the `>` prefix selects an exclusive search mode whose results are
+volatile, and activation is a foreground-bound Win32 call the broker cannot make.
+
+### 2. Signatures
+
+- `SearchContext.Mode` — `SearchContext.AllMode` (`"all"`) | `SearchContext.WindowMode` (`"window"`), with `IsWindowMode`
+- `ISearchClient.ResolveWindowAsync(ActionTarget) -> Task<WindowHandleInfo>`
+- `ISearchClient.RecordWindowSwitchAsync(ActionTarget) -> Task`
+- `IWindowActivator.TryActivate(WindowHandleInfo) -> bool`
+- `WindowHandleInfo(IntPtr Handle, uint Pid, string Title, bool IsMinimized)`
+
+### 3. Contracts
+
+- **Mode is derived from the query text, never stored as ambient state.** `_searchContext`
+  keeps root/filters only; the mode is recomputed per request from the box. Storing it
+  invites the mode and the visible text drifting apart.
+- `>` counts **only at index 0**. `a>b` is an ordinary file search — a `>` inside a
+  filename must not change modes.
+- The broker never sees the `>`. It echoes the stripped query, so every comparison against
+  `resp.Query` uses the stripped form while staleness checks against `_state.Query` use the
+  raw form. Mixing these up silently drops every window response as "stale".
+- A bare `>` is a real query (recent windows), not empty input. It must not fall through to
+  the Idle branch.
+- Window mode clears `Root` and `Filters`: windows are not scoped to a directory.
+- Window results **never seed the prefix cache** — tokens expire with the next enumeration.
+- Only an explicitly non-default mode is written to the wire, keeping global-search payloads
+  byte-identical to the pre-G5 format.
+
+### 4. Validation & Error Matrix
+
+| Condition | UI outcome |
+| --- | --- |
+| `resolve_window` fails (closed / recycled / stale) | `切换失败：…`; activation never attempted; panel retained |
+| `TryActivate` returns false | `无法切换到该窗口`; not hidden; no history |
+| Activation succeeds | Hide, then record |
+| `record_window_switch` throws | Stay silent — the switch already happened |
+| No `IWindowActivator` injected | `窗口切换不可用`; degrade visibly, never throw |
+| Empty result, bare `>` | `没有最近使用过的窗口` |
+| Empty result, typed query | `没有匹配的窗口` |
+
+### 5. Good / Base / Bad Cases
+
+- Good: `>记事` → window rows → Enter → activate → hide → record.
+- Base: no `>` → unchanged global behavior, no `mode` on the wire.
+- Bad: hiding before activating; caching window rows; treating a bare `>` as empty input.
+
+### 6. Tests Required
+
+- `>query` sends `mode=window` with the prefix stripped; global search sends no mode.
+- `a>b` stays in `all` mode.
+- Bare `>` reaches `Results`, not `Idle`.
+- **Ordering**: assert activation happened before the hide callback fired. Verify by
+  mutation — reversing the two must fail the test, or it is proving nothing.
+- Rejected activation: not hidden, no record call, panel retained.
+- Failed history write does not surface as a failed switch.
+- Missing activator reports unavailable rather than throwing.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```csharp
+// Hiding first surrenders foreground rights, so SetForegroundWindow degrades to a
+// taskbar flash. Reads as "Enter did nothing" and reports no error.
+HideRequested?.Invoke();
+_activator.TryActivate(window);
+```
+
+#### Correct
+
+```csharp
+// Activate while still foreground; hide only after it actually worked.
+if (!_activator.TryActivate(window))
+{
+    _state.StatusMessage = "无法切换到该窗口";
+    return;
+}
+HideRequested?.Invoke();
+await _pipe.RecordWindowSwitchAsync(item.ExecutionTarget);
+```
+
 ---
 
 ## Backend State (there is no "server")
@@ -87,3 +172,15 @@ These have all actually happened in this codebase:
 - **Letting a late response overwrite a newer query's results.** Every response must
   match on sequence, current `Query`, and `resp.Query` before being applied.
 - **Reusing the last known host root after a failed detection.** See Overview.
+- **Hiding the search window before activating the target window.** Losing foreground
+  status makes `SetForegroundWindow` degrade to a taskbar flash, so the switch appears to do
+  nothing and no error is raised at any layer. Activate first, hide second.
+- **Comparing a mode-prefixed query against the broker's echo.** The broker echoes the
+  stripped query, so comparing it to the raw `>foo` discards every response as stale and the
+  panel just sits on 搜索中…. Staleness compares against `_state.Query` (raw); echo
+  comparison uses the stripped form.
+- **Writing a test whose assertion is already guaranteed by something else.** The
+  "window results never seed the prefix cache" test passed with the guard deleted, because a
+  null `IndexGeneration` and a prefix mismatch each blocked caching independently. Mutate the
+  code you think you are testing; if the test still passes, it is documentation, not a test —
+  and it should say so.

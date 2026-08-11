@@ -1,3 +1,5 @@
 {"file":".trellis/spec/backend/error-handling.md","reason":"窗口失效、激活拒绝与取消分类"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"禁用模式与内存验收门，核对枚举上限与无常驻列表"}
 {"file":".trellis/spec/frontend/state-management.md","reason":"Window mode 与成功/失败 UI 转换"}
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"WPF 侧质量门与测试要求"}
 {"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"枚举、opaque target、execute 与历史数据流"}
