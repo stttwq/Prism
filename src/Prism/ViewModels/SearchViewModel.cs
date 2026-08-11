@@ -20,6 +20,8 @@ public sealed class SearchViewModel
     private readonly IDebounceTimer _debounce;
     private readonly IDebounceTimer _generationDebounce;
     private readonly ISearchScheduler _scheduler;
+    /// <summary>窗口激活（G5）。为空表示未装配，窗口结果只显示不可切换。</summary>
+    private readonly IWindowActivator? _activator;
     private CancellationTokenSource? _searchCts;
     private int _resultLimit = InitialResultLimit;
     private string _pendingQuery = "";
@@ -49,10 +51,12 @@ public sealed class SearchViewModel
         AppState state,
         ISearchClient pipe,
         IDebounceTimerFactory? timerFactory = null,
-        ISearchScheduler? scheduler = null)
+        ISearchScheduler? scheduler = null,
+        IWindowActivator? activator = null)
     {
         _state = state;
         _pipe = pipe;
+        _activator = activator;
         timerFactory ??= new DispatcherDebounceTimerFactory();
         _scheduler = scheduler ?? new SearchScheduler();
         _debounce = timerFactory.Create(
@@ -112,6 +116,33 @@ public sealed class SearchViewModel
 
     /// <summary>当前搜索上下文，供调用方在保留其他字段的前提下改单个维度。</summary>
     public SearchContext SearchContext => _searchContext;
+
+    /// <summary>窗口模式前缀（G5）。只在输入首字符处生效。</summary>
+    private const char WindowModePrefix = '>';
+
+    /// <summary>
+    /// 解析 `>` 前缀（G5）。模式来自输入文本本身而不是环境状态，所以每次请求都就地推导，
+    /// 不把它存进 <see cref="_searchContext"/>——存起来就会和输入框脱节。
+    ///
+    /// 只认首字符：`a>b` 是普通文件搜索，路径和文件名里出现 `>` 不该改变模式。
+    /// </summary>
+    private static bool IsWindowQuery(string query) =>
+        query.Length > 0 && query[0] == WindowModePrefix;
+
+    /// <summary>去掉 `>` 前缀后真正发给后端的查询。</summary>
+    private static string StripWindowPrefix(string query) =>
+        IsWindowQuery(query) ? query[1..] : query;
+
+    /// <summary>本次请求的上下文：窗口模式下把 root/filters 一并清掉，窗口不受目录范围约束。</summary>
+    private SearchContext ContextFor(string query) =>
+        IsWindowQuery(query)
+            ? _searchContext with
+            {
+                Mode = SearchContext.WindowMode,
+                Root = null,
+                Filters = [],
+            }
+            : _searchContext;
 
     /// <summary>
     /// 切换搜索范围（G4）：root 为 null 表示全局。其余上下文字段（排除路径等）保持不变，
@@ -201,11 +232,21 @@ public sealed class SearchViewModel
 
         _resultLimit = InitialResultLimit;
 
+        // A bare `>` is a real query: window mode with empty input lists recent windows
+        // that still exist. It must not fall through to the Idle branch below.
+        if (IsWindowQuery(text))
+        {
+            _state.Mode = PanelMode.Results;
+            SetSearchingStatus();
+            _debounce.Restart();
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(text))
         {
             // G4 §4.4: host context (valid root) + empty input → recent items under root
-            // via the normal search path. Without a root, recent windows wait on G5;
-            // keep Idle and do not ask the indexer for a full scan.
+            // via the normal search path. Without a root and outside window mode, keep Idle
+            // and do not ask the indexer for a full scan.
             if (!string.IsNullOrWhiteSpace(_searchContext.Root))
             {
                 _state.Mode = PanelMode.Results;
@@ -273,6 +314,12 @@ public sealed class SearchViewModel
 
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
+        if (item.Kind == "window")
+        {
+            await SwitchToWindowAsync(item).ConfigureAwait(true);
+            return;
+        }
+
         try
         {
             await _pipe.ExecuteAsync(item.ExecutionTarget).ConfigureAwait(true);
@@ -281,6 +328,54 @@ public sealed class SearchViewModel
         catch (Exception ex)
         {
             _state.StatusMessage = "打开失败：" + ShortMsg(ex);
+        }
+    }
+
+    /// <summary>
+    /// 切换到窗口（G5）。顺序是硬要求：**先激活、再隐藏**。
+    ///
+    /// 先隐藏会让本进程失去前台身份，随后的 `SetForegroundWindow` 就会被系统降级成任务栏
+    /// 闪烁——看起来像"没反应"。所以激活必须发生在本窗口仍是前台的时候。
+    ///
+    /// 失败时保留 UI、不写成功历史、不结束目标进程。
+    /// </summary>
+    private async Task SwitchToWindowAsync(SearchResult item)
+    {
+        if (_activator is null)
+        {
+            _state.StatusMessage = "窗口切换不可用";
+            return;
+        }
+
+        WindowHandleInfo window;
+        try
+        {
+            window = await _pipe.ResolveWindowAsync(item.ExecutionTarget).ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            // Window closed, handle recycled, or the list went stale.
+            _state.StatusMessage = "切换失败：" + ShortMsg(ex);
+            return;
+        }
+
+        // Activate first, while this window is still the foreground process.
+        if (!_activator.TryActivate(window))
+        {
+            _state.StatusMessage = "无法切换到该窗口";
+            return;
+        }
+
+        HideRequested?.Invoke();
+
+        try
+        {
+            await _pipe.RecordWindowSwitchAsync(item.ExecutionTarget).ConfigureAwait(true);
+        }
+        catch
+        {
+            // The switch already succeeded; a failed history write must not be reported as
+            // a failed switch.
         }
     }
 
@@ -455,15 +550,26 @@ public sealed class SearchViewModel
 
     private async Task RunSearchAsync(string query, int max)
     {
-        // Empty query is only meaningful with a host root (recent under root). Without a
-        // root the UI stays Idle and never reaches here; still guard for context changes.
-        var isEmptyQuery = string.IsNullOrWhiteSpace(query);
-        if (isEmptyQuery && string.IsNullOrWhiteSpace(_searchContext.Root))
+        var context = ContextFor(query);
+        // The broker never sees the `>`; it echoes back the stripped query, so every
+        // comparison against the echo below has to use this form too.
+        var wireQuery = StripWindowPrefix(query);
+        // Empty query is only meaningful with a host root (recent under root) or in window
+        // mode (recent windows). Otherwise the UI stays Idle and never reaches here; still
+        // guard for context changes.
+        var isEmptyQuery = string.IsNullOrWhiteSpace(wireQuery);
+        if (isEmptyQuery
+            && !context.IsWindowMode
+            && string.IsNullOrWhiteSpace(context.Root))
+        {
             return;
+        }
 
         var seq = ++_searchSeq;
         CancelSearch();
-        if (!isEmptyQuery && TryFilterCompleteCache(query, out var cached))
+        // Window results are per-enumeration: their tokens expire on the next publish, so
+        // they must never be served from the prefix cache.
+        if (!isEmptyQuery && !context.IsWindowMode && TryFilterCompleteCache(query, out var cached))
         {
             ApplySearchResponse(cached, query, max, seq, startPoll: false, updateCache: false);
             return;
@@ -493,14 +599,15 @@ public sealed class SearchViewModel
             if (seq == _searchSeq)
                 SetSearchingStatus();
 
-            var resp = await _pipe.SearchAsync(query, max, _searchContext, cts.Token).ConfigureAwait(true);
+            var resp = await _pipe.SearchAsync(wireQuery, max, context, cts.Token).ConfigureAwait(true);
 
             if (seq != _searchSeq) return;
             if (cts.IsCancellationRequested) return;
+            // Staleness is judged against the box, which still holds the `>`.
             if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
             // Broker echoes the request query; for empty input accept either "" or the
             // whitespace the box still holds, as long as both sides trim empty.
-            if (!QueryMatchesResponse(query, resp.Query)) return;
+            if (!QueryMatchesResponse(wireQuery, resp.Query)) return;
 
             ApplySearchResponse(resp, query, max, seq);
         }
@@ -555,6 +662,20 @@ public sealed class SearchViewModel
 
         if (updateCache
             && !string.IsNullOrWhiteSpace(query)
+            // Window tokens are only valid inside the enumeration that minted them, so a
+            // window response can never back local prefix filtering. Today's broker also
+            // sends no IndexGeneration for window mode, which would block the cache on its
+            // own — but relying on that alone would make this safety incidental.
+            // Window tokens are only valid inside the enumeration that minted them, so a
+            // window response must never back local prefix filtering.
+            //
+            // Three independent things already prevent it: window responses carry no
+            // IndexGeneration, the cached raw query keeps the `>` while the echo does not
+            // (so the prefix check cannot match), and the context Mode differs. This guard
+            // is deliberate redundancy — it states the intent so a later change to any of
+            // those three does not silently start caching volatile tokens. A unit test
+            // cannot isolate it for exactly that reason.
+            && !IsWindowQuery(query)
             && !resp.IsIndexing
             && string.IsNullOrWhiteSpace(resp.IndexError)
             && !resp.IsTruncated
@@ -603,6 +724,12 @@ public sealed class SearchViewModel
         else if (list.Count > 0)
         {
             _state.StatusMessage = "";
+        }
+        else if (IsWindowQuery(query))
+        {
+            _state.StatusMessage = string.IsNullOrEmpty(StripWindowPrefix(query))
+                ? "没有最近使用过的窗口"
+                : "没有匹配的窗口";
         }
         else if (string.IsNullOrWhiteSpace(query)
                  && !string.IsNullOrWhiteSpace(_searchContext.Root))
@@ -661,10 +788,12 @@ public sealed class SearchViewModel
             try
             {
                 var resp = await _pipe.SearchAsync(
-                    query, max, _searchContext).ConfigureAwait(true);
+                    StripWindowPrefix(query), max, ContextFor(query)).ConfigureAwait(true);
                 if (seq != _searchSeq) return;
                 if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
-                if (!string.Equals(resp.Query, query, StringComparison.Ordinal)) return;
+                // Echo carries no `>`; compare against the stripped form.
+                if (!string.Equals(resp.Query, StripWindowPrefix(query), StringComparison.Ordinal))
+                    return;
 
                 if (!resp.IsIndexing)
                 {

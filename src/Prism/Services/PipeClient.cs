@@ -108,6 +108,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
         if (!string.IsNullOrWhiteSpace(context.Root))
             payload["root"] = context.Root;
+        // G5: only an explicit non-default mode goes on the wire. A global search payload
+        // therefore stays byte-identical to the pre-G5 format, so an older broker that
+        // never learned `mode` behaves exactly as before.
+        if (!string.Equals(context.Mode, SearchContext.AllMode, StringComparison.Ordinal))
+            payload["mode"] = context.Mode;
         return payload;
     }
 
@@ -248,6 +253,49 @@ public sealed class PipeClient : ISearchClient, IDisposable
         await SendAsync(
             new { type = "run_action", target = TargetPayload(target), action },
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// G5：把枚举 token 换成 broker 已复核的句柄。
+    ///
+    /// 窗口不走 execute：激活受 Windows 前台规则约束，只能由前台进程（本进程）完成，
+    /// 所以 broker 只复核并交出句柄。
+    /// </summary>
+    public async Task<WindowHandleInfo> ResolveWindowAsync(
+        ActionTarget target,
+        CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            new { type = "resolve_window", target = TargetPayload(target) },
+            ct).ConfigureAwait(false);
+        return ParseWindowHandle(resp);
+    }
+
+    /// <summary>G5：激活成功后回报，由 broker 写窗口历史。</summary>
+    public async Task RecordWindowSwitchAsync(ActionTarget target, CancellationToken ct = default)
+    {
+        await SendAsync(
+            new { type = "record_window_switch", target = TargetPayload(target) },
+            ct).ConfigureAwait(false);
+    }
+
+    internal static WindowHandleInfo ParseWindowHandle(JsonElement resp)
+    {
+        if (!resp.TryGetProperty("handle", out var handleValue)
+            || !handleValue.TryGetUInt64(out var handle)
+            || handle == 0)
+        {
+            throw new InvalidOperationException("后端未返回可用的窗口句柄");
+        }
+        var pid = resp.TryGetProperty("pid", out var pidValue) && pidValue.TryGetUInt32(out var parsedPid)
+            ? parsedPid
+            : 0u;
+        return new WindowHandleInfo(
+            (IntPtr)handle,
+            pid,
+            ReadOptionalString(resp, "title") ?? "",
+            resp.TryGetProperty("is_minimized", out var minimized)
+                && minimized.ValueKind == JsonValueKind.True);
     }
 
     internal static object TargetPayload(ActionTarget target) => new

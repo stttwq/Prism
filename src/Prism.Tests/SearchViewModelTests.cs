@@ -525,6 +525,343 @@ public sealed class SearchViewModelTests
         Assert.Equal("global-hit", state.Results[0].Title);
     }
 
+    // ── G5 窗口模式 ──────────────────────────────────────────────────────────────
+
+    /// <summary>窗口结果：ExecuteId/target.value 是本次枚举的 token，不是路径。</summary>
+    private static SearchResult WindowResult(string title, string app = "notepad", string token = "1024") =>
+        new("window", title, app, token, [])
+        {
+            Target = new ActionTarget("window", token),
+        };
+
+    private static SearchResponse WindowResponse(string query, params SearchResult[] results) =>
+        new(query, results, false, null, false, null);
+
+    /// <summary>
+    /// 窗口响应，但带上 generation：用于证明「窗口结果不进前缀缓存」靠的是模式判断，
+    /// 而不是恰好缺字段。
+    /// </summary>
+    private static SearchResponse CacheableWindowResponse(
+        string query,
+        params SearchResult[] results) =>
+        new(query, results, false, null, false, 1, PinyinStatus: "disabled");
+
+    private static (SearchViewModel Vm, AppState State, FakeSearchClient Client,
+        ManualTimerFactory Timers, FakeWindowActivator Activator) WindowFixture()
+    {
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var activator = new FakeWindowActivator();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler(), activator);
+        return (vm, state, client, timers, activator);
+    }
+
+    [Fact]
+    public async Task WindowPrefixSendsWindowModeAndStripsThePrefix()
+    {
+        var (vm, state, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse("记事", WindowResult("无标题 - 记事本")));
+
+        vm.OnQueryChanged(">记事");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        // The broker never sees the `>`.
+        Assert.Equal("记事", client.LastQuery);
+        Assert.Equal(SearchContext.WindowMode, client.LastContext?.Mode);
+        Assert.True(client.LastContext?.IsWindowMode);
+        await Eventually(() => state.Results.Count == 1);
+        Assert.Equal(SearchResultKind.Window, state.Results[0].ResultKind);
+    }
+
+    [Fact]
+    public async Task BareWindowPrefixListsRecentWindowsInsteadOfGoingIdle()
+    {
+        var (vm, state, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse("", WindowResult("无标题 - 记事本")));
+
+        vm.OnQueryChanged(">");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        Assert.Equal("", client.LastQuery);
+        Assert.Equal(SearchContext.WindowMode, client.LastContext?.Mode);
+        Assert.Equal(PanelMode.Results, state.Mode);
+    }
+
+    [Fact]
+    public async Task GlobalSearchStillSendsNoModeSoOldBrokersAreUnaffected()
+    {
+        var (vm, _, client, timers, _) = WindowFixture();
+        client.Enqueue(Response("a", false, 1, Result("alpha")));
+
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        Assert.Equal(SearchContext.AllMode, client.LastContext?.Mode);
+        Assert.False(client.LastContext?.IsWindowMode);
+    }
+
+    [Fact]
+    public async Task PrefixOnlyCountsAtPositionZero()
+    {
+        var (vm, _, client, timers, _) = WindowFixture();
+        client.Enqueue(Response("a>b", false, 1, Result("a>b")));
+
+        vm.OnQueryChanged("a>b");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        // A `>` inside a filename must not switch modes.
+        Assert.Equal("a>b", client.LastQuery);
+        Assert.Equal(SearchContext.AllMode, client.LastContext?.Mode);
+    }
+
+    [Fact]
+    public async Task LeavingWindowModeReturnsToGlobalSearch()
+    {
+        var (vm, _, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+        client.Enqueue(Response("a", false, 1, Result("alpha")));
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        Assert.Equal(SearchContext.WindowMode, client.LastContext?.Mode);
+
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        Assert.Equal(SearchContext.AllMode, client.LastContext?.Mode);
+    }
+
+    [Fact]
+    public async Task WindowModeIgnoresHostRootBecauseWindowsAreNotScopedToADirectory()
+    {
+        var (vm, _, client, timers, _) = WindowFixture();
+        vm.SetScopeRoot(@"C:\Users\me\Docs");
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        Assert.Null(client.LastContext?.Root);
+    }
+
+    /// <summary>
+    /// 窗口 token 只在生成它的那次枚举内有效，所以扩展查询必须重新请求，不能本地过滤旧结果。
+    ///
+    /// 这里只断言可观察行为（确实又发了一次请求）。代码里有三重机制共同保证这件事，
+    /// 单元测试无法把其中任何一条单独隔离出来——mutation 掉 ViewModel 里的模式判断，
+    /// 本测试依然通过。真正的回归信号是「请求次数」，不是某一行代码。
+    /// </summary>
+    [Fact]
+    public async Task WindowQueryGrowthReQueriesInsteadOfFilteringLocally()
+    {
+        var (vm, _, client, timers, _) = WindowFixture();
+        // Generation supplied so the response satisfies the other cache preconditions and
+        // the assertion is not resting on a missing field.
+        client.Enqueue(CacheableWindowResponse("a", WindowResult("abc - Notepad")));
+        client.Enqueue(CacheableWindowResponse("ab", WindowResult("abc - Notepad")));
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        vm.OnQueryChanged(">ab");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        Assert.Equal("ab", client.LastQuery);
+    }
+
+    /// <summary>对照组：普通文件搜索的前缀增长确实会命中缓存，证明上面那条不是因为缓存整体失效。</summary>
+    [Fact]
+    public async Task GlobalPrefixGrowthStillUsesTheCache()
+    {
+        var (vm, _, client, timers, _) = WindowFixture();
+        client.Enqueue(Response("al", false, 7, Result("alpha"), Result("alpine")));
+
+        vm.OnQueryChanged("al");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        vm.OnQueryChanged("alp");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        Assert.Equal(1, client.SearchCount);
+    }
+
+    [Fact]
+    public async Task SuccessfulSwitchActivatesThenHidesAndRecordsHistory()
+    {
+        var (vm, state, client, timers, activator) = WindowFixture();
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+        var hidden = false;
+        var activatedBeforeHide = false;
+        vm.HideRequested += () =>
+        {
+            hidden = true;
+            activatedBeforeHide = activator.Calls.Count > 0;
+        };
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        state.SelectedIndex = 0;
+        await vm.ExecuteSelectedAsync();
+
+        Assert.Single(activator.Calls);
+        Assert.True(hidden);
+        // Hiding first would surrender foreground rights and the activation would degrade
+        // to a taskbar flash, so the order is load-bearing.
+        Assert.True(activatedBeforeHide);
+        Assert.Single(client.RecordCalls);
+        Assert.Equal("window", client.RecordCalls[0].Kind);
+    }
+
+    [Fact]
+    public async Task WindowsAreSwitchedNotOpenedThroughTheShell()
+    {
+        var (vm, state, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        state.SelectedIndex = 0;
+        await vm.ExecuteSelectedAsync();
+
+        // Activation is a foreground-bound Win32 call, not a Shell verb; execute must not
+        // be used for a window.
+        Assert.Single(client.ResolveCalls);
+    }
+
+    [Fact]
+    public async Task RejectedActivationKeepsTheUiAndWritesNoSuccessHistory()
+    {
+        var (vm, state, client, timers, activator) = WindowFixture();
+        activator.Result = false;
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+        var hidden = false;
+        vm.HideRequested += () => hidden = true;
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        state.SelectedIndex = 0;
+        await vm.ExecuteSelectedAsync();
+
+        Assert.False(hidden);
+        Assert.Empty(client.RecordCalls);
+        Assert.Equal("无法切换到该窗口", state.StatusMessage);
+        Assert.Single(state.Results);
+    }
+
+    [Fact]
+    public async Task ClosedWindowReportsFailureAndWritesNoSuccessHistory()
+    {
+        var (vm, state, client, timers, activator) = WindowFixture();
+        client.ResolveFailure = "the window no longer exists";
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+        var hidden = false;
+        vm.HideRequested += () => hidden = true;
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        state.SelectedIndex = 0;
+        await vm.ExecuteSelectedAsync();
+
+        // Resolve failed, so activation must never have been attempted.
+        Assert.Empty(activator.Calls);
+        Assert.False(hidden);
+        Assert.Empty(client.RecordCalls);
+        Assert.Contains("切换失败", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task FailedHistoryWriteDoesNotTurnASuccessfulSwitchIntoAFailure()
+    {
+        var (vm, state, client, timers, activator) = WindowFixture();
+        client.RecordFailure = "history lock is poisoned";
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+        var hidden = false;
+        vm.HideRequested += () => hidden = true;
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        state.SelectedIndex = 0;
+        await vm.ExecuteSelectedAsync();
+
+        Assert.Single(activator.Calls);
+        Assert.True(hidden);
+        Assert.DoesNotContain("失败", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task WithoutAnActivatorWindowSwitchingReportsUnavailable()
+    {
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        // No activator supplied: the feature must degrade visibly, not throw.
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        state.SelectedIndex = 0;
+        await vm.ExecuteSelectedAsync();
+
+        Assert.Equal("窗口切换不可用", state.StatusMessage);
+        Assert.Empty(client.RecordCalls);
+    }
+
+    [Fact]
+    public async Task EmptyWindowListExplainsItselfWithoutTheGenericNoMatchCopy()
+    {
+        var (vm, state, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse(""));
+
+        vm.OnQueryChanged(">");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        Assert.Equal("没有最近使用过的窗口", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task NoMatchingWindowIsDistinctFromNoRecentWindows()
+    {
+        var (vm, state, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse("zzz"));
+
+        vm.OnQueryChanged(">zzz");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        Assert.Equal("没有匹配的窗口", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task WindowModeNeverClaimsTheIndexIsBuilding()
+    {
+        var (vm, state, client, timers, _) = WindowFixture();
+        client.Enqueue(WindowResponse("a", WindowResult("a - Notepad")));
+
+        vm.OnQueryChanged(">a");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+
+        // Window availability is unrelated to index readiness.
+        Assert.False(state.IsIndexing);
+    }
+
     private static SearchResult Result(string title) =>
         new("file", title, $"C:\\{title}", $"C:\\{title}", []);
 
@@ -673,6 +1010,49 @@ public sealed class SearchViewModelTests
         {
             LastTarget = target;
             return Task.CompletedTask;
+        }
+
+        // --- G5 window mode ---
+
+        /// <summary>非空表示 resolve 应当失败，用于覆盖窗口已关闭/句柄复用/列表过期。</summary>
+        public string? ResolveFailure { get; set; }
+        public WindowHandleInfo ResolvedWindow { get; set; } =
+            new(new IntPtr(0x900), 77, "报告.docx - Word", IsMinimized: false);
+        public List<ActionTarget> ResolveCalls { get; } = [];
+        public List<ActionTarget> RecordCalls { get; } = [];
+        /// <summary>非空表示写历史失败；切换本身已成功，不应被报成失败。</summary>
+        public string? RecordFailure { get; set; }
+
+        public Task<WindowHandleInfo> ResolveWindowAsync(
+            ActionTarget target,
+            CancellationToken ct = default)
+        {
+            ResolveCalls.Add(target);
+            LastTarget = target;
+            if (ResolveFailure is not null)
+                throw new InvalidOperationException(ResolveFailure);
+            return Task.FromResult(ResolvedWindow);
+        }
+
+        public Task RecordWindowSwitchAsync(ActionTarget target, CancellationToken ct = default)
+        {
+            RecordCalls.Add(target);
+            if (RecordFailure is not null)
+                throw new InvalidOperationException(RecordFailure);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>可控的窗口激活器，用于覆盖激活成功与被系统前台限制拒绝两条路径。</summary>
+    private sealed class FakeWindowActivator : IWindowActivator
+    {
+        public bool Result { get; set; } = true;
+        public List<WindowHandleInfo> Calls { get; } = [];
+
+        public bool TryActivate(WindowHandleInfo window)
+        {
+            Calls.Add(window);
+            return Result;
         }
     }
 

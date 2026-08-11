@@ -7,6 +7,8 @@ public enum SearchResultKind
     File,
     Folder,
     Web,
+    /// <summary>可切换的顶层窗口（G5）。</summary>
+    Window,
     More,
 }
 
@@ -20,6 +22,9 @@ public sealed record ActionTarget(string Kind, string Value)
             "app" => "application",
             "folder" => "directory",
             "web" => "web",
+            // Window results always arrive with a typed target; this keeps the legacy
+            // fallback from mis-labelling an enumeration token as a file path.
+            "window" => "window",
             _ => "file",
         },
         executeId);
@@ -49,6 +54,7 @@ public sealed record SearchResult(
         "file" => SearchResultKind.File,
         "folder" => SearchResultKind.Folder,
         "web" => SearchResultKind.Web,
+        "window" => SearchResultKind.Window,
         "more" => SearchResultKind.More,
         _ => SearchResultKind.Unknown,
     };

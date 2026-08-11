@@ -67,7 +67,12 @@ public partial class App : Application
         _state = new AppState();
         _pipe = new PipeClient();
         _icons = new IconCache();
-        _vm = new SearchViewModel(_state, _pipe);
+        // G5: activation must run in this process — SetForegroundWindow only takes effect
+        // from the foreground process, which is Prism at the moment Enter is pressed.
+        _vm = new SearchViewModel(
+            _state,
+            _pipe,
+            activator: new Win32WindowActivator());
         ApplySearchExclusions(settings);
 
         // 深浅色跟随系统（替换 App.xaml 中的 Tokens 字典）。

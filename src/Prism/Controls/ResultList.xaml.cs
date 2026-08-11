@@ -288,7 +288,11 @@ public partial class ResultList : UserControl
                 continue;
             }
 
-            if (item.Kind is "web" || string.IsNullOrEmpty(item.ExecuteId) || _icons is null)
+            // "window" carries an enumeration token, not a path — asking the shell for an
+            // icon from it would just fail per row.
+            if (item.Kind is "web" or "window"
+                || string.IsNullOrEmpty(item.ExecuteId)
+                || _icons is null)
             {
                 icon.Tag = null;
                 icon.Source = null;
