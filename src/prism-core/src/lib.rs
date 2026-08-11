@@ -18,6 +18,7 @@ pub mod pinyin_sidecar;
 pub mod root_scope;
 pub mod shell;
 pub mod websearch;
+pub mod window_list;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

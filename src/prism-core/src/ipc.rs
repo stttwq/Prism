@@ -73,6 +73,9 @@ pub enum Request {
         /// 可选的当前目录范围（G4）。缺失或空白等于全局搜索，所以旧前端逐字节兼容。
         #[serde(default)]
         root: Option<String>,
+        /// 显式搜索模式（G5）。缺失等于 `all`，所以旧前端逐字节兼容。
+        #[serde(default)]
+        mode: Option<SearchMode>,
     },
     /// 执行选中项（打开文件 / 启动程序 / 打开网址）。
     Execute {
@@ -112,6 +115,24 @@ pub enum Request {
         pinyin_enabled: bool,
     },
     ClearHistory,
+    /// G5：把一次枚举内有效的 window token 换回可激活的句柄，并复核身份。
+    ///
+    /// 分成 resolve/record 两步是有意的：激活必须由前台进程（WPF）完成，broker 只能
+    /// 在这里做第一次复核；只有 WPF 回报成功后才允许写成功历史。
+    ResolveWindow { target: ActionTarget },
+    /// G5：WPF 激活成功后回报，broker 据此写窗口历史。失败路径不发本消息。
+    RecordWindowSwitch { target: ActionTarget },
+}
+
+/// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    All,
+    Window,
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_max() -> usize {
@@ -180,6 +201,16 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "is_false")]
         cancelled: bool,
     },
+    /// G5：复核通过的窗口句柄，交给 WPF 完成前台激活。
+    ///
+    /// 句柄只在这一条消息里离开 broker。WPF 拿到后必须在激活前再复核一次，压掉
+    /// 「本次复核 → 真正激活」之间的关闭与句柄复用窗口。
+    WindowHandle {
+        handle: u64,
+        pid: u32,
+        title: String,
+        is_minimized: bool,
+    },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
@@ -212,6 +243,8 @@ pub enum SearchResultKind {
     File,
     Folder,
     Web,
+    /// G5：可切换的顶层窗口。旧前端映射为 Unknown 并忽略。
+    Window,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +289,10 @@ pub async fn serve(
         .first_pipe_instance(true)
         .create(pipe_name)?;
 
+    // One snapshot store for the whole broker: window tokens must stay comparable across
+    // reconnects, and it holds only the latest enumeration.
+    let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+
     loop {
         // 等待一个客户端连上当前实例。
         server.connect().await?;
@@ -268,9 +305,18 @@ pub async fn serve(
         let shell = shell.clone();
         let history = history.clone();
         let preferences = preferences.clone();
+        let windows = windows.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(connected, apps, engines, shell, history, preferences).await
+            if let Err(e) = handle_connection(
+                connected,
+                apps,
+                engines,
+                shell,
+                history,
+                preferences,
+                windows,
+            )
+            .await
             {
                 log(format!("连接处理结束：{e}"));
             }
@@ -286,6 +332,7 @@ async fn handle_connection(
     shell: Arc<ShellExecutor>,
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
+    windows: Arc<crate::window_list::WindowSnapshotStore>,
 ) -> std::io::Result<()> {
     log("前端已连接");
     let (reader, mut writer) = tokio::io::split(pipe);
@@ -303,6 +350,7 @@ async fn handle_connection(
                 max,
                 filters,
                 root,
+                mode,
             }) => {
                 search_service(
                     SearchArgs {
@@ -310,15 +358,19 @@ async fn handle_connection(
                         max,
                         filters,
                         root: root.as_deref(),
+                        mode: mode.unwrap_or_default(),
                     },
                     &apps,
                     &engines,
                     &history,
                     &preferences,
+                    &windows,
                 )
                 .await
             }
-            Ok(req) => dispatch_non_search(req, &engines, &shell, &history, &preferences).await,
+            Ok(req) => {
+                dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows).await
+            }
             Err(e) => Response::Error {
                 message: format!("无法解析请求：{e}"),
                 category: None,
@@ -343,6 +395,7 @@ async fn dispatch_non_search(
     shell: &Arc<ShellExecutor>,
     history: &Arc<HistoryStore>,
     preferences: &Arc<BrokerPreferences>,
+    windows: &Arc<crate::window_list::WindowSnapshotStore>,
 ) -> Response {
     match req {
         Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
@@ -415,9 +468,82 @@ async fn dispatch_non_search(
                 category: None,
             },
         },
+        Request::ResolveWindow { target } => {
+            resolve_window(&target, windows, &crate::window_list::SystemWindowProbe)
+        }
+        Request::RecordWindowSwitch { target } => {
+            record_window_switch(&target, windows, &crate::window_list::SystemWindowProbe, history)
+        }
         Request::Search { .. } => Response::Error {
             message: "search must be dispatched asynchronously".into(),
             category: None,
+        },
+    }
+}
+
+/// G5：token → 已复核的句柄。窗口目标永远不进 `ShellExecutor`：激活受 Windows 前台规则
+/// 约束，只能由前台进程（WPF）完成，broker 这里只负责复核并交出句柄。
+fn resolve_window(
+    target: &ActionTarget,
+    windows: &Arc<crate::window_list::WindowSnapshotStore>,
+    probe: &dyn crate::window_list::WindowProbe,
+) -> Response {
+    if target.kind != TargetKind::Window.as_str() {
+        return Response::Error {
+            message: "resolve_window requires a window target".into(),
+            category: Some(crate::shell::ShellErrorKind::TargetInvalid),
+        };
+    }
+    match windows.resolve(&target.value, probe) {
+        Ok(entry) => Response::WindowHandle {
+            handle: entry.handle,
+            pid: entry.pid,
+            title: entry.title,
+            is_minimized: entry.is_minimized,
+        },
+        Err(error) => Response::Error {
+            message: error.message().to_owned(),
+            category: Some(match error {
+                crate::window_list::ResolveError::Malformed => {
+                    crate::shell::ShellErrorKind::TargetInvalid
+                }
+                _ => crate::shell::ShellErrorKind::Conflict,
+            }),
+        },
+    }
+}
+
+/// G5：WPF 回报激活成功后写历史。
+///
+/// 仍然复核一次 token：这条消息只应在成功后到达，但 broker 不能靠前端自证，否则一个
+/// 迟到或伪造的 record 会把没切成功的窗口写成成功历史。历史键是「应用名 + 规范化标题」，
+/// 不是 HWND。
+fn record_window_switch(
+    target: &ActionTarget,
+    windows: &Arc<crate::window_list::WindowSnapshotStore>,
+    probe: &dyn crate::window_list::WindowProbe,
+    history: &Arc<HistoryStore>,
+) -> Response {
+    if target.kind != TargetKind::Window.as_str() {
+        return Response::Error {
+            message: "record_window_switch requires a window target".into(),
+            category: Some(crate::shell::ShellErrorKind::TargetInvalid),
+        };
+    }
+    match windows.resolve(&target.value, probe) {
+        Ok(entry) => {
+            let history_target = ActionTarget::new(TargetKind::Window, entry.history_key());
+            if let Err(error) = history.record(&history_target, HistoryUse::Execute) {
+                log(format!("窗口历史写入失败：{error}"));
+            }
+            Response::Status {
+                is_indexing: false,
+                cancelled: false,
+            }
+        }
+        Err(error) => Response::Error {
+            message: error.message().to_owned(),
+            category: Some(crate::shell::ShellErrorKind::Conflict),
         },
     }
 }
@@ -428,6 +554,7 @@ struct SearchArgs<'a> {
     max: usize,
     filters: Option<Vec<SearchFilter>>,
     root: Option<&'a str>,
+    mode: SearchMode,
 }
 
 async fn search_service(
@@ -436,12 +563,14 @@ async fn search_service(
     engines: &SharedEngines,
     history: &Arc<HistoryStore>,
     preferences: &Arc<BrokerPreferences>,
+    windows: &Arc<crate::window_list::WindowSnapshotStore>,
 ) -> Response {
     let SearchArgs {
         query,
         max,
         filters,
         root,
+        mode,
     } = args;
     if let Err(message) = validate_search_request(max, filters.as_deref()) {
         return Response::Error {
@@ -450,9 +579,20 @@ async fn search_service(
         };
     }
     let filters = filters.filter(|values| !values.is_empty());
+    // G5 window mode is exclusive: no files, apps, or web rows mixed in, and no indexer
+    // round-trip. Checked before the empty-query branch because an empty window query is
+    // meaningful (recent windows) while an empty global query is not.
+    if mode == SearchMode::Window {
+        return window_results(
+            query,
+            window_search(query, max, windows, history, preferences),
+            history,
+        );
+    }
     // G4 empty input: host context shows recent file/dir under root from history only.
     // No apps, web, or full-index scan — empty indexer queries are meaningless and expensive.
-    // Non-host empty input (recent windows) is deferred to G5; keep an empty Results reply.
+    // Non-host empty input stays empty here: recent windows live in window mode (G5), which
+    // returned above, not in an empty global query.
     if query.trim().is_empty() {
         return empty_query_results(query, max, filters.as_deref(), root, history);
     }
@@ -657,12 +797,36 @@ async fn search_service(
     }
 }
 
+/// G5：窗口模式的响应外壳。窗口模式不碰索引，所以索引相关字段一律缺省，
+/// `is_indexing=false`——窗口列表的可用性与索引就绪无关，不该让 UI 显示「索引中」。
+fn window_results(query: &str, items: Vec<SearchResult>, history: &Arc<HistoryStore>) -> Response {
+    Response::Results {
+        query: query.to_owned(),
+        items,
+        is_indexing: false,
+        index_progress: None,
+        index_error: None,
+        index_generation: None,
+        is_truncated: false,
+        matched_count: None,
+        scanned_nodes: None,
+        name_candidates: None,
+        entered_top_k: None,
+        path_constructions: None,
+        pinyin_status: None,
+        history_status: history.take_diagnostic().map(history_status),
+        root_rejection: None,
+        root_message: None,
+    }
+}
+
 /// Empty-query search path for G4 §4.4.
 ///
 /// * With a usable `root` and history on: recent existing file/directory entries under that
 ///   root, capped at `max`, no indexer round-trip.
 /// * Root rejected locally: empty items + structured rejection (UI falls back to global).
-/// * No root / history off: empty items. Recent-window listing waits on G5.
+/// * No root / history off: empty items. Recent windows are window mode's job (G5), not
+///   this path's.
 fn empty_query_results(
     query: &str,
     max: usize,
@@ -904,6 +1068,115 @@ fn build_progress_dto(progress: &BuildProgress) -> IndexProgressDto {
     }
 }
 
+/// G5：把一个窗口按查询打分，取「标题」与「应用名」里更强的那个来源。
+///
+/// 显示上标题是主行、应用名是副行，所以高亮 spans 只在标题命中时才有值；应用名命中时
+/// 不给标题染色，来源由副行自身体现。
+fn rank_window(
+    entry: &crate::window_list::WindowEntry,
+    query: &str,
+    pinyin_enabled: bool,
+    history_score: u32,
+) -> Option<(MatchMetadata, Vec<i32>)> {
+    let mut best: Option<(MatchMetadata, Vec<i32>)> = None;
+    let mut consider = |metadata: MatchMetadata, spans: Vec<i32>| {
+        // MatchMetadata::cmp 把更强的匹配排在前面（Literal < FullPinyin，class/position
+        // 小者优先，history_score 已被反转），所以更强 = 更小。
+        if best.as_ref().is_none_or(|(current, _)| metadata < *current) {
+            best = Some((metadata, spans));
+        }
+    };
+
+    if let Some(mut metadata) = rank_title(&entry.title, query) {
+        metadata.history_score = history_score;
+        consider(metadata, match_spans(&entry.title, query));
+    }
+    if let Some(mut metadata) = rank_title(&entry.app_name, query) {
+        metadata.history_score = history_score;
+        // 命中在应用名上，标题不染色。
+        consider(metadata, Vec::new());
+    }
+    if pinyin_enabled {
+        if let Some(matched) = crate::pinyin::match_name(&entry.title, query) {
+            let metadata = pinyin_metadata(&matched, history_score);
+            consider(metadata, matched.spans);
+        }
+        if let Some(matched) = crate::pinyin::match_name(&entry.app_name, query) {
+            let metadata = pinyin_metadata(&matched, history_score);
+            consider(metadata, Vec::new());
+        }
+    }
+    best
+}
+
+/// G5：把一个窗口条目转成搜索结果。`token` 只在本次枚举内有效。
+fn window_result(
+    entry: &crate::window_list::WindowEntry,
+    token: &str,
+    metadata: Option<MatchMetadata>,
+    match_spans: Vec<i32>,
+) -> SearchResult {
+    SearchResult {
+        kind: SearchResultKind::Window,
+        title: entry.title.clone(),
+        subtitle: entry.app_name.clone(),
+        // execute_id 对窗口没有旧读者语义，与 target.value 保持一致即可。
+        execute_id: token.to_owned(),
+        target: ActionTarget::new(TargetKind::Window, token),
+        match_spans,
+        match_metadata: metadata,
+    }
+}
+
+/// G5：窗口模式搜索。空查询走「历史 ∩ 当前枚举」的最近窗口。
+///
+/// 每次请求都重新枚举，不保留常驻窗口列表；snapshot 随本次 publish 整表替换。
+fn window_search(
+    query: &str,
+    max: usize,
+    windows: &Arc<crate::window_list::WindowSnapshotStore>,
+    history: &Arc<HistoryStore>,
+    preferences: &Arc<BrokerPreferences>,
+) -> Vec<SearchResult> {
+    let self_pids = [std::process::id()];
+    let published = crate::window_list::enumerate_and_publish(windows, &self_pids);
+    let trimmed = query.trim();
+    let mut ranked: Vec<SearchResult> = Vec::new();
+
+    for (token, entry) in &published {
+        let history_target = ActionTarget::new(TargetKind::Window, entry.history_key());
+        let history_score = history.score(&history_target);
+        if trimmed.is_empty() {
+            // 空输入只显示「用过 + 现在还在」的窗口，已关闭的自然不在枚举里。
+            if history_score == 0 {
+                continue;
+            }
+            ranked.push(window_result(
+                entry,
+                token,
+                Some(MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: 0,
+                    history_score,
+                }),
+                Vec::new(),
+            ));
+            continue;
+        }
+        if let Some((metadata, spans)) =
+            rank_window(entry, trimmed, preferences.pinyin_enabled(), history_score)
+        {
+            ranked.push(window_result(entry, token, Some(metadata), spans));
+        }
+    }
+
+    ranked.sort_by(compare_search_results);
+    ranked.truncate(max);
+    ranked
+}
+
 fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
     let title_lower = title.to_lowercase();
     let query_lower = query.to_lowercase();
@@ -1045,6 +1318,296 @@ fn match_spans(title: &str, query: &str) -> Vec<i32> {
     let start_u16 = title_lower[..byte_pos].encode_utf16().count();
     let len_u16 = query_lower.encode_utf16().count();
     vec![start_u16 as i32, len_u16 as i32]
+}
+
+#[cfg(test)]
+mod window_protocol_tests {
+    use super::*;
+    use crate::window_list::{RawWindow, WindowEntry, WindowProbe, WindowSnapshotStore};
+
+    struct AlwaysLive(RawWindow);
+
+    impl WindowProbe for AlwaysLive {
+        fn probe(&self, handle: u64) -> Option<RawWindow> {
+            (handle == self.0.handle).then(|| self.0.clone())
+        }
+    }
+
+    struct AlwaysGone;
+
+    impl WindowProbe for AlwaysGone {
+        fn probe(&self, _handle: u64) -> Option<RawWindow> {
+            None
+        }
+    }
+
+    fn live_window() -> RawWindow {
+        RawWindow {
+            handle: 0x900,
+            pid: 77,
+            title: "报告.docx - Word".into(),
+            app_name: "winword".into(),
+            app_path: r"C:\Office\winword.exe".into(),
+            is_visible: true,
+            ..RawWindow::default()
+        }
+    }
+
+    fn entry() -> WindowEntry {
+        WindowEntry {
+            handle: 0x900,
+            pid: 77,
+            title: "报告.docx - Word".into(),
+            app_name: "winword".into(),
+            app_path: r"C:\Office\winword.exe".into(),
+            is_minimized: false,
+        }
+    }
+
+    fn history_store(tag: &str) -> Arc<HistoryStore> {
+        let dir = std::env::temp_dir()
+            .join(format!("prism-window-history-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(HistoryStore::load(&dir, true))
+    }
+
+    // --- old-reader compatibility -------------------------------------------------
+
+    #[test]
+    fn search_without_mode_still_decodes_and_means_all() {
+        let request: Request =
+            serde_json::from_str(r#"{"type":"search","query":"a","max":10}"#).unwrap();
+        match request {
+            Request::Search { mode, .. } => {
+                assert_eq!(mode, None);
+                assert_eq!(mode.unwrap_or_default(), SearchMode::All);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_mode_decodes() {
+        let request: Request =
+            serde_json::from_str(r#"{"type":"search","query":">a","mode":"window"}"#).unwrap();
+        match request {
+            Request::Search { mode, .. } => assert_eq!(mode, Some(SearchMode::Window)),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_mode_degrades_instead_of_failing_the_request() {
+        // A newer frontend adding a mode must not hard-fail an older broker.
+        let request: Request =
+            serde_json::from_str(r#"{"type":"search","query":"a","mode":"holograph"}"#).unwrap();
+        match request {
+            Request::Search { mode, .. } => assert_eq!(mode, Some(SearchMode::Unknown)),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_mode_is_treated_as_all_not_as_window() {
+        assert_ne!(SearchMode::Unknown, SearchMode::Window);
+    }
+
+    #[test]
+    fn window_kind_serializes_as_snake_case() {
+        let result = window_result(&entry(), "1024", None, Vec::new());
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["kind"], "window");
+        assert_eq!(json["target"]["kind"], "window");
+        assert_eq!(json["target"]["value"], "1024");
+    }
+
+    #[test]
+    fn window_target_value_passes_existing_numeric_validation() {
+        let store = WindowSnapshotStore::new();
+        let token = store.publish(vec![entry()])[0].0.clone();
+        let target = ActionTarget::new(TargetKind::Window, &token);
+        assert_eq!(target.validate().unwrap(), TargetKind::Window);
+    }
+
+    // --- resolve ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_returns_the_handle_for_a_live_token() {
+        let store = Arc::new(WindowSnapshotStore::new());
+        let token = store.publish(vec![entry()])[0].0.clone();
+        let response = resolve_window(
+            &ActionTarget::new(TargetKind::Window, &token),
+            &store,
+            &AlwaysLive(live_window()),
+        );
+        match response {
+            Response::WindowHandle { handle, pid, .. } => {
+                assert_eq!(handle, 0x900);
+                assert_eq!(pid, 77);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_closed_window_as_conflict() {
+        let store = Arc::new(WindowSnapshotStore::new());
+        let token = store.publish(vec![entry()])[0].0.clone();
+        let response = resolve_window(
+            &ActionTarget::new(TargetKind::Window, &token),
+            &store,
+            &AlwaysGone,
+        );
+        assert!(matches!(
+            response,
+            Response::Error {
+                category: Some(crate::shell::ShellErrorKind::Conflict),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_a_non_window_target() {
+        let store = Arc::new(WindowSnapshotStore::new());
+        let response = resolve_window(
+            &ActionTarget::new(TargetKind::File, r"C:\a.txt"),
+            &store,
+            &AlwaysLive(live_window()),
+        );
+        assert!(matches!(
+            response,
+            Response::Error {
+                category: Some(crate::shell::ShellErrorKind::TargetInvalid),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn window_targets_never_reach_the_shell_executor() {
+        // Activation is a foreground-rule-bound Win32 call, not a Shell verb. The shell
+        // path must keep refusing window targets outright.
+        let target = ActionTarget::new(TargetKind::Window, "1024");
+        assert_eq!(target.validate().unwrap(), TargetKind::Window);
+        assert!(crate::actions::list_actions(&target).is_err());
+    }
+
+    // --- record -------------------------------------------------------------------
+
+    #[test]
+    fn record_writes_history_under_an_app_plus_title_key() {
+        let store = Arc::new(WindowSnapshotStore::new());
+        let history = history_store("record");
+        let token = store.publish(vec![entry()])[0].0.clone();
+        let response = record_window_switch(
+            &ActionTarget::new(TargetKind::Window, &token),
+            &store,
+            &AlwaysLive(live_window()),
+            &history,
+        );
+        assert!(matches!(response, Response::Status { .. }));
+
+        let key = ActionTarget::new(TargetKind::Window, entry().history_key());
+        assert!(history.score(&key) > 0);
+        // The handle must not be what got persisted.
+        let by_handle = ActionTarget::new(TargetKind::Window, "2304");
+        assert_eq!(history.score(&by_handle), 0);
+    }
+
+    #[test]
+    fn record_for_a_dead_window_does_not_write_success_history() {
+        let store = Arc::new(WindowSnapshotStore::new());
+        let history = history_store("dead");
+        let token = store.publish(vec![entry()])[0].0.clone();
+        let response = record_window_switch(
+            &ActionTarget::new(TargetKind::Window, &token),
+            &store,
+            &AlwaysGone,
+            &history,
+        );
+        assert!(matches!(response, Response::Error { .. }));
+        let key = ActionTarget::new(TargetKind::Window, entry().history_key());
+        assert_eq!(history.score(&key), 0);
+    }
+
+    #[test]
+    fn record_for_a_stale_token_does_not_write_success_history() {
+        let store = Arc::new(WindowSnapshotStore::new());
+        let history = history_store("stale");
+        let stale = store.publish(vec![entry()])[0].0.clone();
+        store.publish(vec![entry()]);
+        let response = record_window_switch(
+            &ActionTarget::new(TargetKind::Window, &stale),
+            &store,
+            &AlwaysLive(live_window()),
+            &history,
+        );
+        assert!(matches!(response, Response::Error { .. }));
+        let key = ActionTarget::new(TargetKind::Window, entry().history_key());
+        assert_eq!(history.score(&key), 0);
+    }
+
+    // --- ranking ------------------------------------------------------------------
+
+    #[test]
+    fn literal_title_match_beats_pinyin_match() {
+        let (literal, _) = rank_window(&entry(), "报告", true, 0).expect("title hit");
+        let (pinyin, _) = rank_window(&entry(), "bg", true, 0).expect("pinyin hit");
+        assert_eq!(literal.kind, MatchKind::Literal);
+        assert!(literal < pinyin);
+    }
+
+    #[test]
+    fn app_name_match_is_found_when_the_title_does_not_match() {
+        let (metadata, spans) = rank_window(&entry(), "winword", true, 0).expect("app hit");
+        assert_eq!(metadata.kind, MatchKind::Literal);
+        // Hit is on the subtitle, so the title carries no highlight.
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn chinese_title_highlight_uses_utf16_offsets() {
+        let (_, spans) = rank_window(&entry(), "报告", true, 0).expect("title hit");
+        assert_eq!(spans, vec![0, 2]);
+    }
+
+    #[test]
+    fn history_breaks_ties_within_the_same_match_tier() {
+        let (cold, _) = rank_window(&entry(), "报告", true, 0).unwrap();
+        let (warm, _) = rank_window(&entry(), "报告", true, 9).unwrap();
+        assert!(warm < cold, "more-used window must rank first");
+    }
+
+    #[test]
+    fn pinyin_disabled_drops_pinyin_only_hits() {
+        assert!(rank_window(&entry(), "bg", false, 0).is_none());
+        assert!(rank_window(&entry(), "报告", false, 0).is_some());
+    }
+
+    #[test]
+    fn a_window_matching_nothing_is_not_a_candidate() {
+        assert!(rank_window(&entry(), "zzzz", true, 0).is_none());
+    }
+
+    #[test]
+    fn window_search_response_does_not_claim_indexing() {
+        // Window availability is unrelated to index readiness; showing "indexing" here
+        // would be a lie the UI acts on.
+        let history = history_store("shell");
+        let response = window_results("", Vec::new(), &history);
+        match response {
+            Response::Results {
+                is_indexing,
+                index_generation,
+                ..
+            } => {
+                assert!(!is_indexing);
+                assert_eq!(index_generation, None);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1411,6 +1974,7 @@ mod protocol_tests {
             &shell,
             &history,
             &preferences,
+            &Arc::new(crate::window_list::WindowSnapshotStore::new()),
         )
         .await;
         assert!(matches!(
