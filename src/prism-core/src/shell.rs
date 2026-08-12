@@ -275,15 +275,28 @@ fn execute_run_action(target: ActionTarget, action: String) -> Result<ShellOutco
                 .map(|()| ShellOutcome::Success)
                 .map_err(|message| ShellError::new(classify_message(&message), message))
         }
-        // mutation 动作：第二批接入。
-        ActionId::Rename
-        | ActionId::CopyTo
-        | ActionId::MoveTo
-        | ActionId::Recycle
-        | ActionId::DeletePermanent
-        | ActionId::Zip => Err(ShellError::new(
+        // mutation 动作：IFileOperation 在 STA worker 上执行。
+        ActionId::Recycle => crate::file_ops::recycle(&target),
+        ActionId::DeletePermanent => crate::file_ops::delete_permanent(&target),
+        ActionId::Rename => {
+            // Rename 需要 new_name 参数，当前 IPC 协议未携带。
+            // 第二批 DestinationPicker/RenameEditor 接入时补充。
+            Err(ShellError::new(
+                ShellErrorKind::Unsupported,
+                "rename requires a new_name parameter not yet on the wire",
+            ))
+        }
+        ActionId::CopyTo | ActionId::MoveTo => {
+            // CopyTo/MoveTo 需要 destination 参数，当前 IPC 协议未携带。
+            // 第二批 DestinationPicker 接入时补充。
+            Err(ShellError::new(
+                ShellErrorKind::Unsupported,
+                "copy_to/move_to require a destination parameter not yet on the wire",
+            ))
+        }
+        ActionId::Zip => Err(ShellError::new(
             ShellErrorKind::Unsupported,
-            format!("{} is not yet implemented", id.as_str()),
+            "zip is not yet implemented",
         )),
     }
 }
@@ -629,18 +642,40 @@ mod tests {
     #[test]
     fn run_action_mutation_actions_return_unsupported() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        for action in ["rename", "copy_to", "move_to", "recycle", "delete_permanent", "zip"] {
+        // rename/copy_to/move_to need parameters not yet on the wire;
+        // zip is not yet implemented.
+        for action in ["rename", "copy_to", "move_to", "zip"] {
             let err = execute_run_action(target.clone(), action.into()).unwrap_err();
             assert_eq!(
                 err.kind,
                 ShellErrorKind::Unsupported,
                 "{action} should be unsupported"
             );
-            assert!(
-                err.message.contains("not yet implemented"),
-                "{action} message: {}",
-                err.message
-            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_action_recycle_succeeds_on_sta_worker() {
+        let temp = std::env::temp_dir().join(format!(
+            "prism-g6-shell-recycle-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&temp, "test").unwrap();
+        let worker = ShellExecutor::start().unwrap();
+        let target = ActionTarget::new(TargetKind::File, temp.to_str().unwrap());
+        let result = worker
+            .execute(ShellOperation::RunAction {
+                target,
+                action: "recycle".into(),
+            })
+            .await;
+        match result {
+            Ok(ShellOutcome::Success) | Ok(ShellOutcome::Cancelled) => {}
+            Err(e) => panic!("recycle via STA worker failed unexpectedly: {e:?}"),
         }
     }
 
