@@ -3,7 +3,7 @@
   "name": "prism-g6-built-in-actions",
   "title": "G6 完整内置动作",
   "description": "实现安全的单项文件、文件夹与应用内置动作。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
