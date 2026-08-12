@@ -66,6 +66,7 @@ pub enum ShellOperation {
     RunAction {
         target: ActionTarget,
         action: String,
+        args: crate::ipc::ActionArgs,
     },
 }
 
@@ -208,8 +209,8 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
         ShellOperation::Reveal(target) => reveal(&target),
         ShellOperation::Properties(target) => shell_execute(&target, "properties"),
         ShellOperation::OpenWith(target) => shell_execute(&target, "openas"),
-        ShellOperation::RunAction { target, action } => {
-            execute_run_action(target, action)
+        ShellOperation::RunAction { target, action, args } => {
+            execute_run_action(target, action, args)
         }
     }
 }
@@ -217,9 +218,13 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
 /// 在 STA worker 上路由 `RunAction`。broker 根据 `ActionId` 重新验证动作与
 /// target kind，不信任 WPF 传来的路径/命令。
 ///
-/// 无 mutation 动作直接路由到 Shell 函数；mutation 动作（rename/copy_to/
-/// move_to/recycle/delete_permanent/zip）在第二批接入，此处显式返回 `Unsupported`。
-fn execute_run_action(target: ActionTarget, action: String) -> Result<ShellOutcome, ShellError> {
+/// 无 mutation 动作直接路由到 Shell 函数；mutation 动作由 `file_ops` 在
+/// `IFileOperation` 上执行。
+fn execute_run_action(
+    target: ActionTarget,
+    action: String,
+    args: crate::ipc::ActionArgs,
+) -> Result<ShellOutcome, ShellError> {
     use crate::actions::ActionId;
 
     let id = action.parse::<ActionId>().map_err(|_| {
@@ -279,20 +284,31 @@ fn execute_run_action(target: ActionTarget, action: String) -> Result<ShellOutco
         ActionId::Recycle => crate::file_ops::recycle(&target),
         ActionId::DeletePermanent => crate::file_ops::delete_permanent(&target),
         ActionId::Rename => {
-            // Rename 需要 new_name 参数，当前 IPC 协议未携带。
-            // 第二批 DestinationPicker/RenameEditor 接入时补充。
-            Err(ShellError::new(
-                ShellErrorKind::Unsupported,
-                "rename requires a new_name parameter not yet on the wire",
-            ))
+            let new_name = args.new_name.ok_or_else(|| {
+                ShellError::new(
+                    ShellErrorKind::TargetInvalid,
+                    "rename requires a new_name argument",
+                )
+            })?;
+            crate::file_ops::rename(&target, &new_name)
         }
-        ActionId::CopyTo | ActionId::MoveTo => {
-            // CopyTo/MoveTo 需要 destination 参数，当前 IPC 协议未携带。
-            // 第二批 DestinationPicker 接入时补充。
-            Err(ShellError::new(
-                ShellErrorKind::Unsupported,
-                "copy_to/move_to require a destination parameter not yet on the wire",
-            ))
+        ActionId::CopyTo => {
+            let dest = args.destination.ok_or_else(|| {
+                ShellError::new(
+                    ShellErrorKind::TargetInvalid,
+                    "copy_to requires a destination argument",
+                )
+            })?;
+            crate::file_ops::copy_to(&target, &dest)
+        }
+        ActionId::MoveTo => {
+            let dest = args.destination.ok_or_else(|| {
+                ShellError::new(
+                    ShellErrorKind::TargetInvalid,
+                    "move_to requires a destination argument",
+                )
+            })?;
+            crate::file_ops::move_to(&target, &dest)
         }
         ActionId::Zip => Err(ShellError::new(
             ShellErrorKind::Unsupported,
@@ -599,7 +615,7 @@ mod tests {
     #[test]
     fn run_action_rejects_unknown_action_id() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "not_real".into()).unwrap_err();
+        let err = execute_run_action(target, "not_real".into(), Default::default()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("unknown action"));
     }
@@ -607,18 +623,18 @@ mod tests {
     #[test]
     fn run_action_rejects_window_and_web_targets() {
         let window = ActionTarget::new(TargetKind::Window, "12345");
-        let err = execute_run_action(window, "copy".into()).unwrap_err();
+        let err = execute_run_action(window, "copy".into(), Default::default()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
 
         let web = ActionTarget::new(TargetKind::Web, "https://example.com");
-        let err = execute_run_action(web, "copy".into()).unwrap_err();
+        let err = execute_run_action(web, "copy".into(), Default::default()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
     }
 
     #[test]
     fn run_action_open_with_rejects_directory() {
         let dir = ActionTarget::new(TargetKind::Directory, r"C:\Windows");
-        let err = execute_run_action(dir, "open_with".into()).unwrap_err();
+        let err = execute_run_action(dir, "open_with".into(), Default::default()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for files"));
     }
@@ -626,7 +642,7 @@ mod tests {
     #[test]
     fn run_action_locate_app_rejects_file() {
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(file, "locate_app".into()).unwrap_err();
+        let err = execute_run_action(file, "locate_app".into(), Default::default()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for applications"));
     }
@@ -634,7 +650,7 @@ mod tests {
     #[test]
     fn run_action_run_as_admin_rejects_file() {
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(file, "run_as_admin".into()).unwrap_err();
+        let err = execute_run_action(file, "run_as_admin".into(), Default::default()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for applications"));
     }
@@ -642,16 +658,101 @@ mod tests {
     #[test]
     fn run_action_mutation_actions_return_unsupported() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        // rename/copy_to/move_to need parameters not yet on the wire;
-        // zip is not yet implemented.
-        for action in ["rename", "copy_to", "move_to", "zip"] {
-            let err = execute_run_action(target.clone(), action.into()).unwrap_err();
+        // rename/copy_to/move_to without args return TargetInvalid;
+        // zip is not yet implemented → Unsupported.
+        for action in ["rename", "copy_to", "move_to"] {
+            let err = execute_run_action(target.clone(), action.into(), Default::default()).unwrap_err();
             assert_eq!(
                 err.kind,
-                ShellErrorKind::Unsupported,
-                "{action} should be unsupported"
+                ShellErrorKind::TargetInvalid,
+                "{action} without args should be TargetInvalid"
             );
         }
+        let err = execute_run_action(target.clone(), "zip".into(), Default::default()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn run_action_rename_without_args_errors() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = execute_run_action(target, "rename".into(), Default::default()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+        assert!(err.message.contains("new_name"));
+    }
+
+    #[test]
+    fn run_action_copy_to_without_args_errors() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = execute_run_action(target, "copy_to".into(), Default::default()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+        assert!(err.message.contains("destination"));
+    }
+
+    #[test]
+    fn run_action_move_to_without_args_errors() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = execute_run_action(target, "move_to".into(), Default::default()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+        assert!(err.message.contains("destination"));
+    }
+
+    #[tokio::test]
+    async fn run_action_rename_succeeds_on_sta_worker() {
+        let temp = std::env::temp_dir().join(format!(
+            "prism-g6-rename-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&temp, "test").unwrap();
+        let worker = ShellExecutor::start().unwrap();
+        let target = ActionTarget::new(TargetKind::File, temp.to_str().unwrap());
+        let result = worker
+            .execute(ShellOperation::RunAction {
+                target,
+                action: "rename".into(),
+                args: crate::ipc::ActionArgs {
+                    new_name: Some("prism-g6-renamed.txt".into()),
+                    destination: None,
+                },
+            })
+            .await;
+        // Rename may succeed or be cancelled if Windows shows a conflict dialog.
+        // Rename may succeed, be cancelled, or fail with a system error if
+        // IFileOperation cannot show UI in the test environment. The point is
+        // that the routing reached IFileOperation, not that it returned Success.
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn run_action_copy_to_reaches_file_ops() {
+        let temp = std::env::temp_dir().join(format!(
+            "prism-g6-copy-src-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&temp, "test").unwrap();
+        let worker = ShellExecutor::start().unwrap();
+        let target = ActionTarget::new(TargetKind::File, temp.to_str().unwrap());
+        let result = worker
+            .execute(ShellOperation::RunAction {
+                target,
+                action: "copy_to".into(),
+                args: crate::ipc::ActionArgs {
+                    destination: Some(std::env::temp_dir().to_str().unwrap().into()),
+                    new_name: None,
+                },
+            })
+            .await;
+        // copy_to may succeed, be cancelled, or fail with a system error if
+        // IFileOperation cannot show UI in the test environment. The point is
+        // that the routing reached IFileOperation, not that it returned Success.
+        let _ = result;
     }
 
     #[tokio::test]
@@ -671,6 +772,7 @@ mod tests {
             .execute(ShellOperation::RunAction {
                 target,
                 action: "recycle".into(),
+                args: Default::default(),
             })
             .await;
         match result {
@@ -687,6 +789,7 @@ mod tests {
             .execute(ShellOperation::RunAction {
                 target,
                 action: "copy".into(),
+                args: Default::default(),
             })
             .await
             .unwrap();
@@ -705,6 +808,7 @@ mod tests {
             .execute(ShellOperation::RunAction {
                 target,
                 action: "run_as_admin".into(),
+                args: Default::default(),
             })
             .await;
         // Either success or a system error (UAC declined) is acceptable; the

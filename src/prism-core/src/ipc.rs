@@ -105,6 +105,9 @@ pub enum Request {
         #[serde(default)]
         target: Option<ActionTarget>,
         action: String,
+        /// 动作参数：copy_to/move_to 携带 destination，rename 携带 new_name。
+        #[serde(default)]
+        args: Option<ActionArgs>,
     },
     /// 设置页保存后热重载网页引擎列表（步骤 8）。
     ReloadEngines {
@@ -274,6 +277,16 @@ pub struct ActionItem {
     pub has_submenu: bool,
     pub is_section_header: bool,
 }
+
+/// 动作参数：copy_to/move_to 携带 destination，rename 携带 new_name。
+/// 所有字段可选，由具体动作决定哪些是必填。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_name: Option<String>,
+}
 /// 管道服务主循环：创建管道实例 → 等待前端连接 → 交给连接处理器 →
 /// 立刻建下一个实例等待重连。前端崩溃/重启不影响后端。
 pub async fn serve(
@@ -430,12 +443,13 @@ async fn dispatch_non_search(
         Request::Actions { id, target } => {
             list_actions(resolve_target(target, id, Some(TargetKind::File)))
         }
-        Request::RunAction { id, target, action } => {
+        Request::RunAction { id, target, action, args } => {
             run_shell(
                 shell,
                 ShellOperation::RunAction {
                     target: resolve_target(target, id, Some(TargetKind::File)),
                     action,
+                    args: args.unwrap_or_default(),
                 },
                 history,
             )

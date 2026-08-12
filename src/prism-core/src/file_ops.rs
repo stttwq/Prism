@@ -111,9 +111,7 @@ pub(crate) fn delete_permanent(target: &ActionTarget) -> Result<ShellOutcome, Sh
 /// 复制到目标目录。
 ///
 /// `destination` 必须是已存在的目录。冲突由 Windows 标准 UI 处理。
-/// 第二批 DestinationPicker 接入后由 `execute_run_action` 调用。
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn copy_to(target: &ActionTarget, destination: &str) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_NOCONFIRMMKDIR};
 
@@ -137,9 +135,7 @@ pub(crate) fn copy_to(target: &ActionTarget, destination: &str) -> Result<ShellO
 /// 移动到目标目录。
 ///
 /// `destination` 必须是已存在的目录。冲突由 Windows 标准 UI 处理。
-/// 第二批 DestinationPicker 接入后由 `execute_run_action` 调用。
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn move_to(target: &ActionTarget, destination: &str) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_NOCONFIRMMKDIR};
 
@@ -159,9 +155,7 @@ pub(crate) fn move_to(target: &ActionTarget, destination: &str) -> Result<ShellO
 }
 
 /// 重命名：只传新 leaf name，broker 拒绝路径分隔符、空名和超限。
-/// 第二批 RenameEditor 接入后由 `execute_run_action` 调用。
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn rename(target: &ActionTarget, new_name: &str) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::FILEOPERATION_FLAGS;
 
@@ -187,6 +181,20 @@ pub(crate) fn rename(target: &ActionTarget, new_name: &str) -> Result<ShellOutco
             ShellErrorKind::TargetInvalid,
             "新文件名过长",
         ));
+    }
+
+    // 检查新文件名是否与当前 leaf name 相同（不区分大小写）。
+    // IFileOperation 在源=目标时返回 E_INVALIDARG (0x80070057)，提前拦截给出可读错误。
+    if let Some(current_leaf) = std::path::Path::new(&target.value)
+        .file_name()
+        .and_then(|n| n.to_str())
+    {
+        if current_leaf.eq_ignore_ascii_case(trimmed) {
+            return Err(ShellError::new(
+                ShellErrorKind::TargetInvalid,
+                "新文件名与当前文件名相同",
+            ));
+        }
     }
 
     let src_item = shell_item_from_path(&target.value)?;
@@ -307,6 +315,20 @@ mod tests {
         let win = ActionTarget::new(TargetKind::Window, "12345");
         let err = validate_file_target(&win).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_rejects_same_name_case_insensitive() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\temp\test.txt");
+        // 完全相同
+        let err = rename(&target, "test.txt").unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+        assert!(err.message.contains("相同"));
+        // 大小写不同但名字相同
+        let err = rename(&target, "TEST.TXT").unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+        assert!(err.message.contains("相同"));
     }
 
     #[cfg(windows)]
