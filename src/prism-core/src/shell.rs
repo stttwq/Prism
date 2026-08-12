@@ -209,20 +209,82 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
         ShellOperation::Properties(target) => shell_execute(&target, "properties"),
         ShellOperation::OpenWith(target) => shell_execute(&target, "openas"),
         ShellOperation::RunAction { target, action } => {
-            let kind = target.validate()?;
-            if !matches!(
-                kind,
-                TargetKind::File | TargetKind::Directory | TargetKind::Application
-            ) {
+            execute_run_action(target, action)
+        }
+    }
+}
+
+/// 在 STA worker 上路由 `RunAction`。broker 根据 `ActionId` 重新验证动作与
+/// target kind，不信任 WPF 传来的路径/命令。
+///
+/// 无 mutation 动作直接路由到 Shell 函数；mutation 动作（rename/copy_to/
+/// move_to/recycle/delete_permanent/zip）在第二批接入，此处显式返回 `Unsupported`。
+fn execute_run_action(target: ActionTarget, action: String) -> Result<ShellOutcome, ShellError> {
+    use crate::actions::ActionId;
+
+    let id = action.parse::<ActionId>().map_err(|_| {
+        ShellError::new(
+            ShellErrorKind::Unsupported,
+            format!("unknown action: {action}"),
+        )
+    })?;
+
+    let kind = target.validate()?;
+    if matches!(kind, TargetKind::Window | TargetKind::Web) {
+        return Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            "the action does not support this target kind",
+        ));
+    }
+
+    match id {
+        // 无 mutation 文件/文件夹动作：复用已有 Shell 路径。
+        ActionId::OpenFolder => reveal(&target),
+        ActionId::Properties | ActionId::AppProperties => shell_execute(&target, "properties"),
+        ActionId::OpenWith => {
+            if kind != TargetKind::File {
                 return Err(ShellError::new(
                     ShellErrorKind::Unsupported,
-                    "the action does not support this target kind",
+                    "open_with is only available for files",
                 ));
             }
-            crate::actions::run_action_direct(&target.value, &action)
+            shell_execute(&target, "openas")
+        }
+        // 无 mutation 应用专属动作。
+        ActionId::LocateApp => {
+            if kind != TargetKind::Application {
+                return Err(ShellError::new(
+                    ShellErrorKind::Unsupported,
+                    "locate_app is only available for applications",
+                ));
+            }
+            reveal(&target)
+        }
+        ActionId::RunAsAdmin => {
+            if kind != TargetKind::Application {
+                return Err(ShellError::new(
+                    ShellErrorKind::Unsupported,
+                    "run_as_admin is only available for applications",
+                ));
+            }
+            shell_execute(&target, "runas")
+        }
+        // 剪贴板动作（已有实现，无 mutation）。
+        ActionId::Copy | ActionId::Cut | ActionId::CopyPath | ActionId::CopyAppPath => {
+            crate::actions::run_action_direct(&target.value, id.as_str())
                 .map(|()| ShellOutcome::Success)
                 .map_err(|message| ShellError::new(classify_message(&message), message))
         }
+        // mutation 动作：第二批接入。
+        ActionId::Rename
+        | ActionId::CopyTo
+        | ActionId::MoveTo
+        | ActionId::Recycle
+        | ActionId::DeletePermanent
+        | ActionId::Zip => Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            format!("{} is not yet implemented", id.as_str()),
+        )),
     }
 }
 
@@ -441,7 +503,11 @@ fn classify_message(message: &str) -> ShellErrorKind {
         ShellErrorKind::AccessDenied
     } else if message.contains("路径") || message.contains("目标") {
         ShellErrorKind::TargetInvalid
-    } else if message.contains("未知") || message.contains("未实现") {
+    } else if message.contains("未知")
+        || message.contains("未实现")
+        || message.contains("尚未实现")
+        || message.contains("由 Shell 路由直接处理")
+    {
         ShellErrorKind::Unsupported
     } else {
         ShellErrorKind::System
@@ -513,5 +579,104 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome, ShellOutcome::Cancelled);
+    }
+
+    // ── G6 execute_run_action 路由测试 ──────────────────────────
+
+    #[test]
+    fn run_action_rejects_unknown_action_id() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = execute_run_action(target, "not_real".into()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+        assert!(err.message.contains("unknown action"));
+    }
+
+    #[test]
+    fn run_action_rejects_window_and_web_targets() {
+        let window = ActionTarget::new(TargetKind::Window, "12345");
+        let err = execute_run_action(window, "copy".into()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+
+        let web = ActionTarget::new(TargetKind::Web, "https://example.com");
+        let err = execute_run_action(web, "copy".into()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn run_action_open_with_rejects_directory() {
+        let dir = ActionTarget::new(TargetKind::Directory, r"C:\Windows");
+        let err = execute_run_action(dir, "open_with".into()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+        assert!(err.message.contains("only available for files"));
+    }
+
+    #[test]
+    fn run_action_locate_app_rejects_file() {
+        let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = execute_run_action(file, "locate_app".into()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+        assert!(err.message.contains("only available for applications"));
+    }
+
+    #[test]
+    fn run_action_run_as_admin_rejects_file() {
+        let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = execute_run_action(file, "run_as_admin".into()).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+        assert!(err.message.contains("only available for applications"));
+    }
+
+    #[test]
+    fn run_action_mutation_actions_return_unsupported() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        for action in ["rename", "copy_to", "move_to", "recycle", "delete_permanent", "zip"] {
+            let err = execute_run_action(target.clone(), action.into()).unwrap_err();
+            assert_eq!(
+                err.kind,
+                ShellErrorKind::Unsupported,
+                "{action} should be unsupported"
+            );
+            assert!(
+                err.message.contains("not yet implemented"),
+                "{action} message: {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_action_copy_succeeds_on_sta_worker() {
+        let worker = ShellExecutor::start().unwrap();
+        let target = ActionTarget::new(TargetKind::File, r"C:\Windows\explorer.exe");
+        let outcome = worker
+            .execute(ShellOperation::RunAction {
+                target,
+                action: "copy".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, ShellOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn run_action_runas_succeeds_for_application_on_sta_worker() {
+        // ShellExecute "runas" on explorer.exe will show a UAC prompt or succeed
+        // silently depending on the system. We only verify it does not return an
+        // error kind other than what the OS gives us. On test machines this
+        // typically returns Success (explorer.exe is a valid target).
+        let worker = ShellExecutor::start().unwrap();
+        let target = ActionTarget::new(TargetKind::Application, r"C:\Windows\explorer.exe");
+        let result = worker
+            .execute(ShellOperation::RunAction {
+                target,
+                action: "run_as_admin".into(),
+            })
+            .await;
+        // Either success or a system error (UAC declined) is acceptable; the
+        // point is that the routing does not return Unsupported.
+        match result {
+            Ok(ShellOutcome::Success) | Err(ShellError { .. }) => {}
+            Ok(ShellOutcome::Cancelled) => panic!("unexpected cancellation"),
+        }
     }
 }

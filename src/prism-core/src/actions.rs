@@ -1,66 +1,264 @@
-//! 动作面板：基础动作（打开所在文件夹 / 复制 / 剪切 / 复制路径）。
-//! 系统右键菜单（IContextMenu / shell:n）第一版不做，留给后续。
+//! 动作面板：文件/文件夹/应用目标的结构化动作 allowlist。
+//!
+//! 动作 id 是稳定封闭枚举，由 `ActionId` 定义。broker 根据 target kind 重新验证
+//! action 与参数，不信任 WPF 传来的路径/命令。所有目标在执行前重新解析存在性
+//! 和类型。`ActionId` 的变体即协议上限——前端不能发明新 id。
 //!
 //! 消息合同见 frontend-spec.md §6 流程 D、§7。
 
 use crate::ipc::ActionItem;
 use crate::shell::{ActionTarget, ShellError, ShellErrorKind, TargetKind};
+use std::str::FromStr;
 
-/// 返回某路径的基础动作列表（file/folder 通用）。
+/// 稳定封闭的动作 id 枚举。序列化/反序列化走小写 `snake_case`。
+///
+/// 协议上限：前端只能传这些 id。未知 id 在 `ActionId::from_str` 里被拒，
+/// 不进入 `run_action_direct`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActionId {
+    // ── 文件/文件夹通用 ──────────────────────────────────────────
+    /// 打开所在文件夹并选中（explorer /select）。
+    OpenFolder,
+    /// 复制到剪贴板（CF_HDROP + DROPEFFECT_COPY）。
+    Copy,
+    /// 剪切到剪贴板（CF_HDROP + DROPEFFECT_MOVE）。
+    Cut,
+    /// 复制路径文本到剪贴板（CF_UNICODETEXT）。
+    CopyPath,
+    /// 系统属性页（ShellExecute "properties"）。
+    Properties,
+    /// 系统打开方式对话框（ShellExecute "openas"）。仅文件。
+    OpenWith,
+    /// 重命名（WPF 内联编辑 → leaf 验证 → Shell worker 执行）。
+    Rename,
+    /// 复制到…（显式子流程：DestinationPicker → IFileOperation）。
+    CopyTo,
+    /// 移动到…（显式子流程：DestinationPicker → IFileOperation）。
+    MoveTo,
+    /// 移入回收站（IFileOperation，可恢复）。
+    Recycle,
+    /// 永久删除（IFileOperation，强制不可关闭的系统确认）。
+    DeletePermanent,
+    /// 压缩为 ZIP（7-Zip 优先，Windows 11 内置回退）。
+    Zip,
+
+    // ── 应用专属 ────────────────────────────────────────────────
+    /// 定位真实可执行程序所在文件夹。
+    LocateApp,
+    /// 复制真实可执行程序路径到剪贴板。
+    CopyAppPath,
+    /// 查看真实可执行程序属性。
+    AppProperties,
+    /// 以管理员身份运行真实可执行程序（ShellExecute "runas"）。
+    RunAsAdmin,
+}
+
+/// 解析动作 id 字符串失败时的错误。未知 id 返回此错误，
+/// 由调用方映射为 `ShellErrorKind::Unsupported`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownActionError;
+
+impl std::fmt::Display for UnknownActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown action id")
+    }
+}
+
+impl std::error::Error for UnknownActionError {}
+
+impl FromStr for ActionId {
+    type Err = UnknownActionError;
+
+    fn from_str(id: &str) -> Result<Self, Self::Err> {
+        match id {
+            "open_folder" => Ok(Self::OpenFolder),
+            "copy" => Ok(Self::Copy),
+            "cut" => Ok(Self::Cut),
+            "copy_path" => Ok(Self::CopyPath),
+            "properties" => Ok(Self::Properties),
+            "open_with" => Ok(Self::OpenWith),
+            "rename" => Ok(Self::Rename),
+            "copy_to" => Ok(Self::CopyTo),
+            "move_to" => Ok(Self::MoveTo),
+            "recycle" => Ok(Self::Recycle),
+            "delete_permanent" => Ok(Self::DeletePermanent),
+            "zip" => Ok(Self::Zip),
+            "locate_app" => Ok(Self::LocateApp),
+            "copy_app_path" => Ok(Self::CopyAppPath),
+            "app_properties" => Ok(Self::AppProperties),
+            "run_as_admin" => Ok(Self::RunAsAdmin),
+            _ => Err(UnknownActionError),
+        }
+    }
+}
+
+impl ActionId {
+    /// 序列化用的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenFolder => "open_folder",
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+            Self::CopyPath => "copy_path",
+            Self::Properties => "properties",
+            Self::OpenWith => "open_with",
+            Self::Rename => "rename",
+            Self::CopyTo => "copy_to",
+            Self::MoveTo => "move_to",
+            Self::Recycle => "recycle",
+            Self::DeletePermanent => "delete_permanent",
+            Self::Zip => "zip",
+            Self::LocateApp => "locate_app",
+            Self::CopyAppPath => "copy_app_path",
+            Self::AppProperties => "app_properties",
+            Self::RunAsAdmin => "run_as_admin",
+        }
+    }
+
+    /// Segoe Fluent Icons 字形码。无图标返回空字符串。
+    fn icon_glyph(self) -> &'static str {
+        match self {
+            Self::OpenFolder => "\u{E8DA}",   // OpenFolderHorizontal
+            Self::Copy | Self::CopyPath | Self::CopyAppPath | Self::CopyTo => "\u{E8C8}", // Copy
+            Self::Cut | Self::MoveTo => "\u{E8C6}", // Cut
+            Self::Properties | Self::AppProperties => "\u{E946}", // Page / Properties
+            Self::OpenWith => "\u{E7B7}",     // OpenWith
+            Self::Rename => "\u{E8AC}",       // Rename
+            Self::Recycle => "\u{E74D}",      // Delete (recycle)
+            Self::DeletePermanent => "\u{E74D}", // Delete (permanent)
+            Self::Zip => "\u{E7F8}",          // ZipFolder
+            Self::LocateApp => "\u{E8DA}",    // OpenFolderHorizontal
+            Self::RunAsAdmin => "\u{E7EF}",   // Shield / Admin
+        }
+    }
+
+    /// 动作的人类可读标签。
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenFolder => "打开所在文件夹",
+            Self::Copy => "复制",
+            Self::Cut => "剪切",
+            Self::CopyPath => "复制路径至剪贴板",
+            Self::Properties => "属性",
+            Self::OpenWith => "打开方式",
+            Self::Rename => "重命名",
+            Self::CopyTo => "复制到…",
+            Self::MoveTo => "移动到…",
+            Self::Recycle => "移入回收站",
+            Self::DeletePermanent => "永久删除",
+            Self::Zip => "压缩为 ZIP",
+            Self::LocateApp => "打开所在文件夹",
+            Self::CopyAppPath => "复制路径至剪贴板",
+            Self::AppProperties => "属性",
+            Self::RunAsAdmin => "以管理员身份运行",
+        }
+    }
+
+    /// 该动作是否需要 mutation 子流程（DestinationPicker / RenameEditor / 进度等）。
+    /// mutation 动作在第一批尚未接入 Shell worker，由 `run_action_direct` 显式拒绝。
+    #[allow(dead_code)]
+    fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::Rename | Self::CopyTo | Self::MoveTo | Self::Recycle | Self::DeletePermanent | Self::Zip
+        )
+    }
+}
+
+/// 返回某 target kind 允许的动作列表。顺序即面板显示顺序。
+///
+/// broker 在此处重新验证 target kind，不信任 WPF 传来的路径/命令。
+/// Unknown/Window/Web target 不执行文件动作副作用。
 pub fn list_actions(target: &ActionTarget) -> Result<Vec<ActionItem>, ShellError> {
     let kind = target.validate()?;
-    if !matches!(
-        kind,
-        TargetKind::File | TargetKind::Directory | TargetKind::Application
-    ) {
+    let allowed = allowed_actions(kind);
+    if allowed.is_empty() {
         return Err(ShellError::new(
             ShellErrorKind::Unsupported,
             "该目标不支持文件动作",
         ));
     }
-    Ok(vec![
-        ActionItem {
-            id: "open_folder".into(),
-            label: "打开所在文件夹".into(),
-            icon_glyph: "\u{E8DA}".into(), // OpenFolderHorizontal
-            has_submenu: false,
-            is_section_header: false,
-        },
-        ActionItem {
-            id: "copy".into(),
-            label: "复制".into(),
-            icon_glyph: "\u{E8C8}".into(), // Copy
-            has_submenu: false,
-            is_section_header: false,
-        },
-        ActionItem {
-            id: "cut".into(),
-            label: "剪切".into(),
-            icon_glyph: "\u{E8C6}".into(), // Cut
-            has_submenu: false,
-            is_section_header: false,
-        },
-        ActionItem {
-            id: "copy_path".into(),
-            label: "复制路径至剪贴板".into(),
-            icon_glyph: "\u{E8C8}".into(),
-            has_submenu: false,
-            is_section_header: false,
-        },
-        // 系统右键菜单（IContextMenu / shell:n）后续版本再挂"快捷菜单"节。
-    ])
+    Ok(allowed.into_iter().map(action_item).collect())
 }
 
-/// 执行动作。`action` 为 list_actions 返回的 id。
+/// target kind → 允许的 action id 列表。这是协议上限的 allowlist。
+fn allowed_actions(kind: TargetKind) -> Vec<ActionId> {
+    match kind {
+        TargetKind::File => vec![
+            ActionId::OpenFolder,
+            ActionId::Copy,
+            ActionId::Cut,
+            ActionId::CopyPath,
+            ActionId::Properties,
+            ActionId::OpenWith,
+            ActionId::Rename,
+            ActionId::CopyTo,
+            ActionId::MoveTo,
+            ActionId::Recycle,
+            ActionId::DeletePermanent,
+            ActionId::Zip,
+        ],
+        TargetKind::Directory => vec![
+            ActionId::OpenFolder,
+            ActionId::Copy,
+            ActionId::Cut,
+            ActionId::CopyPath,
+            ActionId::Properties,
+            ActionId::Rename,
+            ActionId::CopyTo,
+            ActionId::MoveTo,
+            ActionId::Recycle,
+            ActionId::DeletePermanent,
+            ActionId::Zip,
+        ],
+        TargetKind::Application => vec![
+            ActionId::OpenFolder,
+            ActionId::CopyAppPath,
+            ActionId::AppProperties,
+            ActionId::RunAsAdmin,
+        ],
+        // Window / Web 不进入文件动作面板
+        TargetKind::Window | TargetKind::Web => Vec::new(),
+    }
+}
+
+fn action_item(id: ActionId) -> ActionItem {
+    ActionItem {
+        id: id.as_str().into(),
+        label: id.label().into(),
+        icon_glyph: id.icon_glyph().into(),
+        has_submenu: false,
+        is_section_header: false,
+    }
+}
+
+/// 执行动作。`action` 为 `list_actions` 返回的 id 字符串。
+///
+/// broker 在此处重新解析 `ActionId`，未知 id 被拒。mutation 动作在第一批
+/// 尚未接入 Shell worker，显式返回 `Unsupported`。
 pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), String> {
+    let id = action.parse::<ActionId>().map_err(|_| format!("未知动作：{action}"))?;
     validate_path(path)?;
-    match action {
-        "open_folder" => reveal_in_explorer(path),
-        "copy" => clipboard_set_files(path, preferred_drop_effect_copy()),
-        "cut" => clipboard_set_files(path, preferred_drop_effect_move()),
-        "copy_path" => clipboard_set_text(path),
-        other if other.starts_with("shell:") => Err("系统右键菜单尚未实现".into()),
-        other => Err(format!("未知动作：{other}")),
+    match id {
+        ActionId::OpenFolder => reveal_in_explorer(path),
+        ActionId::Copy => clipboard_set_files(path, preferred_drop_effect_copy()),
+        ActionId::Cut => clipboard_set_files(path, preferred_drop_effect_move()),
+        ActionId::CopyPath => clipboard_set_text(path),
+        ActionId::CopyAppPath => clipboard_set_text(path),
+        // 第一批：mutation 动作和无 mutation 的 Properties/OpenWith/LocateApp/AppProperties/RunAsAdmin
+        // 由 ShellOperation 直接路由（Properties/OpenWith）或留待第二批接入。
+        // 这里只处理直接可执行的无 mutation 动作。
+        ActionId::Properties
+        | ActionId::OpenWith
+        | ActionId::LocateApp
+        | ActionId::AppProperties
+        | ActionId::RunAsAdmin => Err(format!("{action} 由 Shell 路由直接处理，不应进入 run_action_direct")),
+        ActionId::Rename
+        | ActionId::CopyTo
+        | ActionId::MoveTo
+        | ActionId::Recycle
+        | ActionId::DeletePermanent
+        | ActionId::Zip => Err(format!("{action} 尚未实现（mutation 动作第二批接入）")),
     }
 }
 
@@ -295,13 +493,117 @@ mod tests {
         assert!(ids.contains(&"copy"));
         assert!(ids.contains(&"cut"));
         assert!(ids.contains(&"copy_path"));
-        assert_eq!(items.len(), 4, "第一版仅四条基础动作，无快捷菜单占位");
         assert!(items.iter().all(|a| !a.is_section_header));
+    }
+
+    #[test]
+    fn file_allowlist_includes_all_file_actions() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\Windows\explorer.exe");
+        let items = list_actions(&target).expect("ok");
+        let ids: Vec<_> = items.iter().map(|a| a.id.as_str()).collect();
+        // 文件比文件夹多 OpenWith
+        assert!(ids.contains(&"open_with"));
+        assert!(ids.contains(&"rename"));
+        assert!(ids.contains(&"copy_to"));
+        assert!(ids.contains(&"move_to"));
+        assert!(ids.contains(&"recycle"));
+        assert!(ids.contains(&"delete_permanent"));
+        assert!(ids.contains(&"zip"));
+        assert!(ids.contains(&"properties"));
+    }
+
+    #[test]
+    fn directory_allowlist_excludes_open_with() {
+        let target = ActionTarget::new(TargetKind::Directory, r"C:\Windows");
+        let items = list_actions(&target).expect("ok");
+        let ids: Vec<_> = items.iter().map(|a| a.id.as_str()).collect();
+        assert!(!ids.contains(&"open_with"), "目录不应有打开方式");
+        assert!(ids.contains(&"rename"));
+        assert!(ids.contains(&"zip"));
+    }
+
+    #[test]
+    fn application_allowlist_is_app_only() {
+        let target = ActionTarget::new(TargetKind::Application, r"C:\Windows\explorer.exe");
+        let items = list_actions(&target).expect("ok");
+        let ids: Vec<_> = items.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "open_folder",
+                "copy_app_path",
+                "app_properties",
+                "run_as_admin",
+            ]
+        );
+    }
+
+    #[test]
+    fn window_and_web_have_no_actions() {
+        let window = ActionTarget::new(TargetKind::Window, "12345");
+        assert!(list_actions(&window).is_err());
+        let web = ActionTarget::new(TargetKind::Web, "https://example.com");
+        assert!(list_actions(&web).is_err());
     }
 
     #[test]
     fn run_unknown_action_errors() {
         let err = run_action_direct(r"C:\Windows\explorer.exe", "nope").unwrap_err();
         assert!(err.contains("未知动作"));
+    }
+
+    #[test]
+    fn action_id_roundtrip() {
+        for id in [
+            ActionId::OpenFolder,
+            ActionId::Copy,
+            ActionId::Cut,
+            ActionId::CopyPath,
+            ActionId::Properties,
+            ActionId::OpenWith,
+            ActionId::Rename,
+            ActionId::CopyTo,
+            ActionId::MoveTo,
+            ActionId::Recycle,
+            ActionId::DeletePermanent,
+            ActionId::Zip,
+            ActionId::LocateApp,
+            ActionId::CopyAppPath,
+            ActionId::AppProperties,
+            ActionId::RunAsAdmin,
+        ] {
+            let s = id.as_str();
+            assert_eq!(s.parse::<ActionId>(), Ok(id), "roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn unknown_action_id_rejected() {
+        assert!("not_a_real_action".parse::<ActionId>().is_err());
+        assert!("".parse::<ActionId>().is_err());
+    }
+
+    #[test]
+    fn mutation_actions_are_not_yet_implemented() {
+        let path = r"C:\Windows\explorer.exe";
+        for action in ["rename", "copy_to", "move_to", "recycle", "delete_permanent", "zip"] {
+            let err = run_action_direct(path, action).unwrap_err();
+            assert!(
+                err.contains("尚未实现"),
+                "mutation action {action} should be rejected in batch 1: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn properties_and_open_with_are_routed_not_direct() {
+        let path = r"C:\Windows\explorer.exe";
+        for action in ["properties", "open_with", "locate_app", "app_properties", "run_as_admin"] {
+            let err = run_action_direct(path, action).unwrap_err();
+            assert!(
+                err.contains("Shell 路由直接处理"),
+                "action {action} should be routed via ShellOperation: {err}"
+            );
+        }
     }
 }
