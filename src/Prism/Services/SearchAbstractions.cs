@@ -47,6 +47,7 @@ public interface ISearchClient
     Task RevealAsync(ActionTarget target, CancellationToken ct = default);
     Task<IReadOnlyList<ActionItem>> GetActionsAsync(ActionTarget target, CancellationToken ct = default);
     Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default);
+    Task RunActionAsync(ActionTarget target, string action, ActionArgs args, CancellationToken ct = default);
 
     /// <summary>G5：把枚举 token 换成已复核的句柄，交给前台进程激活。</summary>
     Task<WindowHandleInfo> ResolveWindowAsync(ActionTarget target, CancellationToken ct = default);

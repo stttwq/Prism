@@ -250,9 +250,29 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>执行动作面板中的某一项。</summary>
     public async Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default)
     {
-        await SendAsync(
-            new { type = "run_action", target = TargetPayload(target), action },
-            ct).ConfigureAwait(false);
+        await RunActionAsync(target, action, ActionArgs.Empty, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>执行动作面板中的某一项，携带动作参数（destination/new_name）。</summary>
+    public async Task RunActionAsync(ActionTarget target, string action, ActionArgs args, CancellationToken ct = default)
+    {
+        object payload;
+        if (args is { Destination: null, NewName: null })
+        {
+            payload = new { type = "run_action", target = TargetPayload(target), action };
+        }
+        else
+        {
+            object? argsObj = (args.Destination, args.NewName) switch
+            {
+                (not null, null) => new { destination = args.Destination },
+                (null, not null) => new { new_name = args.NewName },
+                (not null, not null) => new { destination = args.Destination, new_name = args.NewName },
+                _ => null,
+            };
+            payload = new { type = "run_action", target = TargetPayload(target), action, args = argsObj };
+        }
+        await SendAsync(payload, ct).ConfigureAwait(false);
     }
 
     /// <summary>

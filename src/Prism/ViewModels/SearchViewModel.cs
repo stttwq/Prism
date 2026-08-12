@@ -489,6 +489,23 @@ public sealed class SearchViewModel
         if (target.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(target.ExecuteId))
             return;
 
+        // rename 需要内联编辑新文件名，不直接发送 IPC。
+        if (action.Id == "rename")
+        {
+            _state.RenameTarget = target;
+            _state.RenameNewName = System.IO.Path.GetFileName(target.ExecuteId);
+            _state.StatusMessage = "";
+            return;
+        }
+
+        // copy_to/move_to 需要 DestinationPicker 子流程，当前以空 destination
+        // 发送会被 broker 拒绝。此子流程在步骤 5 完整实现，暂时直接返回。
+        if (action.Id is "copy_to" or "move_to")
+        {
+            _state.StatusMessage = action.Id == "copy_to" ? "复制到…（待接入目标选择器）" : "移动到…（待接入目标选择器）";
+            return;
+        }
+
         try
         {
             await _pipe.RunActionAsync(target.ExecutionTarget, action.Id).ConfigureAwait(true);
@@ -498,6 +515,38 @@ public sealed class SearchViewModel
         {
             _state.StatusMessage = "动作失败：" + ShortMsg(ex);
         }
+    }
+
+    /// <summary>提交重命名：将新文件名发送给 broker。</summary>
+    public async Task CommitRenameAsync(string newName)
+    {
+        var target = _state.RenameTarget;
+        if (target is null || string.IsNullOrWhiteSpace(newName)) return;
+
+        try
+        {
+            await _pipe.RunActionAsync(
+                target.ExecutionTarget,
+                "rename",
+                new ActionArgs { NewName = newName.Trim() },
+                CancellationToken.None).ConfigureAwait(true);
+            _state.RenameTarget = null;
+            _state.RenameNewName = null;
+            HideRequested?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            // 保留编辑态，显示错误。
+            _state.StatusMessage = "重命名失败：" + ShortMsg(ex);
+        }
+    }
+
+    /// <summary>取消重命名，清空编辑态。</summary>
+    public void CancelRename()
+    {
+        _state.RenameTarget = null;
+        _state.RenameNewName = null;
+        _state.StatusMessage = "";
     }
 
     private void FilterActions(string filter)

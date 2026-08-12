@@ -36,6 +36,8 @@ public sealed class AppState : INotifyPropertyChanged
     private bool _isBackendConnected;
     private string _statusMessage = "";
     private AppTheme _theme = AppTheme.Light;
+    private SearchResult? _renameTarget;
+    private string? _renameNewName;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -121,6 +123,20 @@ public sealed class AppState : INotifyPropertyChanged
         SelectedActionIndex >= 0 && SelectedActionIndex < Actions.Count
             ? Actions[SelectedActionIndex]
             : null;
+
+    /// <summary>重命名编辑态：正在重命名的目标。非 null 时 UI 显示内联编辑器。</summary>
+    public SearchResult? RenameTarget
+    {
+        get => _renameTarget;
+        set => Set(ref _renameTarget, value);
+    }
+
+    /// <summary>重命名编辑态：预填的新文件名（默认为当前文件名）。</summary>
+    public string? RenameNewName
+    {
+        get => _renameNewName;
+        set => Set(ref _renameNewName, value);
+    }
 
     private void Set<T>(ref T field, T value, [CallerMemberName] string? name = null)
     {

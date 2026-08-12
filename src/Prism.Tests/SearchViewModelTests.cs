@@ -1009,8 +1009,22 @@ public sealed class SearchViewModelTests
             CancellationToken ct = default)
         {
             LastTarget = target;
+            LastActionArgs = null;
             return Task.CompletedTask;
         }
+        public Task RunActionAsync(
+            ActionTarget target,
+            string action,
+            ActionArgs args,
+            CancellationToken ct = default)
+        {
+            LastTarget = target;
+            LastActionArgs = args;
+            return Task.CompletedTask;
+        }
+
+        /// <summary>最后一次带参数调用传入的 args，用于断言 rename new_name 等。</summary>
+        public ActionArgs? LastActionArgs { get; set; }
 
         // --- G5 window mode ---
 
