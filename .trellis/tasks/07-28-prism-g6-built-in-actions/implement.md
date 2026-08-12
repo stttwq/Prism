@@ -5,7 +5,7 @@
 3. [ ] 实现复制/剪切和 `IFileOperation` 的复制到、移动到、回收站、永久删除，强制系统确认。
 4. [ ] 实现 DestinationPicker，按历史目标优先、近期目录补足到 8 条，并支持仅文件夹搜索。
 5. [ ] 实现 RenameEditor、leaf 验证和默认选择主体行为。
-6. [ ] 实现 7-Zip/Windows 11 ZIP adapter、结构化参数、冲突与退出验证。
+6. [ ] 实现 ZIP adapter：设置自定义路径 > 自动探测本机 7-Zip > Windows 内置 Shell 回退，结构化参数、冲突与退出验证。
 7. [ ] 将成功、取消、失败映射到隐藏/保留、历史写入和 generation 等待状态。
 8. [ ] 覆盖全部动作矩阵、危险边界与 Windows 11 机器测试；审计 indexer 无动作入口。
 9. [ ] 运行全套质量门、内存复测并更新 Shell/action/frontend state spec。

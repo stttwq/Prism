@@ -19,7 +19,13 @@ action id 是稳定封闭枚举。broker 根据 target kind 重新验证 action 
 
 ## ZIP Adapter
 
-压缩 adapter 首先探测受支持 7-Zip 可执行文件与版本并结构化传参；不可用时调用 Windows 11 内置 ZIP 路径。输出固定 `.zip`，冲突交给系统确认。外部进程退出码、取消和目标生成分别验证。
+压缩 adapter 按优先级选择压缩程序：
+
+1. **设置自定义路径**：用户在 `settings.json` 的 `ZipProgram` 字段指定压缩程序可执行文件完整路径。若设置且文件存在，优先使用。
+2. **自动探测**：设置未指定时，按已知注册表/安装路径探测本机已安装的 7-Zip（`7z.exe`）。
+3. **Windows 内置回退**：两者都不可用时，使用 Windows Shell COM `CopyHere` 到 `.zip` folder 对象（系统内置，无需第三方依赖）。
+
+无论哪条路径，输出固定 `.zip`，冲突交给系统确认。外部进程退出码、取消和目标生成分别验证。adapter 探测结果缓存，避免每次压缩都查注册表/文件系统。
 
 ## WPF State
 
