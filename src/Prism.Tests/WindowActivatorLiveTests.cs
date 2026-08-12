@@ -157,6 +157,70 @@ public sealed class WindowActivatorLiveTests
         Assert.Equal(result, foreground == target.Handle);
     }
 
+    /// <summary>
+    /// 最小化恢复：`SW_RESTORE` 那条分支在自动化测试里从未真的执行过。
+    ///
+    /// 之前的探针都是挑一个已经正常显示的窗口，`IsIconic` 为假直接跳过 `ShowWindow`。
+    /// 这里主动把目标最小化再切回去，所以 `SW_RESTORE` 第一次真的运行。
+    ///
+    /// 顺带钉住一个隐含前提：`TryActivate` 在 `IsWindowVisible` 检查（先）之后才处理
+    /// `IsIconic`（后）。若最小化的窗口 `IsWindowVisible` 返回假，那条 restore 分支就是
+    /// 永远到不了的死代码、最小化的窗口一律切不过去。断言写在这里，前提变了会转红。
+    /// </summary>
+    [Fact(Skip = "实机探针：会最小化并抢前台。手动去掉 Skip 后运行。")]
+    public void RestoresAMinimizedWindowBeforeActivating()
+    {
+        var target = FindSwitchableWindow(excludeForeground: true);
+        Assert.NotEqual(IntPtr.Zero, target.Handle);
+
+        var before = GetForegroundWindow();
+        ShowWindow(target.Handle, SW_MINIMIZE);
+        // Minimizing is asynchronous enough that reading IsIconic immediately can race.
+        for (var i = 0; i < 50 && !IsIconic(target.Handle); i++) Thread.Sleep(20);
+
+        try
+        {
+            Assert.True(IsIconic(target.Handle), "setup failed: target did not minimize");
+
+            // The premise the SW_RESTORE branch depends on. If this is false the branch is
+            // unreachable, and this probe's green would be meaningless.
+            var visibleWhileMinimized = IsWindowVisible(target.Handle);
+            Console.WriteLine($"IsWindowVisible while minimized = {visibleWhileMinimized}");
+            Assert.True(
+                visibleWhileMinimized,
+                "minimized windows must still be WS_VISIBLE, or TryActivate's visibility "
+                + "check rejects them before SW_RESTORE ever runs");
+
+            // IsMinimized is what the broker reported; pass it as a real caller would.
+            var activator = new Win32WindowActivator();
+            var result = activator.TryActivate(target with { IsMinimized = true });
+            var foreground = GetForegroundWindow();
+            var stillIconic = IsIconic(target.Handle);
+
+            Console.WriteLine($"target   = 0x{target.Handle:X} pid={target.Pid} {target.Title}");
+            Console.WriteLine($"before   = 0x{before:X}");
+            Console.WriteLine($"after    = 0x{foreground:X}");
+            Console.WriteLine($"iconic   = {stillIconic}");
+            Console.WriteLine($"returned = {result}");
+            Console.WriteLine(
+                result
+                    ? "OUTCOME: SW_RESTORE ran and the window really came back to the foreground"
+                    : "OUTCOME: refused and reported false");
+
+            // Same contract as the other probes: the return value must match reality.
+            Assert.Equal(result, foreground == target.Handle);
+
+            // Reporting success while leaving the window minimized would be the specific
+            // failure this probe exists to catch: the user sees nothing happen.
+            if (result) Assert.False(stillIconic, "claimed success but the window is still minimized");
+        }
+        finally
+        {
+            // Do not leave the user's window minimized because a probe ran.
+            if (IsIconic(target.Handle)) ShowWindow(target.Handle, SW_RESTORE);
+        }
+    }
+
     /// <summary>找一个 ApplicationFrameWindow（UWP 的外壳窗口，Alt-Tab 显示的就是它）。</summary>
     private static WindowHandleInfo FindApplicationFrameWindow()
     {
@@ -196,6 +260,8 @@ public sealed class WindowActivatorLiveTests
     private const int GWL_EXSTYLE = -20;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const uint GW_OWNER = 4;
+    private const int SW_MINIMIZE = 6;
+    private const int SW_RESTORE = 9;
 
     private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
@@ -209,6 +275,7 @@ public sealed class WindowActivatorLiveTests
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder buf, int max);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder buf, int max);
     [DllImport("dwmapi.dll")]

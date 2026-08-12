@@ -179,6 +179,11 @@ These have all actually happened in this codebase:
   stripped query, so comparing it to the raw `>foo` discards every response as stale and the
   panel just sits on 搜索中…. Staleness compares against `_state.Query` (raw); echo
   comparison uses the stripped form.
+- **Treating `GetForegroundWindow() == handle` as proof the switch is visible.** A window can
+  be foreground *and still minimized*: with `SW_RESTORE` removed, Windows set a minimized
+  window as foreground and the activator reported success, so the user pressed Enter and saw
+  nothing change. Restore before activating, and assert `!IsIconic` too — the foreground
+  identity check alone is green for a switch the user cannot see.
 - **Writing a test whose assertion is already guaranteed by something else.** The
   "window results never seed the prefix cache" test passed with the guard deleted, because a
   null `IndexGeneration` and a prefix mismatch each blocked caching independently. Mutate the

@@ -842,6 +842,45 @@ mod tests {
         assert_ne!(a.history_key(), b.history_key());
     }
 
+    /// 步骤 8「多窗口同应用」：两个 Notepad 必须是两个可独立选中的条目，且历史键不同 ——
+    /// 否则切到其中一个会把另一个也标记为「最近用过」，最近列表就永远指错窗口。
+    #[test]
+    fn two_windows_of_the_same_app_stay_distinct() {
+        let raw = vec![
+            RawWindow { handle: 0x11, title: "a.txt - Notepad".into(), ..switchable() },
+            RawWindow { handle: 0x22, title: "b.txt - Notepad".into(), ..switchable() },
+        ];
+        let (entries, _) = select(raw, &[SELF_PID]);
+        assert_eq!(entries.len(), 2, "same-app windows must not be collapsed");
+        assert_ne!(entries[0].handle, entries[1].handle);
+        assert_ne!(
+            entries[0].history_key(),
+            entries[1].history_key(),
+            "same app, different documents — history must not conflate them"
+        );
+    }
+
+    /// 同应用同标题（两个未命名 Notepad）确实会共享历史键。这是刻意的：标题是唯一稳定的
+    /// 区分信号，而 HWND 不能持久化。此测试把这条边界钉住，避免被当成 bug「修」掉。
+    ///
+    /// **这条是文档而不是测试**（按 state-management.md 的规矩，得说清楚）：把 `history_key`
+    /// 里的标题整个删掉，它依然通过——因为「相等」正是它断言的东西。真正锁住标题参与计算的
+    /// 是上面那条 `two_windows_of_the_same_app_stay_distinct`，同一个 mutation 下只有它转红。
+    #[test]
+    fn same_app_same_title_deliberately_shares_one_history_key() {
+        let raw = vec![
+            RawWindow { handle: 0x11, ..switchable() },
+            RawWindow { handle: 0x22, ..switchable() },
+        ];
+        let (entries, _) = select(raw, &[SELF_PID]);
+        assert_eq!(entries.len(), 2, "both are still separately selectable");
+        assert_eq!(
+            entries[0].history_key(),
+            entries[1].history_key(),
+            "identical app+title is indistinguishable without persisting an HWND"
+        );
+    }
+
     #[test]
     fn history_key_never_contains_the_handle() {
         assert!(!entry().history_key().contains("1234"));
