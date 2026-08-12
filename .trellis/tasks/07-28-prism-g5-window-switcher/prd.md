@@ -18,14 +18,33 @@
 
 ## Acceptance Criteria
 
-- [ ] `>`、`>query`、退出窗口模式和空输入最近窗口有状态测试。
-- [ ] 多窗口同应用、标题变化、窗口关闭、句柄复用、最小化恢复和激活失败有自动化或机器测试。
-- [ ] Prism 自身、工具窗口、无标题和不可切换窗口被稳定过滤。
-- [ ] 字面/拼音/历史排名遵守 G2 等级，中文高亮正确。
-- [ ] 持久历史不会展示已关闭窗口，也不持久化可复用 HWND 作为稳定身份。
-- [ ] 成功切换隐藏 Prism，失败保留可操作 UI 且不写成功历史。
-- [ ] 长时间反复查询不会因常驻窗口列表或事件订阅造成持续内存增长。
-- [ ] Rust tests、Clippy、C# tests 和 WPF Release build 全部通过。
+- [x] `>`、`>query`、退出窗口模式和空输入最近窗口有状态测试。
+- [x] 多窗口同应用、标题变化、窗口关闭、句柄复用、最小化恢复和激活失败有自动化或机器测试。
+- [x] Prism 自身、工具窗口、无标题和不可切换窗口被稳定过滤。
+- [x] 字面/拼音/历史排名遵守 G2 等级，中文高亮正确。
+- [x] 持久历史不会展示已关闭窗口，也不持久化可复用 HWND 作为稳定身份。
+- [x] 成功切换隐藏 Prism，失败保留可操作 UI 且不写成功历史。
+- [x] 长时间反复查询不会因常驻窗口列表或事件订阅造成持续内存增长。
+- [x] Rust tests、Clippy、C# tests 和 WPF Release build 全部通过。
+
+### 验收证据（2026-08-12）
+
+逐条对应到具名测试，避免「感觉做完了」就打勾。详细过程见 `implement.md`。
+
+| 验收条 | 证据 |
+|---|---|
+| 1 状态测试 | `WindowPrefixSendsWindowModeAndStripsThePrefix`、`BareWindowPrefixListsRecentWindowsInsteadOfGoingIdle`、`LeavingWindowModeReturnsToGlobalSearch`、`NoMatchingWindowIsDistinctFromNoRecentWindows` |
+| 2 多窗口/标题/关闭/复用/最小化/激活失败 | `two_windows_of_the_same_app_stay_distinct`、`title_change_alone_does_not_invalidate_the_target`、`closed_window_resolves_to_window_gone`、`recycled_handle_with_a_new_pid_is_rejected`、`RestoresAMinimizedWindowBeforeActivating`（实机）、`RejectedActivationKeepsTheUiAndWritesNoSuccessHistory` |
+| 3 过滤 | `prism_own_windows_are_filtered`、`tool_window_is_filtered`、`untitled_and_whitespace_only_windows_are_filtered`、`owned_window_is_filtered`、`invisible_window_is_filtered`、`null_handle_is_filtered`、`uwp_inner_core_window_is_filtered`；实机 `live_rejection_breakdown` 分类了 205 个被拒窗口 |
+| 4 排名/高亮 | `literal_title_match_beats_pinyin_match`、`chinese_title_highlight_uses_utf16_offsets`、`history_breaks_ties_within_the_same_match_tier`、`pinyin_disabled_drops_pinyin_only_hits` |
+| 5 历史不复活已关闭窗口 | `empty_query_lists_only_windows_that_have_history`、`empty_query_hides_a_remembered_window_once_it_is_closed`、`history_key_never_contains_the_handle` |
+| 6 成功隐藏/失败保留 | `SuccessfulSwitchActivatesThenHidesAndRecordsHistory`、`RejectedActivationKeepsTheUiAndWritesNoSuccessHistory`、`FailedHistoryWriteDoesNotTurnASuccessfulSwitchIntoAFailure` |
+| 7 无持续内存增长 | `scripts/g5-memory-soak.ps1`：400 次 +244KB / 1200 次 +424KB，×3 查询只换 ×1.7 增长且序列震荡 |
+| 8 四道门 | Rust 206 passed / clippy 干净 / C# 101 passed, 5 skipped / build 0 警告 0 错误 |
+
+第 5 条原先**无法被断言**：`window_search` 里直接调 `enumerate_and_publish`，测试进不去真实桌面。
+已把排名部分抽成 `rank_window_list`，「历史 ∩ 当前枚举」这条约定才有了落点。
+Mutation 反验：删掉 `history_score == 0` 那道门 → `empty_query_lists_only_...` 转红。
 
 ## Out Of Scope
 

@@ -217,6 +217,21 @@ ViewModel 层拿到 False 之后的行为（保留 UI、不写成功历史、不
 
 四道门：Rust 204 passed（+2）/ clippy 干净 / C# 101 passed, 5 skipped / build 0 警告 0 错误。
 
+### 空输入的「历史 ∩ 当前枚举」原先无法被断言
+
+对 PRD 验收逐条找证据时发现第 5 条没有落点：`window_search` 直接调
+`enumerate_and_publish`，那个函数在 `cfg(windows)` 下打真实桌面，测试根本进不去。
+于是「已关闭的窗口不会被历史复活」这条**从来只是注释里的声明**。
+
+把排名部分抽成 `rank_window_list(published, ...)`，枚举留在 `window_search` 里，
+约定才有了可断言的位置。补两条：一条是「枚举里有两个窗口、只有一个有历史 → 只列一个」，
+另一条是「有历史的窗口关掉后本次枚举为空 → 一条都不列」，并带一个还开着时的对照组。
+
+Mutation 反验：删掉 `history_score == 0` 那道门 → 前者转红，后者照绿
+（空枚举进、空结果出，它断言的东西与那道门无关）。所以真正锁住这条约定的是前者。
+
+四道门（最终）：Rust 206 passed / clippy 干净 / C# 101 passed, 5 skipped / build 0 警告 0 错误。
+
 ## Open Question Carried Into Phase 2
 
 `ResolveWindow` + `RecordWindowSwitch` 是两次往返。若实机发现两次往返之间的延迟足以让前台

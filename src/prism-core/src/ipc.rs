@@ -1140,10 +1140,22 @@ fn window_search(
 ) -> Vec<SearchResult> {
     let self_pids = [std::process::id()];
     let published = crate::window_list::enumerate_and_publish(windows, &self_pids);
+    rank_window_list(&published, query, max, history, preferences)
+}
+
+/// 排名部分与枚举分开，因为 `enumerate_and_publish` 直接打真实桌面，测试进不去。
+/// 「历史 ∩ 当前枚举」这条约定就住在这里，不拆开的话它没法被断言。
+fn rank_window_list(
+    published: &[(String, crate::window_list::WindowEntry)],
+    query: &str,
+    max: usize,
+    history: &Arc<HistoryStore>,
+    preferences: &Arc<BrokerPreferences>,
+) -> Vec<SearchResult> {
     let trimmed = query.trim();
     let mut ranked: Vec<SearchResult> = Vec::new();
 
-    for (token, entry) in &published {
+    for (token, entry) in published {
         let history_target = ActionTarget::new(TargetKind::Window, entry.history_key());
         let history_score = history.score(&history_target);
         if trimmed.is_empty() {
@@ -1588,6 +1600,69 @@ mod window_protocol_tests {
     #[test]
     fn a_window_matching_nothing_is_not_a_candidate() {
         assert!(rank_window(&entry(), "zzzz", true, 0).is_none());
+    }
+
+    // --- 空输入 = 历史 ∩ 当前枚举（PRD 验收第 5 条）--------------------------------
+
+    /// 空输入只列「用过 + 现在还在」的窗口。这里两个窗口都在枚举里，只有一个有历史。
+    #[test]
+    fn empty_query_lists_only_windows_that_have_history() {
+        let history = history_store("recent-intersect");
+        let used = entry();
+        let never_used = WindowEntry {
+            handle: 0xA01,
+            title: "Untitled - Notepad".into(),
+            app_name: "notepad".into(),
+            ..entry()
+        };
+        history
+            .record(
+                &ActionTarget::new(TargetKind::Window, used.history_key()),
+                HistoryUse::Execute,
+            )
+            .unwrap();
+
+        let published = vec![("10".to_owned(), used), ("11".to_owned(), never_used)];
+        let results = rank_window_list(
+            &published,
+            "",
+            20,
+            &history,
+            &Arc::new(BrokerPreferences::new(true)),
+        );
+
+        assert_eq!(results.len(), 1, "the never-used window must not be listed");
+        assert!(results[0].title.contains("报告.docx"));
+    }
+
+    /// 已关闭的窗口即使有历史也不能出现——它不在本次枚举里，所以求交集后自然消失。
+    /// 这是「持久历史不展示已关闭窗口」那条验收的核心：历史留着，枚举说了不算。
+    #[test]
+    fn empty_query_hides_a_remembered_window_once_it_is_closed() {
+        let history = history_store("recent-closed");
+        let closed = entry();
+        history
+            .record(
+                &ActionTarget::new(TargetKind::Window, closed.history_key()),
+                HistoryUse::Execute,
+            )
+            .unwrap();
+        let preferences = Arc::new(BrokerPreferences::new(true));
+
+        // 还开着：列出来。
+        let present = vec![("10".to_owned(), closed.clone())];
+        assert_eq!(
+            rank_window_list(&present, "", 20, &history, &preferences).len(),
+            1,
+            "control: while enumerated it is listed"
+        );
+
+        // 关掉后本次枚举为空，历史条目仍在磁盘上。
+        let results = rank_window_list(&[], "", 20, &history, &preferences);
+        assert!(
+            results.is_empty(),
+            "history must not resurrect a window that is gone"
+        );
     }
 
     #[test]
