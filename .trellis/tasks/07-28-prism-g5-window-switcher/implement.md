@@ -66,14 +66,69 @@ Opus 常驻托盘所以只有隐藏窗口）。token 数值化、自身进程被
 - **端到端未走过一次。** 没有装 Prism、按 `>`、看列表、按 Enter。协议两端与 UI 状态
   机都只在单测里对过，没有一次真实的 pipe 往返。
 - **≤100MB 同步采样门未跑**（`Measure-ProcessMemory.ps1`）。
-- **cloaked 过滤会漏掉挂起的 UWP。** 实机看到 `SystemSettings "设置"` 与
-  `ApplicationFrameHost "设置"` 被判 cloaked 而排除，但 Alt-Tab 会显示它。
-  `DWMWA_CLOAKED` 对「本桌面挂起的 UWP」和「其他虚拟桌面的窗口」返回同一个
-  `DWM_CLOAKED_SHELL`，当前代码无法区分。行为与 design.md 写的一致，但这是个
-  真实的可用性缺口，需要单独决策（可能要配合 `IVirtualDesktopManager`）。
+- **cloaked 过滤漏掉挂起的 UWP —— 已修（2026-08-12）。** 见下节。
 
 已用 mutation 反验过的断言：把「先激活再隐藏」对调 → 两条测试转红（有效）；
 把前缀缓存 guard 删掉 → 测试仍通过（无效，已改写为只断言可观察行为并加对照组）。
+
+## 挂起 UWP 修复（2026-08-12）
+
+**根因不是「cloaked 判错」，是「cloaked 被当成一条规则」。** `DWMWA_CLOAKED` 对两种完全
+不同的情况返回同一个 `DWM_CLOAKED_SHELL`：本桌面上挂起的 UWP（Alt-Tab 显示，必须可切）
+和停在其他虚拟桌面的窗口（必须排除）。原来 `is_cloaked: bool` 把两者压成一个值，于是
+所有挂起的 UWP 被丢掉。
+
+改法：`RawWindow.cloaked` 存原始 bits；只有 `DWM_CLOAKED_APP` 在过滤里排除；
+「是否在其他虚拟桌面」改由 `IVirtualDesktopManager` 直接回答。该接口在已启用的
+`Win32_UI_Shell` feature 里，**没有新增依赖**。COM 每次枚举初始化一次（复用
+`apps.rs` 的 `LnkResolver` 模式），不是每窗口一次。
+
+**失败一律按「在本桌面」处理。** COM 起不来、`CoCreateInstance` 失败、
+`IsWindowOnCurrentVirtualDesktop` 返回 `E_INVALIDARG`（shell 不跟踪的窗口，或
+HWND 在枚举中途死掉）——全部报 false。多列一个切不过去的窗口是轻得多的 bug，
+静默弄丢用户要找的窗口才是这次要修的那个。
+
+### 测量先于修改，测量改变了修法
+
+按 `verify-before-claiming-fixed`，先给探针加了「shell-cloaked 但保留」的输出再看实机，
+结果第一版修法立刻暴露两个新问题：
+
+```
+shell-cloaked but kept (3):
+  cloaked=0x2 SystemSettings       "设置"            <- 内层 CoreWindow，重复项
+  cloaked=0x2 ApplicationFrameHost "设置"            <- Alt-Tab 显示的就是这个
+  cloaked=0x2 TextInputHost        "Windows 输入体验" <- Alt-Tab 从不显示
+```
+
+单靠 cloak bits 分不开，用 `GetClassNameW` 才能：外壳是 `ApplicationFrameWindow`，
+内层与输入法都是 `Windows.UI.Core.CoreWindow`。一条规则同时解决重复和误列：
+排除 `CoreWindow`。**要点是这条规则不是想出来的，是量出来的**——只跑单测的话，
+会交付一个把「设置」列两遍、还多一个切不过去的输入法窗口的版本。
+
+### A/B（未修版本做对照）
+
+| | 旧策略 `cloaked == 0` | 新策略 |
+|---|---|---|
+| 实机枚举 | **2** 个，无「设置」 | **3** 个，含「设置」 |
+| 保留的 shell-cloaked | 0 | 1（仅 `ApplicationFrameHost`） |
+| `suspended_uwp_..._stays_switchable` | **FAILED** | 通过 |
+
+回归测试在未修版本上转红，所以是可证伪的，不是「跑一次干净」。
+
+### 列出来必须真能切
+
+新增 C# 探针 `ActivatesASuspendedUwpWindow`：shell-cloaked 窗口正是
+`SetForegroundWindow` 最可能拒绝的地方，列进候选却切不过去等于没修。实测
+`cloaked=0x2`，`before=0x1206C6` → `after=0x3073E`，真的拿到了前台。
+
+四道门：Rust 202 passed（+8）/ clippy 干净 / C# 101 passed, 4 skipped / build 0 警告 0 错误。
+
+### 已知边界
+
+- `TextInputHost` 这类裸 `CoreWindow` 一并被排除。若将来有应用只有 CoreWindow
+  而没有 frame host 且需要被切，这条规则会漏掉它 —— 目前实机上没有这种情况。
+- 虚拟桌面判定依赖 `IVirtualDesktopManager` 可用；不可用时会列出其他桌面的窗口，
+  并记一条日志。
 
 ## Open Question Carried Into Phase 2
 

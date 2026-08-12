@@ -31,7 +31,8 @@ windows-service = "0.8"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    # G5: DWMWA_CLOAKED filters other virtual desktops and suspended UWP windows.
+    # G5: DWMWA_CLOAKED。只用 DWM_CLOAKED_APP 排除；「其他虚拟桌面」由 Win32_UI_Shell
+    # 的 IVirtualDesktopManager 判定，因为 DWM_CLOAKED_SHELL 分不开挂起的 UWP。
     "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_Security_Authorization",

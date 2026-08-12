@@ -28,8 +28,19 @@ WPF，broker 是后台进程，它的前台调用会被系统静默降级为任�
 broker 按请求枚举顶层窗口，逐个采集 HWND、PID、进程启动身份、标题、应用名与可切换标志。
 过滤规则（每条都要有单元测试）：
 
-- 不可见（`IsWindowVisible` 为假）、无标题、`WS_EX_TOOLWINDOW`、cloaked（`DWMWA_CLOAKED`，
-  覆盖其他虚拟桌面与已挂起的 UWP）、owner 非空的从属窗口；
+- 不可见（`IsWindowVisible` 为假）、无标题、`WS_EX_TOOLWINDOW`、owner 非空的从属窗口；
+- cloaked **不是一条规则**。`DWMWA_CLOAKED` 对「本桌面上挂起的 UWP」和「其他虚拟桌面的
+  窗口」都返回 `DWM_CLOAKED_SHELL`，一个 bool 分不开，早期实现因此把所有挂起的 UWP
+  （「设置」「计算器」）全丢了，而 Alt-Tab 是显示它们的。现在拆成两条：
+  只有 `DWM_CLOAKED_APP`（应用自己隐藏）在这里排除；「是否在别的虚拟桌面」交给
+  `IVirtualDesktopManager::IsWindowOnCurrentVirtualDesktop` 判定，且**查询失败一律按
+  「在本桌面」处理**——多列一个切不过去的窗口，远好过静默弄丢用户要找的那个。
+  `DWM_CLOAKED_INHERITED` 不需要单独规则：它只出现在 owner 被 cloaked 的窗口上，而
+  owner 非空已经被排除。
+- UWP 内层 `Windows.UI.Core.CoreWindow` 排除：一个 UWP 应用同时有外壳
+  `ApplicationFrameWindow`（Alt-Tab 显示的、激活要打的就是它）和内层 CoreWindow，两者
+  标题相同，都留会把「设置」列两遍。这条同时挡掉 `TextInputHost "Windows 输入体验"`
+  ——它是没有外壳的裸 CoreWindow，Alt-Tab 从不提供。
 - Prism 自身进程的全部窗口；
 - 枚举上限有界（默认 512），超限截断并记日志，不无界增长。
 

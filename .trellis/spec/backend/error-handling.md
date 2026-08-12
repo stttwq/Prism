@@ -131,8 +131,14 @@ the intended terminal state, not a gap to fill.
 
 ### 6. Tests Required
 
-- One test per filter rule (invisible, untitled, tool window, cloaked, owned, own-process),
-  asserting `is_switchable` is false for each in isolation.
+- One test per filter rule (invisible, untitled, tool window, owned, own-process,
+  UWP inner `CoreWindow`), asserting `is_switchable` is false for each in isolation.
+- Cloaking needs **four** tests, not one, because `DWM_CLOAKED_SHELL` is ambiguous:
+  `DWM_CLOAKED_APP` → rejected; shell-cloaked + on another desktop → rejected;
+  shell-cloaked on the current desktop (suspended UWP) → **kept**, this is the regression
+  guard; and shell-cloaked with a failed desktop query → kept, since failing open is
+  required. Assert the redeclared `CLOAKED_*` bits equal the Win32 constants too, or the
+  filter silently reads the wrong flag.
 - `resolve` races: closed window → `WindowGone`; same handle with a new pid → `IdentityChanged`;
   previous-generation token → `StaleGeneration`; title-only change → still resolves.
 - `record_window_switch` writes history under the app+title key, and **writes nothing** for a

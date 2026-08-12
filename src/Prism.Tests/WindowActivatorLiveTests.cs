@@ -119,6 +119,80 @@ public sealed class WindowActivatorLiveTests
         return found;
     }
 
+    /// <summary>
+    /// 挂起的 UWP（`ApplicationFrameWindow`，如「设置」）能否真的被激活。
+    ///
+    /// G5 修 cloaked 过滤后，这类窗口才第一次进入候选列表——列出来却切不过去是没有意义的，
+    /// 而 shell-cloaked 窗口正是 SetForegroundWindow 最可能拒绝的地方，所以单独探一次。
+    ///
+    /// 需要先手动打开「设置」；没开就跳过而不是失败（这是探针，不是 gate）。
+    /// </summary>
+    [Fact(Skip = "实机探针：会抢前台，且需先打开「设置」。手动去掉 Skip 后运行。")]
+    public void ActivatesASuspendedUwpWindow()
+    {
+        var target = FindApplicationFrameWindow();
+        if (target.Handle == IntPtr.Zero)
+        {
+            Console.WriteLine("SKIP: 没找到 ApplicationFrameWindow，请先打开「设置」再跑");
+            return;
+        }
+
+        var before = GetForegroundWindow();
+        var activator = new Win32WindowActivator();
+        var result = activator.TryActivate(target);
+        var foreground = GetForegroundWindow();
+
+        Console.WriteLine($"target   = 0x{target.Handle:X} pid={target.Pid} {target.Title}");
+        Console.WriteLine($"cloaked  = 0x{GetCloaked(target.Handle):X}");
+        Console.WriteLine($"before   = 0x{before:X}");
+        Console.WriteLine($"after    = 0x{foreground:X}");
+        Console.WriteLine($"returned = {result}");
+        Console.WriteLine(
+            result
+                ? "OUTCOME: suspended UWP really came to the foreground"
+                : "OUTCOME: refused and reported false — listing it is then useless, "
+                  + "the cloaked filter fix needs revisiting");
+
+        // Same contract as the general probe: the return value must match reality.
+        Assert.Equal(result, foreground == target.Handle);
+    }
+
+    /// <summary>找一个 ApplicationFrameWindow（UWP 的外壳窗口，Alt-Tab 显示的就是它）。</summary>
+    private static WindowHandleInfo FindApplicationFrameWindow()
+    {
+        var found = new WindowHandleInfo(IntPtr.Zero, 0, "", false);
+        var foreground = GetForegroundWindow();
+
+        EnumWindows((hwnd, _) =>
+        {
+            if (found.Handle != IntPtr.Zero) return false;
+            if (hwnd == foreground) return true;
+            if (!IsWindowVisible(hwnd)) return true;
+
+            var cls = new System.Text.StringBuilder(257);
+            GetClassName(hwnd, cls, cls.Capacity);
+            if (cls.ToString() != "ApplicationFrameWindow") return true;
+
+            var length = GetWindowTextLength(hwnd);
+            if (length <= 0) return true;
+            var buffer = new System.Text.StringBuilder(length + 1);
+            GetWindowText(hwnd, buffer, buffer.Capacity);
+            if (string.IsNullOrWhiteSpace(buffer.ToString())) return true;
+
+            GetWindowThreadProcessId(hwnd, out var pid);
+            found = new WindowHandleInfo(hwnd, pid, buffer.ToString(), IsIconic(hwnd));
+            return false;
+        }, IntPtr.Zero);
+
+        return found;
+    }
+
+    private static int GetCloaked(IntPtr hwnd)
+    {
+        // DWMWA_CLOAKED = 14
+        return DwmGetWindowAttribute(hwnd, 14, out var value, sizeof(int)) == 0 ? value : -1;
+    }
+
     private const int GWL_EXSTYLE = -20;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const uint GW_OWNER = 4;
@@ -135,4 +209,8 @@ public sealed class WindowActivatorLiveTests
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder buf, int max);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder buf, int max);
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out int value, int size);
 }

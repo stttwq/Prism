@@ -28,9 +28,19 @@ pub struct RawWindow {
     pub title: String,
     pub app_name: String,
     pub app_path: String,
+    /// Win32 window class. Used only to drop UWP inner core windows — see [`CORE_WINDOW_CLASS`].
+    pub class_name: String,
     pub is_visible: bool,
     pub is_tool_window: bool,
-    pub is_cloaked: bool,
+    /// Raw `DWM_CLOAKED_*` bits from `DWMWA_CLOAKED`; 0 when the window is not cloaked.
+    /// Kept as bits rather than a bool because `DWM_CLOAKED_SHELL` alone cannot tell a
+    /// suspended UWP app on this desktop from a window on another virtual desktop —
+    /// see [`is_switchable`].
+    pub cloaked: u32,
+    /// True only when `IVirtualDesktopManager` positively reports the window lives on
+    /// another virtual desktop. Defaults to false so a failed query never hides a window
+    /// that is really here.
+    pub is_on_other_desktop: bool,
     pub has_owner: bool,
     pub is_minimized: bool,
 }
@@ -61,17 +71,42 @@ pub fn normalize_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// The single filter policy. `self_pid` is the broker's own process so Prism never
-/// offers to switch to itself.
+/// `DWM_CLOAKED_*` bits, redeclared so the pure filter and its tests compile on
+/// non-Windows CI. `cloaked_bits_match_win32` asserts these against the real constants.
+pub const CLOAKED_APP: u32 = 1;
+pub const CLOAKED_SHELL: u32 = 2;
+pub const CLOAKED_INHERITED: u32 = 4;
+
+/// A UWP app has two top-level windows: an `ApplicationFrameWindow` host (what Alt-Tab
+/// shows and what activation must target) and this inner core window. Both carry the same
+/// title, so keeping both would list 设置 twice. Excluding the inner one also drops
+/// `TextInputHost "Windows 输入体验"`, which is a bare `CoreWindow` with no frame host and
+/// which Alt-Tab never offers.
+pub const CORE_WINDOW_CLASS: &str = "Windows.UI.Core.CoreWindow";
+
+/// The single filter policy. `self_pids` is Prism's own processes so it never offers to
+/// switch to itself.
 ///
-/// Rejects: invisible, empty-title, tool windows, cloaked (covers other virtual
-/// desktops and suspended UWP), owned/subordinate windows, and Prism's own windows.
+/// Rejects: invisible, empty-title, tool windows, windows on other virtual desktops,
+/// app-cloaked windows, UWP inner core windows, owned/subordinate windows, and Prism's own
+/// windows.
+///
+/// **Cloaking is deliberately not a single rule.** `DWMWA_CLOAKED` returns the same
+/// `DWM_CLOAKED_SHELL` for a suspended UWP app on this desktop — which Alt-Tab shows and
+/// so must stay switchable — and for a window parked on another virtual desktop, which
+/// must not. Treating "cloaked at all" as unswitchable dropped every suspended UWP app.
+/// So only `DWM_CLOAKED_APP` (the app hid itself) rejects here, and the other-desktop
+/// case is decided by `IVirtualDesktopManager` instead. `DWM_CLOAKED_INHERITED` needs no
+/// rule of its own: it only appears on windows whose owner is cloaked, and an owned
+/// window is already rejected.
 pub fn is_switchable(window: &RawWindow, self_pids: &[u32]) -> bool {
     window.handle != 0
         && window.is_visible
         && !window.title.trim().is_empty()
         && !window.is_tool_window
-        && !window.is_cloaked
+        && !window.is_on_other_desktop
+        && window.cloaked & CLOAKED_APP == 0
+        && window.class_name != CORE_WINDOW_CLASS
         && !window.has_owner
         && !self_pids.contains(&window.pid)
 }
@@ -235,45 +270,110 @@ mod platform {
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows::Win32::UI::Shell::IVirtualDesktopManager;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, GWL_EXSTYLE, GW_OWNER,
-        WS_EX_TOOLWINDOW,
+        EnumWindows, GetWindow, GetWindowLongW, GetClassNameW, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+        GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
     };
+
+    /// The other-desktop oracle, created once per enumeration.
+    ///
+    /// `DWMWA_CLOAKED` cannot separate "suspended UWP on this desktop" from "on another
+    /// virtual desktop", so this answers the second question directly. Every failure path
+    /// reports `false` (= "on this desktop"): showing a window the user cannot switch to
+    /// is a far milder bug than silently hiding the window they asked for, which is the
+    /// bug this type exists to fix.
+    pub struct DesktopOracle {
+        manager: Option<IVirtualDesktopManager>,
+        need_uninit: bool,
+    }
+
+    impl DesktopOracle {
+        pub fn new() -> Self {
+            use windows::Win32::System::Com::{
+                CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+            };
+            use windows::Win32::UI::Shell::VirtualDesktopManager;
+
+            // Failure is fine and expected: the calling thread may already be in an
+            // apartment. Only uninitialize what we actually initialized.
+            let need_uninit = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+            let manager =
+                unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_INPROC_SERVER) }
+                    .ok();
+            if manager.is_none() {
+                crate::log(
+                    "IVirtualDesktopManager unavailable; windows on other virtual desktops \
+                     will be listed",
+                );
+            }
+            Self { manager, need_uninit }
+        }
+
+        /// True only on a positive "not on the current desktop" answer.
+        pub fn is_on_other_desktop(&self, hwnd: HWND) -> bool {
+            let Some(manager) = self.manager.as_ref() else {
+                return false;
+            };
+            // Returns E_INVALIDARG for windows the shell does not track (and the HWND may
+            // die mid-enumeration); either way, do not hide it.
+            unsafe { manager.IsWindowOnCurrentVirtualDesktop(hwnd) }
+                .map(|on_current| !on_current.as_bool())
+                .unwrap_or(false)
+        }
+    }
+
+    impl Drop for DesktopOracle {
+        fn drop(&mut self) {
+            // Release the interface before leaving the apartment it was created in.
+            self.manager = None;
+            if self.need_uninit {
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+            }
+        }
+    }
 
     /// Enumerate every top-level window with the raw facts the filter needs.
     pub fn enumerate() -> Vec<RawWindow> {
-        let mut windows: Vec<RawWindow> = Vec::new();
-        let ptr = &mut windows as *mut Vec<RawWindow> as isize;
+        let mut sink = (Vec::new(), DesktopOracle::new());
+        let ptr = &mut sink as *mut (Vec<RawWindow>, DesktopOracle) as isize;
         // EnumWindows can fail if a callback returns FALSE; we always return TRUE, so an
         // error here means the system refused to enumerate. Partial results are fine.
         let _ = unsafe { EnumWindows(Some(enum_proc), LPARAM(ptr)) };
-        windows
+        sink.0
     }
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let windows = &mut *(lparam.0 as *mut Vec<RawWindow>);
-        windows.push(collect(hwnd));
+        let (windows, oracle) = &mut *(lparam.0 as *mut (Vec<RawWindow>, DesktopOracle));
+        windows.push(collect(hwnd, Some(oracle)));
         TRUE
     }
 
-    /// Facts for one handle. Also used by the activation-time re-probe.
-    pub fn collect(hwnd: HWND) -> RawWindow {
+    /// Facts for one handle. `oracle` is `None` on the activation-time re-probe, which
+    /// only needs identity and visibility — `resolve` never re-applies the desktop filter,
+    /// because a window the user picked stays a valid target even if they have since
+    /// switched desktops.
+    pub fn collect(hwnd: HWND, oracle: Option<&DesktopOracle>) -> RawWindow {
         if hwnd.0.is_null() || unsafe { !IsWindow(hwnd).as_bool() } {
             return RawWindow::default();
         }
         let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
-        let mut cloaked: u32 = 0;
-        let cloaked = unsafe {
+        let mut cloaked_bits: u32 = 0;
+        let cloaked = if unsafe {
             DwmGetWindowAttribute(
                 hwnd,
                 DWMWA_CLOAKED,
-                &mut cloaked as *mut u32 as *mut _,
+                &mut cloaked_bits as *mut u32 as *mut _,
                 std::mem::size_of::<u32>() as u32,
             )
         }
         .is_ok()
-            && cloaked != 0;
+        {
+            cloaked_bits
+        } else {
+            0
+        };
         let mut pid: u32 = 0;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         let app_path = process_path(pid).unwrap_or_default();
@@ -288,9 +388,13 @@ mod platform {
             title: window_title(hwnd),
             app_name,
             app_path,
+            class_name: window_class(hwnd),
             is_visible: unsafe { IsWindowVisible(hwnd).as_bool() },
             is_tool_window: ex_style & WS_EX_TOOLWINDOW.0 != 0,
-            is_cloaked: cloaked,
+            cloaked,
+            is_on_other_desktop: oracle
+                .map(|oracle| oracle.is_on_other_desktop(hwnd))
+                .unwrap_or(false),
             has_owner: !unsafe { GetWindow(hwnd, GW_OWNER) }
                 .unwrap_or_default()
                 .0
@@ -306,6 +410,16 @@ mod platform {
         }
         let mut buffer = vec![0u16; length as usize + 1];
         let written = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+        if written <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buffer[..written as usize])
+    }
+
+    /// Win32 caps class names at 256 chars, so one fixed buffer always suffices.
+    fn window_class(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 257];
+        let written = unsafe { GetClassNameW(hwnd, &mut buffer) };
         if written <= 0 {
             return String::new();
         }
@@ -345,7 +459,7 @@ impl WindowProbe for SystemWindowProbe {
         if handle == 0 {
             return None;
         }
-        let raw = platform::collect(HWND(handle as *mut _));
+        let raw = platform::collect(HWND(handle as *mut _), None);
         (raw.handle != 0).then_some(raw)
     }
 
@@ -388,9 +502,11 @@ mod tests {
             title: "Untitled - Notepad".into(),
             app_name: "notepad".into(),
             app_path: r"C:\Windows\notepad.exe".into(),
+            class_name: "Notepad".into(),
             is_visible: true,
             is_tool_window: false,
-            is_cloaked: false,
+            cloaked: 0,
+            is_on_other_desktop: false,
             has_owner: false,
             is_minimized: false,
         }
@@ -439,10 +555,107 @@ mod tests {
     }
 
     #[test]
-    fn cloaked_window_is_filtered() {
-        // Covers other virtual desktops and suspended UWP apps.
-        let window = RawWindow { is_cloaked: true, ..switchable() };
+    fn app_cloaked_window_is_filtered() {
+        // DWM_CLOAKED_APP means the app hid the window itself — genuinely not switchable.
+        let window = RawWindow { cloaked: CLOAKED_APP, ..switchable() };
         assert!(!is_switchable(&window, &[SELF_PID]));
+    }
+
+    #[test]
+    fn window_on_another_virtual_desktop_is_filtered() {
+        // Shell-cloaked *and* positively reported elsewhere by IVirtualDesktopManager.
+        let window = RawWindow {
+            cloaked: CLOAKED_SHELL,
+            is_on_other_desktop: true,
+            ..switchable()
+        };
+        assert!(!is_switchable(&window, &[SELF_PID]));
+    }
+
+    /// The bug this module was fixed for: a suspended UWP app (Settings, Calculator) is
+    /// shell-cloaked while sitting on the current desktop. Alt-Tab lists it, so Prism must
+    /// too. Before the fix, `is_cloaked` was one bool and this window was dropped.
+    #[test]
+    fn suspended_uwp_on_this_desktop_stays_switchable() {
+        let window = RawWindow {
+            cloaked: CLOAKED_SHELL,
+            is_on_other_desktop: false,
+            app_name: "ApplicationFrameHost".into(),
+            class_name: "ApplicationFrameWindow".into(),
+            title: "设置".into(),
+            ..switchable()
+        };
+        assert!(
+            is_switchable(&window, &[SELF_PID]),
+            "suspended UWP apps must stay switchable — Alt-Tab shows them"
+        );
+    }
+
+    /// A UWP app exposes both an `ApplicationFrameWindow` and an inner `CoreWindow` with the
+    /// same title. Keeping both listed 设置 twice, so only the frame host survives.
+    #[test]
+    fn uwp_inner_core_window_is_filtered() {
+        let window = RawWindow {
+            cloaked: CLOAKED_SHELL,
+            app_name: "SystemSettings".into(),
+            class_name: CORE_WINDOW_CLASS.into(),
+            title: "设置".into(),
+            ..switchable()
+        };
+        assert!(!is_switchable(&window, &[SELF_PID]));
+    }
+
+    /// `TextInputHost "Windows 输入体验"` is a bare `CoreWindow` with no frame host. Alt-Tab
+    /// never offers it, and un-hiding suspended UWP apps must not drag it in.
+    #[test]
+    fn text_input_host_is_not_offered() {
+        let window = RawWindow {
+            cloaked: CLOAKED_SHELL,
+            app_name: "TextInputHost".into(),
+            class_name: CORE_WINDOW_CLASS.into(),
+            title: "Windows 输入体验".into(),
+            ..switchable()
+        };
+        assert!(!is_switchable(&window, &[SELF_PID]));
+    }
+
+    /// Only the exact class is excluded; a normal app whose class merely resembles it stays.
+    #[test]
+    fn a_normal_window_with_a_similar_class_is_kept() {
+        for class in ["Windows.UI.Core.CoreWindowHost", "CoreWindow", "Chrome_WidgetWin_1"] {
+            let window = RawWindow { class_name: class.into(), ..switchable() };
+            assert!(is_switchable(&window, &[SELF_PID]), "class {class:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_desktop_query_shows_the_window_rather_than_hiding_it() {
+        // DesktopOracle reports false when COM or the query fails. A shell-cloaked window
+        // must then still be offered: over-showing beats silently losing the target.
+        let window = RawWindow { cloaked: CLOAKED_SHELL, is_on_other_desktop: false, ..switchable() };
+        assert!(is_switchable(&window, &[SELF_PID]));
+    }
+
+    #[test]
+    fn app_cloaked_is_rejected_even_on_the_current_desktop() {
+        let window = RawWindow {
+            cloaked: CLOAKED_APP | CLOAKED_SHELL,
+            is_on_other_desktop: false,
+            ..switchable()
+        };
+        assert!(!is_switchable(&window, &[SELF_PID]));
+    }
+
+    /// The redeclared bits must match Win32, or the filter reads the wrong flag.
+    #[test]
+    #[cfg(windows)]
+    fn cloaked_bits_match_win32() {
+        use windows::Win32::Graphics::Dwm::{
+            DWM_CLOAKED_APP, DWM_CLOAKED_INHERITED, DWM_CLOAKED_SHELL,
+        };
+        assert_eq!(CLOAKED_APP, DWM_CLOAKED_APP);
+        assert_eq!(CLOAKED_SHELL, DWM_CLOAKED_SHELL);
+        assert_eq!(CLOAKED_INHERITED, DWM_CLOAKED_INHERITED);
     }
 
     #[test]
@@ -737,8 +950,12 @@ mod tests {
                     "untitled"
                 } else if window.is_tool_window {
                     "tool_window"
-                } else if window.is_cloaked {
-                    "cloaked"
+                } else if window.is_on_other_desktop {
+                    "other_desktop"
+                } else if window.cloaked & CLOAKED_APP != 0 {
+                    "cloaked_app"
+                } else if window.class_name == CORE_WINDOW_CLASS {
+                    "uwp_core_window"
                 } else if window.has_owner {
                     "has_owner"
                 } else if window.pid == self_pid {
@@ -754,11 +971,30 @@ mod tests {
             }
 
             for (reason, count) in &counts {
-                println!("  {reason:<12} {count}");
+                println!("  {reason:<14} {count}");
             }
             println!("titled-but-rejected ({}):", titled_rejects.len());
             for (reason, what) in &titled_rejects {
-                println!("  {reason:<12} {what}");
+                println!("  {reason:<14} {what}");
+            }
+
+            // The suspended-UWP fix, measured rather than asserted: these are shell-cloaked
+            // windows on this desktop that the old single-bool filter dropped.
+            let rescued: Vec<&RawWindow> = raw
+                .iter()
+                .filter(|w| {
+                    w.cloaked & CLOAKED_SHELL != 0
+                        && !w.is_on_other_desktop
+                        && is_switchable(w, &[self_pid])
+                })
+                .collect();
+            println!("shell-cloaked but kept ({}):", rescued.len());
+            for window in &rescued {
+                let title: String = window.title.chars().take(36).collect();
+                println!(
+                    "  cloaked=0x{:x} {} {title:?}",
+                    window.cloaked, window.app_name
+                );
             }
         }
     }
