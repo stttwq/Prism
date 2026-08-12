@@ -757,3 +757,40 @@ no-op（`Finished in 0.37s` + 退出码 0）；服务安装手工、文件锁导
 ### Next Steps
 
 - None - task complete
+
+
+## Session 21: G5 窗口切换器收口：挂起 UWP 修复、步骤 8 机器测试与 PRD 验收证据
+
+**Date**: 2026-08-12
+**Task**: G5 窗口切换器收口：挂起 UWP 修复、步骤 8 机器测试与 PRD 验收证据
+**Branch**: `feature`
+
+### Summary
+
+修挂起 UWP 被 cloaked 过滤丢掉的缺陷：DWMWA_CLOAKED 对「本桌面挂起的 UWP」和「其他虚拟桌面」返回同一个 SHELL 位，原来压成一个 bool。改为存原始 bits，只排除 CLOAKED_APP，虚拟桌面交给 IVirtualDesktopManager。测量先于修改救了这次修法——探针输出暴露第一版会把「设置」列两遍并多列一个切不过去的输入法窗口，加 CoreWindow 规则解决。收口步骤 8：补同应用多窗口测试（mutation 反验只有新增那条转红，原有三条 history_key 测试对标题从键里消失毫无察觉）；补最小化恢复实机探针，SW_RESTORE 第一次真的执行——A/B 挖出真问题，删掉它之后 Windows 照样把仍然最小化的窗口设成前台并返回 true，只断言前台身份的测试是绿的；激活被拒拿掉 AttachThreadInput 兜底做对照，Windows 真的拒了。内存门改测趋势不测阈值（原文是「无持续内存增长」，此前一直被误记为「≤100MB」），400 次 +276KB、1200 次 +424KB 是平台期。逐条找 PRD 验收证据时发现空输入的「历史 ∩ 当前枚举」无法被断言，抽出 rank_window_list 才有落点。四道门：Rust 206 / clippy 干净 / C# 101 passed 5 skipped / build 0 警告 0 错误；端到端 pipe probe 21/21。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `31370b7` | (see git log) |
+| `4527156` | (see git log) |
+| `7459914` | (see git log) |
+| `457d96a` | (see git log) |
+| `47cb02b` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
