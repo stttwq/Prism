@@ -41,6 +41,7 @@
 | 6 成功隐藏/失败保留 | `SuccessfulSwitchActivatesThenHidesAndRecordsHistory`、`RejectedActivationKeepsTheUiAndWritesNoSuccessHistory`、`FailedHistoryWriteDoesNotTurnASuccessfulSwitchIntoAFailure` |
 | 7 无持续内存增长 | `scripts/g5-memory-soak.ps1`：400 次 +244KB / 1200 次 +424KB，×3 查询只换 ×1.7 增长且序列震荡 |
 | 8 四道门 | Rust 206 passed / clippy 干净 / C# 101 passed, 5 skipped / build 0 警告 0 错误 |
+| 端到端 | `scripts/g5-pipe-probe.ps1` 21/21，真实 pipe 往返（用户另行手测确认 UI 正常） |
 
 第 5 条原先**无法被断言**：`window_search` 里直接调 `enumerate_and_publish`，测试进不去真实桌面。
 已把排名部分抽成 `rank_window_list`，「历史 ∩ 当前枚举」这条约定才有了落点。

@@ -230,6 +230,12 @@ ViewModel 层拿到 False 之后的行为（保留 UI、不写成功历史、不
 Mutation 反验：删掉 `history_score == 0` 那道门 → 前者转红，后者照绿
 （空枚举进、空结果出，它断言的东西与那道门无关）。所以真正锁住这条约定的是前者。
 
+抽函数改的是 `ipc.rs`，也就是协议路径本身，所以没有只跑单测就收工：重编 release
+broker（MD5 `ba1b393f` → `050116f4`，确认装进去的确实是改后那份）装到 D 盘临时目录，
+重跑 `scripts/g5-pipe-probe.ps1` → **21/21**，其中 `recorded window now appears in
+recent list` 正是被重构的那条最近窗口路径，在真实 pipe 上走通了。
+内存 soak 重跑 400 次 +276KB、稳态 ~26MB，与重构前同一个平台期。
+
 四道门（最终）：Rust 206 passed / clippy 干净 / C# 101 passed, 5 skipped / build 0 警告 0 错误。
 
 ## Open Question Carried Into Phase 2
