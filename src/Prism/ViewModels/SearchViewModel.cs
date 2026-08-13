@@ -68,7 +68,9 @@ public sealed class SearchViewModel
     /// <summary>Schedules one refresh through the existing broker search path.</summary>
     public void OnIndexGenerationChanged()
     {
-        if (_state.Mode != PanelMode.Results || string.IsNullOrWhiteSpace(_state.Query))
+        if (_state.Mode != PanelMode.Results)
+            return;
+        if (string.IsNullOrWhiteSpace(_state.Query) && string.IsNullOrWhiteSpace(_searchContext.Root))
             return;
 
         _completeCache = null;
@@ -599,11 +601,14 @@ public sealed class SearchViewModel
         if (!string.IsNullOrWhiteSpace(_state.Query) || !string.IsNullOrWhiteSpace(_searchContext.Root))
         {
             _resultLimit = InitialResultLimit;
-            // 等 indexer 的 USN watcher 消化文件变更（rename/copy/move/delete），
-            // 否则立即搜索会返回旧路径。1 秒足够 USN 推进，后续 generation 通知会再刷一次。
-            await Task.Delay(1000).ConfigureAwait(true);
             // 清掉 prefix cache，强制不使用本地缓存。
             _completeCache = null;
+            // 清掉旧结果，显示刷新中状态。
+            _state.Results = Array.Empty<SearchResult>();
+            _state.StatusMessage = "正在刷新…";
+            // 等 indexer 的 USN watcher 消化文件变更。
+            // 先等 1.5 秒做一次搜索，后续 generation 通知到达时会自动再刷一次。
+            await Task.Delay(1500).ConfigureAwait(true);
             await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
         }
     }
