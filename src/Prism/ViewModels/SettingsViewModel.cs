@@ -33,6 +33,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private bool _currentDirectorySearchEnabled;
     private bool _explorerHostIntegrationEnabled;
     private bool _directoryOpusHostIntegrationEnabled;
+    private string? _zipProgram;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -61,6 +62,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _currentDirectorySearchEnabled = settings.CurrentDirectorySearchEnabled;
         _explorerHostIntegrationEnabled = settings.ExplorerHostIntegrationEnabled;
         _directoryOpusHostIntegrationEnabled = settings.DirectoryOpusHostIntegrationEnabled;
+        _zipProgram = settings.ZipProgram;
         DataDir = store.DataDir;
 
         Engines = new ObservableCollection<WebEngineEditItem>(
@@ -272,6 +274,21 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    /// <summary>
+    /// 自定义压缩程序可执行文件完整路径（G6 ZIP adapter）。
+    /// 留空则自动探测 7-Zip，再回退到 Windows 内置 Shell 压缩。
+    /// </summary>
+    public string? ZipProgram
+    {
+        get => _zipProgram;
+        set
+        {
+            if (_zipProgram == value) return;
+            _zipProgram = string.IsNullOrWhiteSpace(value) ? null : value;
+            OnPropertyChanged();
+        }
+    }
+
     private void AddEngine()
     {
         var item = new WebEngineEditItem
@@ -377,6 +394,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             CurrentDirectorySearchEnabled = CurrentDirectorySearchEnabled,
             ExplorerHostIntegrationEnabled = ExplorerHostIntegrationEnabled,
             DirectoryOpusHostIntegrationEnabled = DirectoryOpusHostIntegrationEnabled,
+            ZipProgram = string.IsNullOrWhiteSpace(ZipProgram) ? null : ZipProgram,
         };
 
         try

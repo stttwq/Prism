@@ -60,6 +60,12 @@ public sealed record Settings
     /// </summary>
     public bool DirectoryOpusHostIntegrationEnabled { get; init; } = false;
 
+    /// <summary>
+    /// 自定义压缩程序可执行文件完整路径（G6 ZIP adapter）。设置且文件存在时优先于自动探测。
+    /// 留空则自动探测本机 7-Zip，再回退到 Windows 内置 Shell 压缩。
+    /// </summary>
+    public string? ZipProgram { get; init; }
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
@@ -74,6 +80,7 @@ public sealed record Settings
         CurrentDirectorySearchEnabled = true,
         ExplorerHostIntegrationEnabled = false,
         DirectoryOpusHostIntegrationEnabled = false,
+        ZipProgram = null,
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>

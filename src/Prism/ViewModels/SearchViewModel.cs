@@ -220,6 +220,14 @@ public sealed class SearchViewModel
         if (!text.StartsWith(_lastInputQuery, StringComparison.Ordinal))
             _completeCache = null;
         _lastInputQuery = text;
+
+        // 重命名编辑态：输入直接更新新文件名，不触发搜索或动作过滤。
+        if (_state.RenameTarget is not null)
+        {
+            _state.RenameNewName = text;
+            return;
+        }
+
         _state.Query = text;
         _pendingQuery = text;
 

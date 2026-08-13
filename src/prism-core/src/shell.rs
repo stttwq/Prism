@@ -435,7 +435,10 @@ impl ComApartment {
 fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, ShellError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST, SEE_MASK_NOCLOSEPROCESS,
+    };
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let kind = target.validate()?;
@@ -449,22 +452,47 @@ fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, Shel
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let verb: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
-    let code = unsafe {
-        ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(value.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    }
-    .0 as isize;
-    if code > 32 {
+    let verb_wide: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
+    // 传父目录作为工作目录。
+    let dir: Vec<u16> = std::path::Path::new(&target.value)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(|s| {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        })
+        .unwrap_or_default();
+
+    // SEE_MASK_INVOKEIDLIST: 让 ShellExecuteEx 通过 IContextMenu 路由 verb，
+    // 解决后台进程调用 "properties" 等 verb 时返回 code 31 (SE_ERR_NOASSOC) 的问题。
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST | SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: PCWSTR(verb_wide.as_ptr()),
+        lpFile: PCWSTR(value.as_ptr()),
+        lpParameters: PCWSTR::null(),
+        lpDirectory: if dir.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(dir.as_ptr())
+        },
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+
+    let success = unsafe { ShellExecuteExW(&mut info) };
+    if success.is_ok() {
         Ok(ShellOutcome::Success)
     } else {
-        Err(shell_execute_error(code))
+        // ShellExecuteExW 的错误通过 GetLastError 获取，不像旧 ShellExecuteW 返回 code。
+        let err = windows::core::Error::from_win32();
+        Err(ShellError::new(
+            ShellErrorKind::System,
+            format!("ShellExecuteEx failed: {err}"),
+        ))
     }
 }
 
@@ -507,17 +535,6 @@ fn reveal(target: &ActionTarget) -> Result<ShellOutcome, ShellError> {
         ShellErrorKind::Unsupported,
         "Shell is only available on Windows",
     ))
-}
-
-#[cfg(windows)]
-fn shell_execute_error(code: isize) -> ShellError {
-    let kind = match code {
-        5 => ShellErrorKind::AccessDenied,
-        2 | 3 => ShellErrorKind::TargetInvalid,
-        32 => ShellErrorKind::Conflict,
-        _ => ShellErrorKind::System,
-    };
-    ShellError::new(kind, format!("ShellExecute failed with code {code}"))
 }
 
 fn classify_io_error(error: &std::io::Error) -> ShellErrorKind {

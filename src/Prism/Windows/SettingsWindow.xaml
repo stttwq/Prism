@@ -167,6 +167,17 @@
 
                     <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
 
+                    <TextBlock Text="压缩程序" FontSize="13" FontWeight="SemiBold"
+                               Foreground="#303237" Margin="0,0,0,6"/>
+                    <TextBlock Text="压缩为 ZIP 时优先使用此程序（留空则自动探测 7-Zip，再回退 Windows 内置）："
+                               FontSize="12" Foreground="#9B9FA6"
+                               TextWrapping="Wrap" Margin="0,0,0,4"/>
+                    <TextBox Text="{Binding ZipProgram, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             FontSize="13" Padding="6,4"
+                             Margin="0,0,0,16"/>
+
+                    <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
+
                     <TextBlock Text="数据目录" FontSize="13" FontWeight="SemiBold"
                                Foreground="#303237" Margin="0,0,0,6"/>
                     <TextBlock Text="索引与设置存放位置（安装目录不可写时自动改到用户数据夹）："

@@ -59,6 +59,7 @@ public sealed class SettingsStore
                 ComboHotkey = settings.ComboHotkey ?? Settings.Default.ComboHotkey,
                 WebEngines = settings.WebEngines ?? [],
                 ExcludedPaths = settings.ExcludedPaths ?? [],
+                ZipProgram = string.IsNullOrWhiteSpace(settings.ZipProgram) ? null : settings.ZipProgram,
             };
         }
         catch
