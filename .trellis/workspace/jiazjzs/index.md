@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 21
-- **Last Active**: 2026-08-12
+- **Total Sessions**: 22
+- **Last Active**: 2026-08-13
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~796 | Active |
+| `journal-1.md` | ~846 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 22 | 2026-08-13 | G6 完整内置动作 | `fddaef2`, `3aa15bd`, `2670ef1`, `5d71d65`, `f832857`, `c4d3478`, `7b9e4d9`, `bc6935e`, `d177439`, `ef52ae7`, `387758c`, `668fffb`, `0aa283d`, `7b2655e`, `d6fcc2f`, `2d8a2ba`, `d3281b4`, `1c15af4` | `feature` |
 | 21 | 2026-08-12 | G5 窗口切换器收口：挂起 UWP 修复、步骤 8 机器测试与 PRD 验收证据 | `31370b7`, `4527156`, `7459914`, `457d96a`, `47cb02b` | `feature` |
 | 20 | 2026-08-11 | G5 窗口切换器：枚举/协议/前台激活落地，激活归属修正 | `3e72402` | `feature` |
 | 19 | 2026-08-09 | G4 宿主联动收尾：矩阵签署、三个实机缺陷、构建链路统一 | `18a4c0e`, `c40edea`, `06dc747`, `3475ff2`, `b284bf9`, `3dee8f9`, `0733ad3` | `feature` |

@@ -794,3 +794,53 @@ no-op（`Finished in 0.37s` + 退出码 0）；服务安装手工、文件锁导
 ### Next Steps
 
 - None - task complete
+
+
+## Session 22: G6 完整内置动作
+
+**Date**: 2026-08-13
+**Task**: G6 完整内置动作
+**Branch**: `feature`
+
+### Summary
+
+G6 完整内置动作：ActionId 封闭枚举 allowlist（File=12/Directory=11/Application=4），IFileOperation 回收站/永久删除/复制到/移动到/重命名，ZIP adapter 三级回退（自定义路径>7-Zip 探测>Windows Shell COM），IPC ActionArgs 协议扩展，前端 rename 编辑态+copy_to/move_to 文件夹选择器，mutation 后 generation 超时提示，历史候选磁盘存在性检查修复旧路径不消失，属性 ShellExecuteExW+INVOKEIDLIST 修复 code 31，机器测试矩阵（重名/长路径/中文/只读/源消失/复制到自身/移动到子目录）
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fddaef2` | (see git log) |
+| `3aa15bd` | (see git log) |
+| `2670ef1` | (see git log) |
+| `5d71d65` | (see git log) |
+| `f832857` | (see git log) |
+| `c4d3478` | (see git log) |
+| `7b9e4d9` | (see git log) |
+| `bc6935e` | (see git log) |
+| `d177439` | (see git log) |
+| `ef52ae7` | (see git log) |
+| `387758c` | (see git log) |
+| `668fffb` | (see git log) |
+| `0aa283d` | (see git log) |
+| `7b2655e` | (see git log) |
+| `d6fcc2f` | (see git log) |
+| `2d8a2ba` | (see git log) |
+| `d3281b4` | (see git log) |
+| `1c15af4` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
