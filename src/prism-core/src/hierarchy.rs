@@ -951,6 +951,27 @@ mod tests {
     }
 
     #[test]
+    fn rename_makes_old_name_unsearchable() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "old_name.txt", false)
+            .unwrap();
+        // Rename: same FRN, new name.
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "new_name.txt", false)
+            .unwrap();
+        // New name should be searchable.
+        assert_eq!(volume.search("new_name", 10).len(), 1);
+        // Old name should NOT be searchable.
+        assert_eq!(
+            volume.search("old_name", 10).len(),
+            0,
+            "old name should not be found after rename"
+        );
+    }
+
+    #[test]
     fn directory_rename_updates_descendants_without_traversal() {
         let mut volume = volume();
         volume
