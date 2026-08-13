@@ -3,7 +3,7 @@
   "name": "prism-g8-web-enhancements",
   "title": "G8 网页图标与在线联想",
   "description": "实现专用网页模式、受控在线联想与 favicon 缓存。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

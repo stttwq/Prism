@@ -69,11 +69,14 @@ public partial class App : Application
         _icons = new IconCache();
         // G5: activation must run in this process — SetForegroundWindow only takes effect
         // from the foreground process, which is Prism at the moment Enter is pressed.
+        // G8: suggestion service runs in the user session; broker/indexer never send requests.
         _vm = new SearchViewModel(
             _state,
             _pipe,
-            activator: new Win32WindowActivator());
+            activator: new Win32WindowActivator(),
+            suggestions: new SuggestionService());
         ApplySearchExclusions(settings);
+        _vm.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
 
         // 深浅色跟随系统（替换 App.xaml 中的 Tokens 字典）。
         _theme = new ThemeWatcher(_state);
@@ -166,6 +169,7 @@ public partial class App : Application
         {
             _hotkey?.Apply(settings);
             ApplySearchExclusions(settings);
+            _vm?.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
             Log($"快捷键已应用：{settings.HotkeyMode}" +
                 (settings.HotkeyMode == HotkeyMode.Combo ? $" ({settings.ComboHotkey})" : ""));
         }

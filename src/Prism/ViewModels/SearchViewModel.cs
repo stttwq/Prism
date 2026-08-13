@@ -22,10 +22,20 @@ public sealed class SearchViewModel
     private readonly ISearchScheduler _scheduler;
     /// <summary>窗口激活（G5）。为空表示未装配，窗口结果只显示不可切换。</summary>
     private readonly IWindowActivator? _activator;
+    /// <summary>在线联想服务（G8）。为空表示未装配，网页模式不发送联想请求。</summary>
+    private readonly ISuggestionService? _suggestions;
+    /// <summary>当前引擎列表（G8 网页模式检测用），由设置更新时刷新。</summary>
+    private IReadOnlyList<WebEngine> _webEngines = Settings.DefaultEngines();
+    /// <summary>在线联想开关（G8），默认关闭。</summary>
+    private bool _suggestionsEnabled;
     private CancellationTokenSource? _searchCts;
+    /// <summary>联想请求取消令牌（G8）。查询变化时取消旧请求。</summary>
+    private CancellationTokenSource? _suggestionCts;
     private int _resultLimit = InitialResultLimit;
     private string _pendingQuery = "";
     private int _searchSeq;
+    /// <summary>联想请求序列号（G8）。查询变化时 bump，丢弃迟到响应。</summary>
+    private int _suggestionSeq;
     private string _lastInputQuery = "";
     private SearchCacheEntry? _completeCache;
     private SearchContext _searchContext = SearchContext.Default;
@@ -54,17 +64,26 @@ public sealed class SearchViewModel
         ISearchClient pipe,
         IDebounceTimerFactory? timerFactory = null,
         ISearchScheduler? scheduler = null,
-        IWindowActivator? activator = null)
+        IWindowActivator? activator = null,
+        ISuggestionService? suggestions = null)
     {
         _state = state;
         _pipe = pipe;
         _activator = activator;
+        _suggestions = suggestions;
         timerFactory ??= new DispatcherDebounceTimerFactory();
         _scheduler = scheduler ?? new SearchScheduler();
         _debounce = timerFactory.Create(
             TimeSpan.FromMilliseconds(50), () => _ = OnDebounceTickAsync());
         _generationDebounce = timerFactory.Create(
             TimeSpan.FromMilliseconds(100), () => _ = OnGenerationDebounceTickAsync());
+    }
+
+    /// <summary>更新网页引擎列表和联想开关（G8）。设置保存后由 App 调用。</summary>
+    public void UpdateWebSettings(IReadOnlyList<WebEngine> engines, bool suggestionsEnabled)
+    {
+        _webEngines = engines.Count > 0 ? engines : Settings.DefaultEngines();
+        _suggestionsEnabled = suggestionsEnabled;
     }
 
     /// <summary>Schedules one refresh through the existing broker search path.</summary>
@@ -112,6 +131,7 @@ public sealed class SearchViewModel
             _generationDebounce.Stop();
             _searchSeq++;
             CancelSearch();
+            CancelSuggestions();
             _state.Results = Array.Empty<SearchResult>();
             _state.SelectedIndex = -1;
             _state.Mode = PanelMode.Idle;
@@ -203,6 +223,7 @@ public sealed class SearchViewModel
         _generationDebounce.Stop();
         _searchSeq++;
         CancelSearch();
+        CancelSuggestions();
         _resultLimit = InitialResultLimit;
         _pendingQuery = "";
         _lastInputQuery = "";
@@ -275,6 +296,7 @@ public sealed class SearchViewModel
             _generationDebounce.Stop();
             _searchSeq++;
             CancelSearch();
+            CancelSuggestions();
             _state.Results = Array.Empty<SearchResult>();
             _state.SelectedIndex = -1;
             _state.Mode = PanelMode.Idle;
@@ -715,6 +737,16 @@ public sealed class SearchViewModel
 
     private async Task RunSearchAsync(string query, int max)
     {
+        // G8: web mode — detect web keyword before pipe search. The broker still produces
+        // web results in AllMode, but the dedicated web mode isolates them: only 1 direct
+        // result + up to 5 suggestions, no file/app/window mixing.
+        var webMode = WebModeDetector.TryDetect(query, _webEngines);
+        if (webMode is not null)
+        {
+            await RunWebSearchAsync(query, webMode).ConfigureAwait(true);
+            return;
+        }
+
         var context = ContextFor(query);
         // The broker never sees the `>`; it echoes back the stripped query, so every
         // comparison against the echo below has to use this form too.
@@ -998,6 +1030,141 @@ public sealed class SearchViewModel
         try { _searchCts?.Cancel(); } catch { /* ignore */ }
         _searchCts?.Dispose();
         _searchCts = null;
+    }
+
+    /// <summary>取消正在进行的联想请求（G8）。查询变化时调用。</summary>
+    private void CancelSuggestions()
+    {
+        try { _suggestionCts?.Cancel(); } catch { /* ignore */ }
+        _suggestionCts?.Dispose();
+        _suggestionCts = null;
+    }
+
+    /// <summary>
+    /// 网页模式搜索（G8）。直接结果同步产生，联想异步获取并追加。
+    /// 直接结果不等待网络；联想 800ms 超时静默放弃。
+    /// </summary>
+#pragma warning disable CS1998 // async 方法内无 await：fire-and-forget Task.Run 是故意的
+    private async Task RunWebSearchAsync(string query, WebModeResult webMode)
+    {
+        var seq = ++_searchSeq;
+        CancelSearch();
+        CancelSuggestions();
+        _completeCache = null;
+
+        // 构造直接提交结果：首行显示提交原查询。
+        var directUrl = WebModeDetector.BuildUrl(webMode.UrlTemplate, webMode.QueryTerms);
+        var directTitle = string.IsNullOrEmpty(webMode.QueryTerms)
+            ? $"在 {webMode.EngineName} 中搜索"
+            : $"在 {webMode.EngineName} 中搜索：{webMode.QueryTerms}";
+        var directResult = new SearchResult(
+            Kind: "web",
+            Title: directTitle,
+            Subtitle: directUrl,
+            ExecuteId: directUrl,
+            MatchSpans: BuildWebMatchSpans(directTitle, webMode.QueryTerms))
+        {
+            Target = new ActionTarget("web", directUrl),
+        };
+
+        // 立即显示直接结果，不等待网络。
+        var list = new List<SearchResult> { directResult };
+        if (seq != _searchSeq) return;
+        if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
+
+        _state.Results = list;
+        _state.SelectedIndex = 0;
+        _state.Mode = PanelMode.Results;
+        _state.IsIndexing = false;
+        _state.StatusMessage = _suggestionsEnabled && webMode.IsBuiltIn
+            ? ""  // 联想加载中，但不显示干扰性等待文案
+            : (string.IsNullOrEmpty(webMode.QueryTerms)
+                ? $"按 Enter 在 {webMode.EngineName} 中搜索"
+                : "");
+
+        // 只有内置引擎 + 联想开关开启 + 有查询词时才发请求。
+        if (!_suggestionsEnabled || !webMode.IsBuiltIn || string.IsNullOrWhiteSpace(webMode.QueryTerms))
+            return;
+        if (_suggestions is null)
+            return;
+
+        // 异步发起联想请求，查询变化时取消旧请求。
+        var suggSeq = ++_suggestionSeq;
+        var cts = new CancellationTokenSource();
+        _suggestionCts = cts;
+
+        _ = Task.Run(async () =>
+        {
+            IReadOnlyList<SuggestionItem> suggestions;
+            try
+            {
+                suggestions = await _suggestions.GetSuggestionsAsync(
+                    webMode.EngineName, webMode.QueryTerms, cts.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                // 联想失败静默保留直接结果，不显示干扰性错误。
+                return;
+            }
+
+            // 按请求身份丢弃迟到响应：seq 不匹配说明用户已输入新查询。
+            if (suggSeq != _suggestionSeq) return;
+            if (cts.IsCancellationRequested) return;
+            if (seq != _searchSeq) return;
+            if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
+
+            // 在 UI 线程上追加联想结果（Task.Run 在线程池，需要回到 UI 线程写 Results）。
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    if (suggSeq != _suggestionSeq) { tcs.SetResult(); return; }
+                    if (seq != _searchSeq) { tcs.SetResult(); return; }
+                    if (!string.Equals(query, _state.Query, StringComparison.Ordinal))
+                    {
+                        tcs.SetResult();
+                        return;
+                    }
+
+                    var newList = new List<SearchResult> { directResult };
+                    foreach (var s in suggestions)
+                    {
+                        newList.Add(new SearchResult(
+                            Kind: "web",
+                            Title: s.Text,
+                            Subtitle: s.Url,
+                            ExecuteId: s.Url,
+                            MatchSpans: BuildWebMatchSpans(s.Text, webMode.QueryTerms))
+                        {
+                            Target = new ActionTarget("web", s.Url),
+                        });
+                    }
+
+                    _state.Results = newList;
+                    _state.StatusMessage = "";
+                }
+                finally
+                {
+                    tcs.SetResult();
+                }
+            }));
+            await tcs.Task.ConfigureAwait(true);
+        }, cts.Token);
+    }
+#pragma warning restore CS1998
+
+    /// <summary>网页模式标题中查询词的 UTF-16 匹配区间。</summary>
+    private static int[] BuildWebMatchSpans(string title, string terms)
+    {
+        if (string.IsNullOrEmpty(terms))
+            return [];
+        var idx = title.IndexOf(terms, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0)
+            return [];
+        // 转换为 UTF-16 code unit 偏移（与 ipc::match_spans 约定一致）。
+        var start = title[..idx].Length;
+        return [start, terms.Length];
     }
 
     private static bool QueryMatchesResponse(string requested, string echoed)

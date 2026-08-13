@@ -207,3 +207,93 @@ These have all actually happened in this codebase:
   null `IndexGeneration` and a prefix mismatch each blocked caching independently. Mutate the
   code you think you are testing; if the test still passes, it is documentation, not a test —
   and it should say so.
+
+---
+
+## Web Mode (G8)
+
+### 1. Scope / Trigger
+
+When user input matches a web-engine keyword (`bi`/`b`/`g` or custom), the search enters a
+dedicated web mode: only one direct submit row and up to 5 suggestion rows, with no
+file/app/window mixing. Suggestions are opt-in (default off) and only for built-in engines.
+
+### 2. Signatures
+
+- `WebModeDetector.TryDetect(query, engines) -> WebModeResult?` — pure function, no side effects.
+- `ISuggestionService.GetSuggestionsAsync(engine, query, ct) -> IReadOnlyList<SuggestionItem>`
+- `IHttpTransport.GetAsync(url, ct) -> HttpResponse` — injectable for testing.
+- `SuggestionService(IHttpTransport?)` — production uses `SystemHttpTransport`; tests inject fakes.
+- `FaviconCache(dataDir)` — origin-keyed favicon download/cache with LRU eviction.
+- `SearchViewModel.UpdateWebSettings(engines, suggestionsEnabled)` — called on settings save.
+
+### 3. Contracts
+
+- **Web mode is detected before the pipe search.** `RunSearchAsync` calls
+  `WebModeDetector.TryDetect` first; if it returns non-null, `RunWebSearchAsync` handles the
+  entire flow without touching the broker. The broker's AllMode web results are therefore
+  never shown when a keyword matches — the dedicated web mode replaces them.
+- **Direct result is synchronous.** The submit row appears immediately; suggestions are
+  appended asynchronously. The UI never blocks on network.
+- **Suggestions default off.** `_suggestionsEnabled` starts false; only when the user opts in
+  AND the engine is built-in (Bing/百度/Google) AND there is a non-empty query term does the
+  service fire a request.
+- **Custom engines never call the suggestion API.** `WebModeResult.IsBuiltIn` gates this.
+- **800ms timeout per request.** `SuggestionService` uses `CancellationTokenSource.CancelAfter`
+  linked to the caller's token. Timeout/cancel/network/parse failure → empty list, no error UI.
+- **Request identity discards late responses.** `_suggestionSeq` is bumped on every new web
+  query. The async suggestion callback checks `suggSeq != _suggestionSeq`, `seq != _searchSeq`,
+  and `query != _state.Query` before writing `Results`. A late response from an old query is
+  silently dropped, never overwriting newer results.
+- **Query change cancels old suggestion request.** `CancelSuggestions()` cancels and disposes
+  the previous `_suggestionCts` before a new one is created.
+- **Web mode results never seed the prefix cache.** `_completeCache = null` is set at the
+  start of `RunWebSearchAsync`; the `ApplySearchResponse` cache path is never reached.
+- **Suggestion response limits:** max 5 items, max 128 chars per item, duplicates removed.
+- **favicon authorization is independent of suggestions.** `Settings.FaviconGrants` is a
+  separate dictionary keyed by normalized origin; `Settings.SuggestionsEnabled` is a separate
+  bool. Granting favicon does not enable suggestions, and vice versa.
+- **favicon cache is disk-persisted and bounded.** `FaviconCache` stores images and versioned
+  metadata under `<dataDir>/favicons/`; LRU eviction at 64 entries, 256KB per file, 128×128
+  max pixels. MIME, actual format, and pixel dimensions are all validated before writing.
+- **Privacy:** web query, suggestion text, and favicon URL are never written to history or
+  default logs. `SettingsStore` serializes `FaviconGrants` and `SuggestionsEnabled` but never
+  the query/suggestion content.
+- **UI thread marshaling:** the fire-and-forget suggestion `Task.Run` callback uses
+  `Application.Current.Dispatcher.BeginInvoke` to write `Results` on the UI thread.
+
+### 4. Validation & Error Matrix
+
+| Condition | UI outcome |
+| --- | --- |
+| Web keyword, suggestions off | Direct result only; no network request |
+| Web keyword, suggestions on, built-in | Direct result + up to 5 suggestions appended |
+| Web keyword, custom engine | Direct result only; no suggestion API call |
+| Suggestion timeout (800ms) | Direct result retained; no error shown |
+| Suggestion network error / 4xx/5xx | Direct result retained; no error shown |
+| Suggestion invalid JSON | Direct result retained; no error shown |
+| Late suggestion response (query changed) | Dropped by seq check; never overwrites |
+| favicon not granted | Generic icon; no network request |
+| favicon download fails / corrupt | Generic icon; cache entry deleted |
+| favicon cache miss + granted | `GetFavicon` returns null; `DownloadFaviconAsync` called |
+| favicon cache hit | `GetFavicon` returns cached image |
+
+### 5. Good / Base / Bad Cases
+
+- Good: `bi 天气` → direct Bing row immediately → 5 suggestions appended within 800ms → Enter
+  opens browser.
+- Base: `bi 天气` with suggestions off → direct row only, no network.
+- Bad: blocking the UI on suggestion response; letting a late response overwrite newer
+  results; sending suggestion requests for custom engines; caching web-mode results in the
+  prefix cache.
+
+### 6. Tests Required
+
+- `WebModeDetector`: keyword priority (bi before b), case insensitive, custom engine not
+  built-in, unknown keyword returns null, empty/whitespace returns null, URL encoding.
+- `SuggestionService`: Bing/百度/Google fixed-fixture parsing; max 5; duplicates removed;
+  too-long dropped; invalid JSON → empty; HTTP error → empty; cancellation → empty; 800ms
+  timeout → empty; custom engine → empty; empty query → empty.
+- `FaviconCache`: origin normalization (https, http+port, ftp rejected, empty rejected);
+  not-granted returns null; no-cache returns null; cache directory created; clear works.
+- Privacy: `Settings.Default` has `SuggestionsEnabled = false` and `FaviconGrants = []`.

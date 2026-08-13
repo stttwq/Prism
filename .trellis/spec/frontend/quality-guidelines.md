@@ -87,3 +87,4 @@ C# / .NET 8 / WPF search UI talks to `prism-core` over a single named pipe. UI m
 - [ ] NotifyIcon disposed on exit; Run key path is quoted
 - [ ] Theme change refreshes ResultList brushes + PinButton background
 - [ ] → only handled for file/folder selection; Action errors show under ActionStatus
+- [ ] G8: web mode keyword produces direct result immediately; suggestions default off; late/cancelled/timeout responses do not overwrite newer results; web mode results never seed the prefix cache; favicon authorization independent of suggestions

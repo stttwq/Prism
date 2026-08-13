@@ -94,13 +94,15 @@ Filename: "{app}\Prism.exe"; Description: "立即启动 Prism"; Flags: nowait po
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM Prism.exe /T 2>nul & taskkill /F /IM prism-core.exe /T 2>nul"; Flags: runhidden; RunOnceId: "KillPrism"
 
 [UninstallDelete]
-; 便携模式下数据落在 {app}\data，随软件卸载清理；用户级安装数据在 LocalAppData 不受影响。
+; 便携模式下数据落在 {app}\data（含 G8 favicon 缓存），随软件卸载清理；用户级安装数据在 LocalAppData 不受影响。
 Type: filesandordirs; Name: "{app}\data"
 ; 仅在目录已经为空时删除安装目录，不触碰用户额外放入的文件。
 Type: dirifempty; Name: "{app}"
 ; LocalSystem 索引器的 index-v5.bin / pinyin-v1.bin 均为可重建派生缓存，
 ; 卸载时整个 ProgramData 目录不得残留。
 Type: filesandordirs; Name: "{commonappdata}\Prism"
+; G8 favicon 缓存目录（用户级安装时数据在 LocalAppData）。
+Type: filesandordirs; Name: "{localappdata}\Prism\favicons"
 
 [Code]
 function InitializeSetup(): Boolean;

@@ -17,6 +17,13 @@ public enum HotkeyMode
 public sealed record WebEngine(string Keyword, string Name, string UrlTemplate);
 
 /// <summary>
+/// favicon 联网许可（G8）。用户对某个 origin 授权后，favicon 缓存可下载该 origin 的图标。
+/// </summary>
+/// <param name="Origin">规范化 origin（scheme://host[:port]）。</param>
+/// <param name="GrantedAt">授权时间（UTC ISO 8601），用于审计而非过期。</param>
+public sealed record FaviconGrant(string Origin, string GrantedAt);
+
+/// <summary>
 /// 应用设置，前后端共享，序列化为 JSON。
 /// 用 record + init 便于不可变复制；<see cref="Default"/> 提供全新用户的初始值。
 /// </summary>
@@ -66,6 +73,18 @@ public sealed record Settings
     /// </summary>
     public string? ZipProgram { get; init; }
 
+    /// <summary>
+    /// 在线联想总开关（G8）。默认关闭：用户必须主动开启才发送联想网络请求。
+    /// 只对内置 Bing/百度/Google 生效；自定义引擎不支持联想。
+    /// </summary>
+    public bool SuggestionsEnabled { get; init; } = false;
+
+    /// <summary>
+    /// 已授权获取 favicon 的 origin 集合（G8）。每个 origin 需用户明确同意才联网获取图标。
+    /// 与 <see cref="SuggestionsEnabled"/> 相互独立。Key 为规范化 origin（scheme://host[:port]）。
+    /// </summary>
+    public Dictionary<string, FaviconGrant> FaviconGrants { get; init; } = [];
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
@@ -81,6 +100,8 @@ public sealed record Settings
         ExplorerHostIntegrationEnabled = false,
         DirectoryOpusHostIntegrationEnabled = false,
         ZipProgram = null,
+        SuggestionsEnabled = false,
+        FaviconGrants = [],
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>
