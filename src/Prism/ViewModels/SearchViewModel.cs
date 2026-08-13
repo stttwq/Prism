@@ -33,6 +33,8 @@ public sealed class SearchViewModel
     private string _queryBeforeActions = "";
     /// <summary>后端返回的完整动作列表；输入时按 Label 子串过滤。</summary>
     private IReadOnlyList<ActionItem> _allActions = Array.Empty<ActionItem>();
+    /// <summary>mutation 完成后等待 generation 变化的信号源。</summary>
+    private TaskCompletionSource? _mutationGenerationSignal;
 
     public AppState State => _state;
 
@@ -74,6 +76,8 @@ public sealed class SearchViewModel
             return;
 
         _completeCache = null;
+        _mutationGenerationSignal?.TrySetResult();
+        _mutationGenerationSignal = null;
         _generationDebounce.Restart();
     }
 
@@ -601,15 +605,30 @@ public sealed class SearchViewModel
         if (!string.IsNullOrWhiteSpace(_state.Query) || !string.IsNullOrWhiteSpace(_searchContext.Root))
         {
             _resultLimit = InitialResultLimit;
-            // 清掉 prefix cache，强制不使用本地缓存。
             _completeCache = null;
-            // 清掉旧结果，显示刷新中状态。
             _state.Results = Array.Empty<SearchResult>();
             _state.StatusMessage = "正在刷新…";
-            // 等 indexer 的 USN watcher 消化文件变更。
-            // 先等 1.5 秒做一次搜索，后续 generation 通知到达时会自动再刷一次。
-            await Task.Delay(1500).ConfigureAwait(true);
-            await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
+
+            // 等 indexer 的 USN watcher 消化文件变更：generation 变化或 3 秒超时。
+            // 超时只提示索引尚未刷新，不标为失败。
+            _mutationGenerationSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var generationTask = _mutationGenerationSignal.Task;
+            var timeoutTask = Task.Delay(3000);
+            var completed = await Task.WhenAny(generationTask, timeoutTask).ConfigureAwait(true);
+            _mutationGenerationSignal = null;
+
+            if (completed == timeoutTask)
+            {
+                // generation 超时：先搜索一次（用当前索引），再提示索引尚未刷新。
+                await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
+                _state.StatusMessage = "索引尚未刷新，结果可能不完整";
+            }
+            else
+            {
+                // generation 变化：OnIndexGenerationChanged 已经触发了一次搜索，
+                // 但 generation debounce 可能在 Mode != Results 时被跳过，所以再搜一次。
+                await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
+            }
         }
     }
 

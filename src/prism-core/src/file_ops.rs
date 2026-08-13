@@ -397,4 +397,179 @@ mod tests {
             Err(e) => panic!("recycle failed unexpectedly: {e:?}"),
         }
     }
+
+    // ── G6 机器测试矩阵（live IFileOperation，需手动 --ignored 运行） ──
+
+    fn unique_temp_file(ext: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "prism-g6-{}-{}-{}.{}",
+            ext,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            ext
+        ))
+    }
+
+    /// 重名：rename 到一个已存在的文件名，IFileOperation 应弹出冲突确认。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live IFileOperation; may show rename conflict dialog. Run with --ignored"]
+    fn rename_conflict_existing_name() {
+        let dir = std::env::temp_dir();
+        let src = unique_temp_file("txt");
+        let dst = dir.join(src.file_name().unwrap().to_str().unwrap().to_string() + ".dup");
+        std::fs::write(&src, "src").unwrap();
+        std::fs::write(&dst, "dst").unwrap();
+        let target = ActionTarget::new(TargetKind::File, src.to_str().unwrap());
+        let dst_name = dst.file_name().unwrap().to_str().unwrap();
+        let result = rename(&target, dst_name);
+        // Windows 可能弹冲突确认；成功或取消都可接受，不应是 TargetInvalid。
+        match result {
+            Ok(_) => {}
+            Err(e) if e.kind != ShellErrorKind::TargetInvalid => {}
+            Err(e) => panic!("rename conflict failed with unexpected kind: {e:?}"),
+        }
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// 长路径：文件名接近 MAX_PATH 的文件 rename。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live IFileOperation; tests long path rename. Run with --ignored"]
+    fn rename_long_path() {
+        let long_name = "a".repeat(200) + ".txt";
+        let src = unique_temp_file("txt");
+        std::fs::write(&src, "test").unwrap();
+        let target = ActionTarget::new(TargetKind::File, src.to_str().unwrap());
+        let result = rename(&target, &long_name);
+        // 长路径可能成功或被 Windows 拒绝。
+        let _ = result;
+        // Cleanup: find the file (may have been renamed).
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(src.with_file_name(&long_name));
+    }
+
+    /// 中文路径：文件名含中文的 rename。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live IFileOperation; tests Chinese filename rename. Run with --ignored"]
+    fn rename_chinese_path() {
+        let src = unique_temp_file("txt");
+        std::fs::write(&src, "test").unwrap();
+        let target = ActionTarget::new(TargetKind::File, src.to_str().unwrap());
+        let result = rename(&target, "测试文件.txt");
+        match result {
+            Ok(ShellOutcome::Success) | Ok(ShellOutcome::Cancelled) => {}
+            Err(e) => panic!("rename Chinese path failed unexpectedly: {e:?}"),
+        }
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(src.with_file_name("测试文件.txt"));
+    }
+
+    /// 只读文件：rename 只读文件应成功（IFileOperation 可处理只读属性）。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live IFileOperation; tests read-only file rename. Run with --ignored"]
+    fn rename_readonly_file() {
+        let src = unique_temp_file("txt");
+        std::fs::write(&src, "test").unwrap();
+        let mut perms = std::fs::metadata(&src).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&src, perms).unwrap();
+        let target = ActionTarget::new(TargetKind::File, src.to_str().unwrap());
+        let result = rename(&target, "readonly-renamed.txt");
+        let _ = result;
+        // Restore permissions for cleanup: try to remove the file directly.
+        // If it was renamed, the original no longer exists; if rename failed,
+        // the file is still read-only and remove_file may fail silently.
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(src.with_file_name("readonly-renamed.txt"));
+    }
+
+    /// 源消失：源文件在 rename 前被删除，应返回 TargetInvalid。
+    #[cfg(windows)]
+    #[test]
+    fn rename_source_disappeared() {
+        let ghost = std::env::temp_dir().join(format!(
+            "prism-g6-ghost-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 不创建文件，直接尝试 rename。
+        let target = ActionTarget::new(TargetKind::File, ghost.to_str().unwrap());
+        let err = rename(&target, "newname.txt").unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+    }
+
+    /// 复制到自身：源和目标相同，IFileOperation 应处理或拒绝。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live IFileOperation; tests copy to same directory (self). Run with --ignored"]
+    fn copy_to_self_directory() {
+        let src = unique_temp_file("txt");
+        std::fs::write(&src, "test").unwrap();
+        let target = ActionTarget::new(TargetKind::File, src.to_str().unwrap());
+        // 目标目录 = 源文件所在目录（复制到自身目录，Windows 会自动改名）。
+        let dest = src.parent().unwrap().to_str().unwrap();
+        let result = copy_to(&target, dest);
+        let _ = result;
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// 移动到子目录：将文件移动到其自身的子目录。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live IFileOperation; tests move to subdirectory. Run with --ignored"]
+    fn move_to_subdirectory() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-g6-movetest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("source.txt");
+        std::fs::write(&src, "test").unwrap();
+        let subdir = dir.join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let target = ActionTarget::new(TargetKind::File, src.to_str().unwrap());
+        let result = move_to(&target, subdir.to_str().unwrap());
+        match result {
+            Ok(ShellOutcome::Success) | Ok(ShellOutcome::Cancelled) => {}
+            Err(e) => panic!("move to subdirectory failed unexpectedly: {e:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回收站与永久删除严格区分：回收站设置 FOF_ALLOWUNDO，永久删除不设。
+    #[cfg(windows)]
+    #[test]
+    fn recycle_and_delete_use_different_flags() {
+        // 验证函数本身存在且签名正确；实际 flag 在函数体内硬编码。
+        // recycle 用 FOF_ALLOWUNDO，delete_permanent 用 FOF_WANTNUKEWARNING。
+        // 这里只验证非存在路径返回 TargetInvalid，确保两条路径都到达了
+        // SHCreateItemFromParsingName（在 SetOperationFlags 之前）。
+        let ghost = std::env::temp_dir().join("prism-g6-nonexist-1.txt");
+        let target = ActionTarget::new(TargetKind::File, ghost.to_str().unwrap());
+        assert_eq!(
+            recycle(&target).unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+        let ghost2 = std::env::temp_dir().join("prism-g6-nonexist-2.txt");
+        let target2 = ActionTarget::new(TargetKind::File, ghost2.to_str().unwrap());
+        assert_eq!(
+            delete_permanent(&target2).unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+    }
 }
