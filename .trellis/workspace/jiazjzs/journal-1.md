@@ -844,3 +844,36 @@ G6 完整内置动作：ActionId 封闭枚举 allowlist（File=12/Directory=11/A
 ### Next Steps
 
 - None - task complete
+
+
+## Session 23: G7 ext:/path: 查询过滤：broker 解析 + Top-K 前过滤 + 实机验收
+
+**Date**: 2026-08-13
+**Task**: G7 ext:/path: 查询过滤：broker 解析 + Top-K 前过滤 + 实机验收
+**Branch**: `feature`
+
+### Summary
+
+实现 G7 ext:/path: 查询过滤。broker 侧 parse_query 单次 FSM 解析 ext:/path: token（逗号 OR、引号值、前导点规范化、大小写不敏感），未识别/不完整/未闭合引号回退为普通文本。解析出的 filters 复用 G1 预留、G3 已使用的 filters 通道（不新增协议通道）。indexer 在 search_volumes 和 pinyin_sidecar 的 Top-K 堆前应用 ext（低成本 name-only，目录排除）和 path（高成本完整路径子串匹配）过滤。有过滤器时 broker 跳过 apps/web/window。空 name_query + 过滤器不再短路（修复 find_case_insensitive 空 query 的 windows(0) panic）。实机：ext:pdf→8 items、ext:txt,pdf OR、path:substring、ext+path AND、bi ext:pdf 抑制 web、max=1000→46 pdf、path_constructions=28285、内存 86MB≤100MB。261 Rust tests + 14 ignored / clippy clean / 101 C# tests + 5 skipped / WPF Release 0 warnings 0 errors。G7 已归档。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `caa8ce9` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
