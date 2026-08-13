@@ -11,8 +11,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::hierarchy::{
-    ExclusionMatcher, IndexState, MatchKind, MatchMetadata, RootBound, RootFilter, FLAG_DIRECTORY,
-    FLAG_PRESENT,
+    ExclusionMatcher, IndexState, MatchKind, MatchMetadata, QueryFilters, RootBound, RootFilter,
+    FLAG_DIRECTORY, FLAG_PRESENT,
 };
 use crate::pinyin::{
     encode_compact, match_compact_normalized, normalize_query, PinyinMatch, PinyinMatchKind,
@@ -337,11 +337,12 @@ impl PinyinSidecar {
         max: usize,
         exclusion_paths: &[String],
     ) -> PinyinSearchOutcome {
-        self.search_in_root(index, query, max, exclusion_paths, None)
+        self.search_in_root(index, query, max, exclusion_paths, None, &QueryFilters::none())
     }
 
     /// Pinyin candidates are filtered by the same root rule as the literal path, before
     /// the Top-K heap, so a current-directory search never leaks matches from elsewhere.
+    /// G7: ext/path filters are applied here too, before the Top-K heap.
     pub fn search_in_root(
         &self,
         index: &IndexState,
@@ -349,6 +350,7 @@ impl PinyinSidecar {
         max: usize,
         exclusion_paths: &[String],
         root: Option<RootBound>,
+        filters: &QueryFilters,
     ) -> PinyinSearchOutcome {
         let Some(normalized) = normalize_query(query) else {
             return PinyinSearchOutcome {
@@ -361,6 +363,8 @@ impl PinyinSidecar {
         let mut root_filter = root.map(RootFilter::new);
         let mut heap = BinaryHeap::with_capacity(max);
         let mut matched_count = 0u64;
+        let mut path_constructions = 0u64;
+        let has_path_filter = filters.has_path_filter();
         for record in &self.disk.records {
             if self.delta.contains_key(&record.key) {
                 continue;
@@ -378,6 +382,9 @@ impl PinyinSidecar {
             };
             if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
                 if key_is_literal(index, record.key, query) {
+                    continue;
+                }
+                if !key_passes_filters(index, record.key, filters, has_path_filter, &mut path_constructions) {
                     continue;
                 }
                 matched_count = matched_count.saturating_add(1);
@@ -398,13 +405,16 @@ impl PinyinSidecar {
                 if key_is_literal(index, *key, query) {
                     continue;
                 }
+                if !key_passes_filters(index, *key, filters, has_path_filter, &mut path_constructions) {
+                    continue;
+                }
                 matched_count = matched_count.saturating_add(1);
                 push_candidate(&mut heap, index, *key, matched, max, &exclusions);
             }
         }
 
         let ranked = heap.into_sorted_vec();
-        let path_constructions = ranked.len() as u64;
+        path_constructions = path_constructions.saturating_add(ranked.len() as u64);
         let items = ranked
             .into_iter()
             .filter_map(|candidate| candidate.into_hit(index))
@@ -551,6 +561,43 @@ fn key_is_in_root(
         .volumes
         .get(key.volume as usize)
         .is_some_and(|volume| filter.accepts(key.volume as usize, volume, key.record))
+}
+
+/// G7: applies ext/path filters to a pinyin candidate before it enters the Top-K heap.
+/// Ext is a low-cost name check; path requires constructing the full path (high cost),
+/// counted in `path_constructions`. Returns true when the candidate passes all filters.
+fn key_passes_filters(
+    index: &IndexState,
+    key: RecordKey,
+    filters: &QueryFilters,
+    has_path_filter: bool,
+    path_constructions: &mut u64,
+) -> bool {
+    let Some(volume) = index.volumes.get(key.volume as usize) else {
+        return false;
+    };
+    let Some(slot) = volume.nodes.get(key.record as usize) else {
+        return false;
+    };
+    let Ok(name) = volume.name_at(slot.name_off) else {
+        return false;
+    };
+    let is_directory = slot.flags & FLAG_DIRECTORY != 0;
+    if !filters.ext_matches(name, is_directory) {
+        return false;
+    }
+    if has_path_filter {
+        *path_constructions = path_constructions.saturating_add(1);
+        match volume.path_for(key.record) {
+            Ok(path) => {
+                if !filters.path_matches(&path) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 pub fn path(data_dir: &Path) -> PathBuf {
@@ -834,7 +881,7 @@ mod tests {
         });
 
         assert_eq!(sidecar.search(&index, "wx", 8).items.len(), 3);
-        let scoped = sidecar.search_in_root(&index, "wx", 8, &[], root);
+        let scoped = sidecar.search_in_root(&index, "wx", 8, &[], root, &QueryFilters::none());
         assert_eq!(scoped.items.len(), 1, "{:?}", scoped.items);
         assert_eq!(scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(
@@ -846,7 +893,7 @@ mod tests {
         // a rename outside it does not leak in.
         sidecar.apply_delta(0, 11, Some("支付宝")).unwrap();
         sidecar.apply_delta(0, 12, Some("支付宝")).unwrap();
-        let delta_scoped = sidecar.search_in_root(&index, "zfb", 8, &[], root);
+        let delta_scoped = sidecar.search_in_root(&index, "zfb", 8, &[], root, &QueryFilters::none());
         assert_eq!(delta_scoped.items.len(), 1, "{:?}", delta_scoped.items);
         assert_eq!(delta_scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(delta_scoped.matched_count, 1);

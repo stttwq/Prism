@@ -455,7 +455,7 @@ impl VolumeIndex {
     }
 
     pub fn search(&self, query: &str, max: usize) -> Vec<IndexHit> {
-        search_volumes(std::slice::from_ref(self), query, max, &[], None).items
+        search_volumes(std::slice::from_ref(self), query, max, &[], None, &QueryFilters::none()).items
     }
 
     /// Bounded, memo-free descendant check. Use [`RootFilter`] when many records are
@@ -634,7 +634,14 @@ impl IndexState {
         max: usize,
         exclusion_paths: &[String],
     ) -> SearchOutcome {
-        search_volumes(&self.volumes, query, max, exclusion_paths, None)
+        search_volumes(
+            &self.volumes,
+            query,
+            max,
+            exclusion_paths,
+            None,
+            &QueryFilters::none(),
+        )
     }
 
     /// Same ranking as [`Self::search_with_exclusions`], but candidates outside `root`
@@ -647,7 +654,20 @@ impl IndexState {
         exclusion_paths: &[String],
         root: Option<RootBound>,
     ) -> SearchOutcome {
-        search_volumes(&self.volumes, query, max, exclusion_paths, root)
+        self.search_in_root_filtered(query, max, exclusion_paths, root, &QueryFilters::none())
+    }
+
+    /// G7: ext/path filter-aware variant. Filters are applied **before** the Top-K heap
+    /// so truncation and ordering describe the filtered result set only.
+    pub fn search_in_root_filtered(
+        &self,
+        query: &str,
+        max: usize,
+        exclusion_paths: &[String],
+        root: Option<RootBound>,
+        filters: &QueryFilters,
+    ) -> SearchOutcome {
+        search_volumes(&self.volumes, query, max, exclusion_paths, root, filters)
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -696,6 +716,11 @@ fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
 }
 
 fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
+    if query_lower.is_empty() {
+        // G7: an empty name query matches every candidate (used when ext:/path:
+        // filters are the only criteria). Position 0 means "match at start".
+        return Some(0);
+    }
     if name.is_ascii() && query_lower.is_ascii() {
         name.as_bytes()
             .windows(query_lower.len())
@@ -723,14 +748,84 @@ pub(crate) fn name_eq_ignore_case(left: &str, right: &str) -> bool {
     }
 }
 
+/// G7: per-request ext:/path: filter set applied before the Top-K heap.
+///
+/// `exts` are normalized (leading dot stripped, lowercased); a candidate passes when its
+/// file extension matches any entry (OR). `paths` are case-insensitive substrings matched
+/// against the candidate's full path; all must match (AND). Both checks happen after name
+/// matching but before the bounded heap, so `is_truncated` describes the filtered set only.
+#[derive(Debug, Default, Clone)]
+pub struct QueryFilters {
+    exts: Vec<String>,
+    paths: Vec<String>,
+}
+
+impl QueryFilters {
+    pub fn new(exts: Vec<String>, paths: Vec<String>) -> Self {
+        Self { exts, paths }
+    }
+
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.exts.is_empty() && self.paths.is_empty()
+    }
+
+    /// True when at least one `path:` filter is present (requires path construction).
+    pub(crate) fn has_path_filter(&self) -> bool {
+        !self.paths.is_empty()
+    }
+
+    /// Low-cost extension check (no path construction needed).
+    /// Directories never have an extension in this model.
+    pub(crate) fn ext_matches(&self, name: &str, is_directory: bool) -> bool {
+        if self.exts.is_empty() {
+            return true;
+        }
+        if is_directory {
+            return false;
+        }
+        let ext = file_extension(name);
+        ext.is_some_and(|e| self.exts.iter().any(|target| target.eq_ignore_ascii_case(e)))
+    }
+
+    /// High-cost path check: requires a constructed full path. All path substrings must
+    /// match (AND), case-insensitive.
+    pub(crate) fn path_matches(&self, path: &str) -> bool {
+        if self.paths.is_empty() {
+            return true;
+        }
+        self.paths
+            .iter()
+            .all(|needle| path.to_lowercase().contains(&needle.to_lowercase()))
+    }
+}
+
+/// Extracts the extension from a file name: the portion after the last `.`.
+/// `file.txt` → `txt`; `archive.tar.gz` → `gz`; `noext` → None; `.gitignore` → `gitignore`.
+fn file_extension(name: &str) -> Option<&str> {
+    let last_dot = name.rfind('.')?;
+    // A leading dot with nothing after it (e.g. ".") has no extension.
+    if last_dot + 1 >= name.len() {
+        return None;
+    }
+    Some(&name[last_dot + 1..])
+}
+
 fn search_volumes(
     volumes: &[VolumeIndex],
     query: &str,
     max: usize,
     exclusion_paths: &[String],
     root: Option<RootBound>,
+    filters: &QueryFilters,
 ) -> SearchOutcome {
-    if query.is_empty() || max == 0 {
+    // G7: an empty name query normally means "no search", but when ext:/path:
+    // filters are present the empty name matches every candidate (match_metadata
+    // returns Some for empty query), so we must not short-circuit.
+    if (query.is_empty() && filters.is_empty()) || max == 0 {
         return SearchOutcome {
             items: Vec::new(),
             is_truncated: false,
@@ -753,6 +848,8 @@ fn search_volumes(
     let mut name_candidates = 0u64;
     let mut matched_count = 0u64;
     let mut entered_top_k = 0u64;
+    let mut path_constructions = 0u64;
+    let has_path_filter = filters.has_path_filter();
     for (volume_index, volume) in volumes.iter().enumerate() {
         for (record, slot) in volume.nodes.iter().enumerate() {
             scanned_nodes = scanned_nodes.saturating_add(1);
@@ -780,13 +877,32 @@ fn search_volumes(
             {
                 continue;
             }
+            // G7: ext filter — low cost, checks the name only. Applied before path
+            // construction and before the Top-K heap.
+            let is_directory = slot.flags & FLAG_DIRECTORY != 0;
+            if !filters.ext_matches(name, is_directory) {
+                continue;
+            }
+            // G7: path filter — high cost, needs a constructed full path. Only run
+            // when a path filter is present; still before the Top-K heap so
+            // `is_truncated` describes the filtered set only.
+            if has_path_filter {
+                path_constructions = path_constructions.saturating_add(1);
+                let path = match volume.path_for(record as u32) {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                if !filters.path_matches(&path) {
+                    continue;
+                }
+            }
             matched_count = matched_count.saturating_add(1);
             let candidate = RankedCandidate {
                 volume_index,
                 mount_path: &volume.mount_path,
                 record: record as u32,
                 name,
-                is_directory: slot.flags & FLAG_DIRECTORY != 0,
+                is_directory,
                 metadata,
             };
             if heap.len() < max {
@@ -801,7 +917,9 @@ fn search_volumes(
     }
 
     let ranked = heap.into_sorted_vec();
-    let path_constructions = ranked.len() as u64;
+    // Path construction for surviving candidates: counted separately from the path-filter
+    // constructions above (which only ran when a path filter was present).
+    path_constructions = path_constructions.saturating_add(ranked.len() as u64);
     let items = ranked
         .into_iter()
         .filter_map(|candidate| {
@@ -1597,5 +1715,124 @@ mod tests {
             "negative memo too"
         );
         assert_eq!(filter.bound().root_record, 10);
+    }
+
+    // --- G7: ext/path filter tests ------------------------------------------
+
+    /// Builds a corpus: N files named `file-<i>.txt` + N files named `file-<i>.pdf`
+    /// under C:\docs\, plus a subdirectory `C:\Project X\` with some files.
+    fn filter_fixture() -> IndexState {
+        let mut vol = volume();
+        vol.upsert(frn(10, 1), frn(5, 0), "docs", true).unwrap();
+        for i in 0..20u32 {
+            vol.upsert(frn(100 + i, 1), frn(10, 1), &format!("file-{i}.txt"), false)
+                .unwrap();
+        }
+        for i in 0..20u32 {
+            vol.upsert(frn(200 + i, 1), frn(10, 1), &format!("file-{i}.pdf"), false)
+                .unwrap();
+        }
+        // A directory to test that ext filters exclude directories.
+        vol.upsert(frn(300, 1), frn(10, 1), "notes", true).unwrap();
+        // Files under a directory with a space in the path.
+        vol.upsert(frn(301, 1), frn(5, 0), "Project X", true).unwrap();
+        vol.upsert(frn(302, 1), frn(301, 1), "design.pdf", false)
+            .unwrap();
+        IndexState {
+            volumes: vec![vol],
+            generation: 1,
+            events_since_checkpoint: 0,
+        }
+    }
+
+    #[test]
+    fn ext_filter_returns_only_matching_extension_before_top_k() {
+        let state = filter_fixture();
+        let filters = QueryFilters::new(vec!["pdf".into()], vec![]);
+        let outcome = state.search_in_root_filtered("file", 8, &[], None, &filters);
+        assert_eq!(outcome.items.len(), 8, "should return full max=8 of pdf files");
+        assert!(
+            outcome.items.iter().all(|item| item.name.ends_with(".pdf")),
+            "all results must be pdf"
+        );
+        assert!(
+            outcome.is_truncated,
+            "more than 8 pdf files existed, so truncation must be true"
+        );
+    }
+
+    #[test]
+    fn ext_filter_or_with_multiple_extensions() {
+        let state = filter_fixture();
+        let filters = QueryFilters::new(vec!["txt".into(), "pdf".into()], vec![]);
+        let outcome = state.search_in_root_filtered("file", 1000, &[], None, &filters);
+        assert_eq!(
+            outcome.items.len(),
+            40,
+            "all 20 txt + 20 pdf should match"
+        );
+    }
+
+    #[test]
+    fn ext_filter_excludes_directories() {
+        let state = filter_fixture();
+        let filters = QueryFilters::new(vec!["txt".into()], vec![]);
+        let outcome = state.search_in_root_filtered("notes", 8, &[], None, &filters);
+        // The directory "notes" matches the name query but has no extension.
+        assert!(
+            outcome.items.is_empty(),
+            "directories must not pass ext filters"
+        );
+    }
+
+    #[test]
+    fn path_filter_substring_match_case_insensitive() {
+        let state = filter_fixture();
+        let filters = QueryFilters::new(vec![], vec!["project x".into()]);
+        let outcome = state.search_in_root_filtered("design", 8, &[], None, &filters);
+        assert_eq!(outcome.items.len(), 1);
+        assert!(outcome.items[0].path.contains("Project X"));
+    }
+
+    #[test]
+    fn ext_and_path_combined_and_before_top_k() {
+        let state = filter_fixture();
+        // ext:pdf AND path:"Project X" → only design.pdf under Project X
+        let filters = QueryFilters::new(vec!["pdf".into()], vec!["Project X".into()]);
+        let outcome = state.search_in_root_filtered("design", 8, &[], None, &filters);
+        assert_eq!(outcome.items.len(), 1);
+        assert!(outcome.items[0].name.contains("design"));
+    }
+
+    #[test]
+    fn no_filters_returns_all_matching_candidates() {
+        let state = filter_fixture();
+        let outcome = state.search_in_root_filtered("file", 8, &[], None, &QueryFilters::none());
+        assert_eq!(outcome.items.len(), 8);
+    }
+
+    #[test]
+    fn empty_name_query_with_ext_filter_scans_all_nodes() {
+        // G7: `ext:pdf` with no name token → name_query is empty, but the ext
+        // filter should still return all pdf files. The empty-query guard must
+        // not short-circuit when filters are present.
+        let state = filter_fixture();
+        let filters = QueryFilters::new(vec!["pdf".into()], vec![]);
+        let outcome = state.search_in_root_filtered("", 8, &[], None, &filters);
+        assert_eq!(outcome.items.len(), 8, "should return 8 pdf files");
+        assert!(
+            outcome.items.iter().all(|item| item.name.ends_with(".pdf")),
+            "all results must be pdf"
+        );
+        assert!(outcome.is_truncated, "21 pdf files exist, must truncate");
+    }
+
+    #[test]
+    fn file_extension_helper() {
+        assert_eq!(file_extension("file.txt"), Some("txt"));
+        assert_eq!(file_extension("archive.tar.gz"), Some("gz"));
+        assert_eq!(file_extension("noext"), None);
+        assert_eq!(file_extension(".gitignore"), Some("gitignore"));
+        assert_eq!(file_extension("trailing."), None);
     }
 }

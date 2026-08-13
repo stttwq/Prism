@@ -512,7 +512,14 @@ impl ServiceState {
             None => None,
         };
         let generation = state.generation;
-        if query.is_empty() {
+        let exts = crate::indexer_ipc::ext_filters(filters);
+        let paths = crate::indexer_ipc::path_filters(filters);
+        let has_query_filters = !exts.is_empty() || !paths.is_empty();
+        // G7: an empty name query normally means "no search", but when ext:/path:
+        // filters are present the user wants all files matching the filters — the
+        // empty name matches every candidate in match_metadata, so we must not
+        // short-circuit here.
+        if query.is_empty() && !has_query_filters {
             return Ok(IndexerResponse::Results {
                 generation,
                 items: Vec::new(),
@@ -526,7 +533,17 @@ impl ServiceState {
             });
         }
         let exclusions = crate::indexer_ipc::exclusion_paths(filters);
-        let outcome = state.search_in_root(query, max, &exclusions, root_bound);
+        let query_filters = crate::hierarchy::QueryFilters::new(
+            crate::indexer_ipc::ext_filters(filters),
+            crate::indexer_ipc::path_filters(filters),
+        );
+        let outcome = state.search_in_root_filtered(
+            query,
+            max,
+            &exclusions,
+            root_bound,
+            &query_filters,
+        );
         let mut items: Vec<_> = outcome
             .items
             .into_iter()
@@ -550,6 +567,7 @@ impl ServiceState {
                         max.saturating_sub(items.len()),
                         &exclusions,
                         root_bound,
+                        &query_filters,
                     );
                     matched_count = matched_count.saturating_add(pinyin.matched_count);
                     path_constructions =

@@ -576,6 +576,154 @@ fn record_window_switch(
     }
 }
 
+/// G7：解析 `ext:` / `path:` 查询过滤前缀。
+///
+/// 单次有限状态扫描，识别未转义的 `ext:`、`path:` 和双引号值，输出 `name_query`
+/// 与结构化 filters。任何无效语法都回退为普通文本而非报错丢弃——用户输入不能
+/// 静默丢失。
+///
+/// 语法：
+/// - `report ext:pdf` → name="report", filters=[{ext, pdf}]
+/// - `design ext:md,pdf path:"Project Docs"` → name="design", ext OR md|pdf, path AND
+/// - `ext:.pdf` → 前导点被规范化掉，ext=pdf
+/// - `EXT:PDF` → 大小写不敏感
+/// - `ext:` → 空值，回退为普通文本
+/// - `path:"unterminated` → 未闭合引号，回退为普通文本
+/// - `foo:bar` → 未知前缀，按普通文本处理
+fn parse_query(raw: &str) -> (String, Vec<SearchFilter>) {
+    let known_prefixes = ["ext:", "path:"];
+    let mut name_parts: Vec<&str> = Vec::new();
+    let mut filters = Vec::new();
+
+    let bytes = raw.as_bytes();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        // Skip leading whitespace.
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        // Try to match a known prefix (case-insensitive).
+        let matched = known_prefixes.iter().find_map(|prefix| {
+            let end = pos + prefix.len();
+            if end <= bytes.len() {
+                let slice = &raw[pos..end];
+                if slice.eq_ignore_ascii_case(prefix) {
+                    return Some(*prefix);
+                }
+            }
+            None
+        });
+
+        if let Some(prefix) = matched {
+            let field = prefix.trim_end_matches(':');
+            let value_start = pos + prefix.len();
+
+            // An empty value (whitespace or end-of-string immediately after `:`) means the
+            // token is not a valid filter. Fall back to treating the entire token as plain
+            // text — the prefix itself becomes part of the name query.
+            if value_start >= bytes.len() || bytes[value_start].is_ascii_whitespace() {
+                name_parts.push(&raw[pos..value_start]);
+                pos = value_start;
+                continue;
+            }
+
+            // Read the value: either a quoted string or a whitespace-delimited token.
+            let (value, value_end, closed) = read_filter_value(raw, value_start);
+
+            if !closed || value.is_empty() {
+                // Unterminated quote or empty value: treat the whole token as plain text.
+                name_parts.push(&raw[pos..value_end]);
+                pos = value_end;
+                continue;
+            }
+
+            // Ext values are comma-separated (OR); split and normalize each.
+            if field.eq_ignore_ascii_case("ext") {
+                for part in value.split(',') {
+                    let normalized = normalize_ext(part);
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    if filters.len() >= crate::indexer_ipc::MAX_FILTERS {
+                        break;
+                    }
+                    filters.push(SearchFilter {
+                        field: "ext".into(),
+                        value: normalized,
+                    });
+                }
+            } else if field.eq_ignore_ascii_case("path")
+                && filters.len() < crate::indexer_ipc::MAX_FILTERS
+            {
+                filters.push(SearchFilter {
+                    field: "path".into(),
+                    value: value.to_owned(),
+                });
+            }
+
+            pos = value_end;
+        } else {
+            // Not a filter prefix: consume the token as a plain name part.
+            let start = pos;
+            while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            name_parts.push(&raw[start..pos]);
+        }
+    }
+
+    let name_query = name_parts.join(" ");
+    (name_query, filters)
+}
+
+/// Reads a filter value starting at `start`. Returns (value, end_pos, closed).
+///
+/// - If the value starts with `"`, reads until the closing `"`. `closed=false` if the
+///   string ends without a closing quote (unterminated — caller treats as plain text).
+/// - Otherwise, reads until the next whitespace.
+fn read_filter_value(raw: &str, start: usize) -> (&str, usize, bool) {
+    let bytes = raw.as_bytes();
+    if start < bytes.len() && bytes[start] == b'"' {
+        let inner_start = start + 1;
+        let mut i = inner_start;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            // Unterminated quote — return the rest of the string as the "value" but mark
+            // unclosed so the caller treats the entire token as plain text.
+            return (&raw[inner_start..], bytes.len(), false);
+        }
+        // i points at the closing quote; value_end is past it.
+        return (&raw[inner_start..i], i + 1, true);
+    }
+    // Unquoted: read until whitespace.
+    let mut i = start;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    (&raw[start..i], i, true)
+}
+
+/// Normalizes a single extension value: strip one leading dot, lowercase.
+fn normalize_ext(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix('.').unwrap_or(trimmed);
+    stripped.to_lowercase()
+}
+
+/// True when `filters` contains at least one `ext` or `path` entry (G7).
+fn has_query_filters(filters: &[SearchFilter]) -> bool {
+    filters
+        .iter()
+        .any(|f| f.field == "ext" || f.field == "path")
+}
+
 /// 一次搜索请求的查询部分（与共享状态分开传递，避免参数表无限膨胀）。
 struct SearchArgs<'a> {
     query: &'a str,
@@ -600,13 +748,30 @@ async fn search_service(
         root,
         mode,
     } = args;
-    if let Err(message) = validate_search_request(max, filters.as_deref()) {
+    // G7: parse ext:/path: filter tokens out of the raw query text. The broker owns
+    // parsing so the WPF never duplicates syntax rules. Parsed filters join the same
+    // `filters` channel as G3's exclude_path — no second protocol lane.
+    let (name_query, parsed_filters) = parse_query(query);
+    let mut all_filters: Vec<SearchFilter> = filters.unwrap_or_default();
+    for filter in &parsed_filters {
+        if all_filters.len() >= crate::indexer_ipc::MAX_FILTERS {
+            break;
+        }
+        all_filters.push(filter.clone());
+    }
+    let all_filters = if all_filters.is_empty() {
+        None
+    } else {
+        Some(all_filters)
+    };
+    if let Err(message) = validate_search_request(max, all_filters.as_deref()) {
         return Response::Error {
             message,
             category: None,
         };
     }
-    let filters = filters.filter(|values| !values.is_empty());
+    let filters = all_filters.filter(|values| !values.is_empty());
+    let has_filters = has_query_filters(filters.as_deref().unwrap_or_default());
     // G5 window mode is exclusive: no files, apps, or web rows mixed in, and no indexer
     // round-trip. Checked before the empty-query branch because an empty window query is
     // meaningful (recent windows) while an empty global query is not.
@@ -625,9 +790,13 @@ async fn search_service(
         return empty_query_results(query, max, filters.as_deref(), root, history);
     }
     let mut items = Vec::with_capacity(max.min(128));
-    if let Ok(guard) = engines.read() {
-        if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
-            items.push(hit.into_search_result());
+    // G7: when ext:/path: filters are present, only files/folders are returned — no apps,
+    // web, or window results mixed in.
+    if !has_filters {
+        if let Ok(guard) = engines.read() {
+            if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
+                items.push(hit.into_search_result());
+            }
         }
     }
     let result_slots = max.saturating_sub(items.len());
@@ -635,7 +804,7 @@ async fn search_service(
     let exclusions = exclusion_paths(filters.as_deref());
     let history_weights = history.weights();
     let history_candidates = history_file_candidates(
-        query,
+        &name_query,
         &history_weights,
         preferences.pinyin_enabled(),
         &exclusions,
@@ -655,15 +824,16 @@ async fn search_service(
     // G4: a current-directory scope means "files under this root". Applications are not
     // scoped to a directory, so a root suppresses them entirely rather than leaking
     // global hits (e.g. Start Menu .lnk) into a scoped result list.
-    if result_slots > 0 && root.is_none() {
+    // G7: ext:/path: filters also suppress apps — only files/folders are returned.
+    if result_slots > 0 && root.is_none() && !has_filters {
         if let Ok(apps_guard) = apps.read() {
-            let app_matches = crate::apps::search(&apps_guard, query, usize::MAX);
+            let app_matches = crate::apps::search(&apps_guard, &name_query, usize::MAX);
             app_match_count = app_matches.len() as u64;
             let mut literal_targets = std::collections::HashSet::new();
             for app in app_matches {
                 literal_targets.insert(app.launch_path.clone());
                 let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
-                let mut metadata = rank_title(&app.name, query);
+                let mut metadata = rank_title(&app.name, &name_query);
                 if let Some(metadata) = metadata.as_mut() {
                     metadata.history_score = history.score(&target);
                 }
@@ -677,7 +847,7 @@ async fn search_service(
                     },
                     execute_id: app.launch_path.clone(),
                     target,
-                    match_spans: match_spans(&app.name, query),
+                    match_spans: match_spans(&app.name, &name_query),
                     match_metadata: metadata,
                 });
             }
@@ -686,7 +856,7 @@ async fn search_service(
                     if literal_targets.contains(&app.launch_path) {
                         continue;
                     }
-                    let Some(matched) = crate::pinyin::match_name(&app.name, query) else {
+                    let Some(matched) = crate::pinyin::match_name(&app.name, &name_query) else {
                         continue;
                     };
                     let target =
@@ -711,7 +881,7 @@ async fn search_service(
         }
     }
     let (service, root_rejection, root_message) = search_index_with_root_fallback(
-        query,
+        &name_query,
         result_slots.max(1),
         filters.as_deref(),
         preferences.pinyin_enabled(),
@@ -2208,5 +2378,112 @@ mod protocol_tests {
         let (_, rejection, _) =
             search_index_with_root_fallback("needle", 8, None, false, Some("   ")).await;
         assert_eq!(rejection, None, "a blank root is a global search");
+    }
+}
+
+#[cfg(test)]
+mod query_parser_tests {
+    use super::*;
+
+    fn ext(value: &str) -> SearchFilter {
+        SearchFilter {
+            field: "ext".into(),
+            value: value.into(),
+        }
+    }
+
+    fn path(value: &str) -> SearchFilter {
+        SearchFilter {
+            field: "path".into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn single_ext_filter() {
+        let (name, filters) = parse_query("report ext:pdf");
+        assert_eq!(name, "report");
+        assert_eq!(filters, vec![ext("pdf")]);
+    }
+
+    #[test]
+    fn multi_ext_or() {
+        let (name, filters) = parse_query("design ext:md,pdf");
+        assert_eq!(name, "design");
+        assert_eq!(filters, vec![ext("md"), ext("pdf")]);
+    }
+
+    #[test]
+    fn ext_and_path_combined() {
+        let (name, filters) = parse_query(r#"design ext:md,pdf path:"Project Docs""#);
+        assert_eq!(name, "design");
+        assert_eq!(filters, vec![ext("md"), ext("pdf"), path("Project Docs")]);
+    }
+
+    #[test]
+    fn leading_dot_stripped_and_case_insensitive() {
+        let (name, filters) = parse_query("ext:.PDF");
+        assert_eq!(name, "");
+        assert_eq!(filters, vec![ext("pdf")]);
+    }
+
+    #[test]
+    fn empty_ext_falls_back_to_plain_text() {
+        let (name, filters) = parse_query("ext: ");
+        assert_eq!(name, "ext:");
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn unterminated_quote_falls_back_to_plain_text() {
+        let (name, filters) = parse_query(r#"path:"unterminated"#);
+        assert!(filters.is_empty(), "no filters should be parsed");
+        assert_eq!(name, r#"path:"unterminated"#);
+    }
+
+    #[test]
+    fn unknown_prefix_is_plain_text() {
+        let (name, filters) = parse_query("foo:bar");
+        assert_eq!(name, "foo:bar");
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn repeated_ext_filters_are_preserved() {
+        let (name, filters) = parse_query("ext:pdf ext:pdf");
+        assert_eq!(name, "");
+        assert_eq!(filters, vec![ext("pdf"), ext("pdf")]);
+    }
+
+    #[test]
+    fn path_without_quotes() {
+        let (name, filters) = parse_query(r#"report path:C:\Users"#);
+        assert_eq!(name, "report");
+        assert_eq!(filters, vec![path(r"C:\Users")]);
+    }
+
+    #[test]
+    fn multiple_tokens_and_filters() {
+        let (name, filters) = parse_query(r#"report final ext:pdf path:"My Docs""#);
+        assert_eq!(name, "report final");
+        assert_eq!(filters, vec![ext("pdf"), path("My Docs")]);
+    }
+
+    #[test]
+    fn bare_query_has_no_filters() {
+        let (name, filters) = parse_query("just a normal search");
+        assert_eq!(name, "just a normal search");
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn has_query_filters_detects_ext_and_path() {
+        assert!(has_query_filters(&[ext("pdf")]));
+        assert!(has_query_filters(&[path("docs")]));
+        assert!(!has_query_filters(&[SearchFilter {
+            field: "exclude_path".into(),
+            value: r"C:\x".into(),
+        }]));
+        assert!(!has_query_filters(&[]));
     }
 }

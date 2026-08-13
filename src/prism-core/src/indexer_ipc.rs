@@ -143,6 +143,11 @@ pub struct SearchFilter {
     pub value: String,
 }
 
+/// Recognised filter field names on the `filters` channel.
+const FIELD_EXCLUDE_PATH: &str = "exclude_path";
+const FIELD_EXT: &str = "ext";
+const FIELD_PATH: &str = "path";
+
 pub fn validate_search_request(max: usize, filters: Option<&[SearchFilter]>) -> Result<(), String> {
     if max == 0 || max > MAX_SEARCH_RESULTS {
         return Err(format!("max must be between 1 and {MAX_SEARCH_RESULTS}"));
@@ -162,15 +167,30 @@ pub fn validate_search_request(max: usize, filters: Option<&[SearchFilter]>) -> 
                 "filter value may contain at most {MAX_FILTER_VALUE_BYTES} bytes"
             ));
         }
-        if filter.field != "exclude_path" {
-            return Err(format!("unsupported filter field: {}", filter.field));
-        }
-        if filter.value.trim().is_empty()
-            || filter.value.contains('\0')
-            || filter.value.chars().any(char::is_control)
-            || !std::path::Path::new(filter.value.trim()).is_absolute()
-        {
-            return Err("exclude_path filters require an absolute path".into());
+        match filter.field.as_str() {
+            FIELD_EXCLUDE_PATH => {
+                if filter.value.trim().is_empty()
+                    || filter.value.contains('\0')
+                    || filter.value.chars().any(char::is_control)
+                    || !std::path::Path::new(filter.value.trim()).is_absolute()
+                {
+                    return Err("exclude_path filters require an absolute path".into());
+                }
+            }
+            FIELD_EXT | FIELD_PATH => {
+                if filter.value.trim().is_empty()
+                    || filter.value.contains('\0')
+                    || filter.value.chars().any(char::is_control)
+                {
+                    return Err(format!(
+                        "{} filter value must be a non-empty, control-free string",
+                        filter.field
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!("unsupported filter field: {}", filter.field));
+            }
         }
     }
     Ok(())
@@ -194,7 +214,7 @@ pub fn exclusion_paths(filters: Option<&[SearchFilter]>) -> Vec<String> {
     filters
         .unwrap_or_default()
         .iter()
-        .filter(|filter| filter.field == "exclude_path")
+        .filter(|filter| filter.field == FIELD_EXCLUDE_PATH)
         .map(|filter| {
             filter
                 .value
@@ -203,6 +223,31 @@ pub fn exclusion_paths(filters: Option<&[SearchFilter]>) -> Vec<String> {
                 .trim_end_matches('\\')
                 .to_owned()
         })
+        .collect()
+}
+
+/// Returns `ext:` filter values (G7). Each value is already normalized by the broker parser:
+/// leading dot stripped, lowercased. Multiple values within one `ext:` token are split into
+/// separate filters (OR semantics); multiple `ext:` tokens are AND-ed at the filter level but
+/// collapse to a single OR set at execution time (any ext match passes).
+pub fn ext_filters(filters: Option<&[SearchFilter]>) -> Vec<String> {
+    filters
+        .unwrap_or_default()
+        .iter()
+        .filter(|filter| filter.field == FIELD_EXT)
+        .map(|filter| filter.value.trim().to_owned())
+        .collect()
+}
+
+/// Returns `path:` filter values (G7). Each value is a case-insensitive substring matched
+/// against the candidate's full path. Multiple `path:` filters are AND-ed: a candidate's path
+/// must contain every path substring.
+pub fn path_filters(filters: Option<&[SearchFilter]>) -> Vec<String> {
+    filters
+        .unwrap_or_default()
+        .iter()
+        .filter(|filter| filter.field == FIELD_PATH)
+        .map(|filter| filter.value.trim().to_owned())
         .collect()
 }
 
@@ -278,6 +323,51 @@ mod tests {
             value: "relative".into(),
         }];
         assert!(validate_search_request(8, Some(&relative)).is_err());
+    }
+
+    #[test]
+    fn ext_and_path_filters_are_accepted_and_extracted() {
+        let filters = [
+            SearchFilter {
+                field: "ext".into(),
+                value: "pdf".into(),
+            },
+            SearchFilter {
+                field: "ext".into(),
+                value: "md".into(),
+            },
+            SearchFilter {
+                field: "path".into(),
+                value: r"Project Docs".into(),
+            },
+        ];
+        validate_search_request(8, Some(&filters)).unwrap();
+        assert_eq!(ext_filters(Some(&filters)), vec!["pdf", "md"]);
+        assert_eq!(path_filters(Some(&filters)), vec!["Project Docs"]);
+    }
+
+    #[test]
+    fn empty_ext_or_path_value_is_rejected() {
+        let empty_ext = [SearchFilter {
+            field: "ext".into(),
+            value: "  ".into(),
+        }];
+        assert!(validate_search_request(8, Some(&empty_ext)).is_err());
+
+        let empty_path = [SearchFilter {
+            field: "path".into(),
+            value: "".into(),
+        }];
+        assert!(validate_search_request(8, Some(&empty_path)).is_err());
+    }
+
+    #[test]
+    fn unknown_filter_field_is_still_rejected() {
+        let unknown = [SearchFilter {
+            field: "size".into(),
+            value: "100".into(),
+        }];
+        assert!(validate_search_request(8, Some(&unknown)).is_err());
     }
 
     #[test]

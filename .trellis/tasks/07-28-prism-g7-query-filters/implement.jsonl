@@ -1,5 +1,7 @@
-{"file":"docs/PRISM-COMPREHENSIVE-PLAN.md","reason":"G7 语法、Top-K 前过滤与明确排除范围"}
-{"file":"src/prism-core/src/ipc.rs","reason":"broker 查询解析、provider 合并与结果类型（search.rs 是占位文件，G3 已删）"}
-{"file":"src/prism-core/src/hierarchy.rs","reason":"extension/path/root 的候选阶段执行点"}
-{"file":"src/prism-core/src/indexer_ipc.rs","reason":"结构化 filters 和请求上限"}
-{"file":"src/Prism/ViewModels/SearchViewModel.cs","reason":"filters 请求身份、缓存和迟到响应"}
+{"file":"src/prism-core/src/ipc.rs","reason":"parse_query 解析器 + search_service 集成 + has_query_filters + parser 测试"}
+{"file":"src/prism-core/src/indexer_ipc.rs","reason":"validate_search_request 允许 ext/path field + ext_filters/path_filters 辅助函数 + 协议测试"}
+{"file":"src/prism-core/src/hierarchy.rs","reason":"QueryFilters 结构体 + search_volumes ext/path 过滤在 Top-K 前 + search_in_root_filtered + filter_fixture 测试"}
+{"file":"src/prism-core/src/indexer_runtime.rs","reason":"search 提取 ext/path filters 并传入 hierarchy + pinyin sidecar 调用传 QueryFilters"}
+{"file":"src/prism-core/src/pinyin_sidecar.rs","reason":"search_in_root 增加 QueryFilters 参数 + key_passes_filters 在 Top-K 前应用 ext/path"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"G7 ext/path 过滤 spec：broker 解析、Top-K 前过滤、有过滤器时不返回应用/网页"}
+{"file":".trellis/spec/frontend/state-management.md","reason":"G7 过滤缓存失效 spec：WPF 不复制解析、query 文本天然区分缓存"}

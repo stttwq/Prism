@@ -55,6 +55,24 @@ relax them without a corresponding test change.
 - Protocol kinds are retained as raw strings and projected to
   `SearchResultKind`; unknown strings map to `Unknown` without throwing.
 
+## G7 Filter Cache Identity
+
+- The WPF does **not** parse `ext:` / `path:` syntax. The raw query text is sent
+  unchanged to the broker, which parses it and echoes the original query back in
+  `Response::Results.query`. The frontend's `QueryMatchesResponse` and prefix-cache
+  `StartsWith` checks therefore operate on the original text and need no changes.
+- Different filter queries (`"report ext:pdf"` vs `"report ext:md"`) have different
+  text, so the prefix cache never crosses filter boundaries. A cached response for
+  `"report ext:pdf"` cannot serve `"report ext:md"` because the latter is not a
+  prefix of the former.
+- `SearchContext.Filters` (carrying G3 exclude_path entries) is already part of
+  `SearchContext.IsEquivalentTo`, which gates the prefix cache. G7's parsed filters
+  live in the query text, not in `SearchContext.Filters`, so no new cache-key
+  dimension is needed.
+- Late responses from an old filter query are discarded by the existing
+  `_searchSeq` + `QueryMatchesResponse` mechanism — a stale broker echo that does
+  not match the current input box is rejected before `ApplySearchResponse`.
+
 ## Window Mode (G5)
 
 ### 1. Scope / Trigger
