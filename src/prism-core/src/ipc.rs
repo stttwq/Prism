@@ -40,17 +40,30 @@ pub type SharedEngines = Arc<std::sync::RwLock<Vec<WebEngine>>>;
 
 pub struct BrokerPreferences {
     pinyin_enabled: AtomicBool,
+    zip_program: std::sync::RwLock<Option<String>>,
 }
 
 impl BrokerPreferences {
     pub fn new(pinyin_enabled: bool) -> Self {
         Self {
             pinyin_enabled: AtomicBool::new(pinyin_enabled),
+            zip_program: std::sync::RwLock::new(None),
+        }
+    }
+
+    pub fn with_zip_program(pinyin_enabled: bool, zip_program: Option<String>) -> Self {
+        Self {
+            pinyin_enabled: AtomicBool::new(pinyin_enabled),
+            zip_program: std::sync::RwLock::new(zip_program),
         }
     }
 
     fn pinyin_enabled(&self) -> bool {
         self.pinyin_enabled.load(Ordering::Acquire)
+    }
+
+    fn zip_program(&self) -> Option<String> {
+        self.zip_program.read().ok().and_then(|guard| guard.clone())
     }
 }
 
@@ -450,6 +463,7 @@ async fn dispatch_non_search(
                     target: resolve_target(target, id, Some(TargetKind::File)),
                     action,
                     args: args.unwrap_or_default(),
+                    zip_program: preferences.zip_program(),
                 },
                 history,
             )

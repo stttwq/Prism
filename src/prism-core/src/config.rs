@@ -46,6 +46,11 @@ pub struct Config {
     /// 也接受 camelCase `webEngines` 以便手工编辑。
     #[serde(alias = "WebEngines", alias = "webEngines")]
     pub web_engines: Vec<WebEngine>,
+
+    /// 用户自定义压缩程序可执行文件完整路径。设置且文件存在时优先于自动探测。
+    /// 缺省 `None` 表示未设置，回退到自动探测 7-Zip 或 Windows 内置 Shell。
+    #[serde(alias = "ZipProgram", alias = "zipProgram")]
+    pub zip_program: Option<String>,
 }
 
 impl Default for Config {
@@ -57,6 +62,7 @@ impl Default for Config {
             pinyin_enabled: true,
             // 缺省即带上 bi/b/g（必应优先），与前端 Settings.Default 一致。
             web_engines: WebEngine::defaults(),
+            zip_program: None,
         }
     }
 }

@@ -67,6 +67,8 @@ pub enum ShellOperation {
         target: ActionTarget,
         action: String,
         args: crate::ipc::ActionArgs,
+        /// settings.json 的 ZipProgram 字段值，仅 zip 动作使用。
+        zip_program: Option<String>,
     },
 }
 
@@ -209,8 +211,8 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
         ShellOperation::Reveal(target) => reveal(&target),
         ShellOperation::Properties(target) => shell_execute(&target, "properties"),
         ShellOperation::OpenWith(target) => shell_execute(&target, "openas"),
-        ShellOperation::RunAction { target, action, args } => {
-            execute_run_action(target, action, args)
+        ShellOperation::RunAction { target, action, args, zip_program } => {
+            execute_run_action(target, action, args, zip_program)
         }
     }
 }
@@ -224,6 +226,7 @@ fn execute_run_action(
     target: ActionTarget,
     action: String,
     args: crate::ipc::ActionArgs,
+    zip_program: Option<String>,
 ) -> Result<ShellOutcome, ShellError> {
     use crate::actions::ActionId;
 
@@ -310,10 +313,11 @@ fn execute_run_action(
             })?;
             crate::file_ops::move_to(&target, &dest)
         }
-        ActionId::Zip => Err(ShellError::new(
-            ShellErrorKind::Unsupported,
-            "zip is not yet implemented",
-        )),
+        ActionId::Zip => {
+            // zip 的 output_path：源路径同名 + .zip
+            let output_path = format!("{}.zip", target.value);
+            crate::zip::zip(&target, &output_path, zip_program.as_deref())
+        }
     }
 }
 
@@ -615,7 +619,7 @@ mod tests {
     #[test]
     fn run_action_rejects_unknown_action_id() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "not_real".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(target, "not_real".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("unknown action"));
     }
@@ -623,18 +627,18 @@ mod tests {
     #[test]
     fn run_action_rejects_window_and_web_targets() {
         let window = ActionTarget::new(TargetKind::Window, "12345");
-        let err = execute_run_action(window, "copy".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(window, "copy".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
 
         let web = ActionTarget::new(TargetKind::Web, "https://example.com");
-        let err = execute_run_action(web, "copy".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(web, "copy".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
     }
 
     #[test]
     fn run_action_open_with_rejects_directory() {
         let dir = ActionTarget::new(TargetKind::Directory, r"C:\Windows");
-        let err = execute_run_action(dir, "open_with".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(dir, "open_with".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for files"));
     }
@@ -642,7 +646,7 @@ mod tests {
     #[test]
     fn run_action_locate_app_rejects_file() {
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(file, "locate_app".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(file, "locate_app".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for applications"));
     }
@@ -650,32 +654,34 @@ mod tests {
     #[test]
     fn run_action_run_as_admin_rejects_file() {
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(file, "run_as_admin".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(file, "run_as_admin".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for applications"));
     }
 
     #[test]
-    fn run_action_mutation_actions_return_unsupported() {
+    fn run_action_mutation_actions_without_args_return_target_invalid() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        // rename/copy_to/move_to without args return TargetInvalid;
-        // zip is not yet implemented → Unsupported.
+        // rename/copy_to/move_to without args return TargetInvalid.
         for action in ["rename", "copy_to", "move_to"] {
-            let err = execute_run_action(target.clone(), action.into(), Default::default()).unwrap_err();
+            let err = execute_run_action(target.clone(), action.into(), Default::default(), None).unwrap_err();
             assert_eq!(
                 err.kind,
                 ShellErrorKind::TargetInvalid,
                 "{action} without args should be TargetInvalid"
             );
         }
-        let err = execute_run_action(target.clone(), "zip".into(), Default::default()).unwrap_err();
-        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+        // zip on a nonexistent source: fails because either the source or
+        // output path is invalid/permission-denied. The point is it does
+        // not return Unsupported (routing reached file_ops).
+        let err = execute_run_action(target.clone(), "zip".into(), Default::default(), None).unwrap_err();
+        assert_ne!(err.kind, ShellErrorKind::Unsupported);
     }
 
     #[test]
     fn run_action_rename_without_args_errors() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "rename".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(target, "rename".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("new_name"));
     }
@@ -683,7 +689,7 @@ mod tests {
     #[test]
     fn run_action_copy_to_without_args_errors() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "copy_to".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(target, "copy_to".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("destination"));
     }
@@ -691,7 +697,7 @@ mod tests {
     #[test]
     fn run_action_move_to_without_args_errors() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "move_to".into(), Default::default()).unwrap_err();
+        let err = execute_run_action(target, "move_to".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("destination"));
     }
@@ -717,6 +723,7 @@ mod tests {
                     new_name: Some("prism-g6-renamed.txt".into()),
                     destination: None,
                 },
+                zip_program: None,
             })
             .await;
         // Rename may succeed or be cancelled if Windows shows a conflict dialog.
@@ -747,6 +754,7 @@ mod tests {
                     destination: Some(std::env::temp_dir().to_str().unwrap().into()),
                     new_name: None,
                 },
+                zip_program: None,
             })
             .await;
         // copy_to may succeed, be cancelled, or fail with a system error if
@@ -773,6 +781,7 @@ mod tests {
                 target,
                 action: "recycle".into(),
                 args: Default::default(),
+                zip_program: None,
             })
             .await;
         match result {
@@ -790,6 +799,7 @@ mod tests {
                 target,
                 action: "copy".into(),
                 args: Default::default(),
+                zip_program: None,
             })
             .await
             .unwrap();
@@ -809,6 +819,7 @@ mod tests {
                 target,
                 action: "run_as_admin".into(),
                 args: Default::default(),
+                zip_program: None,
             })
             .await;
         // Either success or a system error (UAC declined) is acceptable; the
