@@ -599,6 +599,11 @@ public sealed class SearchViewModel
         if (!string.IsNullOrWhiteSpace(_state.Query) || !string.IsNullOrWhiteSpace(_searchContext.Root))
         {
             _resultLimit = InitialResultLimit;
+            // 等 indexer 的 USN watcher 消化文件变更（rename/copy/move/delete），
+            // 否则立即搜索会返回旧路径。1 秒足够 USN 推进，后续 generation 通知会再刷一次。
+            await Task.Delay(1000).ConfigureAwait(true);
+            // 清掉 prefix cache，强制不使用本地缓存。
+            _completeCache = null;
             await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
         }
     }

@@ -382,7 +382,30 @@ public partial class SearchWindow : Window
                 _ignoreDeactivate = true;
                 try
                 {
-                    await _vm.RunActionOnAsync(target, action).ConfigureAwait(true);
+                    // rename 需要可见的动作面板才能编辑新文件名，
+                    // 右键菜单场景先进入 Actions 面板再触发 rename。
+                    if (action.Id == "rename")
+                    {
+                        // 先选中目标结果，再进入动作面板。
+                        var idx = IndexOfResult(target);
+                        if (idx >= 0) _vm.State.SelectedIndex = idx;
+                        await EnterActionsUiAsync().ConfigureAwait(true);
+                        // 进入面板后手动选中 rename 动作并执行。
+                        var actions = _vm.State.Actions;
+                        for (var i = 0; i < actions.Count; i++)
+                        {
+                            if (actions[i].Id == "rename" && !actions[i].IsSectionHeader)
+                            {
+                                _vm.State.SelectedActionIndex = i;
+                                break;
+                            }
+                        }
+                        await _vm.ExecuteActionAsync().ConfigureAwait(true);
+                    }
+                    else
+                    {
+                        await _vm.RunActionOnAsync(target, action).ConfigureAwait(true);
+                    }
                 }
                 finally
                 {
