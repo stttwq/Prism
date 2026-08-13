@@ -482,6 +482,16 @@ public sealed class SearchViewModel
         await RunActionOnAsync(target, action).ConfigureAwait(true);
     }
 
+    /// <summary>
+    /// 动作成功后隐藏窗口的动作集合。不在集合中的动作（rename/move_to/
+    /// recycle/delete_permanent/zip）保留窗口，等待 generation 更新或有界超时后重搜。
+    /// </summary>
+    private static readonly HashSet<string> HideAfterSuccessActions = new()
+    {
+        "open_folder", "copy", "cut", "copy_path", "copy_app_path",
+        "properties", "app_properties", "open_with", "locate_app", "run_as_admin",
+    };
+
     /// <summary>执行指定目标上的动作，保持所有入口的成功隐藏和错误提示一致。</summary>
     public async Task RunActionOnAsync(SearchResult target, ActionItem action)
     {
@@ -509,7 +519,12 @@ public sealed class SearchViewModel
         try
         {
             await _pipe.RunActionAsync(target.ExecutionTarget, action.Id).ConfigureAwait(true);
-            HideRequested?.Invoke();
+            // mutation 动作（recycle/delete_permanent/zip）保留窗口等待 generation 刷新；
+            // 其余成功动作隐藏 Prism。
+            if (HideAfterSuccessActions.Contains(action.Id))
+                HideRequested?.Invoke();
+            else
+                _state.StatusMessage = "操作完成，正在刷新…";
         }
         catch (Exception ex)
         {
@@ -532,7 +547,8 @@ public sealed class SearchViewModel
                 CancellationToken.None).ConfigureAwait(true);
             _state.RenameTarget = null;
             _state.RenameNewName = null;
-            HideRequested?.Invoke();
+            // rename 保留窗口，等待 generation 刷新或有界超时后重搜。
+            _state.StatusMessage = "重命名完成，正在刷新…";
         }
         catch (Exception ex)
         {
