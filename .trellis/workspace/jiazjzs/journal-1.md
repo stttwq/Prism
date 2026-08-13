@@ -877,3 +877,38 @@ G6 完整内置动作：ActionId 封闭枚举 allowlist（File=12/Directory=11/A
 ### Next Steps
 
 - None - task complete
+
+
+## Session 24: G8 网页模式与在线联想 + 应用图标替换
+
+**Date**: 2026-08-13
+**Task**: G8 网页模式与在线联想 + 应用图标替换
+**Branch**: `feature`
+
+### Summary
+
+完成 G8 网页图标与在线联想任务：专用 web mode（WebModeDetector 在 RunSearchAsync 入口拦截，不走 pipe search）；可取消 800ms 联想服务（Bing/百度/Google adapter，可注入 IHttpTransport，固定夹具测试）；FaviconCache（origin 规范化、MIME/格式/像素验证、LRU 淘汰、版本化 metadata）；WebIconProvider 程序化矢量生成内置引擎图标；设置页联想开关 + favicon 授权流程；prism.iss 卸载清单含 favicon 缓存目录。33 测试（30 固定夹具 + 3 live #[Skip]）。质量门全绿：C# 131 通过/8 跳过、Rust 261 通过、Clippy 0 警告、Release build 0 错误。最后用用户设计的 SVG 替换应用图标（WPF Geometry 渲染为 6 尺寸 ICO），并添加 <ApplicationIcon> 让 EXE 嵌入 Win32 图标。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `de5d249` | (see git log) |
+| `0c84fcb` | (see git log) |
+| `076d7fc` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

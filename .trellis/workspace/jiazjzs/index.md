@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 23
+- **Total Sessions**: 24
 - **Last Active**: 2026-08-13
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~879 | Active |
+| `journal-1.md` | ~914 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 24 | 2026-08-13 | G8 网页模式与在线联想 + 应用图标替换 | `de5d249`, `0c84fcb`, `076d7fc` | `feature` |
 | 23 | 2026-08-13 | G7 ext:/path: 查询过滤：broker 解析 + Top-K 前过滤 + 实机验收 | `caa8ce9` | `feature` |
 | 22 | 2026-08-13 | G6 完整内置动作 | `fddaef2`, `3aa15bd`, `2670ef1`, `5d71d65`, `f832857`, `c4d3478`, `7b9e4d9`, `bc6935e`, `d177439`, `ef52ae7`, `387758c`, `668fffb`, `0aa283d`, `7b2655e`, `d6fcc2f`, `2d8a2ba`, `d3281b4`, `1c15af4` | `feature` |
 | 21 | 2026-08-12 | G5 窗口切换器收口：挂起 UWP 修复、步骤 8 机器测试与 PRD 验收证据 | `31370b7`, `4527156`, `7459914`, `457d96a`, `47cb02b` | `feature` |
