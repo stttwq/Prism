@@ -209,6 +209,8 @@ public sealed class SearchViewModel
         _state.Actions = Array.Empty<ActionItem>();
         _state.SelectedActionIndex = -1;
         _state.ActionTarget = null;
+        _state.RenameTarget = null;
+        _state.RenameNewName = null;
         _state.Mode = PanelMode.Idle;
         _state.IsIndexing = false;
         _state.StatusMessage = _state.IsBackendConnected ? "" : "正在连接后端…";
@@ -470,6 +472,8 @@ public sealed class SearchViewModel
     public void LeaveActions()
     {
         if (_state.Mode != PanelMode.Actions) return;
+        _state.RenameTarget = null;
+        _state.RenameNewName = null;
         _state.Mode = PanelMode.Results;
         _state.Actions = Array.Empty<ActionItem>();
         _state.SelectedActionIndex = -1;
@@ -482,6 +486,14 @@ public sealed class SearchViewModel
 
     public async Task ExecuteActionAsync()
     {
+        // 重命名编辑态：Enter 提交重命名，不执行动作面板选中项。
+        if (_state.RenameTarget is not null)
+        {
+            var newName = _state.RenameNewName ?? "";
+            await CommitRenameAsync(newName).ConfigureAwait(true);
+            return;
+        }
+
         if (_state.Mode != PanelMode.Actions) return;
         var action = _state.SelectedAction;
         var target = _state.ActionTarget;
