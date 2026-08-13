@@ -379,6 +379,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "live IFileOperation test; sends file to Recycle Bin. Run with --ignored"]
     fn recycle_temp_file_succeeds() {
         let temp = std::env::temp_dir().join(format!(
             "prism-g6-recycle-test-{}-{}.txt",

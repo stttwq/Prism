@@ -703,6 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live IFileOperation test; triggers Windows rename dialog. Run with --ignored"]
     async fn run_action_rename_succeeds_on_sta_worker() {
         let temp = std::env::temp_dir().join(format!(
             "prism-g6-rename-{}-{}.txt",
@@ -734,6 +735,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live IFileOperation test; triggers Windows copy dialog. Run with --ignored"]
     async fn run_action_copy_to_reaches_file_ops() {
         let temp = std::env::temp_dir().join(format!(
             "prism-g6-copy-src-{}-{}.txt",
@@ -764,6 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live IFileOperation test; sends file to Recycle Bin. Run with --ignored"]
     async fn run_action_recycle_succeeds_on_sta_worker() {
         let temp = std::env::temp_dir().join(format!(
             "prism-g6-shell-recycle-{}-{}.txt",
@@ -791,6 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live clipboard test; modifies system clipboard. Run with --ignored"]
     async fn run_action_copy_succeeds_on_sta_worker() {
         let worker = ShellExecutor::start().unwrap();
         let target = ActionTarget::new(TargetKind::File, r"C:\Windows\explorer.exe");
@@ -807,6 +811,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live ShellExecute test; may trigger UAC prompt. Run with --ignored"]
     async fn run_action_runas_succeeds_for_application_on_sta_worker() {
         // ShellExecute "runas" on explorer.exe will show a UAC prompt or succeed
         // silently depending on the system. We only verify it does not return an
