@@ -979,8 +979,9 @@ fn history_file_candidates(
                 continue;
             }
         }
-        // Empty-query recent list only shows paths that still exist (file or directory).
-        if empty_query && !std::path::Path::new(&weight.target.value).exists() {
+        // 只返回磁盘上仍存在的路径（file 或 directory）。rename/move/delete 后
+        // 旧路径不再存在，不应作为历史候选出现在搜索结果中。
+        if !std::path::Path::new(&weight.target.value).exists() {
             continue;
         }
         let Some(title) = std::path::Path::new(&weight.target.value)
@@ -1760,17 +1761,29 @@ mod protocol_tests {
 
     #[test]
     fn file_history_candidates_survive_indexer_top_k_and_respect_exclusions() {
+        // history_file_candidates now filters out paths that don't exist on disk,
+        // so we create real temp files for the test paths.
+        let temp_dir = std::env::temp_dir();
+        let late_dir = temp_dir.join("prism-history-test-late");
+        let zeta_path = late_dir.join("zeta.txt");
+        let beta_path = temp_dir.join("beta.txt");
+        let _ = std::fs::create_dir_all(&late_dir);
+        let _ = std::fs::write(&zeta_path, "test");
+        let _ = std::fs::write(&beta_path, "test");
+        let zeta_str = zeta_path.to_str().unwrap().to_string();
+        let beta_str = beta_path.to_str().unwrap().to_string();
+
         let weights = vec![HistoryWeight {
-            target: ActionTarget::new(TargetKind::File, r"C:\late\zeta.txt"),
+            target: ActionTarget::new(TargetKind::File, &zeta_str),
             score: 4,
         }];
         let mut candidates = history_file_candidates("ta", &weights, true, &[], None);
         candidates.push(SearchResult {
             kind: SearchResultKind::File,
             title: "beta.txt".into(),
-            subtitle: r"C:\beta.txt".into(),
-            execute_id: r"C:\beta.txt".into(),
-            target: ActionTarget::new(TargetKind::File, r"C:\beta.txt"),
+            subtitle: beta_str.clone(),
+            execute_id: beta_str.clone(),
+            target: ActionTarget::new(TargetKind::File, &beta_str),
             match_spans: match_spans("beta.txt", "ta"),
             match_metadata: rank_title("beta.txt", "ta"),
         });
@@ -1784,9 +1797,16 @@ mod protocol_tests {
             Some(4)
         );
 
+        // Exclusion path must use the real temp dir path.
+        let exclusion = late_dir.to_str().unwrap().to_string();
         assert!(
-            history_file_candidates("ta", &weights, true, &[r"C:\late".into()], None).is_empty()
+            history_file_candidates("ta", &weights, true, &[exclusion], None).is_empty()
         );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&zeta_path);
+        let _ = std::fs::remove_file(&beta_path);
+        let _ = std::fs::remove_dir(&late_dir);
     }
 
     #[test]
