@@ -22,6 +22,16 @@ public sealed class PipeClient : ISearchClient, IDisposable
     private StreamWriter? _writer;
     private readonly SemaphoreSlim _ioLock = new(1, 1);
 
+    private System.Threading.Timer? _watchdog;
+    private int _consecutivePingFailures;
+    private bool _wasConnected;
+
+    /// <summary>
+    /// 后端连接状态变化通知。true=已连上，false=断开/重连失败。
+    /// 由 watchdog 和首次连接触发，供上层（App）更新 UI 状态。
+    /// </summary>
+    public event Action<bool>? ConnectionChanged;
+
     /// <summary>实际使用的后端可执行文件路径，供诊断显示。</summary>
     public string BackendPath { get; private set; } = "";
 
@@ -33,6 +43,90 @@ public sealed class PipeClient : ISearchClient, IDisposable
     {
         EnsureBackendRunning();
         await ConnectAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+        StartWatchdog();
+    }
+
+    /// <summary>
+    /// 启动后台 watchdog：每 15 秒 ping 一次后端，连续 2 次失败则重连/重启 core。
+    /// 解决"退出后重开 core 未运行"——core 崩溃或启动失败时自动恢复，无需等用户触发搜索。
+    /// </summary>
+    private void StartWatchdog()
+    {
+        _wasConnected = true;
+        _watchdog?.Dispose();
+        _watchdog = new System.Threading.Timer(
+            callback: _ => _ = WatchdogTickAsync(),
+            state: null,
+            dueTime: TimeSpan.FromSeconds(15),
+            period: TimeSpan.FromSeconds(15));
+    }
+
+    private async Task WatchdogTickAsync()
+    {
+        // watchdog 不持 UI 线程；所有管道操作经 _ioLock 串行化。
+        try
+        {
+            await _ioLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_stream is not { IsConnected: true })
+                {
+                    // 管道已断——直接进入重连路径。
+                    await ReconnectCoreAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                try
+                {
+                    // 复用 SendAsync（已配对读写，取消安全）做一次 ping。
+                    var resp = await SendAsync(new { type = "ping" }, CancellationToken.None)
+                        .ConfigureAwait(false);
+                    _ = resp.GetProperty("version").GetString();
+                    _consecutivePingFailures = 0;
+                    NotifyConnection(true);
+                }
+                catch
+                {
+                    _consecutivePingFailures++;
+                    if (_consecutivePingFailures >= 2)
+                    {
+                        await ReconnectCoreAsync().ConfigureAwait(false);
+                        _consecutivePingFailures = 0;
+                    }
+                }
+            }
+            finally
+            {
+                _ioLock.Release();
+            }
+        }
+        catch
+        {
+            // watchdog 自身异常不应崩溃进程。
+        }
+    }
+
+    /// <summary>重连后端：释放旧管道，必要时重新拉起 core，再连新管道。</summary>
+    private async Task ReconnectCoreAsync()
+    {
+        DisposeStreamOnly();
+        try
+        {
+            EnsureBackendRunning();
+            await ConnectAsync(TimeSpan.FromSeconds(10), CancellationToken.None).ConfigureAwait(false);
+            NotifyConnection(true);
+        }
+        catch
+        {
+            NotifyConnection(false);
+        }
+    }
+
+    private void NotifyConnection(bool connected)
+    {
+        if (connected == _wasConnected) return;
+        _wasConnected = connected;
+        ConnectionChanged?.Invoke(connected);
     }
 
     /// <summary>连接命名管道，UTF-8 无 BOM，按行(\n)收发。</summary>
@@ -526,6 +620,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
     public void Dispose()
     {
+        _watchdog?.Dispose();
         DisposeStreamOnly();
 
         try

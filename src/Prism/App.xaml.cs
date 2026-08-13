@@ -38,6 +38,7 @@ public partial class App : Application
     private SettingsWindow? _settingsWindow;
     private TrayService? _tray;
     private ThemeWatcher? _theme;
+    private SingleInstance? _singleInstance;
     private bool _currentDirectorySearchEnabled = true;
     /// <summary>宿主 adapter 读取的设置快照；保存设置后更新，adapter 的 IsEnabled 委托读这里。</summary>
     private Settings _hostSettings = Settings.Default;
@@ -46,6 +47,17 @@ public partial class App : Application
     {
         base.OnStartup(e);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        // 单实例守卫：必须在任何服务构造（尤其 TryStartBackendAsync）之前，
+        // 防止第二个 Prism.exe 启动第二个 prism-core.exe / 注册第二个热键。
+        // 已有实例时，向前者发 show 指令唤出搜索窗，然后本进程静默退出。
+        _singleInstance = new SingleInstance();
+        if (!_singleInstance.TryAcquire())
+        {
+            _singleInstance.SignalExistingInstance();
+            Shutdown();
+            return;
+        }
 
         // 从 `dotnet run` / 终端启动时挂上父控制台，便于看到"已启动"提示。
         try { AttachConsole(AttachParentProcess); } catch { /* ignore */ }
@@ -66,6 +78,16 @@ public partial class App : Application
 
         _state = new AppState();
         _pipe = new PipeClient();
+        // watchdog 连接状态变化时更新 UI（在后台线程触发，需回到 UI 线程写 AppState）。
+        _pipe.ConnectionChanged += connected =>
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (_state is null) return;
+                _state.IsBackendConnected = connected;
+                _tray?.SetTooltip(connected ? "Prism" : "Prism · 后端未连接");
+                if (!connected)
+                    _state.StatusMessage = "正在重连后端…";
+            }));
         _icons = new IconCache();
         // G5: activation must run in this process — SetForegroundWindow only takes effect
         // from the foreground process, which is Prism at the moment Enter is pressed.
@@ -104,6 +126,11 @@ public partial class App : Application
         Log($"  · 当前主题：{(_state.Theme == AppTheme.Dark ? "深色" : "浅色")}（跟随系统）");
 
         _ = TryStartBackendAsync();
+
+        // 前台监听：后续实例发来的 show 指令在此唤出搜索窗。
+        // 放在服务构造完成后、TryStartBackendAsync 之后：此时 _vm / _icons 已就绪，
+        // ToggleSearchWindow 可安全懒创建搜索窗。
+        _singleInstance.StartForegroundListener(Dispatcher, ToggleSearchWindow);
 
         // 启动稳定后修剪一次工作集（后端已连上前后各可再剪）。
         _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
@@ -304,6 +331,7 @@ public partial class App : Application
         _hotkey?.Dispose();
         _theme?.Dispose();
         _pipe?.Dispose();
+        _singleInstance?.Dispose();
         base.OnExit(e);
     }
 }

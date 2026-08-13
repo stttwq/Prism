@@ -134,6 +134,31 @@ public sealed class SuggestionAdapterTests
     }
 
     [Fact]
+    public async Task Baidu_GBK_Body_Decoded_Correctly()
+    {
+        // .NET 默认不内建 GBK；注册后可在测试中构造 GBK 字节。
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        // 百度联想 API 声明 charset=gbk；用 GBK 编码「知乎」的 JSON 响应。
+        // 若 SuggestionService 一律按 UTF-8 解码会得到乱码（如「之火」），正确解码应得到「知乎」。
+        var gbk = Encoding.GetEncoding("gbk");
+        var body = gbk.GetBytes("""["知乎",["知乎日报","知乎热榜"]]""");
+        var fake = new FakeHttpTransport(2, body, "gbk");
+        var svc = new SuggestionService(fake);
+        var result = await svc.GetSuggestionsAsync("百度", "知乎", CancellationToken.None);
+        Assert.Equal(2, result.Count);
+        Assert.Equal("知乎日报", result[0].Text);
+    }
+
+    [Fact]
+    public void Baidu_Adapter_Url_Requests_Utf8()
+    {
+        // 百度 adapter 应在 URL 中带 ie=utf-8，优先请求 UTF-8 响应。
+        var adapter = new BaiduSuggestionAdapter();
+        var url = adapter.BuildRequestUrl("测试");
+        Assert.Contains("ie=utf-8", url);
+    }
+
+    [Fact]
     public async Task Google_Parses_Suggestions()
     {
         var body = """["hello",["hello world","hello kitty","hello song"]]""";
@@ -237,18 +262,28 @@ public sealed class SuggestionAdapterTests
     private sealed class FakeHttpTransport : IHttpTransport
     {
         private readonly int _statusCategory;
-        private readonly string _body;
+        private readonly byte[] _body;
+        private readonly string? _charSet;
 
-        public FakeHttpTransport(int statusCategory, string body)
+        public FakeHttpTransport(int statusCategory, string body, string? charSet = null)
+        {
+            _statusCategory = statusCategory;
+            _body = Encoding.UTF8.GetBytes(body);
+            _charSet = charSet;
+        }
+
+        /// <summary>直接传原始字节，用于测试 GBK 等非 UTF-8 编码响应。</summary>
+        public FakeHttpTransport(int statusCategory, byte[] body, string? charSet = null)
         {
             _statusCategory = statusCategory;
             _body = body;
+            _charSet = charSet;
         }
 
         public Task<HttpResponse> GetAsync(string url, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
-            return Task.FromResult(new HttpResponse(_statusCategory, Encoding.UTF8.GetBytes(_body)));
+            return Task.FromResult(new HttpResponse(_statusCategory, _body, _charSet));
         }
     }
 

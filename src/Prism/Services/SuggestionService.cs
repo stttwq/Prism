@@ -21,7 +21,8 @@ public interface IHttpTransport
 /// <summary>HTTP 响应结果。</summary>
 /// <param name="StatusCategory">状态码类别：2xx 成功；其他视为失败，返回空联想。</param>
 /// <param name="Body">响应体（已限制字节上限）。</param>
-public sealed record HttpResponse(int StatusCategory, byte[] Body);
+/// <param name="CharSet">响应声明的字符集（来自 Content-Type）；为 null 时按 UTF-8 解码。</param>
+public sealed record HttpResponse(int StatusCategory, byte[] Body, string? CharSet = null);
 
 /// <summary>
 /// 生产 HTTP transport：使用单例 <see cref="HttpClient"/>。
@@ -50,6 +51,7 @@ public sealed class SystemHttpTransport : IHttpTransport
     {
         var resp = await Client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         var category = (int)resp.StatusCode / 100;
+        var charset = resp.Content.Headers.ContentType?.CharSet;
         // 限制实际读取字节，即使 MaxResponseContentBufferSize 设置也显式截断。
         using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         var buf = new byte[64 * 1024];
@@ -57,7 +59,7 @@ public sealed class SystemHttpTransport : IHttpTransport
         int n;
         while (read < buf.Length && (n = await stream.ReadAsync(buf.AsMemory(read), ct).ConfigureAwait(false)) > 0)
             read += n;
-        return new HttpResponse(category, buf[..read]);
+        return new HttpResponse(category, buf[..read], charset);
     }
 }
 
@@ -103,7 +105,7 @@ public sealed class SuggestionService : ISuggestionService
             if (resp.StatusCategory != 2)
                 return [];
 
-            var text = Encoding.UTF8.GetString(resp.Body);
+            var text = (TryResolveEncoding(resp.CharSet) ?? Encoding.UTF8).GetString(resp.Body);
             var suggestions = adapter.Parse(text);
             return Bound(suggestions, adapter, query);
         }
@@ -146,6 +148,34 @@ public sealed class SuggestionService : ISuggestionService
             "Google" => new GoogleSuggestionAdapter(),
             _ => null,
         };
+
+    /// <summary>
+    /// 把响应声明的 charset（如 "gbk"、"gb2312"、"utf-8"）解析为 <see cref="Encoding"/>。
+    /// 百度联想 API 返回 GBK 编码，若一律按 UTF-8 解码会产生乱码（如「知乎」→「之火」）。
+    /// 无法识别的 charset 返回 null，调用方回退 UTF-8。
+    /// </summary>
+    private static Encoding? TryResolveEncoding(string? charSet)
+    {
+        if (string.IsNullOrWhiteSpace(charSet))
+            return null;
+        // .NET Core/.NET 5+ 默认只内建 UTF 系列；GBK/GB2312 需注册 CodePagesEncodingProvider。
+        // 一次性注册，幂等。
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        try
+        {
+            // 把 http charset 名映射到 .NET 编码名。gb2312 在 .NET 上可用 "gb2312"，
+            // 但 GBK 是其超集，统一取 "gbk" 以覆盖全部汉字。
+            var name = charSet.Trim();
+            if (name.Equals("gb2312", StringComparison.OrdinalIgnoreCase))
+                name = "gbk";
+            return Encoding.GetEncoding(name);
+        }
+        catch
+        {
+            // 未知 charset（.NET 无对应 CodePage）回退 UTF-8。
+            return null;
+        }
+    }
 }
 
 /// <summary>联想 adapter 接口：固定 endpoint + 解析逻辑。</summary>
@@ -193,7 +223,7 @@ internal sealed class BaiduSuggestionAdapter : ISuggestionAdapter
     public string UrlTemplate => "https://www.baidu.com/s?wd={q}";
 
     public string BuildRequestUrl(string query) =>
-        "https://suggestion.baidu.com/su?wd=" + SuggestionUrlEncoder.UrlEncode(query) + "&action=opensearch";
+        "https://suggestion.baidu.com/su?wd=" + SuggestionUrlEncoder.UrlEncode(query) + "&action=opensearch&ie=utf-8";
 
     public List<string> Parse(string body)
     {
