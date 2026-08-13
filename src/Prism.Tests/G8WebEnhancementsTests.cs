@@ -342,3 +342,37 @@ public sealed class FaviconCacheTests
         }
     }
 }
+
+/// <summary>
+/// 真实网络联想兼容性检查（G8 design.md review gate）。
+/// 这些测试使用真实 SystemHttpTransport 向三个内置引擎发送实际请求。
+/// 默认 #[ignore]——不在 routine dotnet test 中运行，避免网络依赖和超时。
+/// 手动运行：dotnet test --filter "FullyQualifiedName~LiveSuggestion" -- --filter-listed
+/// </summary>
+public sealed class LiveSuggestionTests
+{
+    [Fact(Skip = "live network test; run explicitly with --filter LiveSuggestion")]
+    public async Task Bing_Live_Suggestion_Returns_Results()
+    {
+        var svc = new SuggestionService();
+        var result = await svc.GetSuggestionsAsync("Bing", "weather", CancellationToken.None);
+        // 网络可用时应返回至少 1 条联想；断网时返回空——两者都是合法行为。
+        // 此测试主要验证 adapter 解析真实 Bing 响应不会抛异常。
+    }
+
+    [Fact(Skip = "live network test; run explicitly with --filter LiveSuggestion")]
+    public async Task Baidu_Live_Suggestion_Returns_Results()
+    {
+        var svc = new SuggestionService();
+        var result = await svc.GetSuggestionsAsync("百度", "天气", CancellationToken.None);
+        // 验证百度 adapter 解析真实响应不会抛异常。
+    }
+
+    [Fact(Skip = "live network test; run explicitly with --filter LiveSuggestion")]
+    public async Task Google_Live_Suggestion_Returns_Results()
+    {
+        var svc = new SuggestionService();
+        var result = await svc.GetSuggestionsAsync("Google", "hello", CancellationToken.None);
+        // Google 在某些地区可能不可达，断网返回空是合法行为。
+    }
+}

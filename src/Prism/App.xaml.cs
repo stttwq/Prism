@@ -151,7 +151,10 @@ public partial class App : Application
             onApplied: ApplySettings,
             onEnginesChanged: ReloadBackendEnginesAsync,
             onPreferencesChanged: UpdateBackendPreferencesAsync,
-            onClearHistory: ClearBackendHistoryAsync);
+            onClearHistory: ClearBackendHistoryAsync,
+            onWebSettingsChanged: (engines, suggestionsEnabled) =>
+                _vm?.UpdateWebSettings(engines, suggestionsEnabled),
+            onRequestFaviconGrant: RequestFaviconGrant);
         _settingsWindow = new SettingsWindow(vm);
         _settingsWindow.Closed += (_, _) =>
         {
@@ -215,6 +218,20 @@ public partial class App : Application
         if (_pipe is null || !_pipe.IsConnected)
             throw new InvalidOperationException("后端未连接");
         await _pipe.ClearHistoryAsync().ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// G8：自定义引擎 origin 变化时弹出 favicon 联网许可对话框。
+    /// 返回 true 表示用户同意联网获取该 origin 的 favicon。
+    /// </summary>
+    private bool RequestFaviconGrant(string origin)
+    {
+        var result = System.Windows.MessageBox.Show(
+            $"是否允许 Prism 联网获取以下站点的图标？\n\n{origin}\n\n图标将缓存到本地。拒绝后使用通用图标，可在设置中重新添加引擎时再次授权。",
+            "Prism · favicon 联网授权",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        return result == MessageBoxResult.Yes;
     }
 
     private void OnRebuildIndex()

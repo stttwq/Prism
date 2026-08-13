@@ -235,13 +235,29 @@
                     </DataGrid.Columns>
                 </DataGrid>
 
-                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,0">
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,8">
                     <Button Content="添加" Command="{Binding AddEngineCommand}"
                             Style="{StaticResource SettingsActionButton}" Margin="0,0,8,0"/>
                     <Button Content="删除选中" Command="{Binding RemoveEngineCommand}"
                             Style="{StaticResource SettingsActionButton}" Margin="0,0,8,0"/>
                     <Button Content="恢复预设" Command="{Binding ResetEnginesCommand}"
                             Style="{StaticResource SettingsActionButton}"/>
+                </StackPanel>
+
+                <Border Grid.Row="2" Height="1" Background="#E8EAEC" Margin="0,0,0,8" VerticalAlignment="Bottom"/>
+
+                <StackPanel Grid.Row="2" VerticalAlignment="Bottom" Margin="0,28,0,0">
+                    <TextBlock Text="在线联想" FontSize="13" FontWeight="SemiBold"
+                               Foreground="#303237" Margin="0,0,0,8"/>
+                    <CheckBox Content="启用在线联想（仅内置 Bing / 百度 / Google，默认关闭）"
+                              IsChecked="{Binding SuggestionsEnabled, Mode=TwoWay}"
+                              FontSize="13" Foreground="#37393E"
+                              Margin="0,0,0,8"/>
+                    <TextBlock Text="开启后，输入网页关键词时会向对应引擎发送查询词以获取联想建议。查询词和联想结果不写入历史或日志。单次请求 800ms 超时，断网或失败时静默回退直接搜索。"
+                               FontSize="12" Foreground="#9B9FA6" TextWrapping="Wrap"
+                               Margin="0,0,0,8"/>
+                    <TextBlock Text="自定义引擎不支持联想。favicon 图标联网获取需在保存引擎时单独授权，与联想开关相互独立。"
+                               FontSize="12" Foreground="#9B9FA6" TextWrapping="Wrap"/>
                 </StackPanel>
             </Grid>
 

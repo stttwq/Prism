@@ -20,6 +20,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly Func<IReadOnlyList<WebEngine>, Task>? _onEnginesChanged;
     private readonly Func<bool, bool, Task>? _onPreferencesChanged;
     private readonly Func<Task>? _onClearHistory;
+    /// <summary>G8：保存设置后通知 App 更新联想开关和引擎列表。</summary>
+    private readonly Action<IReadOnlyList<WebEngine>, bool>? _onWebSettingsChanged;
+    /// <summary>G8：自定义引擎 origin 变化时弹出 favicon 授权对话框。返回 true=授权。</summary>
+    private readonly Func<string, bool>? _onRequestFaviconGrant;
 
     private bool _autoStartEnabled;
     private HotkeyMode _hotkeyMode;
@@ -34,6 +38,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private bool _explorerHostIntegrationEnabled;
     private bool _directoryOpusHostIntegrationEnabled;
     private string? _zipProgram;
+    private bool _suggestionsEnabled;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -43,7 +48,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Action<Settings>? onApplied = null,
         Func<IReadOnlyList<WebEngine>, Task>? onEnginesChanged = null,
         Func<bool, bool, Task>? onPreferencesChanged = null,
-        Func<Task>? onClearHistory = null)
+        Func<Task>? onClearHistory = null,
+        Action<IReadOnlyList<WebEngine>, bool>? onWebSettingsChanged = null,
+        Func<string, bool>? onRequestFaviconGrant = null)
     {
         _store = store;
         _autoStart = autoStart;
@@ -51,6 +58,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onEnginesChanged = onEnginesChanged;
         _onPreferencesChanged = onPreferencesChanged;
         _onClearHistory = onClearHistory;
+        _onWebSettingsChanged = onWebSettingsChanged;
+        _onRequestFaviconGrant = onRequestFaviconGrant;
 
         var settings = store.Load();
         _autoStartEnabled = settings.AutoStart;
@@ -63,6 +72,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _explorerHostIntegrationEnabled = settings.ExplorerHostIntegrationEnabled;
         _directoryOpusHostIntegrationEnabled = settings.DirectoryOpusHostIntegrationEnabled;
         _zipProgram = settings.ZipProgram;
+        _suggestionsEnabled = settings.SuggestionsEnabled;
         DataDir = store.DataDir;
 
         Engines = new ObservableCollection<WebEngineEditItem>(
@@ -289,6 +299,18 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    /// <summary>G8 在线联想开关：默认关闭，只对内置引擎（Bing/百度/Google）生效。</summary>
+    public bool SuggestionsEnabled
+    {
+        get => _suggestionsEnabled;
+        set
+        {
+            if (_suggestionsEnabled == value) return;
+            _suggestionsEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
     private void AddEngine()
     {
         var item = new WebEngineEditItem
@@ -330,6 +352,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             SelectedTab = 0;
             return;
         }
+
+        // G8: 保存前的旧设置，用于检测自定义引擎 origin 变化。
+        var prevSettings = _store.Load();
 
         var engines = new List<WebEngine>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -395,6 +420,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             ExplorerHostIntegrationEnabled = ExplorerHostIntegrationEnabled,
             DirectoryOpusHostIntegrationEnabled = DirectoryOpusHostIntegrationEnabled,
             ZipProgram = string.IsNullOrWhiteSpace(ZipProgram) ? null : ZipProgram,
+            SuggestionsEnabled = _suggestionsEnabled,
+            FaviconGrants = prevSettings.FaviconGrants,
         };
 
         try
@@ -421,6 +448,13 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             _ = ApplyBackendAsync(engines, next.HistoryEnabled, next.PinyinEnabled);
         else
             StatusMessage = "已保存";
+
+        // G8: 同步联想开关和引擎列表给 SearchViewModel（无论后端是否连接）。
+        _onWebSettingsChanged?.Invoke(engines, _suggestionsEnabled);
+
+        // G8: 检查自定义引擎的新 origin，弹出 favicon 联网授权。
+        if (_onRequestFaviconGrant is not null)
+            RequestNewFaviconGrants(engines, prevSettings);
     }
 
     private async Task ApplyBackendAsync(
@@ -440,6 +474,43 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         {
             // 设置已落盘；后端未热重载时提示，重启后端或下次启动也会读到新配置。
             StatusMessage = "已保存设置；后端未刷新：" + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// G8：检查自定义引擎中是否有新 origin 需要单独征求 favicon 联网许可。
+    /// 只对非内置引擎（WebModeDetector 不识别的 Name）触发，且只对磁盘上未授权的 origin 弹窗。
+    /// 用户拒绝或失败时回退通用图标，不阻塞保存。
+    /// </summary>
+    private void RequestNewFaviconGrants(List<WebEngine> engines, Settings prevSettings)
+    {
+        var prevGrants = prevSettings.FaviconGrants;
+        foreach (var eng in engines)
+        {
+            // 内置引擎图标随程序打包，不需要 favicon 授权。
+            if (WebModeDetector.IsBuiltIn(eng))
+                continue;
+
+            var origin = FaviconCache.NormalizeOrigin(eng.UrlTemplate);
+            if (origin is null)
+                continue;
+
+            // 已授权的 origin 不重复弹窗。
+            if (prevGrants.ContainsKey(origin))
+                continue;
+
+            // 弹出授权对话框（由 App 提供 _onRequestFaviconGrant 回调）。
+            var granted = _onRequestFaviconGrant!(origin);
+            if (!granted)
+                continue;
+
+            // 授权成功：更新内存中的 FaviconGrants，并落盘。
+            var disk = _store.Load();
+            var grants = new Dictionary<string, FaviconGrant>(disk.FaviconGrants)
+            {
+                [origin] = new FaviconGrant(origin, DateTimeOffset.UtcNow.ToString("o")),
+            };
+            _store.Save(disk with { FaviconGrants = grants });
         }
     }
 
