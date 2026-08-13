@@ -12,6 +12,7 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>Prism</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\prism.ico</ApplicationIcon>
     <!-- 关闭默认 Page 收集；仅显式登记已实现的 XAML。 -->
     <EnableDefaultPageItems>false</EnableDefaultPageItems>
     <!-- 桌面托盘应用：工作站 GC（默认），显式关掉 Server GC，避免预留大堆。 -->
