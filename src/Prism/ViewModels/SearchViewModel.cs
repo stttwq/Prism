@@ -528,11 +528,29 @@ public sealed class SearchViewModel
             return;
         }
 
-        // copy_to/move_to 需要 DestinationPicker 子流程，当前以空 destination
-        // 发送会被 broker 拒绝。此子流程在步骤 5 完整实现，暂时直接返回。
+        // copy_to/move_to：弹出文件夹选择器。
         if (action.Id is "copy_to" or "move_to")
         {
-            _state.StatusMessage = action.Id == "copy_to" ? "复制到…（待接入目标选择器）" : "移动到…（待接入目标选择器）";
+            var destination = PickDestinationFolder();
+            if (destination is null)
+            {
+                // 用户取消了，不报错。
+                return;
+            }
+            try
+            {
+                await _pipe.RunActionAsync(
+                    target.ExecutionTarget,
+                    action.Id,
+                    new ActionArgs { Destination = destination },
+                    CancellationToken.None).ConfigureAwait(true);
+                _state.StatusMessage = action.Id == "copy_to" ? "复制完成，正在刷新…" : "移动完成，正在刷新…";
+            }
+            catch (Exception ex)
+            {
+                _state.StatusMessage = "动作失败：" + ShortMsg(ex);
+            }
+            await RefreshAsync();
             return;
         }
 
@@ -542,13 +560,46 @@ public sealed class SearchViewModel
             // mutation 动作（recycle/delete_permanent/zip）保留窗口等待 generation 刷新；
             // 其余成功动作隐藏 Prism。
             if (HideAfterSuccessActions.Contains(action.Id))
+            {
                 HideRequested?.Invoke();
+            }
             else
+            {
                 _state.StatusMessage = "操作完成，正在刷新…";
+                await RefreshAsync();
+            }
         }
         catch (Exception ex)
         {
             _state.StatusMessage = "动作失败：" + ShortMsg(ex);
+        }
+    }
+
+    /// <summary>弹出文件夹选择对话框，返回选中的目录路径或 null（用户取消）。</summary>
+    private string? PickDestinationFolder()
+    {
+        using var dialog = new System.Windows.Forms.FolderBrowserDialog
+        {
+            Description = "选择目标文件夹",
+            ShowNewFolderButton = true,
+        };
+        return dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK
+            ? dialog.SelectedPath
+            : null;
+    }
+
+    /// <summary>用当前查询重新搜索，用于 mutation 动作成功后刷新结果。</summary>
+    public async Task RefreshAsync()
+    {
+        if (_state.Mode == PanelMode.Actions)
+        {
+            // 离开动作面板，回到结果模式。
+            LeaveActions();
+        }
+        if (!string.IsNullOrWhiteSpace(_state.Query) || !string.IsNullOrWhiteSpace(_searchContext.Root))
+        {
+            _resultLimit = InitialResultLimit;
+            await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
         }
     }
 
@@ -567,8 +618,8 @@ public sealed class SearchViewModel
                 CancellationToken.None).ConfigureAwait(true);
             _state.RenameTarget = null;
             _state.RenameNewName = null;
-            // rename 保留窗口，等待 generation 刷新或有界超时后重搜。
             _state.StatusMessage = "重命名完成，正在刷新…";
+            await RefreshAsync();
         }
         catch (Exception ex)
         {
