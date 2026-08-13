@@ -55,7 +55,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 - A pinyin rebuild drops the previous mapping before work starts. The bounded USN delta invalidates the sidecar at its threshold, and a concurrent disable must prevent a completed load/rebuild from reinstalling optional memory.
 - Web engines load at backend start from shared `settings.json`; empty/missing list falls back to defaults (Bing-first: `bi`, `b`, `g`).
 - `reload_engines` IPC replaces the in-memory list immediately (RwLock); empty list falls back to defaults. Accept PascalCase engine fields from the frontend.
-- `actions` / `run_action`: path validation same as execute/reveal (absolute only). First-version actions are exactly four: `open_folder` (explorer /select), `copy`/`cut` (CF_HDROP + Preferred DropEffect), `copy_path` (CF_UNICODETEXT). Do not ship placeholder "快捷菜单" rows that cannot run. On clipboard `SetClipboardData` failure, `GlobalFree` the unowned `HGLOBAL` (system only takes ownership after success).
+- `actions` / `run_action`: path validation same as execute/reveal (absolute only). Actions are a closed enum (`ActionId`), not free-form strings; unknown ids are rejected by `FromStr`. The allowlist is `TargetKind → Vec<ActionId>`: File gets 12 actions (incl. `open_with`), Directory gets 11 (no `open_with`), Application gets 4 (`locate_app`/`copy_app_path`/`app_properties`/`run_as_admin`), Window/Web get none. Broker re-validates target kind before routing — never trusts WPF-supplied paths. Mutation actions (`rename`/`copy_to`/`move_to`/`recycle`/`delete_permanent`/`zip`) use `IFileOperation` on the STA worker; `ActionArgs { destination, new_name }` carries parameters. `rename` rejects same-name (case-insensitive) before reaching IFileOperation. `zip` uses three-tier fallback: settings `ZipProgram` > auto-detected 7-Zip > Windows Shell COM. On clipboard `SetClipboardData` failure, `GlobalFree` the unowned `HGLOBAL` (system only takes ownership after success).
 
 ---
 
@@ -71,7 +71,7 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
   unresolved parent in a live batch still rolls back all earlier mutations.
 - Web-search tests: Chinese query URL-encoding; `bi` vs `b`; custom engine list; `execute` https not rejected as relative path; web row sorts before apps when keyword matches.
 - `reload_engines` tests: replace list affects subsequent search; empty list falls back to defaults; PascalCase fields parse.
-- Actions tests: list_actions rejects relative; basics present; unknown run_action errors; IPC `actions` / `run_action` wiring.
+- Actions tests: `list_actions` rejects relative and Window/Web; File allowlist includes all 12 actions; Directory excludes `open_with`; Application is app-only. `ActionId::from_str` roundtrip; unknown id rejected. `run_action_direct` rejects mutation actions. `execute_run_action` routes by `ActionId`: kind validation, `open_with`/`locate_app`/`run_as_admin` kind-restricted, mutation actions reach `file_ops`. `file_ops::rename` rejects same-name, path separators, empty, overlong. `zip` rejects non-`.zip` output and Web target. IPC `actions` / `run_action` wiring with `ActionArgs`.
 - Pinyin lifecycle tests: cache publication precedes sidecar classification, rebuild states return literal results without stale pinyin hits, the delta cannot exceed its threshold, and disabled state releases and does not reinstall the mapping.
 - `cargo test --manifest-path src/prism-core/Cargo.toml` must stay green before calling a step done.
 
