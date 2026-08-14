@@ -1,7 +1,7 @@
 <UserControl x:Class="Prism.Controls.ResultList"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <Grid>
+    <StackPanel>
         <ListBox x:Name="List"
                  Style="{DynamicResource ResultListBoxStyle}"
                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
@@ -30,9 +30,10 @@
                                SnapsToDevicePixels="True"/>
 
                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0">
-                            <!-- 先绑定 Title 保底可见；MatchSpans 高亮由 code-behind 覆盖 Inlines -->
+                            <!-- Title 文本由 code-behind ApplyMatchSpans 写入 Inlines，
+                                 不再绑定 Text——OneWay 绑定会在容器回收时重新推送 Text，
+                                 清掉 Inlines 导致与手动构建的高亮 Run 叠加。 -->
                             <TextBlock x:Name="TitleBlock"
-                                       Text="{Binding Title}"
                                        FontSize="17"
                                        FontFamily="{DynamicResource AppFontFamily}"
                                        Foreground="{DynamicResource TextTitle}"
@@ -61,12 +62,11 @@
 
         <TextBlock x:Name="StatusText"
                    HorizontalAlignment="Left"
-                   VerticalAlignment="Center"
-                   Margin="20,12"
+                   Margin="20,8,20,12"
                    FontSize="13"
                    FontFamily="{DynamicResource AppFontFamily}"
                    Foreground="{DynamicResource TextSubtitle}"
                    TextWrapping="Wrap"
                    Visibility="Collapsed"/>
-    </Grid>
+    </StackPanel>
 </UserControl>

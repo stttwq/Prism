@@ -39,16 +39,6 @@ public partial class SearchWindow : Window
     private int _contextMenuRequestSeq;
     private double _panelTargetHeight;
 
-    // ── 强制前台 ──
-    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
-    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
-    private const int SW_SHOW = 5;
-
     public SearchWindow() : this(new IndexerGenerationClient())
     {
     }
@@ -122,6 +112,7 @@ public partial class SearchWindow : Window
         _icons = icons;
         _theme = theme;
         Results.SetIconCache(icons);
+        Results.SetWebIconProvider(new WebIconProvider());
         vm.HideRequested += () =>
         {
             if (Dispatcher.CheckAccess()) HideAnimated();
@@ -152,7 +143,7 @@ public partial class SearchWindow : Window
     public void ShowAndFocus()
     {
         // 必须在 Show/Activate 之前取前台窗口，之后前台就是 Prism 自己了。
-        var foreground = GetForegroundWindow();
+        var foreground = ForegroundInterop.GetForegroundWindow();
 
         _hiding = false;
         _ignoreDeactivate = true;
@@ -210,36 +201,15 @@ public partial class SearchWindow : Window
             var hwnd = helper.EnsureHandle();
             if (hwnd == IntPtr.Zero) return;
 
-            ShowWindow(hwnd, SW_SHOW);
-            BringWindowToTop(hwnd);
-
-            var foreground = GetForegroundWindow();
-            if (foreground == hwnd)
+            ForegroundInterop.ShowWindow(hwnd, ForegroundInterop.SW_SHOW);
+            if (ForegroundInterop.TryForceForeground(hwnd))
             {
-                SetForegroundWindow(hwnd);
+                Activate();
                 return;
             }
 
-            var foreThread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
-            var appThread = GetCurrentThreadId();
-            if (foreThread != appThread && foreThread != 0)
-            {
-                AttachThreadInput(appThread, foreThread, true);
-                try
-                {
-                    BringWindowToTop(hwnd);
-                    SetForegroundWindow(hwnd);
-                }
-                finally
-                {
-                    AttachThreadInput(appThread, foreThread, false);
-                }
-            }
-            else
-            {
-                SetForegroundWindow(hwnd);
-            }
-
+            // Same-thread case: foreground was already ours, just re-assert.
+            ForegroundInterop.SetForegroundWindow(hwnd);
             Activate();
         }
         catch

@@ -1,5 +1,3 @@
-using System.Runtime.InteropServices;
-
 namespace Prism.Services;
 
 /// <summary>
@@ -29,58 +27,20 @@ public sealed class Win32WindowActivator : IWindowActivator
         // Re-verify: the handle must still be a live window belonging to the same process.
         if (!_query.IsAlive(window.Handle)) return false;
         if (window.Pid != 0 && _query.GetProcessId(window.Handle) != window.Pid) return false;
-        if (!IsWindowVisible(window.Handle)) return false;
+        if (!ForegroundInterop.IsWindowVisible(window.Handle)) return false;
 
         try
         {
             // Restore before activating: a minimized window cannot take the foreground.
-            if (IsIconic(window.Handle))
-                ShowWindow(window.Handle, SW_RESTORE);
-
-            BringWindowToTop(window.Handle);
-            SetForegroundWindow(window.Handle);
-
-            if (GetForegroundWindow() == window.Handle)
-                return true;
-
-            // Windows refuses cross-thread foreground changes unless the calling thread is
-            // attached to the current foreground thread. This is the same fallback the
-            // search window itself uses to summon reliably.
-            var foreground = GetForegroundWindow();
-            var foreThread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
-            var currentThread = GetCurrentThreadId();
-            if (foreThread != 0 && foreThread != currentThread)
-            {
-                AttachThreadInput(currentThread, foreThread, true);
-                try
-                {
-                    BringWindowToTop(window.Handle);
-                    SetForegroundWindow(window.Handle);
-                }
-                finally
-                {
-                    AttachThreadInput(currentThread, foreThread, false);
-                }
-            }
+            if (ForegroundInterop.IsIconic(window.Handle))
+                ForegroundInterop.ShowWindow(window.Handle, ForegroundInterop.SW_RESTORE);
 
             // Report what actually happened rather than assuming the call worked.
-            return GetForegroundWindow() == window.Handle;
+            return ForegroundInterop.TryForceForeground(window.Handle);
         }
         catch
         {
             return false;
         }
     }
-
-    private const int SW_RESTORE = 9;
-
-    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
-    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
 }

@@ -20,6 +20,7 @@ public partial class ResultList : UserControl
     private const double StatusRowHeight = 36;
 
     private IconCache? _icons;
+    private WebIconProvider? _webIcons;
     private IReadOnlyList<SearchResult> _items = Array.Empty<SearchResult>();
     private readonly ObservableCollection<SearchResult> _displayItems = [];
     private bool _syncing;
@@ -42,6 +43,7 @@ public partial class ResultList : UserControl
     }
 
     public void SetIconCache(IconCache cache) => _icons = cache;
+    public void SetWebIconProvider(WebIconProvider provider) => _webIcons = provider;
 
     /// <summary>主题切换后丢弃缓存画刷，下次装饰时重新取。</summary>
     public void InvalidateThemeBrushes()
@@ -71,6 +73,11 @@ public partial class ResultList : UserControl
             {
                 _syncing = false;
             }
+
+            // 立即装饰一次（不在 _syncing 内），让回收的容器在本次同步后就显示正确文字——
+            // 不能只靠下面的 BeginInvoke，否则 DataContext 已变但 Inlines 仍是旧内容的窗口里
+            // 用户会看到残留文字叠加。
+            DecorateVisibleItems();
 
             if (countChanged)
                 UpdateListHeight();
@@ -171,13 +178,10 @@ public partial class ResultList : UserControl
     {
         var rows = Math.Min(_items.Count, MaxVisibleRows);
         var h = rows * RowHeight;
-        if (!string.IsNullOrEmpty(StatusText.Text) && rows == 0)
-            h = StatusRowHeight;
-        if (!string.IsNullOrEmpty(StatusText.Text) && rows > 0)
-            h += StatusRowHeight;
 
         if (h <= 0)
         {
+            // No result rows: let the StackPanel auto-size to StatusText (if any).
             Height = double.NaN;
             List.Height = double.NaN;
             MinHeight = 0;
@@ -290,7 +294,20 @@ public partial class ResultList : UserControl
 
             // "window" carries an enumeration token, not a path — asking the shell for an
             // icon from it would just fail per row.
-            if (item.Kind is "web" or "window"
+            if (item.Kind == "web")
+            {
+                if (_webIcons is not null)
+                {
+                    icon.Tag = "web:" + item.ExecuteId;
+                    icon.Source = _webIcons.GetIcon(item.ExecuteId);
+                }
+                else
+                {
+                    icon.Tag = null;
+                    icon.Source = null;
+                }
+            }
+            else if (item.Kind == "window"
                 || string.IsNullOrEmpty(item.ExecuteId)
                 || _icons is null)
             {

@@ -1,0 +1,125 @@
+using System.Runtime.InteropServices;
+
+namespace Prism.Services;
+
+/// <summary>
+/// 把子进程纳入 Job Object，父进程退出时 OS 内核自动回收子进程，
+/// 防止 Prism 崩溃后 prism-core.exe 变成孤儿继续占管道。
+/// </summary>
+internal sealed class JobObjectGuard : IDisposable
+{
+    private IntPtr _jobHandle;
+    private bool _disposed;
+
+    /// <summary>
+    /// 创建 Job Object 并设置 KILL_ON_JOB_CLOSE 限制。
+    /// 只要本对象不被 Dispose（即父进程不退出），子进程照常运行；
+    /// 父进程退出 → Job 句柄关闭 → OS 杀掉所有关联子进程。
+    /// </summary>
+    public JobObjectGuard()
+    {
+        _jobHandle = CreateJobObject(IntPtr.Zero, null);
+        if (_jobHandle == IntPtr.Zero)
+            return;
+
+        var info = new JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        var extended = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            BasicLimitInformation = info,
+        };
+
+        var length = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        var ptr = Marshal.AllocHGlobal(length);
+        try
+        {
+            Marshal.StructureToPtr(extended, ptr, false);
+            SetInformationJobObject(
+                _jobHandle,
+                JobObjectExtendedLimitInformation,
+                ptr,
+                (uint)length);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
+
+    /// <summary>把进程纳入 Job Object。失败时静默忽略——Job 是保险，不是必要条件。</summary>
+    public bool Assign(IntPtr processHandle)
+    {
+        if (_disposed || _jobHandle == IntPtr.Zero)
+            return false;
+        return AssignProcessToJobObject(_jobHandle, processHandle);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+        _disposed = true;
+        // 关闭 Job 句柄 → OS 内核杀掉所有关联子进程。
+        if (_jobHandle != IntPtr.Zero)
+        {
+            CloseHandle(_jobHandle);
+            _jobHandle = IntPtr.Zero;
+        }
+    }
+
+    // --- P/Invoke ---
+
+    private const int JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    private const int JobObjectExtendedLimitInformation = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr hJob, int infoClass, IntPtr lpInfo, uint cbInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+}

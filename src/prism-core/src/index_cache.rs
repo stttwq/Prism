@@ -12,10 +12,10 @@ const CACHE_VERSION: u32 = 5;
 const CACHE_FILE: &str = "index-v5.bin";
 
 #[derive(Serialize, Deserialize)]
-struct CacheEnvelope {
+struct CacheEnvelope<T> {
     magic: [u8; 8],
     version: u32,
-    state: IndexState,
+    state: T,
 }
 
 pub fn machine_data_dir() -> PathBuf {
@@ -36,7 +36,7 @@ pub fn load(data_dir: &Path) -> Result<IndexState, String> {
         .map_err(|error| format!("open {}: {error}", path.display()))?
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let envelope: CacheEnvelope =
+    let envelope: CacheEnvelope<IndexState> =
         postcard::from_bytes(&bytes).map_err(|error| format!("decode v5 cache: {error}"))?;
     if &envelope.magic != CACHE_MAGIC || envelope.version != CACHE_VERSION {
         return Err("cache is not Prism v5".into());
@@ -54,7 +54,7 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
     let bytes = postcard::to_allocvec(&CacheEnvelope {
         magic: *CACHE_MAGIC,
         version: CACHE_VERSION,
-        state: state.clone(),
+        state,
     })
     .map_err(|error| format!("encode v5 cache: {error}"))?;
     let mut file = std::fs::File::create(&temporary)
@@ -63,7 +63,7 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("write {}: {error}", temporary.display()))?;
     drop(file);
-    atomic_replace(&temporary, &path)
+    crate::fs_util::atomic_replace(&temporary, &path, "cache")
 }
 
 fn validate(state: &IndexState) -> Result<(), String> {
@@ -71,47 +71,6 @@ fn validate(state: &IndexState) -> Result<(), String> {
         volume.validate()?;
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn atomic_replace(temporary: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
-
-    if !destination.exists() {
-        return std::fs::rename(temporary, destination)
-            .map_err(|error| format!("install initial cache: {error}"));
-    }
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let temporary: Vec<u16> = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        ReplaceFileW(
-            PCWSTR(destination.as_ptr()),
-            PCWSTR(temporary.as_ptr()),
-            PCWSTR::null(),
-            REPLACE_FILE_FLAGS(0),
-            None,
-            None,
-        )
-    }
-    .map_err(|error| format!("ReplaceFileW: {error}"))
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(temporary: &Path, destination: &Path) -> Result<(), String> {
-    if destination.exists() {
-        std::fs::remove_file(destination).map_err(|error| error.to_string())?;
-    }
-    std::fs::rename(temporary, destination).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -157,7 +116,7 @@ mod tests {
             state: state(),
         })
         .unwrap();
-        let decoded: CacheEnvelope = postcard::from_bytes(&bytes).unwrap();
+        let decoded: CacheEnvelope<IndexState> = postcard::from_bytes(&bytes).unwrap();
         assert_ne!(&decoded.magic, CACHE_MAGIC);
     }
 }

@@ -86,34 +86,7 @@ public static class WebModeDetector
     {
         if (string.IsNullOrEmpty(urlTemplate))
             return "";
-        return urlTemplate.Replace("{q}", UrlEncode(queryTerms));
-    }
-
-    /// <summary>application/x-www-form-urlencoded 风格的百分号编码（UTF-8 字节）。空格编为 %20。</summary>
-    private static string UrlEncode(string s)
-    {
-        if (string.IsNullOrEmpty(s))
-            return "";
-        var bytes = System.Text.Encoding.UTF8.GetBytes(s);
-        var sb = new System.Text.StringBuilder(s.Length * 3);
-        foreach (var b in bytes)
-        {
-            if ((uint)(b - 'A') <= 'Z' - 'A'
-                || (uint)(b - 'a') <= 'z' - 'a'
-                || (uint)(b - '0') <= '9' - '0'
-                || b == '-' || b == '_' || b == '.' || b == '~')
-            {
-                sb.Append((char)b);
-            }
-            else
-            {
-                sb.Append('%');
-                const string Hex = "0123456789ABCDEF";
-                sb.Append(Hex[b >> 4]);
-                sb.Append(Hex[b & 0xF]);
-            }
-        }
-        return sb.ToString();
+        return urlTemplate.Replace("{q}", SuggestionUrlEncoder.UrlEncode(queryTerms));
     }
 }
 

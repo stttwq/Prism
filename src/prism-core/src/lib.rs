@@ -4,6 +4,7 @@ pub mod actions;
 pub mod apps;
 pub mod config;
 pub mod file_ops;
+pub mod fs_util;
 pub mod hierarchy;
 pub mod history;
 pub mod index_cache;

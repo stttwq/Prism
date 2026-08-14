@@ -282,7 +282,7 @@ impl PinyinSidecar {
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("write pinyin temporary file: {error}"))?;
         drop(file);
-        atomic_replace(&temporary, &destination)
+        crate::fs_util::atomic_replace(&temporary, &destination, "pinyin sidecar")
     }
 
     pub fn encoded_bytes(&self) -> Result<usize, String> {
@@ -773,44 +773,6 @@ impl Drop for MappedFile {
             let _ = CloseHandle(self.mapping);
         }
     }
-}
-
-#[cfg(windows)]
-fn atomic_replace(temporary: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
-
-    if !destination.exists() {
-        return std::fs::rename(temporary, destination)
-            .map_err(|error| format!("install initial pinyin sidecar: {error}"));
-    }
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let temporary: Vec<u16> = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        ReplaceFileW(
-            PCWSTR(destination.as_ptr()),
-            PCWSTR(temporary.as_ptr()),
-            PCWSTR::null(),
-            REPLACE_FILE_FLAGS(0),
-            None,
-            None,
-        )
-    }
-    .map_err(|error| format!("replace pinyin sidecar: {error}"))
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(temporary: &Path, destination: &Path) -> Result<(), String> {
-    std::fs::rename(temporary, destination).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

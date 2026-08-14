@@ -105,7 +105,12 @@ public sealed class SuggestionService : ISuggestionService
             if (resp.StatusCategory != 2)
                 return [];
 
-            var text = (TryResolveEncoding(resp.CharSet) ?? Encoding.UTF8).GetString(resp.Body);
+            // 编码优先级：adapter 声明 > HTTP header charset > UTF-8 回退。
+            // 百度端点 header 不可靠，必须由 adapter 硬编码。
+            var encoding = adapter.ExpectedEncoding
+                ?? TryResolveEncoding(resp.CharSet)
+                ?? Encoding.UTF8;
+            var text = encoding.GetString(resp.Body);
             var suggestions = adapter.Parse(text);
             return Bound(suggestions, adapter, query);
         }
@@ -184,6 +189,12 @@ internal interface ISuggestionAdapter
     string UrlTemplate { get; }
     string BuildRequestUrl(string query);
     List<string> Parse(string responseBody);
+    /// <summary>
+    /// adapter 声明的预期响应编码。非 null 时覆盖 HTTP header 的 charset——
+    /// 百度 suggestion 端点的 Content-Type charset 不可靠（经常缺失或与 body 不符），
+    /// 由 adapter 硬编码才是正确来源。null 表示信任 HTTP header 或回退 UTF-8。
+    /// </summary>
+    Encoding? ExpectedEncoding => null;
 }
 
 /// <summary>Bing 联想 adapter：使用 Bing 搜索建议 API。</summary>
@@ -223,7 +234,21 @@ internal sealed class BaiduSuggestionAdapter : ISuggestionAdapter
     public string UrlTemplate => "https://www.baidu.com/s?wd={q}";
 
     public string BuildRequestUrl(string query) =>
-        "https://suggestion.baidu.com/su?wd=" + SuggestionUrlEncoder.UrlEncode(query) + "&action=opensearch&ie=utf-8";
+        "https://suggestion.baidu.com/su?wd=" + SuggestionUrlEncoder.UrlEncode(query) + "&action=opensearch";
+
+    // 百度 suggestion 端点的 Content-Type charset 不可靠（经常缺失或声称 utf-8 但 body 是 GBK），
+    // 由 adapter 硬编码 GBK 才是正确来源。不信任 HTTP header 避免「知乎」→「之火」乱码。
+    public Encoding? ExpectedEncoding => GetGbkEncoding();
+
+    private static Encoding? GetGbkEncoding()
+    {
+        try
+        {
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            return Encoding.GetEncoding("gbk");
+        }
+        catch { return null; }
+    }
 
     public List<string> Parse(string body)
     {

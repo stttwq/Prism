@@ -65,8 +65,11 @@ Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescripti
 Name: "autostart"; Description: "开机自动启动 Prism(&A)"; GroupDescription: "附加任务："; Flags: checkedonce
 
 [Files]
-; 安装源：dist 目录下的三个 exe 与图标。选项 ignoreversion 表示每次以打包版本覆盖。
+; 安装源：dist 目录下的三个 exe、前端 DLL/运行时配置与图标。
+; Prism.exe 是 framework-dependent（非自包含），需要 Prism.dll 与 runtimeconfig.json 同目录。
 Source: "Prism.exe";        DestDir: "{app}"; Flags: ignoreversion
+Source: "Prism.dll";         DestDir: "{app}"; Flags: ignoreversion
+Source: "Prism.runtimeconfig.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "prism-core.exe";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#IndexerServiceExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "prism.ico";        DestDir: "{app}"; Flags: ignoreversion

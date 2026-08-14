@@ -30,12 +30,13 @@ public sealed class WebIconProvider
     /// <summary>
     /// 获取引擎图标。优先内置图标，其次 favicon 缓存，最后通用图标。
     /// </summary>
-    /// <param name="engineName">引擎显示名。</param>
-    /// <param name="url">引擎 URL（用于提取 origin 查 favicon 缓存）。</param>
-    public ImageSource GetIcon(string engineName, string url)
+    /// <param name="url">引擎 URL（用于提取 origin 查 favicon 缓存，或推断内置引擎）。</param>
+    /// <param name="engineName">引擎显示名（可选，用于精确匹配内置图标）。</param>
+    public ImageSource GetIcon(string url, string? engineName = null)
     {
-        // 内置引擎：程序化生成图标
-        var builtIn = CreateBuiltInIcon(engineName);
+        // 内置引擎：优先用 engineName 匹配，其次从 URL 推断
+        var name = engineName ?? InferEngineName(url);
+        var builtIn = CreateBuiltInIcon(name);
         if (builtIn is not null)
         {
             builtIn.Freeze();
@@ -59,8 +60,18 @@ public sealed class WebIconProvider
         return _genericIcon;
     }
 
+    /// <summary>从 URL 推断内置引擎名。非内置引擎返回 null。</summary>
+    private static string? InferEngineName(string url)
+    {
+        var lower = url.ToLowerInvariant();
+        if (lower.Contains("bing.com")) return "Bing";
+        if (lower.Contains("baidu.com")) return "百度";
+        if (lower.Contains("google.com")) return "Google";
+        return null;
+    }
+
     /// <summary>生成内置引擎图标。非内置引擎返回 null。</summary>
-    private static ImageSource? CreateBuiltInIcon(string engineName)
+    private static ImageSource? CreateBuiltInIcon(string? engineName)
     {
         return engineName switch
         {

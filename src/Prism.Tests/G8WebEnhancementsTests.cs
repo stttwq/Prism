@@ -124,7 +124,10 @@ public sealed class SuggestionAdapterTests
     [Fact]
     public async Task Baidu_Parses_Suggestions()
     {
-        var body = """["天",["天气","天气预报","天气之子"]]""";
+        // 百度 adapter 硬编码 GBK 解码，所以测试 body 也必须用 GBK 编码。
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var gbk = Encoding.GetEncoding("gbk");
+        var body = gbk.GetBytes("""["天",["天气","天气预报","天气之子"]]""");
         var fake = new FakeHttpTransport(2, body);
         var svc = new SuggestionService(fake);
         var result = await svc.GetSuggestionsAsync("百度", "天", CancellationToken.None);
@@ -150,12 +153,28 @@ public sealed class SuggestionAdapterTests
     }
 
     [Fact]
-    public void Baidu_Adapter_Url_Requests_Utf8()
+    public async Task Baidu_GBK_Body_Decoded_Without_Header_Charset()
     {
-        // 百度 adapter 应在 URL 中带 ie=utf-8，优先请求 UTF-8 响应。
+        // 真实百度端点经常不声明 charset——adapter 必须硬编码 GBK，不依赖 header。
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var gbk = Encoding.GetEncoding("gbk");
+        var body = gbk.GetBytes("""["知乎",["知乎日报","知乎热榜"]]""");
+        // charset 为 null（模拟真实百度不声明 charset 的响应）。
+        var fake = new FakeHttpTransport(2, body, null);
+        var svc = new SuggestionService(fake);
+        var result = await svc.GetSuggestionsAsync("百度", "知乎", CancellationToken.None);
+        Assert.Equal(2, result.Count);
+        Assert.Equal("知乎日报", result[0].Text);
+    }
+
+    [Fact]
+    public void Baidu_Adapter_Url_Does_Not_Request_Utf8()
+    {
+        // 百度 adapter 不再带 ie=utf-8——百度端点 charset header 不可靠，
+        // 由 adapter 硬编码 GBK 解码才是正确来源。
         var adapter = new BaiduSuggestionAdapter();
         var url = adapter.BuildRequestUrl("测试");
-        Assert.Contains("ie=utf-8", url);
+        Assert.DoesNotContain("ie=utf-8", url);
     }
 
     [Fact]

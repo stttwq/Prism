@@ -486,21 +486,43 @@ async fn dispatch_non_search(
                 cancelled: false,
             }
         }
-        Request::ClearHistory => match history.clear() {
-            Ok(()) => Response::Status {
-                is_indexing: false,
-                cancelled: false,
-            },
-            Err(message) => Response::Error {
-                message,
-                category: None,
-            },
-        },
+        Request::ClearHistory => {
+            // history.clear() does synchronous file removal. Offload it to a blocking
+            // thread so the tokio worker is not stalled.
+            let history = history.clone();
+            match tokio::task::spawn_blocking(move || history.clear()).await {
+                Ok(Ok(())) => Response::Status {
+                    is_indexing: false,
+                    cancelled: false,
+                },
+                Ok(Err(message)) => Response::Error {
+                    message,
+                    category: None,
+                },
+                Err(error) => {
+                    log(format!("history clear spawn_blocking failed: {error}"));
+                    Response::Error {
+                        message: "history clear failed".into(),
+                        category: None,
+                    }
+                }
+            }
+        }
         Request::ResolveWindow { target } => {
             resolve_window(&target, windows, &crate::window_list::SystemWindowProbe)
         }
         Request::RecordWindowSwitch { target } => {
-            record_window_switch(&target, windows, &crate::window_list::SystemWindowProbe, history)
+            // Synchronous resolve consumes the `probe` borrow before any await.
+            match record_window_switch(&target, windows, &crate::window_list::SystemWindowProbe) {
+                Ok(history_target) => {
+                    write_window_history(history_target, history).await;
+                    Response::Status {
+                        is_indexing: false,
+                        cancelled: false,
+                    }
+                }
+                Err(response) => response,
+            }
         }
         Request::Search { .. } => Response::Error {
             message: "search must be dispatched asynchronously".into(),
@@ -546,33 +568,41 @@ fn resolve_window(
 /// 仍然复核一次 token：这条消息只应在成功后到达，但 broker 不能靠前端自证，否则一个
 /// 迟到或伪造的 record 会把没切成功的窗口写成成功历史。历史键是「应用名 + 规范化标题」，
 /// 不是 HWND。
+///
+/// 拆成同步 resolve + 异步 write 两步：`&dyn WindowProbe` 不是 `Sync`，不能跨
+/// `spawn_blocking` 的 await 边界存活。先在同步阶段消耗 probe，再进入异步阶段写历史。
+#[allow(clippy::result_large_err)]
 fn record_window_switch(
     target: &ActionTarget,
     windows: &Arc<crate::window_list::WindowSnapshotStore>,
     probe: &dyn crate::window_list::WindowProbe,
-    history: &Arc<HistoryStore>,
-) -> Response {
+) -> Result<ActionTarget, Response> {
     if target.kind != TargetKind::Window.as_str() {
-        return Response::Error {
+        return Err(Response::Error {
             message: "record_window_switch requires a window target".into(),
             category: Some(crate::shell::ShellErrorKind::TargetInvalid),
-        };
+        });
     }
     match windows.resolve(&target.value, probe) {
-        Ok(entry) => {
-            let history_target = ActionTarget::new(TargetKind::Window, entry.history_key());
-            if let Err(error) = history.record(&history_target, HistoryUse::Execute) {
-                log(format!("窗口历史写入失败：{error}"));
-            }
-            Response::Status {
-                is_indexing: false,
-                cancelled: false,
-            }
-        }
-        Err(error) => Response::Error {
+        Ok(entry) => Ok(ActionTarget::new(TargetKind::Window, entry.history_key())),
+        Err(error) => Err(Response::Error {
             message: error.message().to_owned(),
             category: Some(crate::shell::ShellErrorKind::Conflict),
-        },
+        }),
+    }
+}
+
+/// Async continuation: writes the resolved history target to disk via
+/// `spawn_blocking` so the tokio worker is not stalled by synchronous file I/O.
+/// Takes only owned data so no non-`Sync` reference crosses the await boundary.
+async fn write_window_history(history_target: ActionTarget, history: &Arc<HistoryStore>) {
+    let history = history.clone();
+    match tokio::task::spawn_blocking(move || history.record(&history_target, HistoryUse::Execute))
+        .await
+    {
+        Ok(Err(error)) => log(format!("窗口历史写入失败：{error}")),
+        Err(error) => log(format!("history spawn_blocking failed: {error}")),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -608,15 +638,17 @@ fn parse_query(raw: &str) -> (String, Vec<SearchFilter>) {
         }
 
         // Try to match a known prefix (case-insensitive).
+        // 用字节比较而非字符串切片——中文 UTF-8 字符是多字节的，
+        // &raw[pos..end] 在非 char boundary 上切片会 panic。
         let matched = known_prefixes.iter().find_map(|prefix| {
             let end = pos + prefix.len();
-            if end <= bytes.len() {
-                let slice = &raw[pos..end];
-                if slice.eq_ignore_ascii_case(prefix) {
-                    return Some(*prefix);
-                }
+            if end <= bytes.len()
+                && bytes[pos..end].eq_ignore_ascii_case(prefix.as_bytes())
+            {
+                Some(*prefix)
+            } else {
+                None
             }
-            None
         });
 
         if let Some(prefix) = matched {
@@ -733,6 +765,156 @@ struct SearchArgs<'a> {
     mode: SearchMode,
 }
 
+/// Collects literal + pinyin app matches from the Start Menu catalog.
+///
+/// Apps are only searched when there is no root scope and no query filters — a
+/// directory scope means "files under this root", and filters mean "files only".
+/// Returns the app results and a count of how many matched (for `matched_count`).
+fn collect_app_results(
+    apps: &SharedApps,
+    name_query: &str,
+    history: &Arc<HistoryStore>,
+    pinyin_enabled: bool,
+) -> (Vec<SearchResult>, u64) {
+    let mut ranked = Vec::new();
+    let mut app_match_count = 0u64;
+    let Ok(apps_guard) = apps.read() else {
+        return (ranked, app_match_count);
+    };
+    let app_matches = crate::apps::search(&apps_guard, name_query, usize::MAX);
+    app_match_count = app_matches.len() as u64;
+    let mut literal_targets = std::collections::HashSet::new();
+    for app in app_matches {
+        literal_targets.insert(app.launch_path.clone());
+        let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
+        let mut metadata = rank_title(&app.name, name_query);
+        if let Some(metadata) = metadata.as_mut() {
+            metadata.history_score = history.score(&target);
+        }
+        ranked.push(SearchResult {
+            kind: SearchResultKind::App,
+            title: app.name.clone(),
+            subtitle: if app.target_path != app.launch_path {
+                app.target_path.clone()
+            } else {
+                app.launch_path.clone()
+            },
+            execute_id: app.launch_path.clone(),
+            target,
+            match_spans: match_spans(&app.name, name_query),
+            match_metadata: metadata,
+        });
+    }
+    if pinyin_enabled {
+        for app in apps_guard.iter() {
+            if literal_targets.contains(&app.launch_path) {
+                continue;
+            }
+            let Some(matched) = crate::pinyin::match_name(&app.name, name_query) else {
+                continue;
+            };
+            let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
+            let metadata = pinyin_metadata(&matched, history.score(&target));
+            ranked.push(SearchResult {
+                kind: SearchResultKind::App,
+                title: app.name.clone(),
+                subtitle: if app.target_path != app.launch_path {
+                    app.target_path.clone()
+                } else {
+                    app.launch_path.clone()
+                },
+                execute_id: app.launch_path.clone(),
+                target: target.clone(),
+                match_spans: matched.spans,
+                match_metadata: Some(metadata),
+            });
+            app_match_count = app_match_count.saturating_add(1);
+        }
+    }
+    (ranked, app_match_count)
+}
+
+/// Fields extracted from an indexer search reply that the final `Response::Results`
+/// needs. Extracted to avoid an 11-tuple return type.
+struct IndexerReplyFields {
+    is_indexing: bool,
+    index_progress: Option<Box<IndexProgressDto>>,
+    index_error: Option<String>,
+    index_generation: Option<u64>,
+    is_truncated: bool,
+    index_matched_count: Option<u64>,
+    scanned_nodes: Option<u64>,
+    name_candidates: Option<u64>,
+    entered_top_k: Option<u64>,
+    path_constructions: Option<u64>,
+    pinyin_status: Option<crate::indexer_ipc::PinyinStatus>,
+}
+
+/// Merges indexer items into `ranked`, skipping any whose target already appears in
+/// `injected_history_targets` (history candidates injected earlier). Returns the
+/// diagnostic fields the response needs.
+fn process_indexer_reply(
+    reply: crate::indexer_client::SearchReply,
+    query: &str,
+    history: &Arc<HistoryStore>,
+    injected_history_targets: &HashSet<(String, String)>,
+    ranked: &mut Vec<SearchResult>,
+) -> IndexerReplyFields {
+    for item in reply.items {
+        let target = ActionTarget::new(
+            if item.is_directory {
+                TargetKind::Directory
+            } else {
+                TargetKind::File
+            },
+            item.path.clone(),
+        );
+        if injected_history_targets.contains(&(target.kind.clone(), target.value.clone())) {
+            continue;
+        }
+        ranked.push(SearchResult {
+            kind: if item.is_directory {
+                SearchResultKind::Folder
+            } else {
+                SearchResultKind::File
+            },
+            title: item.name.clone(),
+            subtitle: item.path.clone(),
+            target: target.clone(),
+            execute_id: item.path,
+            match_spans: item
+                .match_spans
+                .unwrap_or_else(|| match_spans(&item.name, query)),
+            match_metadata: {
+                let mut metadata = item
+                    .match_metadata
+                    .or_else(|| rank_title(&item.name, query));
+                if let Some(metadata) = metadata.as_mut() {
+                    metadata.history_score = history.score(&target);
+                }
+                metadata
+            },
+        });
+    }
+    IndexerReplyFields {
+        is_indexing: reply.status.building || !reply.status.ready,
+        index_progress: reply
+            .status
+            .build_progress
+            .as_ref()
+            .map(|progress| Box::new(build_progress_dto(progress))),
+        index_error: reply.status.message.filter(|_| reply.status.degraded),
+        index_generation: Some(reply.generation),
+        is_truncated: reply.is_truncated,
+        index_matched_count: reply.matched_count,
+        scanned_nodes: reply.scanned_nodes,
+        name_candidates: reply.name_candidates,
+        entered_top_k: reply.entered_top_k,
+        path_constructions: reply.path_constructions,
+        pinyin_status: reply.status.pinyin_status,
+    }
+}
+
 async fn search_service(
     args: SearchArgs<'_>,
     apps: &SharedApps,
@@ -787,7 +969,7 @@ async fn search_service(
     // Non-host empty input stays empty here: recent windows live in window mode (G5), which
     // returned above, not in an empty global query.
     if query.trim().is_empty() {
-        return empty_query_results(query, max, filters.as_deref(), root, history);
+        return empty_query_results(query, max, filters.as_deref(), root, history).await;
     }
     let mut items = Vec::with_capacity(max.min(128));
     // G7: when ext:/path: filters are present, only files/folders are returned — no apps,
@@ -803,13 +985,20 @@ async fn search_service(
     let mut ranked = Vec::new();
     let exclusions = exclusion_paths(filters.as_deref());
     let history_weights = history.weights();
-    let history_candidates = history_file_candidates(
-        &name_query,
-        &history_weights,
-        preferences.pinyin_enabled(),
-        &exclusions,
-        root,
-    );
+    let pinyin_enabled = preferences.pinyin_enabled();
+    let root_clone = root.map(|r| r.to_owned());
+    let name_query_clone = name_query.clone();
+    let history_candidates = tokio::task::spawn_blocking(move || {
+        history_file_candidates(
+            &name_query_clone,
+            &history_weights,
+            pinyin_enabled,
+            &exclusions,
+            root_clone.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_default();
     let injected_history_targets: HashSet<_> = history_candidates
         .iter()
         .map(|candidate| {
@@ -820,65 +1009,20 @@ async fn search_service(
         })
         .collect();
     ranked.extend(history_candidates);
-    let mut app_match_count = 0u64;
     // G4: a current-directory scope means "files under this root". Applications are not
     // scoped to a directory, so a root suppresses them entirely rather than leaking
     // global hits (e.g. Start Menu .lnk) into a scoped result list.
     // G7: ext:/path: filters also suppress apps — only files/folders are returned.
+    let mut app_match_count = 0u64;
     if result_slots > 0 && root.is_none() && !has_filters {
-        if let Ok(apps_guard) = apps.read() {
-            let app_matches = crate::apps::search(&apps_guard, &name_query, usize::MAX);
-            app_match_count = app_matches.len() as u64;
-            let mut literal_targets = std::collections::HashSet::new();
-            for app in app_matches {
-                literal_targets.insert(app.launch_path.clone());
-                let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
-                let mut metadata = rank_title(&app.name, &name_query);
-                if let Some(metadata) = metadata.as_mut() {
-                    metadata.history_score = history.score(&target);
-                }
-                ranked.push(SearchResult {
-                    kind: SearchResultKind::App,
-                    title: app.name.clone(),
-                    subtitle: if app.target_path != app.launch_path {
-                        app.target_path.clone()
-                    } else {
-                        app.launch_path.clone()
-                    },
-                    execute_id: app.launch_path.clone(),
-                    target,
-                    match_spans: match_spans(&app.name, &name_query),
-                    match_metadata: metadata,
-                });
-            }
-            if preferences.pinyin_enabled() {
-                for app in apps_guard.iter() {
-                    if literal_targets.contains(&app.launch_path) {
-                        continue;
-                    }
-                    let Some(matched) = crate::pinyin::match_name(&app.name, &name_query) else {
-                        continue;
-                    };
-                    let target =
-                        ActionTarget::new(TargetKind::Application, app.launch_path.clone());
-                    let metadata = pinyin_metadata(&matched, history.score(&target));
-                    ranked.push(SearchResult {
-                        kind: SearchResultKind::App,
-                        title: app.name.clone(),
-                        subtitle: if app.target_path != app.launch_path {
-                            app.target_path.clone()
-                        } else {
-                            app.launch_path.clone()
-                        },
-                        execute_id: app.launch_path.clone(),
-                        target: target.clone(),
-                        match_spans: matched.spans,
-                        match_metadata: Some(metadata),
-                    });
-                    app_match_count = app_match_count.saturating_add(1);
-                }
-            }
-        }
+        let (app_results, count) = collect_app_results(
+            apps,
+            &name_query,
+            history,
+            preferences.pinyin_enabled(),
+        );
+        app_match_count = count;
+        ranked.extend(app_results);
     }
     let (service, root_rejection, root_message) = search_index_with_root_fallback(
         &name_query,
@@ -888,89 +1032,35 @@ async fn search_service(
         root,
     )
     .await;
-    let (
+    let IndexerReplyFields {
         is_indexing,
         index_progress,
         index_error,
         index_generation,
-        index_truncated,
+        is_truncated: index_truncated,
         index_matched_count,
         scanned_nodes,
         name_candidates,
         entered_top_k,
         path_constructions,
         pinyin_status,
-    ) = match service {
-        Ok(reply) => {
-            for item in reply.items {
-                let target = ActionTarget::new(
-                    if item.is_directory {
-                        TargetKind::Directory
-                    } else {
-                        TargetKind::File
-                    },
-                    item.path.clone(),
-                );
-                if injected_history_targets.contains(&(target.kind.clone(), target.value.clone())) {
-                    continue;
-                }
-                ranked.push(SearchResult {
-                    kind: if item.is_directory {
-                        SearchResultKind::Folder
-                    } else {
-                        SearchResultKind::File
-                    },
-                    title: item.name.clone(),
-                    subtitle: item.path.clone(),
-                    target: target.clone(),
-                    execute_id: item.path,
-                    match_spans: item
-                        .match_spans
-                        .unwrap_or_else(|| match_spans(&item.name, query)),
-                    match_metadata: {
-                        let mut metadata = item
-                            .match_metadata
-                            .or_else(|| rank_title(&item.name, query));
-                        if let Some(metadata) = metadata.as_mut() {
-                            metadata.history_score = history.score(&target);
-                        }
-                        metadata
-                    },
-                });
-            }
-            (
-                reply.status.building || !reply.status.ready,
-                reply
-                    .status
-                    .build_progress
-                    .as_ref()
-                    .map(|progress| Box::new(build_progress_dto(progress))),
-                reply.status.message.filter(|_| reply.status.degraded),
-                Some(reply.generation),
-                reply.is_truncated,
-                reply.matched_count,
-                reply.scanned_nodes,
-                reply.name_candidates,
-                reply.entered_top_k,
-                reply.path_constructions,
-                reply.status.pinyin_status,
-            )
-        }
-        Err(error) => (
-            false,
-            None,
-            Some(error),
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
+    } = match service {
+        Ok(reply) => process_indexer_reply(reply, query, history, &injected_history_targets, &mut ranked),
+        Err(error) => IndexerReplyFields {
+            is_indexing: false,
+            index_progress: None,
+            index_error: Some(error),
+            index_generation: None,
+            is_truncated: false,
+            index_matched_count: None,
+            scanned_nodes: None,
+            name_candidates: None,
+            entered_top_k: None,
+            path_constructions: None,
+            pinyin_status: None,
+        },
     };
-    ranked.sort_by(compare_search_results);
+    sort_search_results(&mut ranked);
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
     items.extend(ranked);
@@ -1025,7 +1115,7 @@ fn window_results(query: &str, items: Vec<SearchResult>, history: &Arc<HistorySt
 /// * Root rejected locally: empty items + structured rejection (UI falls back to global).
 /// * No root / history off: empty items. Recent windows are window mode's job (G5), not
 ///   this path's.
-fn empty_query_results(
+async fn empty_query_results(
     query: &str,
     max: usize,
     filters: Option<&[SearchFilter]>,
@@ -1040,11 +1130,16 @@ fn empty_query_results(
 
     let items = match root {
         Some(root) if history.is_enabled() => {
-            let mut items =
-                history_file_candidates("", &history.weights(), false, &exclusions, Some(root));
+            let weights = history.weights();
+            let root_owned = root.to_owned();
+            let mut items = tokio::task::spawn_blocking(move || {
+                history_file_candidates("", &weights, false, &exclusions, Some(&root_owned))
+            })
+            .await
+            .unwrap_or_default();
             // Rank by history first; compare_search_results already prefers higher
             // history_score within the same match tier, which empty-query items share.
-            items.sort_by(compare_search_results);
+            sort_search_results(&mut items);
             items.truncate(max);
             items
         }
@@ -1383,7 +1478,7 @@ fn rank_window_list(
         }
     }
 
-    ranked.sort_by(compare_search_results);
+    sort_search_results(&mut ranked);
     ranked.truncate(max);
     ranked
 }
@@ -1407,12 +1502,48 @@ fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
     })
 }
 
+#[cfg(test)]
 fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
     left.match_metadata
         .cmp(&right.match_metadata)
         .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
         .then_with(|| left.subtitle.cmp(&right.subtitle))
         .then(left.kind.cmp(&right.kind))
+}
+
+/// Sorts results by `compare_search_results` but pre-computes the lowercased title
+/// once per item instead of once per comparison (O(n) vs O(n log n) allocations).
+fn sort_search_results(items: &mut [SearchResult]) {
+    // Build a parallel array of lowercased titles to avoid re-allocating inside the
+    // comparator. Items are sorted in-place via index permutation.
+    let mut indices: Vec<usize> = (0..items.len()).collect();
+    let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
+    indices.sort_by(|&a, &b| {
+        items[a]
+            .match_metadata
+            .cmp(&items[b].match_metadata)
+            .then_with(|| lowercased[a].cmp(&lowercased[b]))
+            .then_with(|| items[a].subtitle.cmp(&items[b].subtitle))
+            .then(items[a].kind.cmp(&items[b].kind))
+    });
+    // Apply the permutation in-place.
+    let mut visited = vec![false; items.len()];
+    for i in 0..items.len() {
+        if visited[i] {
+            continue;
+        }
+        let mut j = i;
+        while !visited[j] {
+            visited[j] = true;
+            let target = indices[j];
+            if target != j {
+                items.swap(j, target);
+                j = target;
+            } else {
+                break;
+            }
+        }
+    }
 }
 fn list_actions(target: ActionTarget) -> Response {
     match crate::actions::list_actions(&target) {
@@ -1436,19 +1567,24 @@ async fn run_shell(
         ShellOperation::Reveal(target) => Some((target.clone(), HistoryUse::Reveal)),
         ShellOperation::RunAction { target, .. } => Some((target.clone(), HistoryUse::Execute)),
     };
-    finish_shell_response(shell.execute(operation).await, history_record, history)
+    finish_shell_response(shell.execute(operation).await, history_record, history).await
 }
 
-fn finish_shell_response(
+async fn finish_shell_response(
     outcome: Result<ShellOutcome, ShellError>,
     history_record: Option<(ActionTarget, HistoryUse)>,
-    history: &HistoryStore,
+    history: &Arc<HistoryStore>,
 ) -> Response {
     match outcome {
         Ok(ShellOutcome::Success) => {
             if let Some((target, usage)) = history_record {
-                if history.record(&target, usage).is_err() {
-                    log("history write failed");
+                // history.record() does synchronous disk I/O (persist). Offload it to a
+                // blocking thread so the tokio worker is not stalled.
+                let history = history.clone();
+                match tokio::task::spawn_blocking(move || history.record(&target, usage)).await {
+                    Ok(Err(_)) => log("history write failed"),
+                    Err(error) => log(format!("history spawn_blocking failed: {error}")),
+                    Ok(Ok(())) => {}
                 }
             }
             Response::Status {
@@ -1706,19 +1842,18 @@ mod window_protocol_tests {
 
     // --- record -------------------------------------------------------------------
 
-    #[test]
-    fn record_writes_history_under_an_app_plus_title_key() {
+    #[tokio::test]
+    async fn record_writes_history_under_an_app_plus_title_key() {
         let store = Arc::new(WindowSnapshotStore::new());
         let history = history_store("record");
         let token = store.publish(vec![entry()])[0].0.clone();
-        let response = record_window_switch(
+        let history_target = record_window_switch(
             &ActionTarget::new(TargetKind::Window, &token),
             &store,
             &AlwaysLive(live_window()),
-            &history,
-        );
-        assert!(matches!(response, Response::Status { .. }));
-
+        )
+        .expect("should resolve");
+        write_window_history(history_target, &history).await;
         let key = ActionTarget::new(TargetKind::Window, entry().history_key());
         assert!(history.score(&key) > 0);
         // The handle must not be what got persisted.
@@ -1726,8 +1861,8 @@ mod window_protocol_tests {
         assert_eq!(history.score(&by_handle), 0);
     }
 
-    #[test]
-    fn record_for_a_dead_window_does_not_write_success_history() {
+    #[tokio::test]
+    async fn record_for_a_dead_window_does_not_write_success_history() {
         let store = Arc::new(WindowSnapshotStore::new());
         let history = history_store("dead");
         let token = store.publish(vec![entry()])[0].0.clone();
@@ -1735,15 +1870,15 @@ mod window_protocol_tests {
             &ActionTarget::new(TargetKind::Window, &token),
             &store,
             &AlwaysGone,
-            &history,
-        );
+        )
+        .expect_err("dead window should fail");
         assert!(matches!(response, Response::Error { .. }));
         let key = ActionTarget::new(TargetKind::Window, entry().history_key());
         assert_eq!(history.score(&key), 0);
     }
 
-    #[test]
-    fn record_for_a_stale_token_does_not_write_success_history() {
+    #[tokio::test]
+    async fn record_for_a_stale_token_does_not_write_success_history() {
         let store = Arc::new(WindowSnapshotStore::new());
         let history = history_store("stale");
         let stale = store.publish(vec![entry()])[0].0.clone();
@@ -1752,8 +1887,8 @@ mod window_protocol_tests {
             &ActionTarget::new(TargetKind::Window, &stale),
             &store,
             &AlwaysLive(live_window()),
-            &history,
-        );
+        )
+        .expect_err("stale token should fail");
         assert!(matches!(response, Response::Error { .. }));
         let key = ActionTarget::new(TargetKind::Window, entry().history_key());
         assert_eq!(history.score(&key), 0);
@@ -2092,8 +2227,8 @@ mod protocol_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn empty_query_results_require_root_and_enabled_history() {
+    #[tokio::test]
+    async fn empty_query_results_require_root_and_enabled_history() {
         let dir = std::env::temp_dir().join(format!(
             "prism-empty-query-response-{}-{}",
             std::process::id(),
@@ -2124,7 +2259,8 @@ mod protocol_tests {
             )
             .unwrap();
 
-        let with_root = empty_query_results("", 8, None, Some(root_str.as_str()), &history);
+        let with_root =
+            empty_query_results("", 8, None, Some(root_str.as_str()), &history).await;
         match with_root {
             Response::Results { items, .. } => {
                 assert_eq!(items.len(), 1);
@@ -2133,7 +2269,7 @@ mod protocol_tests {
             other => panic!("expected results, got {other:?}"),
         }
 
-        let no_root = empty_query_results("", 8, None, None, &history);
+        let no_root = empty_query_results("", 8, None, None, &history).await;
         match no_root {
             Response::Results { items, .. } => {
                 assert!(
@@ -2145,7 +2281,8 @@ mod protocol_tests {
         }
 
         history.set_enabled(false);
-        let disabled = empty_query_results("", 8, None, Some(root_str.as_str()), &history);
+        let disabled =
+            empty_query_results("", 8, None, Some(root_str.as_str()), &history).await;
         match disabled {
             Response::Results { items, .. } => assert!(items.is_empty()),
             other => panic!("expected results, got {other:?}"),
@@ -2205,16 +2342,17 @@ mod protocol_tests {
         );
     }
 
-    #[test]
-    fn only_successful_shell_outcomes_record_history() {
+    #[tokio::test]
+    async fn only_successful_shell_outcomes_record_history() {
         let dir =
             std::env::temp_dir().join(format!("prism-ipc-history-outcomes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let history = HistoryStore::load(&dir, true);
+        let history = Arc::new(HistoryStore::load(&dir, true));
         let target = ActionTarget::new(TargetKind::File, r"C:\history-outcome.txt");
         let record = || Some((target.clone(), HistoryUse::Execute));
 
-        let cancelled = finish_shell_response(Ok(ShellOutcome::Cancelled), record(), &history);
+        let cancelled =
+            finish_shell_response(Ok(ShellOutcome::Cancelled), record(), &history).await;
         assert!(matches!(
             cancelled,
             Response::Status {
@@ -2231,11 +2369,13 @@ mod protocol_tests {
             }),
             record(),
             &history,
-        );
+        )
+        .await;
         assert!(matches!(failed, Response::Error { .. }));
         assert_eq!(history.score(&target), 0);
 
-        let success = finish_shell_response(Ok(ShellOutcome::Success), record(), &history);
+        let success =
+            finish_shell_response(Ok(ShellOutcome::Success), record(), &history).await;
         assert!(matches!(
             success,
             Response::Status {
@@ -2485,5 +2625,28 @@ mod query_parser_tests {
             value: r"C:\x".into(),
         }]));
         assert!(!has_query_filters(&[]));
+    }
+
+    /// 回归测试：中文输入（如"知乎"）不应在 parse_query 中 panic。
+    /// 根因：parse_query 用字节索引对 &str 做切片 &raw[pos..end]，
+    /// 其中 end = pos + prefix.len()。中文 UTF-8 是 3 字节/字符，
+    /// end=4 落在第二个字符中间 → "end byte index 4 is not a char boundary" panic。
+    /// 修复：改用 bytes[pos..end].eq_ignore_ascii_case 做字节比较，不做字符串切片。
+    #[test]
+    fn chinese_query_does_not_panic_in_parse_query() {
+        // "知乎" = 6 bytes (e7 9f a5 e4 b9 8e)。pos=0, prefix="ext:" len=4,
+        // 旧代码 &raw[0..4] 在字节 4 切片——落在"乎"的中间 → panic。
+        let (name, filters) = parse_query("知乎");
+        assert_eq!(name, "知乎");
+        assert!(filters.is_empty());
+
+        // 混合中英文也不应 panic
+        let (name, filters) = parse_query("知乎 ext:pdf");
+        assert_eq!(name, "知乎");
+        assert_eq!(filters, vec![ext("pdf")]);
+
+        // 纯中文多词
+        let (name, _) = parse_query("知乎日报");
+        assert_eq!(name, "知乎日报");
     }
 }

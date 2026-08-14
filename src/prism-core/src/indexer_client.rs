@@ -1,7 +1,25 @@
-//! Short-lived client used by the user-session broker to query the indexer service.
+//! Broker → indexer client.
+//!
+//! Originally this opened a *fresh* named-pipe connection for every search
+//! request (connect → hello → status → search → close).  Under high-frequency
+//! typing the 2-worker-thread indexer runtime could not re-arm the pipe
+//! listener fast enough, producing ``ERROR_PIPE_BUSY`` and 2-second timeouts
+//! (measured 2026-08-07: 517/800 searches failed during a USN flood).
+//!
+//! The persistent connection below keeps a single long-lived pipe to the
+//! indexer, lazily connecting on first use and reconnecting transparently
+//! after a broken pipe.  All public entry points (``search_with_options``,
+//! ``search_in_root``) reuse the same connection, so a search is now a single
+//! round-trip (``status`` → ``search``) on a warm connection instead of a
+//! three-step handshake on a cold one.
+//!
+//! The short-lived ``search_pipe`` helper is retained for tests that exercise
+//! the wire protocol against a temporary pipe name.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
@@ -65,6 +83,206 @@ pub struct SearchReply {
     pub path_constructions: Option<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// Persistent connection — the long-lived pipe to the indexer service.
+// ---------------------------------------------------------------------------
+
+/// A long-lived connection to the indexer with its own reader/writer halves.
+///
+/// The connection is established lazily on first use and reused for every
+/// subsequent search.  If the pipe breaks (indexer restart, OS error, etc.)
+/// the holder is dropped and the next caller creates a fresh connection.
+struct PersistentConnection {
+    writer: tokio::io::WriteHalf<NamedPipeClient>,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<NamedPipeClient>>>,
+}
+
+impl PersistentConnection {
+    async fn connect(pipe_name: &str) -> Result<Self, String> {
+        let pipe = connect_pipe(pipe_name).await?;
+        let (reader, writer) = tokio::io::split(pipe);
+        let lines = BufReader::new(reader).lines();
+        Ok(Self { writer, lines })
+    }
+
+    /// Send a request and read one response line.  Named-pipe I/O is
+    /// request/response paired, so callers must ensure they hold the
+    /// connection lock for the full exchange.
+    async fn exchange(&mut self, request: &IndexerRequest) -> Result<IndexerResponse, String> {
+        let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        self.writer.write_all(&bytes).await.map_err(|error| error.to_string())?;
+        self.writer.flush().await.map_err(|error| error.to_string())?;
+
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("indexer service closed the connection")?;
+        serde_json::from_str(&line).map_err(|error| format!("invalid indexer response: {error}"))
+    }
+}
+
+/// Process-wide singleton connection guarded by a tokio Mutex.
+static INDEXER_CONNECTION: OnceLock<Mutex<Option<PersistentConnection>>> = OnceLock::new();
+
+fn connection_lock() -> &'static Mutex<Option<PersistentConnection>> {
+    INDEXER_CONNECTION.get_or_init(|| Mutex::new(None))
+}
+
+/// Connect to the indexer pipe, retrying a few times to ride out the
+/// microsecond gap where the server is re-arming a listener slot.
+async fn connect_pipe(pipe_name: &str) -> Result<NamedPipeClient, String> {
+    let mut last_error = None;
+    for _ in 0..5 {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(pipe) => return Ok(pipe),
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    Err(format!(
+        "indexer service is unavailable: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown connection error".into())
+    ))
+}
+
+/// Handshake: exchange Hello messages to verify protocol compatibility.
+async fn handshake(conn: &mut PersistentConnection) -> Result<(), String> {
+    match conn.exchange(&IndexerRequest::Hello { protocol: INDEXER_PROTOCOL }).await? {
+        IndexerResponse::Hello { protocol } if protocol == INDEXER_PROTOCOL => Ok(()),
+        IndexerResponse::Error { message } => Err(message),
+        _ => Err("indexer service returned an invalid hello response".into()),
+    }
+}
+
+/// Ensure the singleton connection exists and is healthy, then run `search`.
+///
+/// If the connection is missing or the exchange fails at the transport level,
+/// a fresh connection is created and the search is retried once.
+async fn search_via_persistent(
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
+    root: Option<&str>,
+) -> Result<SearchReply, SearchFailure> {
+    let guard = connection_lock();
+    let mut conn = guard.lock().await;
+
+    // Lazy connect + handshake on first use, or after a prior drop.
+    let needs_reconnect = conn.is_none();
+    if needs_reconnect {
+        let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
+        handshake(&mut new_conn).await?;
+        *conn = Some(new_conn);
+    }
+
+    // First attempt on the (possibly fresh) connection.
+    match search_on_connection(conn.as_mut().unwrap(), query, max, filters, pinyin_enabled, root).await {
+        Ok(reply) => Ok(reply),
+        // Transport-level failure: drop the connection, reconnect, retry once.
+        Err(failure) if failure.root_rejection.is_none() => {
+            *conn = None; // drop the broken connection
+            let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
+            handshake(&mut new_conn).await?;
+            let reply = search_on_connection(&mut new_conn, query, max, filters, pinyin_enabled, root).await?;
+            *conn = Some(new_conn);
+            Ok(reply)
+        }
+        // Root rejection is a semantic response, not a transport error — propagate as-is.
+        Err(failure) => Err(failure),
+    }
+}
+
+/// Run a full search sequence (status → search) on an established connection.
+async fn search_on_connection(
+    conn: &mut PersistentConnection,
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
+    root: Option<&str>,
+) -> Result<SearchReply, SearchFailure> {
+    let status = match conn.exchange(&IndexerRequest::Status).await.map_err(SearchFailure::from)? {
+        IndexerResponse::Status(status) => status,
+        IndexerResponse::Error { message } => return Err(message.into()),
+        _ => return Err("indexer service returned an invalid status response".into()),
+    };
+    let mut status = status;
+    // Only a completely unready index short-circuits. `ready && building` — a first build
+    // that has published some volumes — must still issue the Search so the volumes that
+    // are already indexed return results.
+    if !status.ready {
+        return Ok(SearchReply {
+            generation: status.generation,
+            status,
+            items: Vec::new(),
+            is_truncated: false,
+            matched_count: Some(0),
+            scanned_nodes: Some(0),
+            name_candidates: Some(0),
+            entered_top_k: Some(0),
+            path_constructions: Some(0),
+        });
+    }
+
+    match conn
+        .exchange(&IndexerRequest::Search {
+            query: query.to_owned(),
+            max,
+            filters: filters.map(ToOwned::to_owned),
+            pinyin_enabled: Some(pinyin_enabled),
+            root: root.map(ToOwned::to_owned),
+        })
+        .await
+        .map_err(SearchFailure::from)?
+    {
+        IndexerResponse::Results {
+            generation,
+            items,
+            is_truncated,
+            matched_count,
+            scanned_nodes,
+            name_candidates,
+            entered_top_k,
+            path_constructions,
+            pinyin_status,
+        } => {
+            if pinyin_status.is_some() {
+                status.pinyin_status = pinyin_status;
+            }
+            Ok(SearchReply {
+                status,
+                generation,
+                items,
+                is_truncated,
+                matched_count,
+                scanned_nodes,
+                name_candidates,
+                entered_top_k,
+                path_constructions,
+            })
+        }
+        IndexerResponse::Error { message } => Err(message.into()),
+        IndexerResponse::RootUnavailable { reason, message } => {
+            // The reason travels as a value, not as prose: the broker turns it back into a
+            // structured field so the UI can explain the fallback instead of guessing.
+            Err(SearchFailure::root(reason, message))
+        }
+        _ => Err("indexer service returned an invalid search response".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API — unchanged signatures, now backed by the persistent connection.
+// ---------------------------------------------------------------------------
+
 pub async fn search(query: &str, max: usize) -> Result<SearchReply, String> {
     search_with_options(query, max, None, false).await
 }
@@ -83,7 +301,7 @@ pub async fn search_with_options(
     filters: Option<&[SearchFilter]>,
     pinyin_enabled: bool,
 ) -> Result<SearchReply, String> {
-    search_pipe(INDEXER_PIPE_NAME, query, max, filters, pinyin_enabled, None)
+    search_via_persistent(query, max, filters, pinyin_enabled, None)
         .await
         .map_err(|failure| failure.message)
 }
@@ -98,9 +316,17 @@ pub async fn search_in_root(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
-    search_pipe(INDEXER_PIPE_NAME, query, max, filters, pinyin_enabled, root).await
+    search_via_persistent(query, max, filters, pinyin_enabled, root).await
 }
 
+// ---------------------------------------------------------------------------
+// Short-lived client — retained for tests that exercise the wire protocol
+// against a temporary pipe name (the persistent singleton is process-wide
+// and always targets the real INDEXER_PIPE_NAME).
+// ---------------------------------------------------------------------------
+
+/// 2-second timeout wrapping the whole short-lived request.
+#[cfg(test)]
 async fn search_pipe(
     pipe_name: &str,
     query: &str,
@@ -117,6 +343,7 @@ async fn search_pipe(
     .map_err(|_| SearchFailure::from("indexer service request timed out"))?
 }
 
+#[cfg(test)]
 async fn search_pipe_inner(
     pipe_name: &str,
     query: &str,
@@ -125,7 +352,7 @@ async fn search_pipe_inner(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
-    let pipe = connect(pipe_name).await?;
+    let pipe = connect_pipe(pipe_name).await?;
     let (reader, mut writer) = tokio::io::split(pipe);
     let mut lines = BufReader::new(reader).lines();
 
@@ -213,25 +440,7 @@ async fn search_pipe_inner(
     }
 }
 
-async fn connect(pipe_name: &str) -> Result<NamedPipeClient, String> {
-    let mut last_error = None;
-    for _ in 0..5 {
-        match ClientOptions::new().open(pipe_name) {
-            Ok(pipe) => return Ok(pipe),
-            Err(error) => {
-                last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-    Err(format!(
-        "indexer service is unavailable: {}",
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "unknown connection error".into())
-    ))
-}
-
+#[cfg(test)]
 async fn write_request<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     request: &IndexerRequest,
@@ -245,6 +454,7 @@ async fn write_request<W: AsyncWriteExt + Unpin>(
     writer.flush().await.map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
     lines: &mut tokio::io::Lines<R>,
 ) -> Result<IndexerResponse, String> {

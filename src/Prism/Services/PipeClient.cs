@@ -17,13 +17,14 @@ public sealed class PipeClient : ISearchClient, IDisposable
     private const int ProtocolVersion = 1;
 
     private Process? _backend;
+    private JobObjectGuard? _jobGuard;
     private NamedPipeClientStream? _stream;
     private StreamReader? _reader;
     private StreamWriter? _writer;
     private readonly SemaphoreSlim _ioLock = new(1, 1);
 
     private System.Threading.Timer? _watchdog;
-    private int _consecutivePingFailures;
+    private int _consecutiveFailures;
     private bool _wasConnected;
 
     /// <summary>
@@ -38,17 +39,67 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>管道是否已连接。</summary>
     public bool IsConnected => _stream is { IsConnected: true };
 
-    /// <summary>拉起后端（若未运行）并连接管道。</summary>
+    /// <summary>
+    /// 先尝试连接已存在的 broker（可能是上次 Prism 留下的存活孤儿，复用它而非拉新进程），
+    /// 连不上才拉起新的 prism-core.exe。所有连接操作都在 _ioLock 内串行化，
+    /// 防止 watchdog、搜索重连、首次启动三者互相 dispose 对方刚建好的 stream。
+    /// </summary>
     public async Task StartAsync(CancellationToken ct = default)
     {
-        EnsureBackendRunning();
-        await ConnectAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+        await ConnectOrReconnectAsync(ct).ConfigureAwait(false);
+        if (_stream is not { IsConnected: true })
+            throw new IOException("无法连接到后端");
         StartWatchdog();
     }
 
     /// <summary>
-    /// 启动后台 watchdog：每 15 秒 ping 一次后端，连续 2 次失败则重连/重启 core。
-    /// 解决"退出后重开 core 未运行"——core 崩溃或启动失败时自动恢复，无需等用户触发搜索。
+    /// 统一的连接入口：先试已有管道，连不上拉进程再连。
+    /// _ioLock 已经串行化了所有调用者——第一个连上后，后续拿到锁会看到
+    /// _stream is { IsConnected: true } 直接返回，不需要额外的重入标志。
+    /// </summary>
+    private async Task ConnectOrReconnectAsync(CancellationToken ct)
+    {
+        await _ioLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // 拿到锁后复查：可能另一个调用者已经在我们等锁期间建好了连接。
+            if (_stream is { IsConnected: true })
+                return;
+
+            DisposeStreamOnly();
+
+            // 第一优先：连已有管道。孤儿 broker 只要还活着，就复用它。
+            if (await TryConnectPipeOnlyAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false))
+                return;
+
+            // 连不上才拉新进程，拉起后立即纳入 Job Object（Prism 崩溃时 OS 自动回收）。
+            EnsureBackendRunning();
+            await ConnectInnerAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _ioLock.Release();
+        }
+    }
+
+    /// <summary>尝试连接已有 broker 管道（不拉进程）。成功返回 true。</summary>
+    private async Task<bool> TryConnectPipeOnlyAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        try
+        {
+            await ConnectInnerAsync(timeout, ct).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 启动后台 watchdog：首次 3 秒后检查，之后每 15 秒一次。
+    /// 只做非阻塞的 IsConnected 检测——管道断了才走 ConnectOrReconnectAsync 重连。
+    /// 连续 2 次发现管道断开才触发重连，避免单次抖动误判。
     /// </summary>
     private void StartWatchdog()
     {
@@ -57,63 +108,29 @@ public sealed class PipeClient : ISearchClient, IDisposable
         _watchdog = new System.Threading.Timer(
             callback: _ => _ = WatchdogTickAsync(),
             state: null,
-            dueTime: TimeSpan.FromSeconds(15),
+            dueTime: TimeSpan.FromSeconds(3),
             period: TimeSpan.FromSeconds(15));
     }
 
     private async Task WatchdogTickAsync()
     {
-        // watchdog 不持 UI 线程；所有管道操作经 _ioLock 串行化。
+        // 非阻塞检测：IsConnected 是 OS 层面的管道状态，不需要发请求、不持锁。
+        if (_stream is { IsConnected: true })
+        {
+            _consecutiveFailures = 0;
+            NotifyConnection(true);
+            return;
+        }
+
+        _consecutiveFailures++;
+        if (_consecutiveFailures < 2)
+            return;
+
+        _consecutiveFailures = 0;
+        // 管道断了——走统一重连路径（持锁 + 重入保护）。
         try
         {
-            await _ioLock.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                if (_stream is not { IsConnected: true })
-                {
-                    // 管道已断——直接进入重连路径。
-                    await ReconnectCoreAsync().ConfigureAwait(false);
-                    return;
-                }
-
-                try
-                {
-                    // 复用 SendAsync（已配对读写，取消安全）做一次 ping。
-                    var resp = await SendAsync(new { type = "ping" }, CancellationToken.None)
-                        .ConfigureAwait(false);
-                    _ = resp.GetProperty("version").GetString();
-                    _consecutivePingFailures = 0;
-                    NotifyConnection(true);
-                }
-                catch
-                {
-                    _consecutivePingFailures++;
-                    if (_consecutivePingFailures >= 2)
-                    {
-                        await ReconnectCoreAsync().ConfigureAwait(false);
-                        _consecutivePingFailures = 0;
-                    }
-                }
-            }
-            finally
-            {
-                _ioLock.Release();
-            }
-        }
-        catch
-        {
-            // watchdog 自身异常不应崩溃进程。
-        }
-    }
-
-    /// <summary>重连后端：释放旧管道，必要时重新拉起 core，再连新管道。</summary>
-    private async Task ReconnectCoreAsync()
-    {
-        DisposeStreamOnly();
-        try
-        {
-            EnsureBackendRunning();
-            await ConnectAsync(TimeSpan.FromSeconds(10), CancellationToken.None).ConfigureAwait(false);
+            await ConnectOrReconnectAsync(CancellationToken.None).ConfigureAwait(false);
             NotifyConnection(true);
         }
         catch
@@ -129,8 +146,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
         ConnectionChanged?.Invoke(connected);
     }
 
-    /// <summary>连接命名管道，UTF-8 无 BOM，按行(\n)收发。</summary>
-    private async Task ConnectAsync(TimeSpan timeout, CancellationToken ct)
+    /// <summary>
+    /// 连接命名管道，UTF-8 无 BOM，按行(\n)收发。
+    /// 调用方必须已持有 _ioLock。内部直接读写握手，不走 SendAsync（避免重入死锁）。
+    /// </summary>
+    private async Task ConnectInnerAsync(TimeSpan timeout, CancellationToken ct)
     {
         DisposeStreamOnly();
 
@@ -144,11 +164,18 @@ public sealed class PipeClient : ISearchClient, IDisposable
         _reader = new StreamReader(stream, utf8);
         _writer = new StreamWriter(stream, utf8) { AutoFlush = false, NewLine = "\n" };
 
-        var hello = await SendAsync(
-            new { type = "hello", protocol = ProtocolVersion }, ct).ConfigureAwait(false);
-        if (!hello.TryGetProperty("type", out var type)
+        // 握手直接读写——调用方已持 _ioLock，不能再调 SendAsync（它会再次 WaitAsync 导致死锁）。
+        var json = JsonSerializer.Serialize(new { type = "hello", protocol = ProtocolVersion });
+        await _writer.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+        await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+
+        var line = await _reader.ReadLineAsync(CancellationToken.None).ConfigureAwait(false)
+            ?? throw new IOException("后端在握手时关闭了管道");
+        using var doc = JsonDocument.Parse(line);
+        var root = doc.RootElement;
+        if (!root.TryGetProperty("type", out var type)
             || type.GetString() != "hello"
-            || !hello.TryGetProperty("protocol", out var protocol)
+            || !root.TryGetProperty("protocol", out var protocol)
             || !protocol.TryGetInt32(out var version)
             || version != ProtocolVersion)
         {
@@ -433,23 +460,33 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// 重要：一旦请求写出，必须把对应响应读完，绝不能因 CancellationToken 中途放弃读——
     /// 否则管道里会残留旧响应，下一次 Search 会读到上一次的结果（表现为高亮/列表错位）。
     /// 取消只作用于"等锁"和"业务层丢弃结果"；ViewModel 用 seq 丢弃过期 UI 更新。
+    /// 管道断开时在锁内做一次快速重连尝试（500ms），连不上才快速失败——
+    /// 不拉进程（交给 watchdog），避免阻塞搜索路径。
     /// </summary>
     private async Task<JsonElement> SendAsync(object request, CancellationToken ct)
     {
-        if (_writer is null || _reader is null)
-            throw new InvalidOperationException("管道尚未连接");
-
         await _ioLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // 管道断开时做一次快速重连（仅连已有管道，500ms 超时，不拉进程）。
+            // 连不上就快速失败，让用户看到错误而非卡住——watchdog 会在后台拉进程重连。
+            if (_stream is not { IsConnected: true } || _writer is null || _reader is null)
+            {
+                DisposeStreamOnly();
+                // 只尝试连已有 broker 管道，不拉进程——拉进程交给 StartAsync/watchdog。
+                await TryConnectPipeOnlyAsync(TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
+                if (_stream is not { IsConnected: true })
+                    throw new IOException("后端未连接");
+            }
+
             try
             {
                 var json = JsonSerializer.Serialize(request);
                 // 写出后必须完成配对读，故读写使用 None，避免取消留下孤儿响应。
-                await _writer.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+                await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
                 await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
 
-                var line = await _reader.ReadLineAsync(CancellationToken.None).ConfigureAwait(false)
+                var line = await _reader!.ReadLineAsync(CancellationToken.None).ConfigureAwait(false)
                     ?? throw new IOException("后端在返回响应前关闭了管道");
 
                 // 配对完成后再兑现取消，让上层丢弃结果而不破坏管道。
@@ -476,7 +513,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             }
             catch
             {
-                // 传输层失败：释放管道，IsConnected 变 false，上层可重连。
+                // 传输层失败：释放管道，IsConnected 变 false，watchdog 会重连。
                 DisposeStreamOnly();
                 throw;
             }
@@ -530,7 +567,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
         };
     }
 
-    /// <summary>确保后端进程在运行；未运行则定位可执行文件并启动。</summary>
+    /// <summary>确保后端进程在运行；未运行则定位可执行文件并启动，并纳入 Job Object。</summary>
     private void EnsureBackendRunning()
     {
         if (_backend is { HasExited: false })
@@ -549,6 +586,10 @@ public sealed class PipeClient : ISearchClient, IDisposable
         };
         _backend = Process.Start(psi)
             ?? throw new IOException("启动 prism-core.exe 失败");
+
+        // 纳入 Job Object：Prism 崩溃/被杀时 OS 自动回收 broker，不留孤儿占管道。
+        _jobGuard ??= new JobObjectGuard();
+        _jobGuard.Assign(_backend.Handle);
     }
 
     /// <summary>
@@ -630,6 +671,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
         catch { /* ignore */ }
         _backend?.Dispose();
+
+        // 释放 Job Object：如果 Prism 正常退出，Kill 已处理子进程；
+        // 如果 Prism 崩溃走到这里，关闭 Job 句柄让 OS 回收 broker。
+        _jobGuard?.Dispose();
+        _jobGuard = null;
         _ioLock.Dispose();
     }
 }

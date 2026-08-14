@@ -764,6 +764,9 @@ public sealed class SearchViewModel
 
         var seq = ++_searchSeq;
         CancelSearch();
+        // 常规搜索路径也必须取消遗留的 web 联想 Task.Run——从 web mode 切到非 web mode 时，
+        // 旧的 Phase B 联想仍在飞行中，不取消它会通过 staleness 守卫后覆盖文件搜索结果。
+        CancelSuggestions();
         // Window results are per-enumeration: their tokens expire on the next publish, so
         // they must never be served from the prefix cache.
         if (!isEmptyQuery && !context.IsWindowMode && TryFilterCompleteCache(query, out var cached))
