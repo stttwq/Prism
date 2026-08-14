@@ -30,9 +30,9 @@ Shell 操作、剪贴板、用户设置和联网一律留在普通用户会话�
    产物为 `dist\PrismSetup-1.0.0.exe`。安装源已在 `dist/` 备齐，共四个文件：
    `Prism.exe`（单文件）、`prism-core.exe`、`prism-indexer-service.exe`、`prism.ico`。
 
-   > **`dist/` 里的产物目前落后于源码，发版前必须重建。** 截至 2026-08-09：三个 exe 是当天
-   > 11:40 的构建，而 `indexer_runtime.rs` 在 13:18 又改过；`PrismSetup-1.0.0.exe` 更旧，
-   > 停在 8 月 2 日。先跑 `.\scripts\prism-build.ps1` 再打包，不要直接拿库里的二进制。
+   > **`dist/` 里的产物可能落后于源码，发版前必须重建。** 先跑 `.\scripts\prism-build.ps1`
+   > 再打包，不要直接拿库里的二进制。「跑的不是你改的代码」是本项目最常见的
+   > 时间黑洞，成因和排查方法见 [`docs/排查踩坑记录.md`](docs/排查踩坑记录.md)。
 
 ## 使用
 
@@ -41,8 +41,12 @@ Shell 操作、剪贴板、用户设置和联网一律留在普通用户会话�
 - **搜文件**：输入文件名片段，1 秒内列出全盘匹配结果，越打字越刷新。跨卷结果参与同一排序，
   不再按 MFT 顺序截断。
   - `回车` 打开选中项；
-  - `→` 打开动作面板（打开所在文件夹 / 复制 / 剪切 / 复制路径 / 系统右键菜单）；
+  - `→` 打开动作面板（打开所在文件夹 / 复制 / 剪切 / 复制路径 / 重命名 / 复制到… / 移动到… /
+    移入回收站 / 永久删除 / 压缩为 ZIP / 属性 / 打开方式 / 系统右键菜单）；
   - `Ctrl + 1..9` 直接打开第 1~9 条结果。
+- **查询过滤器**：在搜索词后加 `ext:pdf` 按扩展名过滤（逗号分隔多个，如 `ext:pdf,doc`），
+  `path:"Project Docs"` 按路径过滤（引号包裹含空格的值）。过滤器只返回文件/文件夹，不混入
+  应用和网页结果。
 - **拼音搜索**：默认开启。支持首字母与全拼，`wx` / `weixin` / `weix` / `xin` 都能命中「微信」；
   不匹配父路径，至少两个拉丁字母才触发。sidecar 缺失或损坏时自动退回字面搜索。
 - **使用历史**：默认开启。成功的打开/定位操作会在**同一匹配等级内**加权，不会让弱拼音命中
@@ -82,19 +86,17 @@ Shell 操作、剪贴板、用户设置和联网一律留在普通用户会话�
 门槛是**三个进程**（`Prism.exe` + `prism-core.exe` + `prism-indexer-service.exe`）同步采样的
 私有工作集之和 ≤ 100MiB。不要用任务管理器的「提交大小」或 `PrivateMemorySize64` 代替。
 
-最近一次完整实测（2026-08-01，G2 收尾，拼音开启，3 卷索引 `memory_bytes` 约 62MB）：
+最近一次完整实测（2026-08-14，拼音开启，3 卷索引）：
 
-| 进程 | 私有工作集 P50 |
+| 进程 | 私有工作集 |
 | --- | ---: |
-| Prism.exe | 4.0 MiB |
-| prism-core.exe | 3.3 MiB |
-| prism-indexer-service.exe | 47.9 MiB |
-| **合计** | **55.2 MiB** |
+| Prism.exe | 15.0 MiB |
+| prism-core.exe | 8.5 MiB |
+| prism-indexer-service.exe | 78.7 MiB |
+| **合计** | **102.2 MiB** |
 
-同机关闭拼音后合计 54.6 MiB。拼音 sidecar 常驻在索引服务里，该进程的开/关差值是
-约 0.1MB；两次采样合计差 0.7MB，其余来自 broker 的正常波动。无论按哪种算法，都远低于
-拼音额外常驻 ≤10MB 的验收目标。
-
+Prism.exe 内存偏高是因为前台窗口已展开且加载了结果图标；隐藏后会降回 ~4 MiB。
+prism-indexer-service.exe 占大头，主要是 MFT 索引常驻内存（3 卷约 330 万节点）。
 绝对值随索引规模变化，不同机器、不同卷数不可直接对比。
 采样口径、门槛定义与失败矩阵见
 [`.trellis/spec/backend/quality-guidelines.md`](.trellis/spec/backend/quality-guidelines.md)，
@@ -130,7 +132,7 @@ coreutils `link` 会被 rustc 当链接器用（只在产出 `.exe` 时才报错
 
 ## 质量门
 
-每个阶段收尾前四条全绿（2026-08-09 实测：Rust 147 通过 / C# 84 通过 / clippy 与 build 无告警）：
+每个阶段收尾前四条全绿（2026-08-14 实测：Rust 262 通过 / C# 134 通过 / clippy 与 build 无告警）：
 
 ```bash
 cargo test --manifest-path src/prism-core/Cargo.toml

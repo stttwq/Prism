@@ -18,7 +18,7 @@
 > | Q5 reveal 重复 | **只部分解决** | `ipc.rs` 那一份已删，两条路径都收敛到 broker 的 STA worker（`ShellExecutor`）。但 `explorer /select` 的参数构造**至今仍有两份**：`shell.rs::reveal`（走 `ShellOperation::Reveal`）和 `actions.rs::reveal_in_explorer`（走 `RunAction` → `run_action_direct` 的 `open_folder`）。两者都在生产路径上，`normalized` / `arg` 构造逐字相同，只有错误类型不同。**原始风险「改一处忘改另一处」依然存在。** |
 > | Q6 排除目录硬编码 | **改用协议通道** | 7 项机器级硬排除保持在服务侧；用户过滤走 `filters` 的 `exclude_path`。原文的 `Arc<Arc<Vec<T>>>` atomic swap 方案是错的，未采用 |
 > | Q7 协议类型偏弱 | **已修复** | `SearchResultKind` serde 枚举 + broker `Hello { protocol }` 显式协商；C# 未知值映射 `Unknown` |
-> | Q8 前端零测试 | **已修复** | `src/Prism.Tests` 84 个测试；`ISearchClient` / `IDebounceTimerFactory` / `ISearchScheduler` 已抽接口 |
+> | Q8 前端零测试 | **已修复** | `src/Prism.Tests` 134 个测试；`ISearchClient` / `IDebounceTimerFactory` / `ISearchScheduler` 已抽接口 |
 > | Q9a 日志粗糙 | **已修复，但未用 `tracing`** | 自建 `logging.rs`，broker 与 indexer 各写 JSONL；原文的 `tracing-appender` 1MB 大小轮转是能力误判 |
 > | Q9b 校验职责混乱 | **已修复** | typed action target 取代字符串推断 |
 > | Q10 `.lnk` 名称清洗 | **判断被推翻，未按原文修** | `&`、`(x86)` 不是控制字符，影响被夸大；无真实异常样本 |

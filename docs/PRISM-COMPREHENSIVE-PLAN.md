@@ -1,13 +1,13 @@
 # Prism 综合优化与功能演进计划
 
-> 状态：**执行中 / G0–G4 与 G9 已交付归档，G5–G8 未启动**  
-> 编制日期：2026-07-28；进度更新：2026-08-09  
+> 状态：**G0–G4、G6–G9 已交付归档；G5 窗口切换器未启动**  
+> 编制日期：2026-07-28；进度更新：2026-08-14  
 > 编制时代码基线：`main` / `c0de808`；当前分支：`feature`  
 > 输入文档：[`PRISM-OPTIMIZATION-REPORT.md`](./PRISM-OPTIMIZATION-REPORT.md)、[`POST-ROADMAP-REVISED.md`](./POST-ROADMAP-REVISED.md)  
 > 性质：跨阶段实施蓝图。**已完成阶段的实际结论见 §0 与各阶段归档任务，本文正文保留编制时的
 > 计划原文**——正文里的"当前""现状"均指 2026-07-28，不是今天的代码。
 
-## 0. 进度快照（2026-08-09）
+## 0. 进度快照（2026-08-14）
 
 | 阶段 | 状态 | 归档位置 / 说明 |
 | --- | --- | --- |
@@ -18,9 +18,9 @@
 | G2 历史 + 拼音 | **已交付** | `archive/2026-08/07-28-prism-g2-history-pinyin` |
 | G4 当前目录与宿主联动 | **已交付**（两个 adapter 默认关闭） | `archive/2026-08/07-28-prism-g4-host-integration`；兼容矩阵已签署 |
 | G5 窗口切换器 | 未启动（planning，P2） | `tasks/07-28-prism-g5-window-switcher` |
-| G6 完整内置动作 | 未启动（planning，P2） | `tasks/07-28-prism-g6-built-in-actions` |
-| G7 `ext:` / `path:` 过滤 | 未启动（planning，P3） | `tasks/07-28-prism-g7-query-filters` |
-| G8 网页图标与在线联想 | 未启动（planning，P3） | `tasks/07-28-prism-g8-web-enhancements` |
+| G6 完整内置动作 | **已交付** | `archive/2026-08/07-28-prism-g6-built-in-actions`；12 个动作（打开文件夹/复制/剪切/复制路径/重命名/复制到…/移动到…/回收站/永久删除/压缩ZIP/属性/打开方式） |
+| G7 `ext:` / `path:` 过滤 | **已交付** | `archive/2026-08/07-28-prism-g7-query-filters`；broker 端解析 + Top-K 前过滤 |
+| G8 网页图标与在线联想 | **已交付** | `archive/2026-08/07-28-prism-g8-web-enhancements`；专用 web mode + 可取消 800ms 联想 + favicon 缓存 + 内置引擎图标 |
 
 **两个从实测中分出来的在办任务**（不在原 G 编号内）：
 
@@ -70,8 +70,8 @@
   `{commonappdata}\Prism`，索引缓存与拼音 sidecar 卸载后不残留。
 - **§8.4 的放弃点未被触发。** Explorer 与 Opus 两个宿主都在时间盒内跑通并签署矩阵；
   `SystemFileDialog` 按计划**未实现**，由 `DisabledHostAdapter` 占位。
-- **§14.3 的质量门当前实测**：Rust 147 通过、C# 84 通过、clippy `-D warnings` 无告警、
-  WPF Release build 通过（2026-08-09）。§14.3 里的 `dotnet test` 目标是
+- **§14.3 的质量门当前实测**：Rust 262 通过、C# 134 通过、clippy `-D warnings` 无告警、
+  WPF Release build 通过（2026-08-14）。§14.3 里的 `dotnet test` 目标是
   `src/Prism.Tests/Prism.Tests.csproj`。
 - **§18 的审批约束已按阶段逐个满足**，不再适用于 G0–G4/G9；G5–G8 仍需单独审批后启动。
 
