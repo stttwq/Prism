@@ -118,6 +118,17 @@ public partial class SearchWindow : Window
             if (Dispatcher.CheckAccess()) HideAnimated();
             else Dispatcher.Invoke(HideAnimated);
         };
+        vm.IdleMemoryReleaseRequested += () =>
+        {
+            // 清空查询丢弃了结果引用，但窗口仍可见不会走 ReleaseIdleMemory。
+            // 在 ApplicationIdle 上做一次轻量回收 + 工作集修剪，不在 hot path 上阻塞。
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _icons?.Clear();
+                GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
+                App.TrimWorkingSet();
+            }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        };
         vm.State.PropertyChanged += OnStateChanged;
         vm.RootRejected += rejection =>
         {

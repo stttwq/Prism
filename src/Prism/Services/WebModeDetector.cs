@@ -12,30 +12,34 @@ public static class WebModeDetector
     /// <summary>
     /// 尝试从输入中解析出网页关键词。与 broker 端逻辑一致：
     /// 首个空白分隔 token 为关键词，长度降序匹配避免 <c>bi</c> 被误匹配为 <c>b</c>。
+    /// **必须有关键词 + 空格**才触发网页模式——仅输入 <c>g</c> 或 <c>bi</c> 不带空格时
+    /// 返回 null，让本地文件搜索正常工作。例如 <c>g</c> 搜本地，<c>g </c> 进入网页模式。
     /// </summary>
     /// <param name="query">用户原始输入（未 trim 的文本框值）。</param>
     /// <param name="engines">当前引擎列表（含内置和自定义）。</param>
     /// <returns>命中时返回检测器结果；否则 null。</returns>
     public static WebModeResult? TryDetect(string query, IReadOnlyList<WebEngine> engines)
     {
-        var q = query.AsSpan().Trim();
-        if (q.IsEmpty || engines.Count == 0)
+        if (string.IsNullOrWhiteSpace(query) || engines.Count == 0)
             return null;
 
-        // 拆出首 token
-        var spaceIdx = q.IndexOfAny(' ', '\t');
-        ReadOnlySpan<char> keywordSpan;
-        ReadOnlySpan<char> restSpan;
+        // Find first non-whitespace (skip leading spaces), then require whitespace
+        // after the keyword. "g" → null (local search); "g " → web mode.
+        var q = query.AsSpan();
+        var start = 0;
+        while (start < q.Length && char.IsWhiteSpace(q[start]))
+            start++;
+        if (start >= q.Length)
+            return null;
+        var remaining = q[start..];
+
+        // 拆出首 token — 必须有空白分隔符，否则视为普通本地搜索。
+        var spaceIdx = remaining.IndexOfAny(' ', '\t');
         if (spaceIdx < 0)
-        {
-            keywordSpan = q;
-            restSpan = ReadOnlySpan<char>.Empty;
-        }
-        else
-        {
-            keywordSpan = q[..spaceIdx];
-            restSpan = q[(spaceIdx + 1)..];
-        }
+            return null;
+
+        var keywordSpan = remaining[..spaceIdx];
+        var restSpan = remaining[(spaceIdx + 1)..];
 
         if (keywordSpan.IsEmpty)
             return null;

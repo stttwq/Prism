@@ -847,6 +847,11 @@ fn persist_first_build_with<F>(state: &ServiceState, save: F) -> Result<(), Stri
 where
     F: FnOnce(&IndexState) -> Result<(), String>,
 {
+    // Clone the index under the read lock (fast: pure memcpy), then release the
+    // lock before save() runs validate + serialize + fsync. validate() walks every
+    // node calling path_for (O(depth) per node), which for 3.3M nodes takes many
+    // seconds — holding the read lock that long blocks USN writers and starves the
+    // 2-worker runtime, causing ERROR_PIPE_BUSY and apparent hangs.
     let snapshot = {
         let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
         guard.as_ref().cloned().ok_or("index is not ready")?
@@ -1154,6 +1159,9 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         log("skipping v5 cache write: the first build has not completed");
         return Ok(());
     }
+    // Clone under the read lock (fast memcpy), then release before save(). save() calls
+    // validate() which walks every node with path_for (O(depth) per node) — holding the
+    // read lock that long blocks USN writers and starves the 2-worker async runtime.
     let snapshot = {
         let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
         guard.as_ref().cloned().ok_or("index is not ready")?

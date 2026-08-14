@@ -52,6 +52,13 @@ public sealed class SearchViewModel
     public event Action? HideRequested;
 
     /// <summary>
+    /// 查询从非空变为空时请求释放空闲内存（由 SearchWindow 订阅）。
+    /// 清空查询会丢弃结果引用，但 GC 只在窗口隐藏时跑——这里让窗口在 idle 时
+    /// 额外做一次轻量回收，避免反复搜索后工作集只涨不降。
+    /// </summary>
+    public event Action? IdleMemoryReleaseRequested;
+
+    /// <summary>
     /// 后端拒绝了本次请求携带的 root（结构化原因）。结果集已经是全局搜索，
     /// 订阅方负责把范围状态切回全局并提示，避免 UI 与实际搜索范围背离。
     /// </summary>
@@ -297,6 +304,10 @@ public sealed class SearchViewModel
             _searchSeq++;
             CancelSearch();
             CancelSuggestions();
+            // 之前有结果时，清空查询丢弃了大量引用；请求窗口在 idle 时做一次轻量
+            // 回收，避免反复搜索后工作集只涨不降（不在 hot path 上同步阻塞）。
+            if (_state.Results.Count > 0)
+                IdleMemoryReleaseRequested?.Invoke();
             _state.Results = Array.Empty<SearchResult>();
             _state.SelectedIndex = -1;
             _state.Mode = PanelMode.Idle;
@@ -1068,6 +1079,9 @@ public sealed class SearchViewModel
             MatchSpans: BuildWebMatchSpans(directTitle, webMode.QueryTerms))
         {
             Target = new ActionTarget("web", directUrl),
+            // 首行身份与查询词无关：标题/URL 每按一键都变，但它始终是"同一行"。
+            // 不给稳定键，ResultList 会删旧行插新行，容器重建导致图标闪烁。
+            RowKey = "web:direct:" + webMode.EngineName,
         };
 
         // 立即显示直接结果，不等待网络。
@@ -1116,46 +1130,65 @@ public sealed class SearchViewModel
             if (seq != _searchSeq) return;
             if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
 
-            // 在 UI 线程上追加联想结果（Task.Run 在线程池，需要回到 UI 线程写 Results）。
-            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+            // 回到 UI 线程写 Results（GetSuggestionsAsync 的续体在线程池上）。
+            // 无 Application（单元测试）或已在 UI 线程时直接应用——否则整条联想应用路径
+            // 在测试里永远不执行，行身份/闪烁这类回归就没人守。
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.CheckAccess())
             {
-                try
-                {
-                    if (suggSeq != _suggestionSeq) { tcs.SetResult(); return; }
-                    if (seq != _searchSeq) { tcs.SetResult(); return; }
-                    if (!string.Equals(query, _state.Query, StringComparison.Ordinal))
-                    {
-                        tcs.SetResult();
-                        return;
-                    }
+                ApplySuggestions();
+                return;
+            }
 
-                    var newList = new List<SearchResult> { directResult };
-                    foreach (var s in suggestions)
-                    {
-                        newList.Add(new SearchResult(
-                            Kind: "web",
-                            Title: s.Text,
-                            Subtitle: s.Url,
-                            ExecuteId: s.Url,
-                            MatchSpans: BuildWebMatchSpans(s.Text, webMode.QueryTerms))
-                        {
-                            Target = new ActionTarget("web", s.Url),
-                        });
-                    }
-
-                    _state.Results = newList;
-                    _state.StatusMessage = "";
-                }
-                finally
-                {
-                    tcs.SetResult();
-                }
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _ = dispatcher.BeginInvoke(new Action(() =>
+            {
+                try { ApplySuggestions(); }
+                finally { tcs.SetResult(); }
             }));
             await tcs.Task.ConfigureAwait(true);
+
+            void ApplySuggestions()
+            {
+                // 重查身份：BeginInvoke 排队期间用户可能又敲了键。
+                if (suggSeq != _suggestionSeq) return;
+                if (seq != _searchSeq) return;
+                if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
+
+                _state.Results = BuildWebRows(directResult, suggestions, webMode);
+                _state.StatusMessage = "";
+            }
         }, cts.Token);
     }
 #pragma warning restore CS1998
+
+    /// <summary>
+    /// 网页模式结果行：首行直接提交 + 联想行。行身份（RowKey）按槽位而非内容确定——
+    /// 内容每按一键都变，但第 N 行始终是第 N 行，ResultList 才能原地更新而不重建容器
+    /// （重建 = 图标空一帧 = 逐键闪烁）。
+    /// </summary>
+    private static List<SearchResult> BuildWebRows(
+        SearchResult directResult,
+        IReadOnlyList<SuggestionItem> suggestions,
+        WebModeResult webMode)
+    {
+        var rows = new List<SearchResult>(suggestions.Count + 1) { directResult };
+        for (var i = 0; i < suggestions.Count; i++)
+        {
+            var s = suggestions[i];
+            rows.Add(new SearchResult(
+                Kind: "web",
+                Title: s.Text,
+                Subtitle: s.Url,
+                ExecuteId: s.Url,
+                MatchSpans: BuildWebMatchSpans(s.Text, webMode.QueryTerms))
+            {
+                Target = new ActionTarget("web", s.Url),
+                RowKey = $"web:sugg:{webMode.EngineName}:{i}",
+            });
+        }
+        return rows;
+    }
 
     /// <summary>网页模式标题中查询词的 UTF-16 匹配区间。</summary>
     private static int[] BuildWebMatchSpans(string title, string terms)

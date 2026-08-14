@@ -858,20 +858,33 @@ fn process_indexer_reply(
     query: &str,
     history: &Arc<HistoryStore>,
     injected_history_targets: &HashSet<(String, String)>,
+    app_resolved_paths: &HashSet<String>,
     ranked: &mut Vec<SearchResult>,
 ) -> IndexerReplyFields {
     for item in reply.items {
-        let target = ActionTarget::new(
-            if item.is_directory {
-                TargetKind::Directory
-            } else {
-                TargetKind::File
-            },
-            item.path.clone(),
-        );
-        if injected_history_targets.contains(&(target.kind.clone(), target.value.clone())) {
+        let kind = if item.is_directory {
+            TargetKind::Directory
+        } else {
+            TargetKind::File
+        };
+        // Dedup check: borrow the kind/value as owned strings for the HashSet lookup
+        // without cloning into a separate ActionTarget first.
+        let kind_str = kind.as_str();
+        if injected_history_targets
+            .contains(&(kind_str.to_string(), item.path.clone()))
+        {
             continue;
         }
+        // Cross-kind dedup: if a Start Menu app already resolved to this file path
+        // (e.g. "Wub_x64.lnk" → "Wub_x64.exe"), skip the indexer file result so the
+        // same .exe doesn't appear twice with different titles.
+        if app_resolved_paths.contains(&item.path) {
+            continue;
+        }
+        // Build the target once, compute its history score while borrowed, then move
+        // it into the SearchResult — avoiding the previous target.clone().
+        let target = ActionTarget::new(kind, &item.path);
+        let history_score = history.score(&target);
         ranked.push(SearchResult {
             kind: if item.is_directory {
                 SearchResultKind::Folder
@@ -880,7 +893,7 @@ fn process_indexer_reply(
             },
             title: item.name.clone(),
             subtitle: item.path.clone(),
-            target: target.clone(),
+            target,
             execute_id: item.path,
             match_spans: item
                 .match_spans
@@ -890,7 +903,7 @@ fn process_indexer_reply(
                     .match_metadata
                     .or_else(|| rank_title(&item.name, query));
                 if let Some(metadata) = metadata.as_mut() {
-                    metadata.history_score = history.score(&target);
+                    metadata.history_score = history_score;
                 }
                 metadata
             },
@@ -1014,6 +1027,7 @@ async fn search_service(
     // global hits (e.g. Start Menu .lnk) into a scoped result list.
     // G7: ext:/path: filters also suppress apps — only files/folders are returned.
     let mut app_match_count = 0u64;
+    let mut app_resolved_paths: HashSet<String> = HashSet::new();
     if result_slots > 0 && root.is_none() && !has_filters {
         let (app_results, count) = collect_app_results(
             apps,
@@ -1022,6 +1036,16 @@ async fn search_service(
             preferences.pinyin_enabled(),
         );
         app_match_count = count;
+        // Collect resolved target paths so indexer file results pointing to the same
+        // .exe can be deduped (e.g. "Wub_x64.lnk" → "Wub_x64.exe").
+        for r in &app_results {
+            if r.kind == SearchResultKind::App
+                && !r.subtitle.is_empty()
+                && !r.subtitle.eq_ignore_ascii_case(&r.execute_id)
+            {
+                app_resolved_paths.insert(r.subtitle.clone());
+            }
+        }
         ranked.extend(app_results);
     }
     let (service, root_rejection, root_message) = search_index_with_root_fallback(
@@ -1045,7 +1069,7 @@ async fn search_service(
         path_constructions,
         pinyin_status,
     } = match service {
-        Ok(reply) => process_indexer_reply(reply, query, history, &injected_history_targets, &mut ranked),
+        Ok(reply) => process_indexer_reply(reply, query, history, &injected_history_targets, &app_resolved_paths, &mut ranked),
         Err(error) => IndexerReplyFields {
             is_indexing: false,
             index_progress: None,
@@ -1514,10 +1538,10 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 /// Sorts results by `compare_search_results` but pre-computes the lowercased title
 /// once per item instead of once per comparison (O(n) vs O(n log n) allocations).
 fn sort_search_results(items: &mut [SearchResult]) {
-    // Build a parallel array of lowercased titles to avoid re-allocating inside the
-    // comparator. Items are sorted in-place via index permutation.
-    let mut indices: Vec<usize> = (0..items.len()).collect();
+    // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
+    // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
+    let mut indices: Vec<usize> = (0..items.len()).collect();
     indices.sort_by(|&a, &b| {
         items[a]
             .match_metadata

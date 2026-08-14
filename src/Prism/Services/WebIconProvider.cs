@@ -19,12 +19,25 @@ public sealed class WebIconProvider
 {
     private readonly FaviconCache? _faviconCache;
     private readonly ImageSource _genericIcon;
+    private readonly Dictionary<string, ImageSource> _builtInIcons = new(StringComparer.OrdinalIgnoreCase);
 
     public WebIconProvider(FaviconCache? faviconCache = null)
     {
         _faviconCache = faviconCache;
         _genericIcon = CreateGenericIcon();
         _genericIcon.Freeze();
+        // 预建并冻结内置引擎图标，避免每次 GetIcon 重建导致 UI 闪烁。
+        foreach (var (name, hex, letter) in new (string, string, string)[]
+        {
+            ("Bing", "#008373", "B"),
+            ("百度", "#2932E1", "百"),
+            ("Google", "#4285F4", "G"),
+        })
+        {
+            var icon = CreateLetterIcon(hex, letter);
+            icon.Freeze();
+            _builtInIcons[name] = icon;
+        }
     }
 
     /// <summary>
@@ -36,12 +49,8 @@ public sealed class WebIconProvider
     {
         // 内置引擎：优先用 engineName 匹配，其次从 URL 推断
         var name = engineName ?? InferEngineName(url);
-        var builtIn = CreateBuiltInIcon(name);
-        if (builtIn is not null)
-        {
-            builtIn.Freeze();
-            return builtIn;
-        }
+        if (name is not null && _builtInIcons.TryGetValue(name, out var cached))
+            return cached;
 
         // 自定义引擎：查 favicon 缓存
         if (_faviconCache is not null)
@@ -60,6 +69,19 @@ public sealed class WebIconProvider
         return _genericIcon;
     }
 
+    /// <summary>
+    /// 图标身份键：决定 GetIcon 返回哪个图标的最小信息（内置引擎名或 origin）。
+    /// 网页模式的 URL 每按一次键就变，但图标只取决于引擎，用它作为 UI 侧的缓存键，
+    /// 避免逐键重新赋值 Image.Source 造成闪烁。
+    /// </summary>
+    public string IconKey(string url, string? engineName = null)
+    {
+        var name = engineName ?? InferEngineName(url);
+        if (name is not null && _builtInIcons.ContainsKey(name))
+            return "builtin:" + name;
+        return FaviconCache.NormalizeOrigin(url) ?? "generic";
+    }
+
     /// <summary>从 URL 推断内置引擎名。非内置引擎返回 null。</summary>
     private static string? InferEngineName(string url)
     {
@@ -68,18 +90,6 @@ public sealed class WebIconProvider
         if (lower.Contains("baidu.com")) return "百度";
         if (lower.Contains("google.com")) return "Google";
         return null;
-    }
-
-    /// <summary>生成内置引擎图标。非内置引擎返回 null。</summary>
-    private static ImageSource? CreateBuiltInIcon(string? engineName)
-    {
-        return engineName switch
-        {
-            "Bing" => CreateLetterIcon("#008373", "B"),
-            "百度" => CreateLetterIcon("#2932E1", "百"),
-            "Google" => CreateLetterIcon("#4285F4", "G"),
-            _ => null,
-        };
     }
 
     /// <summary>通用网页图标：灰色圆 + "W"。</summary>

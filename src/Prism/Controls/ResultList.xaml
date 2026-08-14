@@ -14,7 +14,9 @@
                  MouseDoubleClick="OnDoubleClick">
             <ListBox.ItemTemplate>
                 <DataTemplate>
-                    <Grid Height="62" Margin="0">
+                    <Grid Height="62" Margin="0"
+                          TextOptions.TextFormattingMode="Display"
+                          TextOptions.TextRenderingMode="ClearType">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
@@ -27,19 +29,22 @@
                                Margin="20,0,14,0"
                                VerticalAlignment="Center"
                                Stretch="Uniform"
+                               RenderOptions.BitmapScalingMode="Linear"
                                SnapsToDevicePixels="True"/>
 
                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0">
-                            <!-- Title 文本由 code-behind ApplyMatchSpans 写入 Inlines，
-                                 不再绑定 Text——OneWay 绑定会在容器回收时重新推送 Text，
-                                 清掉 Inlines 导致与手动构建的高亮 Run 叠加。 -->
+                            <!-- Title/Subtitle 文本都由 code-behind 写入，不用绑定：
+                                 Title 绑定会在容器回收时重新推送 Text，清掉 ApplyMatchSpans
+                                 手动构建的高亮 Run；Subtitle 绑定则要求内容变化时替换集合项，
+                                 而替换会重建行容器（图标 Source 归零后重设 = 闪烁）。
+                                 网页模式每按一键 URL 就变，正是这条路径。 -->
                             <TextBlock x:Name="TitleBlock"
                                        FontSize="17"
                                        FontFamily="{DynamicResource AppFontFamily}"
                                        Foreground="{DynamicResource TextTitle}"
                                        TextTrimming="CharacterEllipsis"
                                        TextWrapping="NoWrap"/>
-                            <TextBlock Text="{Binding Subtitle}"
+                            <TextBlock x:Name="SubtitleBlock"
                                        FontSize="13"
                                        FontFamily="{DynamicResource AppFontFamily}"
                                        Foreground="{DynamicResource TextSubtitle}"

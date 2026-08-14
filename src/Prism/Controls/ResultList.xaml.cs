@@ -91,27 +91,27 @@ public partial class ResultList : UserControl
         }
     }
 
+    /// <summary>
+    /// 只增删移动，不替换同键项。替换会触发 Replace 通知让 ListBox 重建行容器，
+    /// 新容器在下次装饰前 Image 为空——每按一键一帧空白，正是网页图标闪烁的来源。
+    /// Title/Subtitle/MatchSpans 全部由 DecorateVisibleItems 从 _items 原地重绘。
+    ///
+    /// 代价：_displayItems[i] 可能是比 _items[i] 更旧的实例。行模板刻意不绑定任何字段，
+    /// 所有事件处理都按索引从 _items 取当前项（ItemAt）。给模板加 {Binding} 前须重新审视这里。
+    /// </summary>
     private void SynchronizeDisplayItems(IReadOnlyList<SearchResult> next)
     {
         for (var i = 0; i < next.Count; i++)
         {
             var desired = next[i];
             if (i < _displayItems.Count && HasSameKey(_displayItems[i], desired))
-            {
-                RefreshBoundFieldsIfNeeded(i, desired);
                 continue;
-            }
 
             var existingIndex = FindByKey(desired, i + 1);
             if (existingIndex >= 0)
-            {
                 _displayItems.Move(existingIndex, i);
-                RefreshBoundFieldsIfNeeded(i, desired);
-            }
             else
-            {
                 _displayItems.Insert(i, desired);
-            }
         }
 
         while (_displayItems.Count > next.Count)
@@ -128,18 +128,12 @@ public partial class ResultList : UserControl
         return -1;
     }
 
-    private void RefreshBoundFieldsIfNeeded(int index, SearchResult desired)
-    {
-        // MatchSpans are painted from _items in DecorateVisibleItems, so a
-        // query-only highlight change does not replace the row container.
-        if (!string.Equals(_displayItems[index].Subtitle, desired.Subtitle, StringComparison.Ordinal))
-            _displayItems[index] = desired;
-    }
-
     private static bool HasSameKey(SearchResult left, SearchResult right) =>
-        string.Equals(left.Kind, right.Kind, StringComparison.Ordinal)
-        && string.Equals(left.ExecuteId, right.ExecuteId, StringComparison.Ordinal)
-        && string.Equals(left.Title, right.Title, StringComparison.Ordinal);
+        string.Equals(left.ContainerKey, right.ContainerKey, StringComparison.Ordinal);
+
+    /// <summary>按索引取当前项；容器 DataContext 可能是旧实例，不可用于执行。</summary>
+    private SearchResult? ItemAt(int index) =>
+        index >= 0 && index < _items.Count ? _items[index] : null;
 
     public int SelectedIndex
     {
@@ -206,7 +200,10 @@ public partial class ResultList : UserControl
         var source = e.OriginalSource as DependencyObject;
         if (source is null) return;
         if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
-        if (container.DataContext is SearchResult { Kind: "more" } result)
+        // Resolve from _items, not container.DataContext: same-key rows are never replaced in
+        // _displayItems, so a container can still hold an earlier instance of that row.
+        var index = List.ItemContainerGenerator.IndexFromContainer(container);
+        if (ItemAt(index) is { Kind: "more" } result)
             ItemInvoked?.Invoke(result);
     }
 
@@ -217,8 +214,7 @@ public partial class ResultList : UserControl
         if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
 
         var index = List.ItemContainerGenerator.IndexFromContainer(container);
-        if (index < 0 || index >= _items.Count) return;
-        var result = _items[index];
+        if (ItemAt(index) is not { } result) return;
         if (result.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(result.ExecuteId))
             return;
 
@@ -229,7 +225,7 @@ public partial class ResultList : UserControl
 
     private void OnDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
-        if (List.SelectedItem is SearchResult r)
+        if (ItemAt(List.SelectedIndex) is { } r)
             ItemInvoked?.Invoke(r);
     }
 
@@ -263,11 +259,16 @@ public partial class ResultList : UserControl
             var item = _items[i];
 
             var titleBlock = FindDescendant<TextBlock>(container, "TitleBlock");
+            var subtitleBlock = FindDescendant<TextBlock>(container, "SubtitleBlock");
             var hotkey = FindDescendant<TextBlock>(container, "HotkeyHint");
             var icon = FindDescendant<Image>(container, "IconImage");
 
             if (titleBlock is not null)
                 ApplyMatchSpans(titleBlock, item.Title, item.MatchSpans);
+
+            if (subtitleBlock is not null
+                && !string.Equals(subtitleBlock.Text, item.Subtitle, StringComparison.Ordinal))
+                subtitleBlock.Text = item.Subtitle;
 
             if (hotkey is not null)
             {
@@ -298,8 +299,14 @@ public partial class ResultList : UserControl
             {
                 if (_webIcons is not null)
                 {
-                    icon.Tag = "web:" + item.ExecuteId;
-                    icon.Source = _webIcons.GetIcon(item.ExecuteId);
+                    // Key on the engine, not the URL: the URL carries the query, so keying on
+                    // it would reassign Source on every keystroke — a visible icon flicker.
+                    var webKey = "web:" + _webIcons.IconKey(item.ExecuteId);
+                    if (!Equals(icon.Tag as string, webKey))
+                    {
+                        icon.Tag = webKey;
+                        icon.Source = _webIcons.GetIcon(item.ExecuteId);
+                    }
                 }
                 else
                 {

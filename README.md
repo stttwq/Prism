@@ -20,11 +20,11 @@ Shell 操作、剪贴板、用户设置和联网一律留在普通用户会话�
 
 如需自行编译安装包：
 
-1. 安装 Inno Setup 6（https://jrsoftware.org/isdl.php）。
-2. 在仓库根目录执行：
+1. 安装 Inno Setup（https://jrsoftware.org/isdl.php）。
+2. 在仓库根目录执行（路径按实际安装位置调整）：
 
    ```bash
-   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" dist\prism.iss
+   "D:\LS\Setup 7\ISCC.exe" dist\prism.iss
    ```
 
    产物为 `dist\PrismSetup-1.0.0.exe`。安装源已在 `dist/` 备齐，共四个文件：

@@ -10,8 +10,8 @@
 ;   - 装在 Program Files（只读）→ 自动退回 %LocalAppData%\Prism，并在设置页显示。
 ; 故安装到 Program Files 不会因写权限失败而崩溃，详见 design.md「数据目录策略」。
 ;
-; 编译：
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" prism.iss
+; 编译（路径按实际安装位置调整）：
+;   "D:\LS\Setup 7\ISCC.exe" prism.iss
 ; 产物：dist\PrismSetup-1.0.0.exe
 
 #define MyAppName "Prism"

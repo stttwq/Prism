@@ -6,6 +6,8 @@
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ShowActivated="True" Focusable="True"
         WindowStartupLocation="Manual"
+        UseLayoutRounding="True"
+        RenderOptions.BitmapScalingMode="HighQuality"
         Opacity="0">
     <!-- 第九步：PinButton + ActionPanel + 圆角裁剪 + 展开动画 -->
     <Grid Margin="20">

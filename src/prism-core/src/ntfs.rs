@@ -525,7 +525,11 @@ mod platform {
             LowUsn: 0,
             HighUsn: i64::MAX,
         };
-        let mut records = Vec::with_capacity(500_000);
+        // Start with a modest initial capacity and let `extend` grow it in batches.
+        // The previous 500k pre-allocation reserved ~32 MB of empty UsnRecord slots
+        // (each struct is ~64 bytes) even for small volumes; a 64k hint keeps the
+        // initial footprint low while still amortizing the first few batches.
+        let mut records = Vec::with_capacity(64_000);
         let mut output = vec![0u8; 256 * 1024];
         loop {
             ensure_build_continues(should_cancel)?;

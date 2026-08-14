@@ -98,10 +98,20 @@ public sealed class WebModeDetectorTests
     }
 
     [Fact]
-    public void Keyword_Only_No_Query_Terms()
+    public void Keyword_Only_Without_Space_Returns_Null()
     {
-        // "bi" alone → keyword=bi, queryTerms="" (direct search still works)
-        var r = WebModeDetector.TryDetect("bi", Defaults);
+        // "bi" alone (no space) → null: local search, not web mode.
+        // The user must type "bi " (with a space) to enter web mode.
+        Assert.Null(WebModeDetector.TryDetect("bi", Defaults));
+        Assert.Null(WebModeDetector.TryDetect("g", Defaults));
+        Assert.Null(WebModeDetector.TryDetect("b", Defaults));
+    }
+
+    [Fact]
+    public void Keyword_With_Space_But_No_Query_Terms()
+    {
+        // "bi " (trailing space, no terms) → web mode with empty query terms.
+        var r = WebModeDetector.TryDetect("bi ", Defaults);
         Assert.NotNull(r);
         Assert.Equal("", r!.QueryTerms);
     }

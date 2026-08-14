@@ -46,6 +46,17 @@ public sealed record SearchResult(
     public SearchMatchMetadata? MatchMetadata { get; init; }
     public ActionTarget? Target { get; init; }
 
+    /// <summary>
+    /// 行身份键（可选）。ResultList 用它决定"同一行更新"还是"删旧插新"。
+    /// 网页模式的行内容每次按键都变（URL 与标题都含查询词），若按内容比对身份，
+    /// 行会被反复删除重建，容器重建瞬间图标为空——表现为每敲一个字母图标闪一下。
+    /// 这类行显式给一个与查询无关的稳定键，让容器原地更新。
+    /// </summary>
+    public string? RowKey { get; init; }
+
+    /// <summary>容器复用比对用的键。未显式指定 RowKey 时退回按内容比对。</summary>
+    public string ContainerKey => RowKey ?? $"{Kind}\u001f{ExecuteId}\u001f{Title}";
+
     public ActionTarget ExecutionTarget => Target ?? ActionTarget.FromLegacy(Kind, ExecuteId);
 
     public SearchResultKind ResultKind => Kind switch

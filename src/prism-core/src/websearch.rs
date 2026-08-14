@@ -89,11 +89,12 @@ impl WebHit {
 ///
 /// 无匹配 / 空查询 / 仅空白 → `None`（走普通文件/程序搜索）。
 pub fn try_match(query: &str, engines: &[WebEngine]) -> Option<WebHit> {
-    let query = query.trim();
-    if query.is_empty() || engines.is_empty() {
+    if query.trim().is_empty() || engines.is_empty() {
         return None;
     }
 
+    // Pass the untrimmed query: split_first_token checks for whitespace after the
+    // keyword, so "g " enters web mode but "g" does not.
     let (keyword, rest) = split_first_token(query)?;
     if keyword.is_empty() {
         return None;
@@ -128,19 +129,21 @@ pub fn try_match(query: &str, engines: &[WebEngine]) -> Option<WebHit> {
     None
 }
 
-/// 拆出首 token 与剩余部分。无空白时 rest 为空串。
+/// 拆出首 token 与剩余部分。**必须有关键词 + 空白分隔符**才返回 Some——
+/// 仅输入 `g` 或 `bi` 不带空格时返回 None，让本地文件搜索正常工作。
+/// 例：`g hello` → Some(("g", " hello"))；`g ` → Some(("g", ""))；`g` → None。
 fn split_first_token(query: &str) -> Option<(&str, &str)> {
-    let q = query.trim();
-    if q.is_empty() {
+    // Find first non-whitespace (skip leading spaces).
+    let start = query.find(|c: char| !c.is_whitespace())?;
+    let after_start = &query[start..];
+    // There must be whitespace after the keyword.
+    let ws = after_start.find(char::is_whitespace)?;
+    let keyword = &after_start[..ws];
+    let rest = &after_start[ws..];
+    if keyword.is_empty() {
         return None;
     }
-    match q.find(char::is_whitespace) {
-        Some(i) => {
-            let (kw, rest) = q.split_at(i);
-            Some((kw, rest))
-        }
-        None => Some((q, "")),
-    }
+    Some((keyword, rest))
 }
 
 /// application/x-www-form-urlencoded 风格的百分号编码（UTF-8 字节）。
@@ -248,6 +251,24 @@ mod tests {
     fn empty_or_whitespace_returns_none() {
         assert!(try_match("", &defaults()).is_none());
         assert!(try_match("   ", &defaults()).is_none());
+    }
+
+    #[test]
+    fn keyword_only_without_space_returns_none() {
+        // Keywords without a space must NOT trigger web mode — the user should be
+        // able to search local files whose names start with "g", "b", "bi", etc.
+        assert!(try_match("g", &defaults()).is_none());
+        assert!(try_match("bi", &defaults()).is_none());
+        assert!(try_match("b", &defaults()).is_none());
+        assert!(try_match("G", &defaults()).is_none());
+    }
+
+    #[test]
+    fn keyword_with_trailing_space_enters_web_mode() {
+        // "g " (trailing space, no terms) → web mode with empty query.
+        let hit = try_match("g ", &defaults()).expect("trailing space should enter web mode");
+        assert_eq!(hit.engine_name, "Google");
+        assert_eq!(hit.query_terms, "");
     }
 
     #[test]
