@@ -38,6 +38,8 @@ public partial class ResultList : UserControl
         List.Loaded += (_, _) =>
         {
             HookScrollViewer();
+            // 挂进可视树后才拿得到真实 DPI；此前 UpdateListHeight 只能按 1.0 算行高。
+            UpdateListHeight();
             DecorateVisibleItems();
         };
     }
@@ -171,7 +173,14 @@ public partial class ResultList : UserControl
     private void UpdateListHeight()
     {
         var rows = Math.Min(_items.Count, MaxVisibleRows);
-        var h = rows * RowHeight;
+        var h = rows * SnappedRowHeight();
+
+        // 行数没超过可视上限时必须彻底禁掉滚动，不能只依赖"高度刚好装得下"。
+        ScrollViewer.SetVerticalScrollBarVisibility(
+            List,
+            _items.Count > MaxVisibleRows
+                ? ScrollBarVisibility.Auto
+                : ScrollBarVisibility.Disabled);
 
         if (h <= 0)
         {
@@ -183,9 +192,38 @@ public partial class ResultList : UserControl
         else
         {
             Height = h;
-            List.Height = Math.Min(_items.Count, MaxVisibleRows) * RowHeight;
+            List.Height = h;
             MinHeight = h;
         }
+    }
+
+    /// <summary>
+    /// 单行占用的实际布局高度：UseLayoutRounding 会把每行 62 DIP 向上贴到整数设备像素，
+    /// 所以非整数缩放下真实行高比 62 略大。
+    ///
+    /// 必须按贴齐后的值分配高度，否则 9 行内容会比 9*62 的视口高出 1~2px。
+    /// ListBox 是按项滚动的（CanContentScroll=True）：视口装不下第 9 项就报 ViewportHeight=8、
+    /// ScrollableHeight=1，方向键选到第 9 行触发 ScrollIntoView 时整滚一项——
+    /// 第一行被顶出视口，末尾露出一整行 62px 的白方框。
+    /// 单纯把滚动条设成 Disabled 拦不住这条路径（ScrollIntoView 仍会改 offset），
+    /// 唯一可靠的办法是让视口真的装得下。
+    /// </summary>
+    private double SnappedRowHeight()
+    {
+        var scale = 1.0;
+        if (PresentationSource.FromVisual(this) is not null)
+        {
+            var dpi = VisualTreeHelper.GetDpi(this);
+            if (dpi.DpiScaleY > 0) scale = dpi.DpiScaleY;
+        }
+        if (Math.Abs(scale - 1.0) < 0.0001) return RowHeight;
+        return Math.Ceiling(RowHeight * scale) / scale;
+    }
+
+    protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+    {
+        base.OnDpiChanged(oldDpi, newDpi);
+        UpdateListHeight();
     }
 
     private void OnSelectionChanged(object sender, SelectionChangedEventArgs e)
