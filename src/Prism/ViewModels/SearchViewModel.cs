@@ -898,14 +898,20 @@ public sealed class SearchViewModel
             _completeCache = new SearchCacheEntry(resp, _searchContext);
         }
 
-        var prevId = _state.SelectedResult?.ExecuteId;
+        var prev = _state.SelectedResult;
         _state.Results = list;
         var keep = -1;
-        if (!string.IsNullOrEmpty(prevId))
+        if (prev is not null)
         {
             for (var i = 0; i < list.Count; i++)
             {
-                if (list[i].ExecuteId == prevId) { keep = i; break; }
+                // "more" 行的 ExecuteId 为空，不能按 ExecuteId 匹配；按 Kind 匹配，
+                // 否则 generation 变化触发的重搜会把 "more" 选中丢失，跳回第 0 行。
+                if (prev.Kind == "more" && list[i].Kind == "more"
+                    || !string.IsNullOrEmpty(prev.ExecuteId) && list[i].ExecuteId == prev.ExecuteId)
+                {
+                    keep = i; break;
+                }
             }
         }
         _state.SelectedIndex = keep >= 0 ? keep : (list.Count > 0 ? 0 : -1);

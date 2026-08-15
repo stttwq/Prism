@@ -263,7 +263,14 @@ public partial class ResultList : UserControl
 
     private void OnDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
-        if (ItemAt(List.SelectedIndex) is { } r)
+        // 从点击位置解析实际行，不用 List.SelectedIndex：双击的第一次点击会经
+        // PreviewMouseLeftButtonUp 触发 ShowMoreAsync，其异步搜索可能在 DoubleClick
+        // 触发前就把 SelectedIndex 重置为 0，导致此处拿到的是第一行而非双击的行。
+        var source = e.OriginalSource as DependencyObject;
+        if (source is null) return;
+        if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
+        var index = List.ItemContainerGenerator.IndexFromContainer(container);
+        if (ItemAt(index) is { } r)
             ItemInvoked?.Invoke(r);
     }
 
