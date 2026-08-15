@@ -743,6 +743,10 @@ public sealed class SearchViewModel
     private async Task ShowMoreAsync()
     {
         _resultLimit = ExpandedResultLimit;
+        // 清除选中，使 ApplySearchResponse 不会尝试保留 "more" 行的选中——
+        // 后者会让 SelectedIndex 落在列表末尾（展开后仍有截断时），用户看到的
+        // 是滚到底部而非从顶部开始浏览。
+        _state.SelectedIndex = -1;
         await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
     }
 
