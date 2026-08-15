@@ -418,6 +418,67 @@ public sealed class HostScopeControllerTests
         }
     }
 
+    [Fact]
+    public void ComputeCaptureIsPureUntilApplied()
+    {
+        var adapter = new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs");
+        var controller = Controller(adapter, out _, out _);
+        var changes = 0;
+        controller.Changed += () => changes++;
+
+        var result = controller.ComputeCapture(Explorer);
+
+        // 不修改状态、不触发事件：后台线程可安全调用。
+        Assert.Equal(0, changes);
+        Assert.Equal(HostDetectionStatus.Detected, result.Status);
+        Assert.Equal(HostKind.None, controller.Host.Kind);
+        Assert.Equal(SearchScope.Global, controller.Scope);
+        Assert.Null(controller.Root);
+        Assert.Equal("", controller.Notice);
+
+        // 重复计算幂等。
+        Assert.Equal(result, controller.ComputeCapture(Explorer));
+        Assert.Equal(0, changes);
+    }
+
+    [Fact]
+    public void ResetComputeApplyMatchesDirectCapture()
+    {
+        // 成功路径：三段式与直接 Capture 状态一致。
+        var adapter = new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs");
+        var controller = Controller(adapter, out _, out _);
+        var changes = 0;
+        controller.Changed += () => changes++;
+
+        controller.ResetForCapture();
+        Assert.Equal(1, changes);
+        controller.ApplyCapture(controller.ComputeCapture(Explorer));
+
+        Assert.Equal(2, changes);
+        Assert.Equal(HostDetectionStatus.Detected, controller.Host.Status);
+        Assert.Equal(SearchScope.CurrentDirectory, controller.Scope);
+        Assert.Equal(@"C:\Users\me\Docs", controller.Root);
+        Assert.Equal("", controller.Notice);
+        Assert.True(controller.IsScopeLabelVisible);
+
+        // 降级路径：字段逐一与直接 Capture 等价。
+        controller.ResetForCapture();
+        adapter.FolderReason = HostFailureReason.FolderUnavailable;
+        controller.ApplyCapture(controller.ComputeCapture(Explorer));
+
+        var other = Controller(
+            new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs")
+            {
+                FolderReason = HostFailureReason.FolderUnavailable,
+            },
+            out _, out _);
+        var direct = other.Capture(Explorer);
+
+        Assert.Equal(direct, controller.Host);
+        Assert.Equal(other.Scope, controller.Scope);
+        Assert.Equal(other.Notice, controller.Notice);
+    }
+
     private static HostScopeController Controller(
         FakeAdapter adapter,
         out FakeValidator validator,

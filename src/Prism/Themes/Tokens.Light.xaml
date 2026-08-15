@@ -12,6 +12,14 @@
     <SolidColorBrush x:Key="Divider" Color="#E8EAEC"/>
     <SolidColorBrush x:Key="ScrollThumb" Color="#D4D7DA"/>
 
+    <!-- 设置窗表面（G 系列修复：设置页从硬编码浅色迁移为令牌，浅色取值与迁移前完全一致） -->
+    <SolidColorBrush x:Key="BgSettingsPage" Color="#F7F8FA"/>
+    <SolidColorBrush x:Key="BgSettingsNav" Color="#EEF0F3"/>
+    <SolidColorBrush x:Key="BgSettingsNavHover" Color="#E0E3E8"/>
+    <SolidColorBrush x:Key="BgSettingsInput" Color="#FFFFFF"/>
+    <SolidColorBrush x:Key="BgSettingsAltRow" Color="#FAFBFC"/>
+    <SolidColorBrush x:Key="BorderSettingsInput" Color="#D0D3D8"/>
+
     <sys:Double x:Key="WindowWidth">660</sys:Double>
     <sys:Double x:Key="RadiusWindow">10</sys:Double>
     <sys:Double x:Key="HeaderHeight">68</sys:Double>

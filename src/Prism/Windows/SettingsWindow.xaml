@@ -7,15 +7,15 @@
         MinWidth="560" MinHeight="400"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResizeWithGrip"
-        Background="#F7F8FA"
-        FontFamily="微软雅黑, Segoe UI">
+        Background="{DynamicResource BgSettingsPage}"
+        FontFamily="{DynamicResource AppFontFamily}">
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
 
         <Style x:Key="SettingsNavButton" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="Foreground" Value="#37393E"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
             <Setter Property="FontSize" Value="13.5"/>
             <Setter Property="Padding" Value="20,10,12,10"/>
             <Setter Property="HorizontalContentAlignment" Value="Left"/>
@@ -32,7 +32,7 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Bd" Property="Background" Value="#E0E3E8"/>
+                                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgSettingsNavHover}"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -43,10 +43,10 @@
         <Style x:Key="SettingsActionButton" TargetType="Button">
             <Setter Property="Padding" Value="14,6"/>
             <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Background" Value="White"/>
-            <Setter Property="BorderBrush" Value="#D0D3D8"/>
+            <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderSettingsInput}"/>
             <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Foreground" Value="#37393E"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="MinWidth" Value="72"/>
         </Style>
@@ -54,11 +54,165 @@
         <Style x:Key="SettingsPrimaryButton" TargetType="Button">
             <Setter Property="Padding" Value="18,6"/>
             <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Background" Value="#1E7AD4"/>
+            <Setter Property="Background" Value="{DynamicResource TextMatch}"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="Foreground" Value="White"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="MinWidth" Value="80"/>
+        </Style>
+
+        <!-- 带边框输入框：替代默认白色系统 TextBox，深浅色都成立 -->
+        <Style x:Key="SettingsTextBoxStyle" TargetType="TextBox">
+            <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="CaretBrush" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderSettingsInput}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="FontFamily" Value="{DynamicResource AppFontFamily}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4">
+                            <ScrollViewer x:Name="PART_ContentHost"
+                                          Margin="{TemplateBinding Padding}"
+                                          VerticalAlignment="Center"
+                                          Focusable="False"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                                <Setter Property="BorderBrush" Value="{DynamicResource TextMatch}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.55"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 主题化勾选框：默认 Aero2 白底方块在深色页面上刺眼 -->
+        <Style x:Key="SettingsCheckBoxStyle" TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <StackPanel Orientation="Horizontal" Background="Transparent">
+                            <Border x:Name="Box"
+                                    Width="16" Height="16"
+                                    CornerRadius="3"
+                                    Background="{DynamicResource BgSettingsInput}"
+                                    BorderBrush="{DynamicResource BorderSettingsInput}"
+                                    BorderThickness="1"
+                                    VerticalAlignment="Center">
+                                <Path x:Name="Check"
+                                      Data="M 3,7 L 6.5,10.5 L 13,3.5"
+                                      Stroke="{DynamicResource TextMatch}"
+                                      StrokeThickness="1.6"
+                                      StrokeStartLineCap="Round"
+                                      StrokeEndLineCap="Round"
+                                      Visibility="Collapsed"/>
+                            </Border>
+                            <ContentPresenter Margin="6,0,0,0"
+                                              VerticalAlignment="Center"
+                                              RecognizesAccessKey="True"/>
+                        </StackPanel>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Check" Property="Visibility" Value="Visible"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Box" Property="BorderBrush" Value="{DynamicResource TextMatch}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.55"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="SettingsRadioButtonStyle" TargetType="RadioButton">
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <StackPanel Orientation="Horizontal" Background="Transparent">
+                            <Border x:Name="Circle"
+                                    Width="16" Height="16"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource BgSettingsInput}"
+                                    BorderBrush="{DynamicResource BorderSettingsInput}"
+                                    BorderThickness="1"
+                                    VerticalAlignment="Center">
+                                <Ellipse x:Name="Dot"
+                                         Width="6" Height="6"
+                                         Fill="{DynamicResource TextMatch}"
+                                         Visibility="Collapsed"/>
+                            </Border>
+                            <ContentPresenter Margin="6,0,0,0"
+                                              VerticalAlignment="Center"
+                                              RecognizesAccessKey="True"/>
+                        </StackPanel>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Dot" Property="Visibility" Value="Visible"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Circle" Property="BorderBrush" Value="{DynamicResource TextMatch}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.55"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="SettingsDataGridColumnHeaderStyle" TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="{DynamicResource BgSettingsNav}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="12.5"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource Divider}"/>
+            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+        </Style>
+
+        <Style x:Key="SettingsDataGridStyle" TargetType="DataGrid">
+            <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="RowBackground" Value="{DynamicResource BgSettingsInput}"/>
+            <Setter Property="AlternatingRowBackground" Value="{DynamicResource BgSettingsAltRow}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource Divider}"/>
+            <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource Divider}"/>
+            <Setter Property="VerticalGridLinesBrush" Value="{DynamicResource Divider}"/>
+            <Setter Property="ColumnHeaderStyle" Value="{StaticResource SettingsDataGridColumnHeaderStyle}"/>
+            <Setter Property="RowStyle">
+                <Setter.Value>
+                    <Style TargetType="DataGridRow">
+                        <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+                        <Style.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Setter.Value>
+            </Setter>
         </Style>
     </Window.Resources>
 
@@ -69,11 +223,11 @@
         </Grid.ColumnDefinitions>
 
         <!-- 左侧导航 -->
-        <Border Grid.Column="0" Background="#EEF0F3" Padding="0,16,0,16">
+        <Border Grid.Column="0" Background="{DynamicResource BgSettingsNav}" Padding="0,16,0,16">
             <StackPanel>
                 <TextBlock Text="设置"
                            FontSize="18" FontWeight="SemiBold"
-                           Foreground="#303237"
+                           Foreground="{DynamicResource TextTitle}"
                            Margin="20,0,12,16"/>
                 <Button Content="常规"
                         Command="{Binding SelectTabCommand}" CommandParameter="0"
@@ -101,63 +255,62 @@
                           Visibility="{Binding IsGeneralTab, Converter={StaticResource BoolToVis}}">
                 <StackPanel>
                     <TextBlock Text="常规" FontSize="20" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,18"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,18"/>
 
                     <TextBlock Text="呼出快捷键" FontSize="13" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,8"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
 
                     <RadioButton Content="双击 Ctrl（默认）"
                                  IsChecked="{Binding IsDoubleCtrlMode, Mode=TwoWay}"
                                  GroupName="HotkeyMode"
-                                 FontSize="13" Foreground="#37393E"
+                                 Style="{StaticResource SettingsRadioButtonStyle}"
                                  Margin="0,0,0,8"/>
-
                     <RadioButton Content="自定义组合键"
                                  IsChecked="{Binding IsComboMode, Mode=TwoWay}"
                                  GroupName="HotkeyMode"
-                                 FontSize="13" Foreground="#37393E"
+                                 Style="{StaticResource SettingsRadioButtonStyle}"
                                  Margin="0,0,0,8"/>
 
                     <StackPanel Margin="22,0,0,16"
                                 IsEnabled="{Binding IsComboEditorEnabled}">
                         <TextBlock Text="点击下方框并按下组合键（如 Alt+Space）"
-                                   FontSize="12" Foreground="#9B9FA6"
+                                   FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                                    Margin="0,0,0,6"/>
                         <controls:HotkeyRecorderBox Value="{Binding ComboHotkey, Mode=TwoWay}"/>
                     </StackPanel>
 
-                    <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
                     <TextBlock Text="启动" FontSize="13" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,8"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
                     <CheckBox Content="开机时自动启动 Prism"
                               IsChecked="{Binding AutoStart, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,16"/>
 
-                    <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
                     <TextBlock Text="搜索" FontSize="13" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,8"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
                     <CheckBox Content="启用拼音搜索"
                               IsChecked="{Binding PinyinEnabled, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,8"/>
                     <CheckBox Content="使用成功操作历史优化同级排序"
                               IsChecked="{Binding HistoryEnabled, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,8"/>
                     <CheckBox Content="从文件管理器呼出时限定当前目录（含子目录，Ctrl+G 切换）"
                               IsChecked="{Binding CurrentDirectorySearchEnabled, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,8"/>
                     <CheckBox Content="识别 Windows 资源管理器当前目录（实验性 / 需兼容矩阵验收）"
                               IsChecked="{Binding ExplorerHostIntegrationEnabled, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,8"/>
                     <CheckBox Content="识别 Directory Opus 当前目录（实验性 / 需兼容矩阵验收）"
                               IsChecked="{Binding DirectoryOpusHostIntegrationEnabled, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,10"/>
                     <Button Content="清除使用历史"
                             Command="{Binding ClearHistoryCommand}"
@@ -165,26 +318,26 @@
                             HorizontalAlignment="Left"
                             Margin="0,0,0,16"/>
 
-                    <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
                     <TextBlock Text="压缩程序" FontSize="13" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,6"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
                     <TextBlock Text="压缩为 ZIP 时优先使用此程序（留空则自动探测 7-Zip，再回退 Windows 内置）："
-                               FontSize="12" Foreground="#9B9FA6"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                                TextWrapping="Wrap" Margin="0,0,0,4"/>
                     <TextBox Text="{Binding ZipProgram, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                             FontSize="13" Padding="6,4"
+                             Style="{StaticResource SettingsTextBoxStyle}"
                              Margin="0,0,0,16"/>
 
-                    <Border Height="1" Background="#E8EAEC" Margin="0,4,0,16"/>
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
                     <TextBlock Text="数据目录" FontSize="13" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,6"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
                     <TextBlock Text="索引与设置存放位置（安装目录不可写时自动改到用户数据夹）："
-                               FontSize="12" Foreground="#9B9FA6"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                                TextWrapping="Wrap" Margin="0,0,0,4"/>
                     <TextBlock Text="{Binding DataDir}"
-                               FontSize="13" Foreground="#37393E"
+                               FontSize="13" Foreground="{DynamicResource TextQuery}"
                                TextWrapping="Wrap"/>
                 </StackPanel>
             </ScrollViewer>
@@ -200,12 +353,13 @@
 
                 <StackPanel Grid.Row="0" Margin="0,0,0,12">
                     <TextBlock Text="网页搜索" FontSize="20" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,8"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
                     <TextBlock Text="在搜索框输入「关键词 + 空格 + 内容」即可用默认浏览器打开对应网站。URL 中用 {q} 代表搜索词。"
-                               FontSize="12" Foreground="#9B9FA6" TextWrapping="Wrap"/>
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
                 </StackPanel>
 
                 <DataGrid Grid.Row="1"
+                          Style="{StaticResource SettingsDataGridStyle}"
                           ItemsSource="{Binding Engines}"
                           SelectedItem="{Binding SelectedEngine, Mode=TwoWay}"
                           AutoGenerateColumns="False"
@@ -214,11 +368,7 @@
                           CanUserResizeRows="False"
                           HeadersVisibility="Column"
                           GridLinesVisibility="Horizontal"
-                          BorderBrush="#E8EAEC"
                           BorderThickness="1"
-                          Background="White"
-                          RowBackground="White"
-                          AlternatingRowBackground="#FAFBFC"
                           SelectionMode="Single"
                           SelectionUnit="FullRow"
                           FontSize="13">
@@ -244,20 +394,20 @@
                             Style="{StaticResource SettingsActionButton}"/>
                 </StackPanel>
 
-                <Border Grid.Row="2" Height="1" Background="#E8EAEC" Margin="0,0,0,8" VerticalAlignment="Bottom"/>
+                <Border Grid.Row="2" Height="1" Background="{DynamicResource Divider}" Margin="0,0,0,8" VerticalAlignment="Bottom"/>
 
                 <StackPanel Grid.Row="2" VerticalAlignment="Bottom" Margin="0,28,0,0">
                     <TextBlock Text="在线联想" FontSize="13" FontWeight="SemiBold"
-                               Foreground="#303237" Margin="0,0,0,8"/>
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
                     <CheckBox Content="启用在线联想（仅内置 Bing / 百度 / Google，默认关闭）"
                               IsChecked="{Binding SuggestionsEnabled, Mode=TwoWay}"
-                              FontSize="13" Foreground="#37393E"
+                              Style="{StaticResource SettingsCheckBoxStyle}"
                               Margin="0,0,0,8"/>
                     <TextBlock Text="开启后，输入网页关键词时会向对应引擎发送查询词以获取联想建议。查询词和联想结果不写入历史或日志。单次请求 800ms 超时，断网或失败时静默回退直接搜索。"
-                               FontSize="12" Foreground="#9B9FA6" TextWrapping="Wrap"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"
                                Margin="0,0,0,8"/>
                     <TextBlock Text="自定义引擎不支持联想。favicon 图标联网获取需在保存引擎时单独授权，与联想开关相互独立。"
-                               FontSize="12" Foreground="#9B9FA6" TextWrapping="Wrap"/>
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
                 </StackPanel>
             </Grid>
 
@@ -265,23 +415,23 @@
             <StackPanel Grid.Row="0"
                         Visibility="{Binding IsAboutTab, Converter={StaticResource BoolToVis}}">
                 <TextBlock Text="关于" FontSize="20" FontWeight="SemiBold"
-                           Foreground="#303237" Margin="0,0,0,18"/>
+                           Foreground="{DynamicResource TextTitle}" Margin="0,0,0,18"/>
                 <TextBlock Text="Prism" FontSize="28" FontWeight="SemiBold"
-                           Foreground="#1E7AD4" Margin="0,0,0,8"/>
-                <TextBlock FontSize="13" Foreground="#37393E" Margin="0,0,0,4"
+                           Foreground="{DynamicResource TextMatch}" Margin="0,0,0,8"/>
+                <TextBlock FontSize="13" Foreground="{DynamicResource TextQuery}" Margin="0,0,0,4"
                            Text="{Binding Version, StringFormat=版本 {0}, Mode=OneWay}"/>
                 <TextBlock Text="Windows 快速搜索 / 启动工具，替代 Listary 的日常核心用法。"
-                           FontSize="13" Foreground="#9B9FA6"
+                           FontSize="13" Foreground="{DynamicResource TextSubtitle}"
                            TextWrapping="Wrap" Margin="0,12,0,0"/>
                 <TextBlock Text="界面文字均为中文。后端 prism-core 负责索引与搜索，前端负责窗口与托盘。"
-                           FontSize="12" Foreground="#9B9FA6"
+                           FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                            TextWrapping="Wrap" Margin="0,8,0,0"/>
             </StackPanel>
 
             <!-- 状态行 -->
             <TextBlock Grid.Row="1"
                        Text="{Binding StatusMessage}"
-                       FontSize="12" Foreground="#1E7AD4"
+                       FontSize="12" Foreground="{DynamicResource TextMatch}"
                        TextWrapping="Wrap"
                        MinHeight="18"
                        Margin="0,12,0,8"/>

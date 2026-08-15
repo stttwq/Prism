@@ -224,6 +224,8 @@ public partial class ResultList : UserControl
     {
         base.OnDpiChanged(oldDpi, newDpi);
         UpdateListHeight();
+        // DPI 变化后图标身份键带新尺寸，重装饰会触发按新尺寸重载。
+        DecorateVisibleItems();
     }
 
     private void OnSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -309,7 +311,19 @@ public partial class ResultList : UserControl
             var icon = FindDescendant<Image>(container, "IconImage");
 
             if (titleBlock is not null)
-                ApplyMatchSpans(titleBlock, item.Title, item.MatchSpans);
+            {
+                // 脏检查：SearchResult 是不可变 record，(标题, 高亮区间) 引用都相同即内容相同。
+                // 每次按键周期本方法会执行 2-4 遍、滚动事件也全量重刷——跳过未变行可省掉
+                // Inline 集合重建与文本布局重算（逐键与滚动的主要掉帧来源之一）。
+                var applied = titleBlock.Tag as AppliedTitle;
+                if (applied is null
+                    || !ReferenceEquals(applied.Title, item.Title)
+                    || !ReferenceEquals(applied.Spans, item.MatchSpans))
+                {
+                    ApplyMatchSpans(titleBlock, item.Title, item.MatchSpans);
+                    titleBlock.Tag = new AppliedTitle { Title = item.Title, Spans = item.MatchSpans };
+                }
+            }
 
             if (subtitleBlock is not null
                 && !string.Equals(subtitleBlock.Text, item.Subtitle, StringComparison.Ordinal))
@@ -319,7 +333,9 @@ public partial class ResultList : UserControl
             {
                 if (i < 9 && item.Kind != "more")
                 {
-                    hotkey.Text = $"Ctrl+{i + 1}";
+                    var hint = $"Ctrl+{i + 1}";
+                    if (!string.Equals(hotkey.Text, hint, StringComparison.Ordinal))
+                        hotkey.Text = hint;
                     hotkey.Visibility = Visibility.Visible;
                 }
                 else
@@ -369,11 +385,12 @@ public partial class ResultList : UserControl
             else
             {
                 var path = item.ExecuteId;
-                if (!Equals(icon.Tag as string, path))
+                var identity = path + "@" + IconPixelSize();
+                if (!Equals(icon.Tag as string, identity))
                 {
-                    icon.Tag = path;
+                    icon.Tag = identity;
                     icon.Source = null;
-                    _ = LoadIconAsync(path, icon);
+                    _ = LoadIconAsync(path, IconPixelSize(), identity, icon);
                 }
             }
         }
@@ -413,19 +430,34 @@ public partial class ResultList : UserControl
         return img;
     }
 
-    private async Task LoadIconAsync(string path, Image target)
+    private async Task LoadIconAsync(string path, int pixelSize, string identity, Image target)
     {
         if (_icons is null) return;
         try
         {
-            var src = await _icons.GetAsync(path).ConfigureAwait(true);
-            if (!Equals(target.Tag as string, path)) return;
+            var src = await _icons.GetAsync(path, pixelSize).ConfigureAwait(true);
+            if (!Equals(target.Tag as string, identity)) return;
             target.Source = src;
         }
         catch
         {
             // 图标失败不影响搜索。
         }
+    }
+
+    /// <summary>
+    /// 图标源应取的物理像素：32 DIP × 当前 DPI 缩放向上取整。
+    /// 非 100% 缩放下仍取 32px 源会被拉伸发虚——这是与系统资源管理器观感的主要差距。
+    /// </summary>
+    private int IconPixelSize()
+    {
+        var scale = 1.0;
+        if (PresentationSource.FromVisual(this) is not null)
+        {
+            var dpi = VisualTreeHelper.GetDpi(this);
+            if (dpi.DpiScaleX > 0) scale = dpi.DpiScaleX;
+        }
+        return Math.Max(32, (int)Math.Ceiling(32 * scale));
     }
 
     private Brush MatchBrush(FrameworkElement el) =>
@@ -495,5 +527,12 @@ public partial class ResultList : UserControl
             if (nested is not null) return nested;
         }
         return null;
+    }
+
+    /// <summary>TitleBlock.Tag 的脏检查载体：记录上次装饰用的标题与高亮区间实例。</summary>
+    private sealed class AppliedTitle
+    {
+        public required string Title { get; init; }
+        public required int[] Spans { get; init; }
     }
 }

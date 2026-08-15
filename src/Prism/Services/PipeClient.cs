@@ -128,9 +128,12 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
         _consecutiveFailures = 0;
         // 管道断了——走统一重连路径（持锁 + 重入保护）。
+        // 重连令牌带上限：_ioLock 可能被一个带超时的慢请求占着（最多约 8 秒），
+        // tick 决不能在锁上无限堆叠。
+        using var reconnectCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         try
         {
-            await ConnectOrReconnectAsync(CancellationToken.None).ConfigureAwait(false);
+            await ConnectOrReconnectAsync(reconnectCts.Token).ConfigureAwait(false);
             NotifyConnection(true);
         }
         catch
@@ -184,10 +187,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
     }
 
+    /// <summary>查询类请求的读超时：覆盖搜索（毫秒级）+ 索引写锁最坏停顿（数秒），到点销毁流并触发重连自愈。</summary>
+    private static readonly TimeSpan QueryReadTimeout = TimeSpan.FromSeconds(8);
+
     /// <summary>发送 ping，返回后端版本号。</summary>
     public async Task<string> PingAsync(CancellationToken ct = default)
     {
-        var resp = await SendAsync(new { type = "ping" }, ct).ConfigureAwait(false);
+        var resp = await SendAsync(new { type = "ping" }, ct, QueryReadTimeout).ConfigureAwait(false);
         return resp.GetProperty("version").GetString() ?? "";
     }
 
@@ -203,7 +209,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
         SearchContext context,
         CancellationToken ct = default)
     {
-        var resp = await SendAsync(SearchPayload(query, max, context), ct).ConfigureAwait(false);
+        var resp = await SendAsync(SearchPayload(query, max, context), ct, QueryReadTimeout).ConfigureAwait(false);
         return ParseSearchResponse(resp, query);
     }
 
@@ -334,7 +340,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             Name = e.Name,
             UrlTemplate = e.UrlTemplate,
         }).ToArray();
-        await SendAsync(new { type = "reload_engines", engines = payload }, ct).ConfigureAwait(false);
+        await SendAsync(new { type = "reload_engines", engines = payload }, ct, QueryReadTimeout).ConfigureAwait(false);
     }
 
     public async Task UpdatePreferencesAsync(
@@ -347,18 +353,18 @@ public sealed class PipeClient : ISearchClient, IDisposable
             type = "update_preferences",
             history_enabled = historyEnabled,
             pinyin_enabled = pinyinEnabled,
-        }, ct).ConfigureAwait(false);
+        }, ct, QueryReadTimeout).ConfigureAwait(false);
     }
 
     public async Task ClearHistoryAsync(CancellationToken ct = default)
     {
-        await SendAsync(new { type = "clear_history" }, ct).ConfigureAwait(false);
+        await SendAsync(new { type = "clear_history" }, ct, QueryReadTimeout).ConfigureAwait(false);
     }
 
     /// <summary>请求某文件/文件夹的动作列表（→ 键动作面板）。</summary>
     public async Task<IReadOnlyList<ActionItem>> GetActionsAsync(ActionTarget target, CancellationToken ct = default)
     {
-        var resp = await SendAsync(new { type = "actions", target = TargetPayload(target) }, ct).ConfigureAwait(false);
+        var resp = await SendAsync(new { type = "actions", target = TargetPayload(target) }, ct, QueryReadTimeout).ConfigureAwait(false);
         var items = new List<ActionItem>();
         if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
         {
@@ -408,7 +414,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
     {
         var resp = await SendAsync(
             new { type = "resolve_window", target = TargetPayload(target) },
-            ct).ConfigureAwait(false);
+            ct,
+            QueryReadTimeout).ConfigureAwait(false);
         return ParseWindowHandle(resp);
     }
 
@@ -417,7 +424,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
     {
         await SendAsync(
             new { type = "record_window_switch", target = TargetPayload(target) },
-            ct).ConfigureAwait(false);
+            ct,
+            QueryReadTimeout).ConfigureAwait(false);
     }
 
     internal static WindowHandleInfo ParseWindowHandle(JsonElement resp)
@@ -462,8 +470,15 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// 取消只作用于"等锁"和"业务层丢弃结果"；ViewModel 用 seq 丢弃过期 UI 更新。
     /// 管道断开时在锁内做一次快速重连尝试（500ms），连不上才快速失败——
     /// 不拉进程（交给 watchdog），避免阻塞搜索路径。
+    /// 读超时：查询类请求（搜索/状态/动作列表等）传入 <paramref name="readTimeout"/>，
+    /// 超时取消配对读并整条销毁流——流被丢弃后不存在孤儿响应问题，
+    /// 重连走 hello 握手重新同步。动作类请求可能弹交互式系统对话框（属性页/复制确认），
+    /// 合法等待任意久，因此不传超时、保持原有阻塞语义。
     /// </summary>
-    private async Task<JsonElement> SendAsync(object request, CancellationToken ct)
+    private async Task<JsonElement> SendAsync(
+        object request,
+        CancellationToken ct,
+        TimeSpan? readTimeout = null)
     {
         await _ioLock.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -479,6 +494,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
                     throw new IOException("后端未连接");
             }
 
+            CancellationTokenSource? readDeadline = null;
             try
             {
                 var json = JsonSerializer.Serialize(request);
@@ -486,7 +502,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
                 await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
 
-                var line = await _reader!.ReadLineAsync(CancellationToken.None).ConfigureAwait(false)
+                if (readTimeout is { } timeout)
+                {
+                    readDeadline = new CancellationTokenSource(timeout);
+                }
+                var line = await _reader!.ReadLineAsync(readDeadline?.Token ?? CancellationToken.None).ConfigureAwait(false)
                     ?? throw new IOException("后端在返回响应前关闭了管道");
 
                 // 配对完成后再兑现取消，让上层丢弃结果而不破坏管道。
@@ -502,6 +522,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 }
                 return root.Clone();
             }
+            catch (OperationCanceledException) when (readDeadline?.IsCancellationRequested == true)
+            {
+                // 读超时：broker 活着但不应答。销毁整条流让协议重新同步——
+                // 这不是可复用的连接，直接按传输层失败处理。
+                DisposeStreamOnly();
+                throw new IOException($"后端响应超时（{Math.Round(readTimeout!.Value.TotalSeconds)} 秒）");
+            }
             catch (OperationCanceledException)
             {
                 throw;
@@ -516,6 +543,10 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 // 传输层失败：释放管道，IsConnected 变 false，watchdog 会重连。
                 DisposeStreamOnly();
                 throw;
+            }
+            finally
+            {
+                readDeadline?.Dispose();
             }
         }
         finally

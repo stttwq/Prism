@@ -1,6 +1,5 @@
 using System.Windows;
 using System.Windows.Input;
-using System.Windows.Media;
 
 namespace Prism.Controls;
 
@@ -25,17 +24,6 @@ public partial class HotkeyRecorderBox : System.Windows.Controls.UserControl
         typeof(bool),
         typeof(HotkeyRecorderBox),
         new PropertyMetadata(false, OnIsRecordingChanged));
-
-    private static readonly Brush IdleBorder = Freeze(new SolidColorBrush(Color.FromRgb(0xD0, 0xD3, 0xD8)));
-    private static readonly Brush ActiveBorder = Freeze(new SolidColorBrush(Color.FromRgb(0x1E, 0x7A, 0xD4)));
-    private static readonly Brush IdleFg = Freeze(new SolidColorBrush(Color.FromRgb(0x37, 0x39, 0x3E)));
-    private static readonly Brush HintFg = Freeze(new SolidColorBrush(Color.FromRgb(0x9B, 0x9F, 0xA6)));
-
-    private static Brush Freeze(SolidColorBrush b)
-    {
-        if (b.CanFreeze) b.Freeze();
-        return b;
-    }
 
     public string Value
     {
@@ -133,7 +121,7 @@ public partial class HotkeyRecorderBox : System.Windows.Controls.UserControl
         if (parts.Count == 0)
         {
             Display.Text = "请配合 Ctrl / Alt / Shift / Win 使用";
-            Display.Foreground = HintFg;
+            Display.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextSubtitle");
             e.Handled = true;
             return;
         }
@@ -159,27 +147,31 @@ public partial class HotkeyRecorderBox : System.Windows.Controls.UserControl
         return key.ToString();
     }
 
+    /// <summary>
+    /// 画刷全部走 SetResourceReference（令牌键）：主题切换时由资源系统自动重解析，
+    /// 不需要像 ResultList/PinButton 那样订阅 ThemeApplied 手动失效缓存。
+    /// </summary>
     private void UpdateDisplay()
     {
         if (Chrome is null || Display is null) return;
 
         if (IsRecording)
         {
-            Chrome.BorderBrush = ActiveBorder;
+            Chrome.SetResourceReference(System.Windows.Controls.Border.BorderBrushProperty, "TextMatch");
             Display.Text = "请按下组合键…（Esc 取消）";
-            Display.Foreground = HintFg;
+            Display.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextSubtitle");
         }
         else if (string.IsNullOrWhiteSpace(Value))
         {
-            Chrome.BorderBrush = IdleBorder;
+            Chrome.SetResourceReference(System.Windows.Controls.Border.BorderBrushProperty, "BorderSettingsInput");
             Display.Text = "点击此处，然后按下组合键";
-            Display.Foreground = HintFg;
+            Display.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextSubtitle");
         }
         else
         {
-            Chrome.BorderBrush = IdleBorder;
+            Chrome.SetResourceReference(System.Windows.Controls.Border.BorderBrushProperty, "BorderSettingsInput");
             Display.Text = Value;
-            Display.Foreground = IdleFg;
+            Display.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextQuery");
         }
     }
 }

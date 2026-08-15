@@ -8,8 +8,8 @@
              PreviewKeyDown="OnPreviewKeyDown"
              MouseLeftButtonDown="OnMouseLeftButtonDown">
     <Border x:Name="Chrome"
-            Background="White"
-            BorderBrush="#D0D3D8"
+            Background="{DynamicResource BgSettingsInput}"
+            BorderBrush="{DynamicResource BorderSettingsInput}"
             BorderThickness="1"
             CornerRadius="4"
             Padding="10,6">
@@ -17,8 +17,8 @@
             <TextBlock x:Name="Display"
                        VerticalAlignment="Center"
                        FontSize="13"
-                       FontFamily="微软雅黑, Segoe UI"
-                       Foreground="#37393E"
+                       FontFamily="{DynamicResource AppFontFamily}"
+                       Foreground="{DynamicResource TextSubtitle}"
                        Text="点击此处，然后按下组合键"/>
         </Grid>
     </Border>

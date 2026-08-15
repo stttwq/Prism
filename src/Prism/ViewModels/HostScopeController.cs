@@ -16,6 +16,12 @@ public sealed class HostScopeController
     private readonly IReadOnlyList<IHostAdapter> _adapters;
     private readonly IRootValidator _validator;
     private readonly IHostWindowProbe _probe;
+    /// <summary>
+    /// 覆盖状态写入组。Capture 的计算段可在线程池执行，与本类其他变更并发；
+    /// 持锁期间绝不等待外部：<see cref="Changed"/> 的订阅方只做非阻塞工作
+    /// （UI 线程直接执行；后台线程经 Dispatcher.BeginInvoke 异步派发）。
+    /// </summary>
+    private readonly object _gate = new();
 
     public HostScopeController(
         IEnumerable<IHostAdapter>? adapters = null,
@@ -62,34 +68,61 @@ public sealed class HostScopeController
     /// <summary>设置页总开关。关闭时立即清空宿主上下文并回到全局。</summary>
     public void SetCurrentDirectoryEnabled(bool enabled)
     {
-        if (CurrentDirectoryEnabled == enabled) return;
-        CurrentDirectoryEnabled = enabled;
-        if (!enabled)
+        lock (_gate)
         {
-            Host = HostContext.Cleared(HostDetectionStatus.FeatureDisabled);
+            if (CurrentDirectoryEnabled == enabled) return;
+            CurrentDirectoryEnabled = enabled;
+            if (!enabled)
+            {
+                Host = HostContext.Cleared(HostDetectionStatus.FeatureDisabled);
+                Scope = SearchScope.Global;
+                // 用户自己关掉的功能不需要降级提示。
+                Notice = "";
+            }
+            Changed?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// 每次呼出调用，传入呼出前保存的前台 HWND。返回本次的宿主上下文；
+    /// 任何失败都返回无 root 的上下文，绝不沿用上一次目录。
+    /// 同步复合形式（计算 + 应用一次完成），单测与需要单次 Changed 的场景用这个。
+    /// </summary>
+    public HostContext Capture(IntPtr foregroundWindow)
+    {
+        var result = ComputeCapture(foregroundWindow);
+        ApplyCapture(result);
+        return result;
+    }
+
+    /// <summary>
+    /// 异步捕获前先清掉旧 root：呼出路径在 UI 线程同步调用它，
+    /// 让窗口立即以「全局 / 无范围标签」出现，不等宿主识别结果。
+    /// </summary>
+    public void ResetForCapture()
+    {
+        lock (_gate)
+        {
+            Host = HostContext.None;
             Scope = SearchScope.Global;
-            // 用户自己关掉的功能不需要降级提示。
             Notice = "";
         }
         Changed?.Invoke();
     }
 
     /// <summary>
-    /// 每次呼出调用，传入呼出前保存的前台 HWND。返回本次的宿主上下文；
-    /// 任何失败都返回无 root 的上下文，绝不沿用上一次目录。
+    /// 纯计算宿主上下文：适配器的跨进程 COM / 子进程等待都发生在这里，
+    /// 可从任意线程调用（适配器无状态，COM 对象在单次调用内创建并释放）。
+    /// 不修改任何状态、不触发事件。
     /// </summary>
-    public HostContext Capture(IntPtr foregroundWindow)
+    public HostContext ComputeCapture(IntPtr foregroundWindow)
     {
-        Host = HostContext.None;
-        Scope = SearchScope.Global;
-        Notice = "";
-
         if (!CurrentDirectoryEnabled)
-            return Settle(HostContext.Cleared(HostDetectionStatus.FeatureDisabled));
+            return HostContext.Cleared(HostDetectionStatus.FeatureDisabled);
         if (foregroundWindow == IntPtr.Zero)
-            return Settle(HostContext.Cleared(HostDetectionStatus.NoSupportedHost));
+            return HostContext.Cleared(HostDetectionStatus.NoSupportedHost);
         if (!_probe.IsAlive(foregroundWindow))
-            return Settle(HostContext.Cleared(HostDetectionStatus.HostGone));
+            return HostContext.Cleared(HostDetectionStatus.HostGone);
 
         foreach (var adapter in _adapters)
         {
@@ -102,7 +135,7 @@ public sealed class HostScopeController
             }
             catch
             {
-                return Settle(HostContext.Cleared(HostDetectionStatus.DetectFailed));
+                return HostContext.Cleared(HostDetectionStatus.DetectFailed);
             }
 
             if (!detection.IsHost)
@@ -110,11 +143,11 @@ public sealed class HostScopeController
                 if (detection.Reason is HostFailureReason.NotThisHost
                     or HostFailureReason.AdapterDisabled)
                     continue;
-                return Settle(HostContext.Cleared(StatusFor(detection.Reason)));
+                return HostContext.Cleared(StatusFor(detection.Reason));
             }
 
             if (!detection.Capabilities.HasFlag(HostCapability.ReadFolder))
-                return Settle(HostContext.Cleared(HostDetectionStatus.FolderUnavailable));
+                return HostContext.Cleared(HostDetectionStatus.FolderUnavailable);
 
             HostFolder folder;
             try
@@ -123,7 +156,7 @@ public sealed class HostScopeController
             }
             catch
             {
-                return Settle(HostContext.Cleared(HostDetectionStatus.FolderUnavailable));
+                return HostContext.Cleared(HostDetectionStatus.FolderUnavailable);
             }
 
             if (!folder.IsSuccess)
@@ -131,58 +164,72 @@ public sealed class HostScopeController
                 var reason = folder.Reason == HostFailureReason.None
                     ? HostFailureReason.FolderUnavailable
                     : folder.Reason;
-                return Settle(HostContext.Cleared(StatusFor(reason)));
+                return HostContext.Cleared(StatusFor(reason));
             }
 
             var rejection = _validator.Validate(folder.Path, out var normalized);
             if (rejection is not null)
-                return Settle(HostContext.Cleared(StatusFor(rejection.Value)));
+                return HostContext.Cleared(StatusFor(rejection.Value));
 
-            Host = new HostContext(
+            return new HostContext(
                 detection.Kind,
                 foregroundWindow,
                 normalized,
                 HostDetectionStatus.Detected);
-            Scope = SearchScope.CurrentDirectory;
-            Notice = "";
-            Changed?.Invoke();
-            return Host;
         }
 
         // 前台不是受支持的宿主：正常全局搜索，不打扰用户。
-        return Settle(HostContext.Cleared(HostDetectionStatus.NoSupportedHost));
+        return HostContext.Cleared(HostDetectionStatus.NoSupportedHost);
+    }
+
+    /// <summary>把 <see cref="ComputeCapture"/> 的结果写回状态并触发 Changed。
+    /// 调用方负责串台检查（窗口隐藏 / 重新呼出时丢弃过期结果）。</summary>
+    public void ApplyCapture(HostContext result)
+    {
+        lock (_gate)
+        {
+            Host = result;
+            Scope = result.Status == HostDetectionStatus.Detected
+                ? SearchScope.CurrentDirectory
+                : SearchScope.Global;
+            Notice = NoticeFor(result.Status);
+        }
+        Changed?.Invoke();
     }
 
     /// <summary>范围标签点击 / `Ctrl+G`。返回是否发生了切换。</summary>
     public bool ToggleScope()
     {
-        if (Scope == SearchScope.CurrentDirectory)
+        lock (_gate)
         {
-            Scope = SearchScope.Global;
+            if (Scope == SearchScope.CurrentDirectory)
+            {
+                Scope = SearchScope.Global;
+                Notice = "";
+                Changed?.Invoke();
+                return true;
+            }
+
+            if (!CurrentDirectoryEnabled)
+            {
+                Notice = "当前目录搜索已在设置中关闭";
+                Changed?.Invoke();
+                return false;
+            }
+            if (!Host.HasUsableRoot)
+            {
+                Notice = "没有可用的当前目录，保持全局搜索";
+                Changed?.Invoke();
+                return false;
+            }
+            if (!Revalidate())
+                return false;
+
+            Scope = SearchScope.CurrentDirectory;
             Notice = "";
             Changed?.Invoke();
             return true;
         }
-
-        if (!CurrentDirectoryEnabled)
-        {
-            Notice = "当前目录搜索已在设置中关闭";
-            Changed?.Invoke();
-            return false;
-        }
-        if (!Host.HasUsableRoot)
-        {
-            Notice = "没有可用的当前目录，保持全局搜索";
-            Changed?.Invoke();
-            return false;
-        }
-        if (!Revalidate())
-            return false;
-
-        Scope = SearchScope.CurrentDirectory;
-        Notice = "";
-        Changed?.Invoke();
-        return true;
     }
 
     /// <summary>
@@ -190,25 +237,28 @@ public sealed class HostScopeController
     /// </summary>
     public bool Revalidate()
     {
-        if (!Host.HasUsableRoot)
+        lock (_gate)
         {
-            Invalidate(Host.Status == HostDetectionStatus.Detected
-                ? HostDetectionStatus.HostGone
-                : Host.Status);
-            return false;
+            if (!Host.HasUsableRoot)
+            {
+                Invalidate(Host.Status == HostDetectionStatus.Detected
+                    ? HostDetectionStatus.HostGone
+                    : Host.Status);
+                return false;
+            }
+            if (!_probe.IsAlive(Host.CapturedWindow))
+            {
+                Invalidate(HostDetectionStatus.HostGone);
+                return false;
+            }
+            var rejection = _validator.Validate(Host.Root, out _);
+            if (rejection is not null)
+            {
+                Invalidate(StatusFor(rejection.Value));
+                return false;
+            }
+            return true;
         }
-        if (!_probe.IsAlive(Host.CapturedWindow))
-        {
-            Invalidate(HostDetectionStatus.HostGone);
-            return false;
-        }
-        var rejection = _validator.Validate(Host.Root, out _);
-        if (rejection is not null)
-        {
-            Invalidate(StatusFor(rejection.Value));
-            return false;
-        }
-        return true;
     }
 
     /// <summary>
@@ -217,10 +267,13 @@ public sealed class HostScopeController
     /// </summary>
     public void Invalidate(HostDetectionStatus status)
     {
-        Host = HostContext.Cleared(status);
-        Scope = SearchScope.Global;
-        Notice = NoticeFor(status);
-        Changed?.Invoke();
+        lock (_gate)
+        {
+            Host = HostContext.Cleared(status);
+            Scope = SearchScope.Global;
+            Notice = NoticeFor(status);
+            Changed?.Invoke();
+        }
     }
 
     public void Invalidate(RootRejection rejection) => Invalidate(StatusFor(rejection));
@@ -320,15 +373,6 @@ public sealed class HostScopeController
     /// </summary>
     private static bool ShouldInvalidateHost(HostFailureReason reason) =>
         reason is HostFailureReason.HostGone or HostFailureReason.HostElevated;
-
-    private HostContext Settle(HostContext cleared)
-    {
-        Host = cleared;
-        Scope = SearchScope.Global;
-        Notice = NoticeFor(cleared.Status);
-        Changed?.Invoke();
-        return Host;
-    }
 
     private static HostDetectionStatus StatusFor(HostFailureReason reason) => reason switch
     {

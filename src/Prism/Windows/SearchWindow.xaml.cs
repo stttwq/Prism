@@ -38,6 +38,8 @@ public partial class SearchWindow : Window
     private bool _contextMenuActionPending;
     private int _contextMenuRequestSeq;
     private double _panelTargetHeight;
+    /// <summary>呼出捕获的串台序号：快速呼出/隐藏/再呼出时丢弃过期的后台识别结果。</summary>
+    private int _captureSeq;
 
     // ── Win32 foreground hook ─────────────────────────────────────────────
     // Deactivated 事件在两个 Topmost 窗口交互时可能不触发，SetWinEventHook 以
@@ -161,8 +163,9 @@ public partial class SearchWindow : Window
         vm.State.PropertyChanged += OnStateChanged;
         vm.RootRejected += rejection =>
         {
-            if (Dispatcher.CheckAccess()) _scope.Invalidate(rejection);
-            else Dispatcher.Invoke(() => _scope.Invalidate(rejection));
+            // BeginInvoke 而非 Invoke：后台线程触发的 Invalidate 不能阻塞等待 UI，
+            // 否则与控制器内部状态锁互等（见 HostScopeController._gate 注释）。
+            Dispatcher.BeginInvoke(() => _scope.Invalidate(rejection));
         };
         if (_theme is not null)
             _theme.ThemeApplied += OnThemeApplied;
@@ -194,8 +197,12 @@ public partial class SearchWindow : Window
         Header.ClearQuery();
         Header.SetMode(PanelMode.Idle);
         _suppressQueryEvent = false;
-        // 每次呼出重新识别宿主，绝不沿用上一次目录。
-        _scope.Capture(foreground);
+        // 每次呼出重新识别宿主，绝不沿用上一次目录。识别跑在后台线程：
+        // 适配器做跨进程 COM / 子进程等待（Opus 最长数秒），放 UI 线程会冻住呼出动画，
+        // 且低级键盘钩子同线程，卡顿超时会被 Windows 静默摘除热键。
+        // 前台窗口必须同步采样（Show 之前），范围先重置为全局，结果异步回来再应用。
+        var captureSeq = ++_captureSeq;
+        _scope.ResetForCapture();
         ApplyScopeUi();
         ApplyState(_vm?.State, animatePanel: false);
 
@@ -226,6 +233,28 @@ public partial class SearchWindow : Window
             Header.FocusQuery();
             ReleaseDeactivateGuardAfterDelay();
         }, System.Windows.Threading.DispatcherPriority.Input);
+
+        _ = RunCaptureAsync(foreground, captureSeq);
+    }
+
+    /// <summary>
+    /// 后台识别宿主并回到 UI 线程应用。迟到无害：空查询下 root 到达由
+    /// SetSearchContext 触发「当前目录最近使用」重搜，用户已输入则重搜自动带上 root。
+    /// </summary>
+    private async Task RunCaptureAsync(IntPtr foreground, int seq)
+    {
+        HostContext result;
+        try
+        {
+            result = await Task.Run(() => _scope.ComputeCapture(foreground)).ConfigureAwait(true);
+        }
+        catch
+        {
+            result = HostContext.Cleared(HostDetectionStatus.DetectFailed);
+        }
+        // 过期结果：窗口已隐藏或已再次呼出，直接丢弃。
+        if (seq != _captureSeq || !IsVisible || _hiding) return;
+        _scope.ApplyCapture(result);
     }
 
     private void ForceActivate()
@@ -487,7 +516,9 @@ public partial class SearchWindow : Window
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.Invoke(OnScopeChanged);
+            // BeginInvoke：OnScopeChanged 可能在持控制器状态锁的后台线程上触发，
+            // 同步 Invoke 会与 UI 线程的锁获取互等。FIFO 派发保序即可。
+            Dispatcher.BeginInvoke(OnScopeChanged);
             return;
         }
         ApplyScopeUi();
@@ -619,7 +650,18 @@ public partial class SearchWindow : Window
         if (string.IsNullOrWhiteSpace(path))
             path = item.ExecuteId;
 
-        var reveal = _scope.TryRevealInHost(path, isDirectory: item.Kind == "folder");
+        // 宿主定位同样在后台线程执行：Explorer 定位含最长 2 秒的轮询、
+        // Opus 是子进程等待，绝不能挂在 UI 线程上。
+        HostRevealResult reveal;
+        try
+        {
+            reveal = await Task.Run(() =>
+                _scope.TryRevealInHost(path, isDirectory: item.Kind == "folder")).ConfigureAwait(true);
+        }
+        catch
+        {
+            reveal = HostRevealResult.Failure(HostFailureReason.ActionFailed);
+        }
         if (!reveal.Attempted)
         {
             await _vm.RevealSelectedAsync().ConfigureAwait(true);

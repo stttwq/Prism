@@ -12,6 +12,14 @@
     <SolidColorBrush x:Key="Divider" Color="#3C4043"/>
     <SolidColorBrush x:Key="ScrollThumb" Color="#5F6368"/>
 
+    <!-- 设置窗表面：与深色搜索卡（BgWindow #202124）同族的分层表面色 -->
+    <SolidColorBrush x:Key="BgSettingsPage" Color="#1B1C1E"/>
+    <SolidColorBrush x:Key="BgSettingsNav" Color="#232527"/>
+    <SolidColorBrush x:Key="BgSettingsNavHover" Color="#2E3033"/>
+    <SolidColorBrush x:Key="BgSettingsInput" Color="#282A2C"/>
+    <SolidColorBrush x:Key="BgSettingsAltRow" Color="#242628"/>
+    <SolidColorBrush x:Key="BorderSettingsInput" Color="#3C4043"/>
+
     <!-- 尺寸/字体与浅色相同 -->
     <sys:Double x:Key="WindowWidth">660</sys:Double>
     <sys:Double x:Key="RadiusWindow">10</sys:Double>

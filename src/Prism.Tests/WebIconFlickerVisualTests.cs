@@ -102,6 +102,77 @@ public sealed class WebIconFlickerVisualTests
         Assert.Empty(failures);
     }
 
+    /// <summary>
+    /// 标题装饰脏检查：同一批 SearchResult 实例重复装饰（每次按键周期会跑 2-4 遍）
+    /// 不应重建 Inlines；换了新实例（哪怕内容相同）必须重新装饰。
+    /// </summary>
+    [Fact]
+    public void Title_Decoration_Skips_Unchanged_Rows_And_Reapplies_New_Item_Instances()
+    {
+        RunOnSta(() =>
+        {
+            var list = new ResultList();
+            var window = new Window
+            {
+                Width = 800,
+                Height = 400,
+                WindowStyle = WindowStyle.None,
+                ShowInTaskbar = false,
+                Left = -10000,
+                Top = -10000,
+                Content = list,
+            };
+            window.Show();
+            Pump();
+
+            list.Items = new[]
+            {
+                FileRow("alpha.txt", [0, 5]),
+                FileRow("beta.txt", [0, 4]),
+            };
+            Pump();
+
+            var box = FindDescendant<ListBox>(list);
+            Assert.NotNull(box);
+            var container = box!.ItemContainerGenerator.ContainerFromIndex(0) as ListBoxItem;
+            Assert.NotNull(container);
+            var title = FindDescendant<TextBlock>(container, "TitleBlock");
+            Assert.NotNull(title);
+            var runAfterFirstDecorate = title!.Inlines.FirstInline;
+            Assert.NotNull(runAfterFirstDecorate);
+
+            // 同一批实例再次触发装饰（选中变化路径）：Inlines 不应重建。
+            box.SelectedIndex = 1;
+            Pump();
+            Assert.Same(runAfterFirstDecorate, title.Inlines.FirstInline);
+
+            // 同键新实例：容器不重建，但内容必须重新装饰。
+            list.Items = new[]
+            {
+                FileRow("alpha.txt", [0, 5]),
+                FileRow("beta.txt", [0, 4]),
+            };
+            Pump();
+
+            var sameContainer = box.ItemContainerGenerator.ContainerFromIndex(0) as ListBoxItem;
+            Assert.NotNull(sameContainer);
+            Assert.Same(container, sameContainer);
+            var sameTitle = FindDescendant<TextBlock>(sameContainer, "TitleBlock");
+            Assert.NotNull(sameTitle);
+            Assert.NotSame(runAfterFirstDecorate, sameTitle!.Inlines.FirstInline);
+            Assert.Equal("alpha.txt", new System.Windows.Documents.TextRange(
+                sameTitle.ContentStart, sameTitle.ContentEnd).Text);
+
+            window.Close();
+        });
+    }
+
+    private static SearchResult FileRow(string name, int[] spans) =>
+        new("file", name, @"C:\" + name, @"C:\" + name, spans)
+        {
+            Target = new ActionTarget("file", @"C:\" + name),
+        };
+
     /// <summary>与 SearchViewModel.RunWebSearchAsync/BuildWebRows 一致的行形状。</summary>
     private static List<SearchResult> WebRows(string terms, int suggestionCount)
     {

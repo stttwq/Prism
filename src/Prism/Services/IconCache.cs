@@ -22,20 +22,20 @@ public sealed class IconCache
     private readonly ConcurrentDictionary<string, ImageSource?> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<string> _order = new();
 
-    /// <summary>异步获取 32×32 系统图标。</summary>
-    public Task<ImageSource?> GetAsync(string path, CancellationToken ct = default)
+    /// <summary>异步获取系统文件图标；pixelSize 按目标物理像素请求（高 DPI 下取 48/256px 源，避免拉伸发虚）。</summary>
+    public Task<ImageSource?> GetAsync(string path, int pixelSize = 32, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(path))
             return Task.FromResult<ImageSource?>(null);
 
-        var key = CacheKey(path);
+        var key = SizedKey(path, pixelSize);
         if (_cache.TryGetValue(key, out var hit))
             return Task.FromResult(hit);
 
         return Task.Run(() =>
         {
             ct.ThrowIfCancellationRequested();
-            var icon = LoadIcon(path);
+            var icon = LoadIcon(path, pixelSize);
             if (_cache.TryAdd(key, icon))
             {
                 _order.Enqueue(key);
@@ -63,7 +63,11 @@ public sealed class IconCache
 
     /// <summary>
     /// 缓存键：可执行/快捷方式/目录用完整路径；其余用扩展名键，避免每文件一图。
+    /// 尺寸并入键：多显示器不同缩放的条目共存，LRU 自然淘汰。
     /// </summary>
+    internal static string SizedKey(string path, int pixelSize) =>
+        CacheKey(path) + "@" + Math.Max(1, pixelSize);
+
     internal static string CacheKey(string path)
     {
         // URL
@@ -104,7 +108,86 @@ public sealed class IconCache
         }
     }
 
-    private static ImageSource? LoadIcon(string path)
+    private static ImageSource? LoadIcon(string path, int pixelSize)
+    {
+        // 高 DPI：优先从系统图像列表取更大尺寸的源图标（48 / 256px），
+        // 显示时按 32 DIP × 缩放近乎原样呈现。任何一步失败回退 32px 老路径。
+        if (pixelSize > 32)
+        {
+            var larger = TryLoadFromSystemImageList(path, pixelSize);
+            if (larger is not null)
+                return larger;
+        }
+        return LoadIcon32(path);
+    }
+
+    /// <summary>系统图像列表尺寸标志（commoncontrols.h SHIL_*）。</summary>
+    private const int SHIL_EXTRALARGE = 0x2;
+    private const int SHIL_JUMBO = 0x4;
+    private const int ILD_TRANSPARENT = 0x1;
+
+    /// <summary>
+    /// 经 SHGFI_SYSICONINDEX + SHGetImageList 取 48/256px 源图标。
+    /// USEFILEATTRIBUTES 语义与 32px 路径一致（不存在的文件按类型给图标）。
+    /// </summary>
+    private static ImageSource? TryLoadFromSystemImageList(string path, int pixelSize)
+    {
+        var listFlag = pixelSize <= 48 ? SHIL_EXTRALARGE : SHIL_JUMBO;
+        var isDir = Directory.Exists(path);
+        var exists = isDir || File.Exists(path);
+
+        var flags = SHGFI_SYSICONINDEX;
+        uint attrs = 0;
+        if (!exists)
+        {
+            flags |= SHGFI_USEFILEATTRIBUTES;
+            attrs = (path.EndsWith('\\') || path.EndsWith('/'))
+                ? FILE_ATTRIBUTE_DIRECTORY
+                : FILE_ATTRIBUTE_NORMAL;
+        }
+        else if (isDir)
+        {
+            attrs = FILE_ATTRIBUTE_DIRECTORY;
+        }
+
+        var shfi = new SHFILEINFO();
+        var hr = SHGetFileInfo(path, attrs, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
+        if (hr == IntPtr.Zero)
+            return null;
+
+        IImageList? imageList = null;
+        IntPtr hIcon = IntPtr.Zero;
+        try
+        {
+            var iid = new Guid(0x46EB5926, 0x582E, 0x4017, 0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x50);
+            if (SHGetImageList(listFlag, ref iid, out imageList) != 0 || imageList is null)
+                return null;
+            imageList.GetIcon(shfi.iIcon, ILD_TRANSPARENT, out hIcon);
+            if (hIcon == IntPtr.Zero)
+                return null;
+            var source = Imaging.CreateBitmapSourceFromHIcon(
+                hIcon,
+                Int32Rect.Empty,
+                BitmapSizeOptions.FromWidthAndHeight(pixelSize, pixelSize));
+            source.Freeze();
+            return source;
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            if (hIcon != IntPtr.Zero)
+                DestroyIcon(hIcon);
+            if (imageList is not null)
+            {
+                try { Marshal.ReleaseComObject(imageList); } catch { /* ignore */ }
+            }
+        }
+    }
+
+    private static ImageSource? LoadIcon32(string path)
     {
         try
         {
@@ -163,9 +246,44 @@ public sealed class IconCache
 
     private const uint SHGFI_ICON = 0x000000100;
     private const uint SHGFI_LARGEICON = 0x000000000;
+    private const uint SHGFI_SYSICONINDEX = 0x000004000;
     private const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
     private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+
+    /// <summary>
+    /// IImageList（系统图像列表）最小声明：vtable 槽位必须与 commoncontrols.h 逐一对齐——
+    /// IUnknown 之后依次是 Add/ReplaceIcon/SetOverlayImage/Replace/AddMasked/Draw/Remove/GetIcon。
+    /// 除 GetIcon 外全是占位，绝不能调用；槽位错位会导致 AccessViolation（进程级崩溃，
+    /// catch 不可达），改这里时务必对照 SDK 原文。
+    /// </summary>
+    [ComImport]
+    [Guid("46EB5926-582E-4017-9FDF-E8998DAA0950")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IImageList
+    {
+        void Add(IntPtr hbmImage, IntPtr hbmMask, out int pi);
+        void ReplaceIcon(int i, IntPtr hicon, out int pi);
+        void SetOverlayImage(int iImage, int iOverlay);
+        void Replace(int iImage, IntPtr hbmImage, IntPtr hbmMask);
+        void AddMasked(IntPtr hbmImage, int crMask, out int pi);
+        void Draw(ref DRAW_PARAMS pimldp);
+        void Remove(int i);
+        void GetIcon(int i, int flags, out IntPtr hicon);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DRAW_PARAMS
+    {
+        public IntPtr HwndDst;
+        public int XDst;
+        public int YDst;
+        public int CxDst;
+        public int CyDst;
+    }
+
+    [DllImport("shell32.dll", EntryPoint = "SHGetImageList", SetLastError = false)]
+    private static extern int SHGetImageList(int iImageList, ref Guid riid, out IImageList ppv);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SHFILEINFO
