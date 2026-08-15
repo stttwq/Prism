@@ -48,6 +48,7 @@ pub fn log(msg: impl AsRef<str>) {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let event_id = logging::redacted_id(msg.as_ref());
-    eprintln!("[prism {ms}] {event_id}");
-    logging::redacted_message(msg.as_ref());
+    let sanitized = logging::sanitize(msg.as_ref());
+    eprintln!("[prism {ms}] {sanitized}");
+    logging::event_detail("info", &event_id, &sanitized, None, None);
 }

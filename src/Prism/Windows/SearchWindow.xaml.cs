@@ -39,6 +39,26 @@ public partial class SearchWindow : Window
     private int _contextMenuRequestSeq;
     private double _panelTargetHeight;
 
+    // ── Win32 foreground hook ─────────────────────────────────────────────
+    // Deactivated 事件在两个 Topmost 窗口交互时可能不触发，SetWinEventHook 以
+    // 系统级事件兜底。OUTOFCONTEXT 保证回调在 UI 线程消息循环上执行。
+    private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+    private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+
+    private delegate void WinEventProc(
+        IntPtr hWinEventHook, uint eventCode, IntPtr hwnd,
+        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+    [DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(
+        uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
+        WinEventProc lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+    [DllImport("user32.dll")] private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+    private WinEventProc? _foregroundHookProc; // keep-alive: GC must not collect the delegate
+    private IntPtr _foregroundHook;
+    private IntPtr _hwnd;
+
     public SearchWindow() : this(new IndexerGenerationClient())
     {
     }
@@ -55,9 +75,18 @@ public partial class SearchWindow : Window
         InitializeComponent();
         PreviewKeyDown += OnWindowPreviewKeyDown;
         Deactivated += OnDeactivated;
+        _foregroundHookProc = OnForegroundChanged;
+        _foregroundHook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero,
+            _foregroundHookProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         SizeChanged += (_, _) => UpdateCardClip();
-        Loaded += (_, _) => UpdateCardClip();
-        Closed += (_, _) => _generationClient.Dispose();
+        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; UpdateCardClip(); };
+        Closed += (_, _) =>
+        {
+            if (_foregroundHook != IntPtr.Zero) { UnhookWinEvent(_foregroundHook); _foregroundHook = IntPtr.Zero; }
+            _hwnd = IntPtr.Zero;
+            _generationClient.Dispose();
+        };
         _generationClient.GenerationChanged += _ => Dispatcher.BeginInvoke(() =>
         {
             if (IsVisible && !_hiding && _vm is not null
@@ -175,8 +204,6 @@ public partial class SearchWindow : Window
         Show();
         SyncGenerationPolling();
         ForceActivate();
-        Topmost = true;
-        Topmost = false;
         Topmost = true;
 
         var fadeIn = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(FadeInMs))
@@ -310,6 +337,28 @@ public partial class SearchWindow : Window
 
     private void OnDeactivated(object? sender, EventArgs e)
     {
+        if (!SearchWindowFocusPolicy.ShouldHide(
+                _ignoreDeactivate,
+                _contextMenuOpen,
+                _contextMenuActionPending,
+                IsPinned,
+                _hiding))
+            return;
+        HideAnimated();
+    }
+
+    private void OnForegroundChanged(
+        IntPtr hWinEventHook, uint eventCode, IntPtr hwnd,
+        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+    {
+        if (idObject != 0) return;
+        // 先检查 guard，不碰任何 WPF 状态——避免窗口初始化期间的重入崩溃。
+        // ShowAndFocus 在 Show() 之前设 _ignoreDeactivate=true，300ms 后才释放，
+        // 此期间 Topmost 切换可能触发本回调，此时访问 WindowInteropHelper.Handle
+        // 会强制创建未完成的 HwndSource，导致 coreclr.dll Access Violation。
+        if (_ignoreDeactivate || _hiding) return;
+        if (!IsVisible) return;
+        if (hwnd != IntPtr.Zero && hwnd == _hwnd) return;
         if (!SearchWindowFocusPolicy.ShouldHide(
                 _ignoreDeactivate,
                 _contextMenuOpen,

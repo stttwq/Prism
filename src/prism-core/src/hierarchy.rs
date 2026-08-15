@@ -489,8 +489,13 @@ impl VolumeIndex {
                 .nodes
                 .get(slot.parent_record as usize)
                 .ok_or_else(|| format!("cache parent record is outside node table: {record}"))?;
-            if parent.flags & (FLAG_PRESENT | FLAG_DIRECTORY) != FLAG_PRESENT | FLAG_DIRECTORY {
-                return Err(format!("cache parent is not a present directory: {record}"));
+            if parent.flags & FLAG_PRESENT == 0 {
+                // 父目录已被删除但子节点仍在——USN replay 的合法中间态。
+                // 搜索路径在 path_for() 中会跳过这些节点，不影响功能。
+                continue;
+            }
+            if parent.flags & FLAG_DIRECTORY == 0 {
+                return Err(format!("cache parent is not a directory: {record}"));
             }
             if slot.name_off == NO_NAME {
                 if slot.flags & FLAG_EXCLUDED == 0 || slot.flags & FLAG_DIRECTORY != 0 {

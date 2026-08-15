@@ -124,8 +124,9 @@ fn run_runtime(stop: Arc<prism_core::indexer_runtime::Shutdown>) -> Result<(), S
 
 fn log_service_error(context: &str, error: &str) {
     let message = format!("{context}: {error}");
+    let sanitized = prism_core::logging::sanitize(&message);
     prism_core::log(&message);
-    prism_core::logging::event("error", "indexer_service_failure", None, None);
+    prism_core::logging::event_detail("error", "indexer_service_failure", &sanitized, None, None);
     let data_dir = prism_core::index_cache::machine_data_dir();
     if std::fs::create_dir_all(&data_dir).is_ok() {
         let path = data_dir.join("service.log");
@@ -134,7 +135,7 @@ fn log_service_error(context: &str, error: &str) {
             .append(true)
             .open(path)
         {
-            let _ = writeln!(file, "{}", prism_core::logging::redacted_id(&message));
+            let _ = writeln!(file, "{sanitized}");
         }
     }
 }

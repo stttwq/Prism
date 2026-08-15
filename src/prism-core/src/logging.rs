@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 static LOGGER: OnceLock<Mutex<Option<RollingLogger>>> = OnceLock::new();
 
 struct RollingLogger {
@@ -35,7 +35,36 @@ pub fn event(level: &str, event: &str, elapsed_ms: Option<u128>, generation: Opt
     let Some(logger) = guard.as_mut() else {
         return;
     };
-    if logger.write(level, event, elapsed_ms, generation).is_err() {
+    if logger.write(level, event, None, elapsed_ms, generation).is_err() {
+        *guard = None;
+    }
+}
+
+/// Like [`event`] but also writes a human-readable `detail` field (after sanitization)
+/// so that error messages and diagnostic context survive in the log instead of being
+/// reduced to an opaque hash. The `event` field stays the same (hashed id or short name)
+/// for backward compatibility with existing log readers.
+pub fn event_detail(
+    level: &str,
+    event: &str,
+    detail: &str,
+    elapsed_ms: Option<u128>,
+    generation: Option<u64>,
+) {
+    let sanitized = sanitize(detail);
+    let Some(slot) = LOGGER.get() else {
+        return;
+    };
+    let Ok(mut guard) = slot.lock() else {
+        return;
+    };
+    let Some(logger) = guard.as_mut() else {
+        return;
+    };
+    if logger
+        .write(level, event, Some(&sanitized), elapsed_ms, generation)
+        .is_err()
+    {
         *guard = None;
     }
 }
@@ -89,6 +118,47 @@ pub fn redacted_id(message: &str) -> String {
     format!("message_{:016x}", stable_hash(message))
 }
 
+/// Sanitizes free-form log text so it is safe to write without hashing.
+///
+/// Replaces backslashes with forward slashes for readability, and redacts the
+/// username segment under `C:/Users/<name>/` (or any drive letter) to `<user>`.
+/// Paths without a user directory (e.g. `C:/ProgramData/Prism`) are preserved.
+pub fn sanitize(text: &str) -> String {
+    let normalized = text.replace('\\', "/");
+    if normalized.len() < 12 {
+        return normalized;
+    }
+    // Match patterns like "C:/Users/XXX/" (any single drive letter).
+    let bytes = normalized.as_bytes();
+    let mut out = String::with_capacity(normalized.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for "<letter>:/Users/" at position i.
+        if i + 10 < bytes.len()
+            && bytes[i + 1] == b':'
+            && bytes[i + 2] == b'/'
+            && &bytes[i + 3..i + 9] == b"Users/"
+        {
+            // Drive letter + ":/Users/"
+            out.push(bytes[i] as char);
+            out.push_str(":/Users/");
+            i += 9;
+            // Skip until the next '/' (the username segment).
+            let name_start = i;
+            while i < bytes.len() && bytes[i] != b'/' {
+                i += 1;
+            }
+            if i > name_start {
+                out.push_str("<user>");
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 impl RollingLogger {
     fn open(process: &str, directory: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(directory)?;
@@ -101,6 +171,7 @@ impl RollingLogger {
         &mut self,
         level: &str,
         event: &str,
+        detail: Option<&str>,
         elapsed_ms: Option<u128>,
         generation: Option<u64>,
     ) -> std::io::Result<()> {
@@ -111,13 +182,24 @@ impl RollingLogger {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_millis())
             .unwrap_or(0);
-        let record = serde_json::json!({
-            "timestamp_ms": timestamp_ms,
-            "level": level,
-            "event": event,
-            "elapsed_ms": elapsed_ms,
-            "generation": generation,
-        });
+        let record = if let Some(detail) = detail {
+            serde_json::json!({
+                "timestamp_ms": timestamp_ms,
+                "level": level,
+                "event": event,
+                "detail": detail,
+                "elapsed_ms": elapsed_ms,
+                "generation": generation,
+            })
+        } else {
+            serde_json::json!({
+                "timestamp_ms": timestamp_ms,
+                "level": level,
+                "event": event,
+                "elapsed_ms": elapsed_ms,
+                "generation": generation,
+            })
+        };
         serde_json::to_writer(&mut self.file, &record)?;
         self.file.write_all(b"\n")?;
         self.file.flush()
@@ -156,7 +238,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut logger = RollingLogger::open("broker", &dir).unwrap();
         logger
-            .write("info", "search_complete", Some(12), Some(3))
+            .write("info", "search_complete", None, Some(12), Some(3))
             .unwrap();
         let text = std::fs::read_to_string(dir.join("broker.jsonl")).unwrap();
         assert!(text.contains("search_complete"));
@@ -204,6 +286,90 @@ mod tests {
         let mut logger = RollingLogger::open("broker", &dir).unwrap();
         std::fs::create_dir(dir.join("broker.jsonl.1")).unwrap();
         assert!(logger.rotate().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_redacts_username() {
+        let result = sanitize(r"C:\Users\jia\Documents\file.txt");
+        assert!(
+            result.contains("<user>"),
+            "username should be redacted: {result}"
+        );
+        assert!(
+            !result.contains("jia"),
+            "original username must not appear: {result}"
+        );
+        assert!(
+            result.contains("Documents/file.txt"),
+            "rest of path should be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_programdata() {
+        let result = sanitize(r"C:\ProgramData\Prism\index-v5.bin");
+        assert!(
+            result.contains("ProgramData/Prism"),
+            "ProgramData path should not be redacted: {result}"
+        );
+        assert!(
+            !result.contains("<user>"),
+            "no <user> placeholder expected: {result}"
+        );
+    }
+
+    #[test]
+    fn sanitize_handles_multiple_drive_letters() {
+        let result = sanitize(r"D:\Users\bob\file.txt E:\Users\alice\other.txt");
+        assert!(result.contains("<user>"), "{result}");
+        assert!(!result.contains("bob"), "{result}");
+        assert!(!result.contains("alice"), "{result}");
+    }
+
+    #[test]
+    fn event_detail_writes_readable_text() {
+        let dir =
+            std::env::temp_dir().join(format!("prism-log-detail-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init("test_detail", &dir);
+        event_detail(
+            "error",
+            "rebuild_save_failed",
+            "replace cache: Access is denied. (0x80070005)",
+            None,
+            None,
+        );
+        let text = std::fs::read_to_string(dir.join("test_detail.jsonl")).unwrap();
+        assert!(
+            text.contains("rebuild_save_failed"),
+            "event name should be present: {text}"
+        );
+        assert!(
+            text.contains("Access is denied"),
+            "detail text should be readable: {text}"
+        );
+        assert!(
+            text.contains("\"detail\""),
+            "detail field should be a JSON key: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_without_detail_has_no_detail_field() {
+        let dir =
+            std::env::temp_dir().join(format!("prism-log-no-detail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init("test_no_detail", &dir);
+        event("info", "search_complete", Some(12), Some(3));
+        let text = std::fs::read_to_string(dir.join("test_no_detail.jsonl")).unwrap();
+        assert!(
+            !text.contains("\"detail\""),
+            "no detail field when event() is used: {text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

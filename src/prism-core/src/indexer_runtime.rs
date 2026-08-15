@@ -20,6 +20,7 @@ use crate::ntfs::{self, VolumeDescriptor};
 use crate::pinyin_sidecar::{LoadErrorKind, PinyinSidecar};
 use crate::root_scope::RootScope;
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
+use crate::logging;
 
 pub struct Shutdown {
     requested: AtomicBool,
@@ -691,26 +692,35 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
         tokio::select! {
             _ = stop.cancelled() => break,
             result = &mut pipe_task => {
-                return match result {
-                    Ok(Ok(())) => Err("indexer pipe server stopped unexpectedly".into()),
-                    Ok(Err(error)) => Err(format!("indexer pipe server: {error}")),
-                    Err(error) => Err(format!("indexer pipe task: {error}")),
+                let error = match result {
+                    Ok(Ok(())) => "indexer pipe server stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("indexer pipe server: {error}"),
+                    Err(error) => format!("indexer pipe task: {error}"),
                 };
+                logging::event_detail("error", "pipe_server_exit", &error, None, None);
+                return Err(error);
             }
             reason = rebuild_rx.recv() => {
                 let Some(reason) = reason else { break };
                 epoch.fetch_add(1, Ordering::AcqRel);
                 state.building.store(true, Ordering::Release);
+                logging::event_detail("info", "rebuild_requested", &reason, None, None);
                 log(format!("serialized index rebuild requested: {reason}"));
                 while rebuild_rx.try_recv().is_ok() {}
                 let rebuilt = tokio::task::spawn_blocking(build_all).await
                     .map_err(|error| format!("rebuild task: {error}"))?;
                 match rebuilt {
                     Ok((index, descriptors)) => {
-                        index_cache::save(&index, &data_dir)?;
+                        if let Err(error) = index_cache::save(&index, &data_dir) {
+                            logging::event_detail("error", "rebuild_save_failed", &error, None, None);
+                            return Err(error);
+                        }
                         state.set_pinyin_status(PinyinStatus::Building);
                         state.publish(index);
-                        rebuild_pinyin_from_live(state.clone()).await?;
+                        if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
+                            logging::event_detail("error", "rebuild_pinyin_failed", &error, None, None);
+                            return Err(error);
+                        }
                         start_watchers(state.clone(), descriptors, stop.clone(), epoch.clone(), rebuild_tx.clone());
                         last_checkpoint = Instant::now();
                     }
@@ -721,13 +731,19 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 if state.pinyin_needs_rebuild.swap(false, Ordering::AcqRel)
                     && state.pinyin_status() != PinyinStatus::Disabled
                 {
-                    rebuild_pinyin_from_live(state.clone()).await?;
+                    if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
+                        logging::event_detail("error", "maintenance_pinyin_failed", &error, None, None);
+                        return Err(error);
+                    }
                 }
                 let checkpoint_due = state.index.read().ok().and_then(|guard| {
                     guard.as_ref().map(|index| index.events_since_checkpoint >= 100_000)
                 }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(60 * 60);
                 if checkpoint_due {
-                    checkpoint_async(state.clone(), data_dir.clone()).await?;
+                    if let Err(error) = checkpoint_async(state.clone(), data_dir.clone()).await {
+                        logging::event_detail("error", "maintenance_checkpoint_failed", &error, None, None);
+                        return Err(error);
+                    }
                     last_checkpoint = Instant::now();
                 }
             }
@@ -1166,7 +1182,10 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
         guard.as_ref().cloned().ok_or("index is not ready")?
     };
-    index_cache::save(&snapshot, data_dir)?;
+    if let Err(error) = index_cache::save(&snapshot, data_dir) {
+        logging::event_detail("error", "checkpoint_save_failed", &error, None, None);
+        return Err(error);
+    }
     if state.pinyin_status() != PinyinStatus::Disabled {
         // Rebuild from the live tree under its read lock. A clone taken for the v5
         // checkpoint can be one USN batch behind by the time the sidecar is installed.
