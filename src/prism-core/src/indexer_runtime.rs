@@ -1096,6 +1096,7 @@ fn watch_volume(
     watcher_epoch: u64,
 ) -> Result<(), String> {
     let handle = ntfs::open_volume(descriptor, false)?;
+    let mut output = Vec::with_capacity(ntfs::USN_READ_CHUNK);
     while !stop.is_requested() && epoch.load(Ordering::Acquire) == watcher_epoch {
         let (journal_id, start_usn) = {
             let guard = service.index.read().map_err(|_| "index lock is poisoned")?;
@@ -1114,7 +1115,8 @@ fn watch_volume(
         if journal.journal_id != journal_id || start_usn < journal.first_usn {
             return Err("USN checkpoint expired or journal id changed".into());
         }
-        let (next_usn, records) = ntfs::read_changes(&handle, journal_id, start_usn, true)?;
+        let (next_usn, records) =
+            ntfs::read_changes(&handle, journal_id, start_usn, true, &mut output)?;
         if stop.is_requested() || epoch.load(Ordering::Acquire) != watcher_epoch {
             return Ok(());
         }

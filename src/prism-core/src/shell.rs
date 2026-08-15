@@ -485,6 +485,13 @@ fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, Shel
 
     let success = unsafe { ShellExecuteExW(&mut info) };
     if success.is_ok() {
+        // SEE_MASK_NOCLOSEPROCESS 让系统把进程句柄交给我们，必须还回去；
+        // 句柄本身无人使用，只关不读。
+        if !info.hProcess.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+            }
+        }
         Ok(ShellOutcome::Success)
     } else {
         // ShellExecuteExW 的错误通过 GetLastError 获取，不像旧 ShellExecuteW 返回 code。

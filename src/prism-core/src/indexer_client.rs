@@ -131,6 +131,17 @@ fn connection_lock() -> &'static Mutex<Option<PersistentConnection>> {
     INDEXER_CONNECTION.get_or_init(|| Mutex::new(None))
 }
 
+/// Ceiling on waiting for the process-wide connection mutex: each in-flight
+/// exchange is capped by `REQUEST_BUDGET`, so exceeding this means the queue
+/// is wedged — fail fast instead of piling more waiters on.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Total budget for one search sequence (connect + handshake + search + retry).
+/// A live-but-unresponsive indexer service must never pin the connection
+/// mutex forever. Generous against normal exchanges (milliseconds) plus the
+/// indexer's worst-case write-lock stall during name-pool compaction (seconds).
+const REQUEST_BUDGET: Duration = Duration::from_secs(8);
+
 /// Connect to the indexer pipe, retrying a few times to ride out the
 /// microsecond gap where the server is re-arming a listener slot.
 async fn connect_pipe(pipe_name: &str) -> Result<NamedPipeClient, String> {
@@ -165,6 +176,10 @@ async fn handshake(conn: &mut PersistentConnection) -> Result<(), String> {
 ///
 /// If the connection is missing or the exchange fails at the transport level,
 /// a fresh connection is created and the search is retried once.
+///
+/// Both the lock wait and the whole in-lock sequence are time-bounded: a hung
+/// indexer must degrade this one request into an error, never block every
+/// subsequent search behind the process-wide mutex.
 async fn search_via_persistent(
     query: &str,
     max: usize,
@@ -173,30 +188,44 @@ async fn search_via_persistent(
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
     let guard = connection_lock();
-    let mut conn = guard.lock().await;
+    let mut conn = tokio::time::timeout(LOCK_WAIT, guard.lock())
+        .await
+        .map_err(|_| SearchFailure::from("indexer connection is busy".to_string()))?;
 
-    // Lazy connect + handshake on first use, or after a prior drop.
-    let needs_reconnect = conn.is_none();
-    if needs_reconnect {
-        let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
-        handshake(&mut new_conn).await?;
-        *conn = Some(new_conn);
-    }
-
-    // First attempt on the (possibly fresh) connection.
-    match search_on_connection(conn.as_mut().unwrap(), query, max, filters, pinyin_enabled, root).await {
-        Ok(reply) => Ok(reply),
-        // Transport-level failure: drop the connection, reconnect, retry once.
-        Err(failure) if failure.root_rejection.is_none() => {
-            *conn = None; // drop the broken connection
+    let request = async {
+        // Lazy connect + handshake on first use, or after a prior drop.
+        let needs_reconnect = conn.is_none();
+        if needs_reconnect {
             let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
             handshake(&mut new_conn).await?;
-            let reply = search_on_connection(&mut new_conn, query, max, filters, pinyin_enabled, root).await?;
             *conn = Some(new_conn);
-            Ok(reply)
         }
-        // Root rejection is a semantic response, not a transport error — propagate as-is.
-        Err(failure) => Err(failure),
+
+        // First attempt on the (possibly fresh) connection.
+        match search_on_connection(conn.as_mut().unwrap(), query, max, filters, pinyin_enabled, root).await {
+            Ok(reply) => Ok(reply),
+            // Transport-level failure: drop the connection, reconnect, retry once.
+            Err(failure) if failure.root_rejection.is_none() => {
+                *conn = None; // drop the broken connection
+                let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
+                handshake(&mut new_conn).await?;
+                let reply = search_on_connection(&mut new_conn, query, max, filters, pinyin_enabled, root).await?;
+                *conn = Some(new_conn);
+                Ok(reply)
+            }
+            // Root rejection is a semantic response, not a transport error — propagate as-is.
+            Err(failure) => Err(failure),
+        }
+    };
+
+    match tokio::time::timeout(REQUEST_BUDGET, request).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // Cancelled mid-exchange: the connection may sit on a half-read
+            // response line — it must never be reused.
+            *conn = None;
+            Err(SearchFailure::from("indexer request timed out".to_string()))
+        }
     }
 }
 

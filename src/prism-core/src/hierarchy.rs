@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 pub const FLAG_PRESENT: u16 = 0x0001;
 pub const FLAG_DIRECTORY: u16 = 0x0002;
 pub const FLAG_EXCLUDED: u16 = 0x0004;
-const MAX_RECORD_NUMBER: usize = 2_000_000;
+/// 槽表按 MFT 记录号预分配（12 字节/槽，resize 全量落实）。
+/// 上限 2M 会拒绝现代系统盘（2~8M 记录很常见），且 build 失败会让整个索引
+/// 服务退出。16M ≈ 192MB 槽表上限，实际按卷真实记录数落实；病态稀疏卷
+/// 仍由 prepare_initial_capacity 的 32× 密度检查拦截。
+const MAX_RECORD_NUMBER: usize = 16_777_216;
 const MAX_PATH_DEPTH: usize = 64;
 const NO_NAME: u32 = u32::MAX;
 
@@ -1049,6 +1053,16 @@ mod tests {
         volume.prepare_initial_capacity(70_000, 3_000).unwrap();
         assert_eq!(volume.nodes.len(), 70_001);
         assert!(volume.prepare_initial_capacity(100_000, 1).is_err());
+    }
+
+    #[test]
+    fn initial_capacity_supports_large_modern_volumes_up_to_the_cap() {
+        // 现代系统盘常见 2~8M 条 MFT 记录：3M 记录 + 足量活跃文件必须可索引。
+        let mut volume = volume();
+        volume.prepare_initial_capacity(3_000_000, 150_000).unwrap();
+        assert_eq!(volume.nodes.len(), 3_000_001);
+        // 超过 16,777,216 上限仍拒绝（内存护栏）。
+        assert!(volume.prepare_initial_capacity(16_777_216, 16_777_216).is_err());
     }
 
     #[test]

@@ -54,8 +54,6 @@ struct SidecarDisk {
 pub struct PinyinSidecar {
     disk: SidecarDisk,
     delta: BTreeMap<RecordKey, Option<Vec<u8>>>,
-    #[cfg(windows)]
-    mapping: Option<MappedFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,8 +231,6 @@ impl PinyinSidecar {
         Ok(Self {
             disk,
             delta: BTreeMap::new(),
-            #[cfg(windows)]
-            mapping: None,
         })
     }
 
@@ -258,11 +254,11 @@ impl PinyinSidecar {
             message: error.to_string(),
         })?;
         validate_disk(&disk, index)?;
+        // 反序列化完成后 mapping 立即随本地变量 drop：mmap 与堆拷贝双份常驻
+        // 等于白占一份内存（大卷可达百 MB），而这里的字节此后再无读取。
         Ok(Self {
             disk,
             delta: BTreeMap::new(),
-            #[cfg(windows)]
-            mapping: Some(mapping),
         })
     }
 
@@ -292,22 +288,14 @@ impl PinyinSidecar {
     }
 
     pub fn resident_bytes(&self) -> usize {
-        let heap = self.disk.records.capacity() * std::mem::size_of::<SidecarRecord>()
+        self.disk.records.capacity() * std::mem::size_of::<SidecarRecord>()
             + self.disk.payload.capacity()
             + self
                 .delta
                 .values()
                 .filter_map(Option::as_ref)
                 .map(Vec::capacity)
-                .sum::<usize>();
-        #[cfg(windows)]
-        {
-            heap + self.mapping.as_ref().map(MappedFile::len).unwrap_or(0)
-        }
-        #[cfg(not(windows))]
-        {
-            heap
-        }
+                .sum::<usize>()
     }
 
     pub fn apply_delta(
@@ -757,10 +745,6 @@ impl MappedFile {
     fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.view.Value.cast::<u8>(), self.len) }
     }
-
-    fn len(&self) -> usize {
-        self.len
-    }
 }
 
 #[cfg(windows)]
@@ -881,8 +865,6 @@ mod tests {
         sidecar.save(&dir).unwrap();
         let loaded = PinyinSidecar::load(&dir, &index).unwrap();
         assert_eq!(loaded.disk.records.len(), 2);
-        #[cfg(windows)]
-        assert!(loaded.mapping.is_some());
         drop(loaded);
 
         let mut different = index.clone();

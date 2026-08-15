@@ -463,24 +463,30 @@ mod platform {
         Ok(volume)
     }
 
+    /// USN 读取缓冲大小。监听循环跨调用复用一块缓冲，
+    /// 不再每毫秒分配并清零 256 KiB（空闲卷曾以此速率空转）。
+    pub const USN_READ_CHUNK: usize = 256 * 1024;
+
     pub fn read_changes(
         handle: &VolumeHandle,
         journal_id: u64,
         start_usn: i64,
         wait: bool,
+        output: &mut Vec<u8>,
     ) -> Result<(i64, Vec<UsnRecord>), String> {
         let input = READ_USN_JOURNAL_DATA_V0 {
             StartUsn: start_usn,
             ReasonMask: WATCH_REASON_MASK,
             ReturnOnlyOnClose: 0,
-            Timeout: if wait { 1 } else { 0 },
+            // 空闲时在内核里阻塞等待而不是 1ms 超时轮询：有变更立即返回，
+            // 停止/重建标志最坏 250ms 内被看到（服务关停预算 2s，余量充足）。
+            Timeout: if wait { 250 } else { 0 },
             BytesToWaitFor: if wait { 1 } else { 0 },
             UsnJournalID: journal_id,
         };
-        let mut output = vec![0u8; 256 * 1024];
-        let bytes = ioctl_buffer(handle.0, FSCTL_READ_USN_JOURNAL, &input, &mut output)?;
-        output.truncate(bytes);
-        parse_usn_buffer(&output)
+        output.resize(USN_READ_CHUNK, 0);
+        let bytes = ioctl_buffer(handle.0, FSCTL_READ_USN_JOURNAL, &input, output)?;
+        parse_usn_buffer(&output[..bytes])
     }
 
     fn replay_until(
@@ -491,10 +497,12 @@ mod platform {
     ) -> Result<(), String> {
         let mut cursor = volume.next_usn;
         let mut replay = Vec::new();
+        let mut output = Vec::with_capacity(USN_READ_CHUNK);
         while cursor < high_water {
             ensure_build_continues(should_cancel)?;
             let before = cursor;
-            let (next, mut records) = read_changes(handle, volume.journal_id, before, false)?;
+            let (next, mut records) =
+                read_changes(handle, volume.journal_id, before, false, &mut output)?;
             if next <= before {
                 return Err("USN replay cursor did not advance".into());
             }
