@@ -11,7 +11,7 @@
 //! 第九步：actions / run_action 接基础动作（打开所在文件夹/复制/剪切/复制路径）。
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -143,7 +143,9 @@ pub enum Request {
     ///
     /// 分成 resolve/record 两步是有意的：激活必须由前台进程（WPF）完成，broker 只能
     /// 在这里做第一次复核；只有 WPF 回报成功后才允许写成功历史。
-    ResolveWindow { target: ActionTarget },
+    ResolveWindow {
+        target: ActionTarget,
+    },
     /// G5：WPF 激活成功后回报，broker 据此写窗口历史。失败路径不发本消息。
     RecordWindowSwitch {
         target: ActionTarget,
@@ -312,8 +314,29 @@ pub struct ActionArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_name: Option<String>,
 }
+/// 并发 armed 的管道 listener 数（对齐 indexer 侧 `indexer_runtime::PIPE_LISTENERS`）。
+/// 单 listener 在 `connect()` 返回到下一次 `create()` 之间存在不可避免的空窗，
+/// 空窗内到达的客户端拿到 ERROR_PIPE_BUSY；多个 listener 互为备份。前端即将引入
+/// 第二条长连接（动作通道，审计 C1），同样依赖多 listener 消除建连竞争。
+const PIPE_LISTENERS: usize = 4;
+
+/// serve 的共享状态束：accept_loop 与连接任务都需要整组句柄，
+/// 打包避免超长参数列表。
+struct BrokerShared {
+    apps: SharedApps,
+    engines: SharedEngines,
+    shell: Arc<ShellExecutor>,
+    history: Arc<HistoryStore>,
+    preferences: Arc<BrokerPreferences>,
+    windows: Arc<crate::window_list::WindowSnapshotStore>,
+}
+
 /// 管道服务主循环：创建管道实例 → 等待前端连接 → 交给连接处理器 →
 /// 立刻建下一个实例等待重连。前端崩溃/重启不影响后端。
+///
+/// 实例重建失败不再让进程退出（审计 H3：此前任何一次 `create` 失败都会令
+/// `serve` 上抛 → main 退出，活动连接全断），改为退避重试；仅当确认管道名被
+/// 第三方进程抢注（名下已无任何实例仍被占用）时才视为致命。
 pub async fn serve(
     pipe_name: &str,
     apps: SharedApps,
@@ -322,43 +345,174 @@ pub async fn serve(
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
 ) -> std::io::Result<()> {
-    // first_pipe_instance 默认 true，确保本进程是该管道名的首个持有者。
-    let mut server = ServerOptions::new()
+    // 首个实例带 first_pipe_instance(true)：创建失败说明管道名已被另一个 broker
+    // 持有（真双实例），唯一正确动作是退出并让 main 上报。
+    let first = ServerOptions::new()
         .first_pipe_instance(true)
         .create(pipe_name)?;
 
     // One snapshot store for the whole broker: window tokens must stay comparable across
     // reconnects, and it holds only the latest enumeration.
-    let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+    let shared = Arc::new(BrokerShared {
+        apps,
+        engines,
+        shell,
+        history,
+        preferences,
+        windows: Arc::new(crate::window_list::WindowSnapshotStore::new()),
+    });
 
+    let ownership = Arc::new(PipeOwnership::new());
+    ownership.instances.fetch_add(1, Ordering::Relaxed);
+
+    let mut listeners = tokio::task::JoinSet::new();
+    listeners.spawn(accept_loop(
+        pipe_name.to_owned(),
+        first,
+        shared.clone(),
+        ownership.clone(),
+    ));
+    // 其余 listener 在启动期一次性补齐：失败不致命（该槽位缺席时其余 listener
+    // 照常服务，最坏退化为单 listener，与修复前行为一致）。
+    for _ in 1..PIPE_LISTENERS {
+        match ServerOptions::new().create(pipe_name) {
+            Ok(pipe) => {
+                ownership.instances.fetch_add(1, Ordering::Relaxed);
+                listeners.spawn(accept_loop(
+                    pipe_name.to_owned(),
+                    pipe,
+                    shared.clone(),
+                    ownership.clone(),
+                ));
+            }
+            Err(error) => {
+                log(format!(
+                    "额外管道 listener 创建失败，降级为更少并发槽位：{error}"
+                ));
+            }
+        }
+    }
+
+    // 任一 accept 循环退出 = 无法保证仍有 armed listener，整体上抛（对齐 indexer 语义）。
+    let first_result = listeners.join_next().await;
+    listeners.abort_all();
+    match first_result {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(std::io::Error::other(format!(
+            "broker pipe listener task: {error}"
+        ))),
+        None => Err(std::io::Error::other(
+            "no broker pipe listeners were started",
+        )),
+    }
+}
+
+/// 本进程对管道名的持有状态：名下实例数（armed listener + 已连接实例）与
+/// 抢注探测的互斥锁。
+struct PipeOwnership {
+    instances: AtomicUsize,
+    probe_lock: tokio::sync::Mutex<()>,
+}
+
+impl PipeOwnership {
+    fn new() -> Self {
+        Self {
+            instances: AtomicUsize::new(0),
+            probe_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
+/// 单个 listener 的 accept 循环：等待客户端 → 交给连接任务 → 立刻重建本槽位。
+async fn accept_loop(
+    pipe_name: String,
+    mut server: NamedPipeServer,
+    shared: Arc<BrokerShared>,
+    ownership: Arc<PipeOwnership>,
+) -> std::io::Result<()> {
     loop {
-        // 等待一个客户端连上当前实例。
-        server.connect().await?;
-        // 立刻为下一个客户端准备好新实例，再处理当前连接。
+        if let Err(error) = server.connect().await {
+            // armed 实例被本错误路径丢弃，计数必须同步减掉，否则抢注探测永远看不到 0。
+            ownership.instances.fetch_sub(1, Ordering::Relaxed);
+            return Err(error);
+        }
         let connected = server;
-        server = ServerOptions::new().create(pipe_name)?;
+        // 实例从 armed 转为 connected，仍归本进程持有，计数不变；
+        // 连接任务结束时由其减 1。
+        server = rearm_listener(&pipe_name, &ownership).await?;
 
-        let apps = apps.clone();
-        let engines = engines.clone();
-        let shell = shell.clone();
-        let history = history.clone();
-        let preferences = preferences.clone();
-        let windows = windows.clone();
+        let shared = shared.clone();
+        let ownership = ownership.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                connected,
+            let BrokerShared {
                 apps,
                 engines,
                 shell,
                 history,
                 preferences,
                 windows,
+            } = &*shared;
+            let result = handle_connection(
+                connected,
+                apps.clone(),
+                engines.clone(),
+                shell.clone(),
+                history.clone(),
+                preferences.clone(),
+                windows.clone(),
             )
-            .await
-            {
+            .await;
+            ownership.instances.fetch_sub(1, Ordering::Relaxed);
+            if let Err(e) = result {
                 log(format!("连接处理结束：{e}"));
             }
         });
+    }
+}
+
+/// 重建本槽位的 listener（审计 H3）。普通失败按退避无限重试；仅当名下实例数
+/// 归零（本进程不再持有任何管道实例）时，用 `first_pipe_instance(true)` 探测
+/// 管道名归属：探测成功说明无人占用，顺带恢复首实例身份；仍被占用则只能是
+/// 第三方进程抢注——此时两个 broker 会随机分走客户端连接，必须退出让位。
+///
+/// 探测互斥：多个槽位同时进入零持有窗口时，串行探测避免 A 槽刚建好的实例
+/// 让 B 槽的探测误判成抢注。
+async fn rearm_listener(
+    pipe_name: &str,
+    ownership: &PipeOwnership,
+) -> std::io::Result<NamedPipeServer> {
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        if ownership.instances.load(Ordering::Relaxed) == 0 {
+            let _guard = ownership.probe_lock.lock().await;
+            // 拿到锁后复查：等锁期间兄弟槽位可能已经重建了实例。
+            if ownership.instances.load(Ordering::Relaxed) == 0 {
+                return match ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(pipe_name)
+                {
+                    Ok(server) => {
+                        ownership.instances.fetch_add(1, Ordering::Relaxed);
+                        Ok(server)
+                    }
+                    Err(error) => Err(std::io::Error::new(
+                        error.kind(),
+                        format!("broker pipe name taken over by another process: {error}"),
+                    )),
+                };
+            }
+        }
+        match ServerOptions::new().create(pipe_name) {
+            Ok(server) => {
+                ownership.instances.fetch_add(1, Ordering::Relaxed);
+                return Ok(server);
+            }
+            Err(error) => {
+                log(format!("管道 listener 重建失败，{delay:?} 后重试：{error}"));
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
     }
 }
 
@@ -423,6 +577,27 @@ impl<R: tokio::io::AsyncRead + Unpin> BoundedLineReader<R> {
     }
 }
 
+/// 握手（首行）限时（审计 L1 分阶段空闲策略）：客户端连上后正常会立刻发 hello，
+/// 连上不发首行的空连接 10 秒即断开，防止挂死客户端的连接任务常驻。
+/// 已完成握手的连接**不设**空闲超时：前端是全生命期单连接设计，掐空闲会把
+/// 每次击键搜索退化回逐请求建连，重演 ERROR_PIPE_BUSY（教训见 indexer_client.rs 头注）。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 读连接的首行（握手），带限时。超时归一成与行读取相同的 `Err(String)` 语义，
+/// 由调用方按"回错误后断开"处理；超时值作为参数以便单测注入毫秒级时限。
+async fn read_handshake_line<R: tokio::io::AsyncRead + Unpin>(
+    lines: &mut BoundedLineReader<R>,
+    timeout: std::time::Duration,
+) -> Result<Option<String>, String> {
+    match tokio::time::timeout(timeout, lines.next_line()).await {
+        Ok(inner) => inner,
+        Err(_) => Err(format!(
+            "握手超时：连接 {} 秒内未收到首行",
+            timeout.as_secs()
+        )),
+    }
+}
+
 /// 单个连接的收发循环：逐行读入 JSON 请求，分发后逐行写回 JSON 响应。
 async fn handle_connection(
     pipe: NamedPipeServer,
@@ -437,23 +612,34 @@ async fn handle_connection(
     let (reader, mut writer) = tokio::io::split(pipe);
     let mut lines = BoundedLineReader::new(reader);
 
-    while let Some(line) = match lines.next_line().await {
-        Ok(option) => option,
-        Err(message) => {
-            // 超长/损坏的入站行：回一条错误说明后断开连接。
-            let response = Response::Error {
-                message,
-                category: None,
-            };
-            if let Ok(mut buf) = serde_json::to_vec(&response) {
-                buf.push(b'\n');
-                let _ = writer.write_all(&buf).await;
-                let _ = writer.flush().await;
+    let mut first_line = true;
+    loop {
+        let read = if std::mem::take(&mut first_line) {
+            read_handshake_line(&mut lines, HANDSHAKE_TIMEOUT).await
+        } else {
+            lines.next_line().await
+        };
+        let line = match read {
+            Ok(option) => match option {
+                Some(line) => line,
+                None => break, // EOF：客户端断开
+            },
+            Err(message) => {
+                // 超长/损坏的入站行（或握手超时）：回一条错误说明后断开连接。
+                let response = Response::Error {
+                    message,
+                    category: None,
+                };
+                if let Ok(mut buf) = serde_json::to_vec(&response) {
+                    buf.push(b'\n');
+                    let _ = writer.write_all(&buf).await;
+                    let _ = writer.flush().await;
+                }
+                log("入站请求行异常，断开连接");
+                return Ok(());
             }
-            log("入站请求行异常，断开连接");
-            return Ok(());
-        }
-    } {
+        };
+
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -793,9 +979,7 @@ fn parse_query(raw: &str) -> (String, Vec<SearchFilter>) {
         // &raw[pos..end] 在非 char boundary 上切片会 panic。
         let matched = known_prefixes.iter().find_map(|prefix| {
             let end = pos + prefix.len();
-            if end <= bytes.len()
-                && bytes[pos..end].eq_ignore_ascii_case(prefix.as_bytes())
-            {
+            if end <= bytes.len() && bytes[pos..end].eq_ignore_ascii_case(prefix.as_bytes()) {
                 Some(*prefix)
             } else {
                 None
@@ -1030,9 +1214,7 @@ fn process_indexer_reply(
         // Dedup check: borrow the kind/value as owned strings for the HashSet lookup
         // without cloning into a separate ActionTarget first.
         let kind_str = kind.as_str();
-        if injected_history_targets
-            .contains(&(kind_str.to_string(), item.path.clone()))
-        {
+        if injected_history_targets.contains(&(kind_str.to_string(), item.path.clone())) {
             continue;
         }
         // Cross-kind dedup: if a Start Menu app already resolved to this file path
@@ -1206,12 +1388,8 @@ async fn search_service(
     let mut app_match_count = 0u64;
     let mut app_resolved_paths: HashSet<String> = HashSet::new();
     if result_slots > 0 && root.is_none() && !has_filters {
-        let (app_results, count) = collect_app_results(
-            apps,
-            &name_query,
-            history,
-            preferences.pinyin_enabled(),
-        );
+        let (app_results, count) =
+            collect_app_results(apps, &name_query, history, preferences.pinyin_enabled());
         app_match_count = count;
         // Collect resolved target paths so indexer file results pointing to the same
         // .exe can be deduped (e.g. "Wub_x64.lnk" → "Wub_x64.exe").
@@ -1249,7 +1427,14 @@ async fn search_service(
         path_constructions,
         pinyin_status,
     } = match service {
-        Ok(reply) => process_indexer_reply(reply, query, history, &injected_history_targets, &app_resolved_paths, &mut ranked),
+        Ok(reply) => process_indexer_reply(
+            reply,
+            query,
+            history,
+            &injected_history_targets,
+            &app_resolved_paths,
+            &mut ranked,
+        ),
         Err(error) => IndexerReplyFields {
             is_indexing: false,
             index_progress: None,
@@ -1740,10 +1925,12 @@ fn recent_windows(
         ));
     }
     ranked.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.title.to_lowercase().cmp(&right.1.title.to_lowercase()))
+        right.0.cmp(&left.0).then_with(|| {
+            left.1
+                .title
+                .to_lowercase()
+                .cmp(&right.1.title.to_lowercase())
+        })
     });
     ranked.truncate(max);
     ranked.into_iter().map(|(_, result)| result).collect()
@@ -1839,7 +2026,13 @@ async fn run_shell(
         ShellOperation::Reveal(target) => Some((target.clone(), HistoryUse::Reveal)),
         ShellOperation::RunAction { target, .. } => Some((target.clone(), HistoryUse::Execute)),
     };
-    finish_shell_response(shell.execute(operation).await, history_record, history, query_key).await
+    finish_shell_response(
+        shell.execute(operation).await,
+        history_record,
+        history,
+        query_key,
+    )
+    .await
 }
 
 async fn finish_shell_response(
@@ -1989,8 +2182,8 @@ mod window_protocol_tests {
     }
 
     fn history_store(tag: &str) -> Arc<HistoryStore> {
-        let dir = std::env::temp_dir()
-            .join(format!("prism-window-history-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("prism-window-history-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Arc::new(HistoryStore::load(&dir, true))
     }
@@ -2657,8 +2850,7 @@ mod protocol_tests {
             )
             .unwrap();
 
-        let with_root =
-            empty_query_results("", 8, None, Some(root_str.as_str()), &history).await;
+        let with_root = empty_query_results("", 8, None, Some(root_str.as_str()), &history).await;
         match with_root {
             Response::Results { items, .. } => {
                 assert_eq!(items.len(), 1);
@@ -2679,8 +2871,7 @@ mod protocol_tests {
         }
 
         history.set_enabled(false);
-        let disabled =
-            empty_query_results("", 8, None, Some(root_str.as_str()), &history).await;
+        let disabled = empty_query_results("", 8, None, Some(root_str.as_str()), &history).await;
         match disabled {
             Response::Results { items, .. } => assert!(items.is_empty()),
             other => panic!("expected results, got {other:?}"),
@@ -2761,10 +2952,16 @@ mod protocol_tests {
         };
         // "plain" 是精确命中（class 0），"picked" 是子串命中（class 2）：
         // 没有 pick 时 plain 必须在前——先验证基准序。
-        let mut baseline = vec![item(MatchKind::Literal, "plain", 0), item(MatchKind::Literal, "picked", 2)];
+        let mut baseline = vec![
+            item(MatchKind::Literal, "plain", 0),
+            item(MatchKind::Literal, "picked", 2),
+        ];
         sort_search_results(&mut baseline);
         assert_eq!(
-            baseline.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            baseline
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
             ["plain", "picked"],
             "baseline: exact match beats substring without picks"
         );
@@ -2777,7 +2974,10 @@ mod protocol_tests {
         let picks = vec![false, true, true];
         sort_search_results_with_picks(&mut items, Some(&picks));
         assert_eq!(
-            items.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
             ["picked", "plain", "pinyin"],
             "picked literal ranks first; picked pinyin must not cross the kind tier"
         );
@@ -2808,7 +3008,10 @@ mod protocol_tests {
         ];
         sort_search_results(&mut items);
         assert_eq!(
-            items.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
             ["exact", "substring", "pinyin"]
         );
     }
@@ -2863,10 +3066,9 @@ mod protocol_tests {
     /// 三种形态都必须解码——旧前端永远不发这个字段。
     #[test]
     fn action_query_field_is_optional_and_backward_compatible() {
-        let legacy: Request = serde_json::from_str(
-            r#"{"type":"execute","target":{"kind":"file","value":"C:\\a"}}"#,
-        )
-        .unwrap();
+        let legacy: Request =
+            serde_json::from_str(r#"{"type":"execute","target":{"kind":"file","value":"C:\\a"}}"#)
+                .unwrap();
         match legacy {
             Request::Execute { query, .. } => assert_eq!(query, None),
             other => panic!("unexpected request: {other:?}"),
@@ -2919,10 +3121,8 @@ mod protocol_tests {
     /// 查询键缺失（旧前端）时只记 frecency。
     #[tokio::test]
     async fn successful_action_with_query_records_pick_memory() {
-        let dir = std::env::temp_dir().join(format!(
-            "prism-ipc-history-pick-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("prism-ipc-history-pick-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let history = Arc::new(HistoryStore::load(&dir, true));
         let target = ActionTarget::new(TargetKind::File, r"C:\pick.txt");
@@ -3276,5 +3476,95 @@ mod query_parser_tests {
         // 纯中文多词
         let (name, _) = parse_query("知乎日报");
         assert_eq!(name, "知乎日报");
+    }
+}
+
+/// 审计批次 2：H3 管道实例重建策略 + L1 握手限时。
+#[cfg(test)]
+mod pipe_lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    fn temp_pipe(tag: &str) -> String {
+        format!(r"\\.\pipe\prism-broker-test-{tag}-{}", std::process::id())
+    }
+
+    /// H3：名下无实例 + 管道名被别的持有者占用 → 必须判定为抢注并返回 Err，
+    /// 而不是无限重试（两个 broker 并存会随机分走客户端连接）。
+    #[tokio::test]
+    async fn rearm_detects_foreign_takeover_when_we_hold_nothing() {
+        let name = temp_pipe("takeover");
+        // 模拟第三方持有者：管道名上已存在首实例。
+        let _foreign = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+
+        let ownership = PipeOwnership::new();
+        let result = rearm_listener(&name, &ownership).await;
+        assert!(result.is_err(), "名下无实例仍被占用必须是抢注错误");
+        assert_eq!(ownership.instances.load(Ordering::Relaxed), 0);
+    }
+
+    /// H3：名下无实例 + 管道名无人占用 → 探测成功，直接以首实例身份恢复服务。
+    #[tokio::test]
+    async fn rearm_adopts_first_instance_when_name_is_free() {
+        let name = temp_pipe("free");
+        let ownership = PipeOwnership::new();
+
+        let server = rearm_listener(&name, &ownership).await.unwrap();
+        assert_eq!(ownership.instances.load(Ordering::Relaxed), 1);
+        drop(server);
+    }
+
+    /// H3：名下仍有自己的实例（正常状态）→ 走普通重建，与自己实例并存，不误判抢注。
+    #[tokio::test]
+    async fn rearm_plain_creates_alongside_own_instances() {
+        let name = temp_pipe("own");
+        let ownership = PipeOwnership::new();
+        let _own = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        ownership.instances.store(1, Ordering::Relaxed);
+
+        let server = rearm_listener(&name, &ownership).await.unwrap();
+        assert_eq!(ownership.instances.load(Ordering::Relaxed), 2);
+        drop(server);
+    }
+
+    /// L1：客户端连上后不发首行 → 握手读超时（Err 而非永久挂起）。
+    #[tokio::test]
+    async fn silent_client_times_out_of_handshake() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut lines = BoundedLineReader::new(server);
+        let result = read_handshake_line(&mut lines, Duration::from_millis(50)).await;
+        assert!(result.is_err(), "静默客户端必须在握手限时内被拒");
+        let _ = client.shutdown().await;
+    }
+
+    /// L1：客户端立刻发首行 → 握手读原样返回行内容，不受限时影响。
+    #[tokio::test]
+    async fn prompt_client_passes_handshake() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"{\"type\":\"hello\"}\n").await.unwrap();
+        client.flush().await.unwrap();
+        let mut lines = BoundedLineReader::new(server);
+        let line = read_handshake_line(&mut lines, Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "{\"type\":\"hello\"}");
+    }
+
+    /// L1：握手前先到 EOF（客户端秒断）→ 返回 None 而不是等满限时。
+    #[tokio::test]
+    async fn early_eof_returns_none_without_waiting() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+        let mut lines = BoundedLineReader::new(server);
+        let result = read_handshake_line(&mut lines, Duration::from_secs(10)).await;
+        assert_eq!(result, Ok(None));
     }
 }

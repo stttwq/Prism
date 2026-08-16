@@ -16,11 +16,11 @@ use crate::indexer_ipc::{
     requested_root, validate_search_request, BuildProgress, IndexerItem, IndexerRequest,
     IndexerResponse, IndexerStatus, PinyinStatus, SearchFilter,
 };
+use crate::logging;
 use crate::ntfs::{self, VolumeDescriptor};
 use crate::pinyin_sidecar::{LoadErrorKind, PinyinSidecar};
 use crate::root_scope::RootScope;
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
-use crate::logging;
 
 pub struct Shutdown {
     requested: AtomicBool,
@@ -547,13 +547,8 @@ impl ServiceState {
             crate::indexer_ipc::ext_filters(filters),
             crate::indexer_ipc::path_filters(filters),
         );
-        let outcome = state.search_in_root_filtered(
-            query,
-            max,
-            &exclusions,
-            root_bound,
-            &query_filters,
-        );
+        let outcome =
+            state.search_in_root_filtered(query, max, &exclusions, root_bound, &query_filters);
         let mut items: Vec<_> = outcome
             .items
             .into_iter()
@@ -946,7 +941,13 @@ async fn acquire_initial_index(
             failed_volumes.len(),
             failed_volumes.join("; ")
         );
-        logging::event_detail("error", "initial_build_skipped_volumes", &message, None, None);
+        logging::event_detail(
+            "error",
+            "initial_build_skipped_volumes",
+            &message,
+            None,
+            None,
+        );
         state.set_error(message);
     }
     Ok(InitialIndex {
@@ -1412,6 +1413,27 @@ fn create_pipe(first: bool) -> std::io::Result<NamedPipeServer> {
     result
 }
 
+/// 握手（hello 行）限时（审计 L1 分阶段空闲策略）：连上不发 hello 的客户端
+/// 10 秒即断开，防止挂死客户端任务常驻。已握手连接不设空闲超时——broker 侧是
+/// 全生命期单连接设计（见 indexer_client.rs 头注），掐空闲会重演 ERROR_PIPE_BUSY。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 读 hello 行，带限时。EOF/超时都归一为 `Err(String)`；超时值作参数以便单测注入毫秒级时限。
+async fn read_hello_line<R: tokio::io::AsyncRead + Unpin>(
+    lines: &mut crate::ipc::BoundedLineReader<R>,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    match tokio::time::timeout(timeout, lines.next_line()).await {
+        Ok(Ok(Some(line))) => Ok(line),
+        Ok(Ok(None)) => Err("client closed before hello".into()),
+        Ok(Err(message)) => Err(message),
+        Err(_) => Err(format!(
+            "handshake timeout: no hello within {}s",
+            timeout.as_secs()
+        )),
+    }
+}
+
 pub(crate) async fn handle_connection(
     pipe: NamedPipeServer,
     state: Arc<ServiceState>,
@@ -1419,10 +1441,7 @@ pub(crate) async fn handle_connection(
     let (reader, mut writer) = tokio::io::split(pipe);
     // 有界逐行读（1MB 上限）：无上限的 lines() 会让任意本地进程灌超长行撑爆内存。
     let mut lines = crate::ipc::BoundedLineReader::new(reader);
-    let hello = lines
-        .next_line()
-        .await?
-        .ok_or("client closed before hello")?;
+    let hello = read_hello_line(&mut lines, HANDSHAKE_TIMEOUT).await?;
     match serde_json::from_str::<IndexerRequest>(&hello) {
         Ok(IndexerRequest::Hello { protocol }) if protocol == INDEXER_PROTOCOL => {
             write_response(&mut writer, &IndexerResponse::Hello { protocol }).await?;
@@ -2024,5 +2043,47 @@ mod tests {
                 other => panic!("expected RootUnavailable for {root}, got {other:?}"),
             }
         }
+    }
+
+    /// 审计批次 2 L1：连上不发 hello 的客户端必须在限时内被拒，而不是常驻挂死任务。
+    #[tokio::test]
+    async fn silent_client_times_out_of_hello() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut lines = crate::ipc::BoundedLineReader::new(server);
+        let error = read_hello_line(&mut lines, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(error.contains("handshake timeout"), "got: {error}");
+        let _ = client.shutdown().await;
+    }
+
+    /// 审计批次 2 L1：客户端先断开（EOF 先于限时）→ 立即报 closed，不空等。
+    #[tokio::test]
+    async fn early_eof_before_hello_reports_closure_immediately() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+        let mut lines = crate::ipc::BoundedLineReader::new(server);
+        let error = read_hello_line(&mut lines, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "client closed before hello");
+    }
+
+    /// 审计批次 2 L1：及时发 hello 的客户端正常通过握手读。
+    #[tokio::test]
+    async fn prompt_client_passes_hello() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client
+            .write_all(
+                format!("{{\"type\":\"Hello\",\"protocol\":{INDEXER_PROTOCOL}}}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let mut lines = crate::ipc::BoundedLineReader::new(server);
+        let hello = read_hello_line(&mut lines, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(hello.contains("Hello"));
     }
 }
