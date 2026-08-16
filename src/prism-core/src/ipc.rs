@@ -633,6 +633,9 @@ async fn dispatch_non_search(
         }
         Request::RecordWindowSwitch { target, query } => {
             let windows_for_blocking = windows.clone();
+            // `Response` 体积大（228B），闭包返回 Result<_, Response> 触发
+            // result_large_err——与 record_window_switch 函数本体同款豁免。
+            #[allow(clippy::result_large_err)]
             let resolved = tokio::task::spawn_blocking(move || {
                 record_window_switch(
                     &target,
@@ -656,7 +659,9 @@ async fn dispatch_non_search(
                 }
                 Ok(Err(response)) => response,
                 Err(error) => {
-                    log(format!("record_window_switch spawn_blocking failed: {error}"));
+                    log(format!(
+                        "record_window_switch spawn_blocking failed: {error}"
+                    ));
                     Response::Error {
                         message: format!("record_window_switch task failed: {error}"),
                         category: None,
@@ -2995,8 +3000,7 @@ mod protocol_tests {
     async fn resolve_and_record_window_reject_stale_tokens_off_worker() {
         let shell = ShellExecutor::start().unwrap();
         let history = Arc::new(HistoryStore::load(
-            &std::env::temp_dir()
-                .join(format!("prism-ipc-window-resolve-{}", std::process::id())),
+            &std::env::temp_dir().join(format!("prism-ipc-window-resolve-{}", std::process::id())),
             true,
         ));
         let preferences = Arc::new(BrokerPreferences::new(true));
@@ -3004,7 +3008,9 @@ mod protocol_tests {
 
         let stale = ActionTarget::new(TargetKind::Window, "1");
         for request in [
-            Request::ResolveWindow { target: stale.clone() },
+            Request::ResolveWindow {
+                target: stale.clone(),
+            },
             Request::RecordWindowSwitch {
                 target: stale,
                 query: None,

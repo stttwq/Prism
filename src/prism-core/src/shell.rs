@@ -333,7 +333,9 @@ fn execute_run_action(
             })?;
             crate::file_ops::move_to(&target, &dest)
         }
-        ActionId::Zip => crate::zip::zip(&target, &zip_output_path(&target), zip_program.as_deref()),
+        ActionId::Zip => {
+            crate::zip::zip(&target, &zip_output_path(&target), zip_program.as_deref())
+        }
     }
 }
 

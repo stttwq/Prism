@@ -427,12 +427,19 @@ mod tests {
     #[test]
     fn zip_external_validates_like_zip() {
         let web = ActionTarget::new(TargetKind::Web, "https://example.com");
-        let err = zip_external(&web, r"C:\out.zip", None).unwrap().unwrap_err();
+        let err = zip_external(&web, r"C:\out.zip", None)
+            .unwrap()
+            .unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
-        assert_eq!(err.message, zip(&web, r"C:\out.zip", None).unwrap_err().message);
+        assert_eq!(
+            err.message,
+            zip(&web, r"C:\out.zip", None).unwrap_err().message
+        );
 
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let bad_output = zip_external(&file, r"C:\out.rar", None).unwrap().unwrap_err();
+        let bad_output = zip_external(&file, r"C:\out.rar", None)
+            .unwrap()
+            .unwrap_err();
         assert_eq!(bad_output.kind, ShellErrorKind::TargetInvalid);
         assert_eq!(
             bad_output.message,
