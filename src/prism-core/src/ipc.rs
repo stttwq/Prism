@@ -607,12 +607,42 @@ async fn dispatch_non_search(
             }
         }
         Request::ResolveWindow { target } => {
-            resolve_window(&target, windows, &crate::window_list::SystemWindowProbe)
+            // S3：probe 底层是 OpenProcess/GetWindowTextW 等同步 Win32 调用，
+            // 不能占用 2 个 tokio worker 之一（会连管道 accept 一起堵）——与
+            // window 搜索路径同一模式。SystemWindowProbe 是零大小单元结构体，
+            // 在 blocking 闭包里直接构造，无需把 probe 引用跨 await 边界传递。
+            let windows_for_blocking = windows.clone();
+            match tokio::task::spawn_blocking(move || {
+                resolve_window(
+                    &target,
+                    &windows_for_blocking,
+                    &crate::window_list::SystemWindowProbe,
+                )
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    log(format!("resolve_window spawn_blocking failed: {error}"));
+                    Response::Error {
+                        message: format!("resolve_window task failed: {error}"),
+                        category: None,
+                    }
+                }
+            }
         }
         Request::RecordWindowSwitch { target, query } => {
-            // Synchronous resolve consumes the `probe` borrow before any await.
-            match record_window_switch(&target, windows, &crate::window_list::SystemWindowProbe) {
-                Ok(history_target) => {
+            let windows_for_blocking = windows.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                record_window_switch(
+                    &target,
+                    &windows_for_blocking,
+                    &crate::window_list::SystemWindowProbe,
+                )
+            })
+            .await;
+            match resolved {
+                Ok(Ok(history_target)) => {
                     write_window_history(
                         history_target,
                         history,
@@ -624,7 +654,14 @@ async fn dispatch_non_search(
                         cancelled: false,
                     }
                 }
-                Err(response) => response,
+                Ok(Err(response)) => response,
+                Err(error) => {
+                    log(format!("record_window_switch spawn_blocking failed: {error}"));
+                    Response::Error {
+                        message: format!("record_window_switch task failed: {error}"),
+                        category: None,
+                    }
+                }
             }
         }
         Request::Search { .. } => Response::Error {
@@ -672,8 +709,8 @@ fn resolve_window(
 /// 迟到或伪造的 record 会把没切成功的窗口写成成功历史。历史键是「应用名 + 规范化标题」，
 /// 不是 HWND。
 ///
-/// 拆成同步 resolve + 异步 write 两步：`&dyn WindowProbe` 不是 `Sync`，不能跨
-/// `spawn_blocking` 的 await 边界存活。先在同步阶段消耗 probe，再进入异步阶段写历史。
+/// resolve 本身放进 `spawn_blocking`（S3：probe 底层是同步 Win32 调用，不能占用
+/// tokio worker），写历史另起 `spawn_blocking` 做文件 I/O；两步之间只传 owned 数据。
 #[allow(clippy::result_large_err)]
 fn record_window_switch(
     target: &ActionTarget,
@@ -2949,6 +2986,50 @@ mod protocol_tests {
 
     fn default_engines() -> SharedEngines {
         Arc::new(std::sync::RwLock::new(WebEngine::defaults()))
+    }
+
+    /// S3：resolve/record 迁入 spawn_blocking 后行为不变——过期 token 照样被拒。
+    /// 空 store 的 generation 为 0，世代检查发生在 Win32 probe 之前，
+    /// 所以这条测试路径完全不触发真实窗口枚举。
+    #[tokio::test]
+    async fn resolve_and_record_window_reject_stale_tokens_off_worker() {
+        let shell = ShellExecutor::start().unwrap();
+        let history = Arc::new(HistoryStore::load(
+            &std::env::temp_dir()
+                .join(format!("prism-ipc-window-resolve-{}", std::process::id())),
+            true,
+        ));
+        let preferences = Arc::new(BrokerPreferences::new(true));
+        let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+
+        let stale = ActionTarget::new(TargetKind::Window, "1");
+        for request in [
+            Request::ResolveWindow { target: stale.clone() },
+            Request::RecordWindowSwitch {
+                target: stale,
+                query: None,
+            },
+        ] {
+            let response = dispatch_non_search(
+                request,
+                &default_engines(),
+                &shell,
+                &history,
+                &preferences,
+                &windows,
+            )
+            .await;
+            assert!(
+                matches!(
+                    response,
+                    Response::Error {
+                        category: Some(crate::shell::ShellErrorKind::Conflict),
+                        ..
+                    }
+                ),
+                "stale-generation tokens must stay conflicts after the spawn_blocking move"
+            );
+        }
     }
 
     /// The broker protocol gained `root` without a version bump, so an old frontend that
