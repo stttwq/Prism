@@ -819,6 +819,16 @@ async fn acquire_initial_index(
 
     let (descriptors, records_estimate) = match cached {
         CachedLoad::Hit { index, descriptors } => {
+            // L4：与首建循环的 stop 检查对称。停机请求已到达时不再发布缓存索引：
+            // 发布会连带拼音加载，run() 的关停路径还会把刚从盘上读入的索引再做一次
+            // 全量 validate + 序列化 + fsync（秒到几十秒），白白拉长 StopPending。
+            if stop.is_requested() {
+                return Ok(InitialIndex {
+                    descriptors,
+                    watchers_started: false,
+                    interrupted: true,
+                });
+            }
             publish_cached_index(state, index);
             // 拼音加载的任务级故障（JoinError）不该带着完好的缓存索引一起退出：
             // 内部失败已自降级为字面搜索，这里补一层降级提示即可。
