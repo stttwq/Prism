@@ -1185,7 +1185,10 @@ async fn search_service(
     }
     let (service, root_rejection, root_message) = search_index_with_root_fallback(
         &name_query,
-        result_slots.max(1),
+        // 候选放宽：向索引器要 3× 槽位（上限沿用 MAX_SEARCH_RESULTS），让重度
+        // 使用但匹配位置靠后的文件也能活到 broker 重排；最终截断仍在
+        // result_slots，is_truncated 语义不变。协议与索引器代码零改动。
+        indexer_request_max(result_slots),
         filters.as_deref(),
         preferences.pinyin_enabled(),
         root,
@@ -1332,6 +1335,14 @@ async fn empty_query_results(
         root_rejection,
         root_message,
     }
+}
+
+/// 索引器请求量 = 3× 结果槽位，上限 MAX_SEARCH_RESULTS（索引器会拒绝更大值），
+/// 下限 1（槽位被 web 行占尽时也保持合法请求）。
+fn indexer_request_max(result_slots: usize) -> usize {
+    result_slots
+        .saturating_mul(3)
+        .clamp(1, crate::indexer_ipc::MAX_SEARCH_RESULTS)
 }
 
 /// Runs the indexer search for an optional current-directory root.
@@ -3013,6 +3024,19 @@ mod protocol_tests {
             );
             assert_eq!(json["root_message"].as_str(), Some(reason.message()));
         }
+    }
+
+    /// 候选放宽的边界：3× 放大、槽位耗尽仍合法、不越过协议上限。
+    #[test]
+    fn indexer_request_max_widens_within_protocol_bounds() {
+        assert_eq!(indexer_request_max(8), 24);
+        assert_eq!(indexer_request_max(0), 1, "web 行占尽槽位也要保持合法请求");
+        assert_eq!(indexer_request_max(1000), 1000, "more 模式已在上限，不放大");
+        assert_eq!(
+            indexer_request_max(400),
+            1000,
+            "3× 超上限时收敛到 MAX_SEARCH_RESULTS"
+        );
     }
 
     /// A root the indexer refuses degrades to a global search. The reply must still be a
