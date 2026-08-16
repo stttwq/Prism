@@ -152,6 +152,26 @@ impl ShellExecutor {
         if cancelled.load(Ordering::Acquire) {
             return Ok(ShellOutcome::Cancelled);
         }
+        // S2a：外部进程 zip（7-Zip/自定义压缩程序）不进 STA 队列——纯
+        // std::process 调用分钟级等待，会占死唯一的 Shell worker；当前
+        // spawn_blocking 线程正好是它的归宿。Windows Shell COM 压缩路径
+        // （CopyHere 需要 COM apartment）返回 None，照旧走 STA。
+        if let ShellOperation::RunAction {
+            ref target,
+            ref action,
+            ref zip_program,
+            ..
+        } = operation
+        {
+            if action == crate::actions::ActionId::Zip.as_str() {
+                let output_path = zip_output_path(target);
+                if let Some(result) =
+                    crate::zip::zip_external(target, &output_path, zip_program.as_deref())
+                {
+                    return result;
+                }
+            }
+        }
         let (result, receiver) = mpsc::channel();
         self.sender
             .send(WorkerMessage::Execute(WorkItem {
@@ -313,12 +333,13 @@ fn execute_run_action(
             })?;
             crate::file_ops::move_to(&target, &dest)
         }
-        ActionId::Zip => {
-            // zip 的 output_path：源路径同名 + .zip
-            let output_path = format!("{}.zip", target.value);
-            crate::zip::zip(&target, &output_path, zip_program.as_deref())
-        }
+        ActionId::Zip => crate::zip::zip(&target, &zip_output_path(&target), zip_program.as_deref()),
     }
+}
+
+/// zip 动作的输出路径：源路径同名 + `.zip`。
+fn zip_output_path(target: &ActionTarget) -> String {
+    format!("{}.zip", target.value)
 }
 
 impl ActionTarget {
@@ -636,6 +657,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome, ShellOutcome::Cancelled);
+    }
+
+    /// S2a：zip 分流发生在进 STA 队列之前，验证错误必须与走 STA 路径时一致
+    /// （zip 与 zip_external 共用同一校验）。
+    #[test]
+    fn run_action_zip_rejects_invalid_targets_before_the_sta_queue() {
+        let worker = ShellExecutor::start().unwrap();
+        for target in [
+            ActionTarget::new(TargetKind::Window, "12345"),
+            ActionTarget::new(TargetKind::Web, "https://example.com"),
+        ] {
+            let error = worker
+                .execute_blocking(
+                    ShellOperation::RunAction {
+                        target,
+                        action: "zip".into(),
+                        args: Default::default(),
+                        zip_program: None,
+                    },
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, ShellErrorKind::Unsupported);
+            assert!(error.message.contains("zip requires"));
+        }
     }
 
     // ── G6 execute_run_action 路由测试 ──────────────────────────

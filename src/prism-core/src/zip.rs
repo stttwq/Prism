@@ -172,16 +172,8 @@ fn scopeguard<F: FnOnce()>(f: F) -> impl Drop {
     Guard(Some(f))
 }
 
-/// 将文件/目录压缩为 ZIP。
-///
-/// `target` 是要压缩的文件或目录。输出 ZIP 文件路径由调用方决定。
-/// `output_path` 是目标 `.zip` 文件路径。
-/// `custom_zip_program` 是 `settings.json` 的 `ZipProgram` 字段值。
-pub(crate) fn zip(
-    target: &ActionTarget,
-    output_path: &str,
-    custom_zip_program: Option<&str>,
-) -> Result<ShellOutcome, ShellError> {
+/// 校验 zip 目标与输出路径，`zip` 与 `zip_external` 共用同一规则。
+fn validate_zip_request(target: &ActionTarget, output_path: &str) -> Result<(), ShellError> {
     let kind = target.validate()?;
     if !matches!(kind, TargetKind::File | TargetKind::Directory) {
         return Err(ShellError::new(
@@ -195,6 +187,20 @@ pub(crate) fn zip(
             "output path must end with .zip",
         ));
     }
+    Ok(())
+}
+
+/// 将文件/目录压缩为 ZIP。
+///
+/// `target` 是要压缩的文件或目录。输出 ZIP 文件路径由调用方决定。
+/// `output_path` 是目标 `.zip` 文件路径。
+/// `custom_zip_program` 是 `settings.json` 的 `ZipProgram` 字段值。
+pub(crate) fn zip(
+    target: &ActionTarget,
+    output_path: &str,
+    custom_zip_program: Option<&str>,
+) -> Result<ShellOutcome, ShellError> {
+    validate_zip_request(target, output_path)?;
 
     let program = get_zip_program(custom_zip_program);
     match program {
@@ -207,6 +213,35 @@ pub(crate) fn zip(
             ShellErrorKind::System,
             "no ZIP program available",
         )),
+    }
+}
+
+/// S2a：仅当压缩走外部进程（7-Zip/自定义程序）时执行并返回 `Some(result)`；
+/// 探测为 Windows Shell COM 时返回 `None`，交回调用方走原 STA 队列——
+/// `CopyHere` 需要 COM apartment，必须留在 STA worker 上。
+///
+/// 外部进程路径是纯 `std::process` 调用（分钟级等待），放进单线程 STA 队列会把
+/// 唯一的 Shell worker 占死：期间所有 Shell 动作（含 scan_apps）无限排队。
+/// 目标/输出校验与 [`zip`] 完全一致。
+pub(crate) fn zip_external(
+    target: &ActionTarget,
+    output_path: &str,
+    custom_zip_program: Option<&str>,
+) -> Option<Result<ShellOutcome, ShellError>> {
+    if let Err(error) = validate_zip_request(target, output_path) {
+        return Some(Err(error));
+    }
+    match get_zip_program(custom_zip_program) {
+        ZipProgram::External {
+            exe_path,
+            is_seven_zip,
+        } => Some(zip_with_external(
+            &target.value,
+            output_path,
+            &exe_path,
+            is_seven_zip,
+        )),
+        ZipProgram::WindowsShell | ZipProgram::None => None,
     }
 }
 
@@ -384,5 +419,24 @@ mod tests {
         let target = ActionTarget::new(TargetKind::Web, "https://example.com");
         let err = zip(&target, r"C:\out.zip", None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
+    }
+
+    /// S2a：zip_external 的目标/输出校验与 zip 完全一致（错误在程序探测之前
+    /// 返回，不依赖机器上装没装 7-Zip）。
+    #[cfg(windows)]
+    #[test]
+    fn zip_external_validates_like_zip() {
+        let web = ActionTarget::new(TargetKind::Web, "https://example.com");
+        let err = zip_external(&web, r"C:\out.zip", None).unwrap().unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+        assert_eq!(err.message, zip(&web, r"C:\out.zip", None).unwrap_err().message);
+
+        let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let bad_output = zip_external(&file, r"C:\out.rar", None).unwrap().unwrap_err();
+        assert_eq!(bad_output.kind, ShellErrorKind::TargetInvalid);
+        assert_eq!(
+            bad_output.message,
+            zip(&file, r"C:\out.rar", None).unwrap_err().message
+        );
     }
 }
