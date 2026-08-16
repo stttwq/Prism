@@ -13,15 +13,23 @@
 //! round-trip (``status`` → ``search``) on a warm connection instead of a
 //! three-step handshake on a cold one.
 //!
+//! Concurrency (audit batch 2, conservative M2): the singleton lock is only
+//! ever acquired with ``try_lock``.  When a search is already in flight, the
+//! next request does **not** queue behind it (the old 10 s queue manifested as
+//! a frontend-wide freeze during slow indexer periods) — it degrades to a
+//! one-off short connection for that single request.  The indexer service
+//! arms 4 pipe listeners, so concurrent instances are natively supported; a
+//! real connection pool is deferred to audit batch 9.
+//!
 //! The short-lived ``search_pipe`` helper is retained for tests that exercise
 //! the wire protocol against a temporary pipe name.
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::sync::Mutex;
 
 use crate::indexer_ipc::{
     IndexerItem, IndexerRequest, IndexerResponse, IndexerStatus, SearchFilter,
@@ -111,8 +119,14 @@ impl PersistentConnection {
     async fn exchange(&mut self, request: &IndexerRequest) -> Result<IndexerResponse, String> {
         let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
-        self.writer.write_all(&bytes).await.map_err(|error| error.to_string())?;
-        self.writer.flush().await.map_err(|error| error.to_string())?;
+        self.writer
+            .write_all(&bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| error.to_string())?;
 
         let line = self
             .lines
@@ -131,15 +145,10 @@ fn connection_lock() -> &'static Mutex<Option<PersistentConnection>> {
     INDEXER_CONNECTION.get_or_init(|| Mutex::new(None))
 }
 
-/// Ceiling on waiting for the process-wide connection mutex: each in-flight
-/// exchange is capped by `REQUEST_BUDGET`, so exceeding this means the queue
-/// is wedged — fail fast instead of piling more waiters on.
-const LOCK_WAIT: Duration = Duration::from_secs(10);
-
 /// Total budget for one search sequence (connect + handshake + search + retry).
-/// A live-but-unresponsive indexer service must never pin the connection
-/// mutex forever. Generous against normal exchanges (milliseconds) plus the
-/// indexer's worst-case write-lock stall during name-pool compaction (seconds).
+/// A live-but-unresponsive indexer service must never pin a request forever.
+/// Generous against normal exchanges (milliseconds) plus the indexer's
+/// worst-case write-lock stall during name-pool compaction (seconds).
 const REQUEST_BUDGET: Duration = Duration::from_secs(8);
 
 /// Connect to the indexer pipe, retrying a few times to ride out the
@@ -165,21 +174,26 @@ async fn connect_pipe(pipe_name: &str) -> Result<NamedPipeClient, String> {
 
 /// Handshake: exchange Hello messages to verify protocol compatibility.
 async fn handshake(conn: &mut PersistentConnection) -> Result<(), String> {
-    match conn.exchange(&IndexerRequest::Hello { protocol: INDEXER_PROTOCOL }).await? {
+    match conn
+        .exchange(&IndexerRequest::Hello {
+            protocol: INDEXER_PROTOCOL,
+        })
+        .await?
+    {
         IndexerResponse::Hello { protocol } if protocol == INDEXER_PROTOCOL => Ok(()),
         IndexerResponse::Error { message } => Err(message),
         _ => Err("indexer service returned an invalid hello response".into()),
     }
 }
 
-/// Ensure the singleton connection exists and is healthy, then run `search`.
+/// Run a search, preferring the warm persistent connection.
 ///
-/// If the connection is missing or the exchange fails at the transport level,
-/// a fresh connection is created and the search is retried once.
-///
-/// Both the lock wait and the whole in-lock sequence are time-bounded: a hung
-/// indexer must degrade this one request into an error, never block every
-/// subsequent search behind the process-wide mutex.
+/// The singleton lock is taken with `try_lock` only (audit batch 2, M2
+/// conservative): if a search is already in flight, this request degrades to
+/// a one-off short connection instead of queueing — the former 10 s queue
+/// turned any slow indexer period into a frontend-wide freeze.  Both paths are
+/// time-bounded by `REQUEST_BUDGET`; a hung indexer degrades this one request
+/// into an error, never blocks subsequent searches.
 async fn search_via_persistent(
     query: &str,
     max: usize,
@@ -187,11 +201,24 @@ async fn search_via_persistent(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
-    let guard = connection_lock();
-    let mut conn = tokio::time::timeout(LOCK_WAIT, guard.lock())
-        .await
-        .map_err(|_| SearchFailure::from("indexer connection is busy".to_string()))?;
+    match connection_lock().try_lock() {
+        Ok(conn) => search_on_persistent(conn, query, max, filters, pinyin_enabled, root).await,
+        Err(_contention) => {
+            search_one_off(INDEXER_PIPE_NAME, query, max, filters, pinyin_enabled, root).await
+        }
+    }
+}
 
+/// The lock-held path: lazy connect + handshake + (status → search) with one
+/// transport-level reconnect retry.
+async fn search_on_persistent(
+    mut conn: tokio::sync::MutexGuard<'static, Option<PersistentConnection>>,
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
+    root: Option<&str>,
+) -> Result<SearchReply, SearchFailure> {
     let request = async {
         // Lazy connect + handshake on first use, or after a prior drop.
         let needs_reconnect = conn.is_none();
@@ -202,14 +229,25 @@ async fn search_via_persistent(
         }
 
         // First attempt on the (possibly fresh) connection.
-        match search_on_connection(conn.as_mut().unwrap(), query, max, filters, pinyin_enabled, root).await {
+        match search_on_connection(
+            conn.as_mut().unwrap(),
+            query,
+            max,
+            filters,
+            pinyin_enabled,
+            root,
+        )
+        .await
+        {
             Ok(reply) => Ok(reply),
             // Transport-level failure: drop the connection, reconnect, retry once.
             Err(failure) if failure.root_rejection.is_none() => {
                 *conn = None; // drop the broken connection
                 let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
                 handshake(&mut new_conn).await?;
-                let reply = search_on_connection(&mut new_conn, query, max, filters, pinyin_enabled, root).await?;
+                let reply =
+                    search_on_connection(&mut new_conn, query, max, filters, pinyin_enabled, root)
+                        .await?;
                 *conn = Some(new_conn);
                 Ok(reply)
             }
@@ -229,6 +267,27 @@ async fn search_via_persistent(
     }
 }
 
+/// The contention path: a one-off connection (connect → hello → status →
+/// search → drop) that never touches the process-wide singleton.  The pipe
+/// name is a parameter so tests can exercise it against a temporary pipe.
+async fn search_one_off(
+    pipe_name: &str,
+    query: &str,
+    max: usize,
+    filters: Option<&[SearchFilter]>,
+    pinyin_enabled: bool,
+    root: Option<&str>,
+) -> Result<SearchReply, SearchFailure> {
+    let attempt = async {
+        let mut conn = PersistentConnection::connect(pipe_name).await?;
+        handshake(&mut conn).await?;
+        search_on_connection(&mut conn, query, max, filters, pinyin_enabled, root).await
+    };
+    tokio::time::timeout(REQUEST_BUDGET, attempt)
+        .await
+        .map_err(|_| SearchFailure::from("indexer request timed out".to_string()))?
+}
+
 /// Run a full search sequence (status → search) on an established connection.
 async fn search_on_connection(
     conn: &mut PersistentConnection,
@@ -238,7 +297,11 @@ async fn search_on_connection(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
-    let status = match conn.exchange(&IndexerRequest::Status).await.map_err(SearchFailure::from)? {
+    let status = match conn
+        .exchange(&IndexerRequest::Status)
+        .await
+        .map_err(SearchFailure::from)?
+    {
         IndexerResponse::Status(status) => status,
         IndexerResponse::Error { message } => return Err(message.into()),
         _ => return Err("indexer service returned an invalid status response".into()),
@@ -543,6 +606,49 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    /// 审计批次 2 M2（保守版）：锁竞争降级路径的一次性短连接必须能独立完成
+    /// 整条 hello → status → search 序列，不依赖全局单例连接。
+    #[tokio::test]
+    async fn one_off_connection_completes_a_full_search() {
+        let pipe_name = format!(r"\\.\pipe\prism-indexer-oneoff-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&pipe_name)
+            .unwrap();
+        let state = ServiceState::new();
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "test".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "needle.txt", false).unwrap();
+        state.publish(IndexState {
+            volumes: vec![volume],
+            generation: 4,
+            events_since_checkpoint: 0,
+        });
+        let server_task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            handle_connection(server, state).await.unwrap();
+        });
+
+        let reply = search_one_off(&pipe_name, "needle", 10, None, false, None)
+            .await
+            .unwrap();
+        assert!(reply.status.ready);
+        assert_eq!(reply.items.len(), 1);
+        assert_eq!(reply.items[0].path, r"C:\needle.txt");
+        drop(reply);
+        server_task.await.unwrap();
+    }
+
     /// M7：入站行长上限。超过 1MB 的行必须让连接断开，
     /// 而不是被无限缓冲撑爆服务内存。
     #[tokio::test]
@@ -567,7 +673,10 @@ mod tests {
             protocol: crate::INDEXER_PROTOCOL,
         })
         .unwrap();
-        writer.write_all(format!("{hello}\n").as_bytes()).await.unwrap();
+        writer
+            .write_all(format!("{hello}\n").as_bytes())
+            .await
+            .unwrap();
         writer.flush().await.unwrap();
         read_response(&mut lines).await.unwrap();
 
