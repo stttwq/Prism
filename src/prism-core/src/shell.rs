@@ -231,9 +231,12 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
         ShellOperation::Reveal(target) => reveal(&target),
         ShellOperation::Properties(target) => shell_execute(&target, "properties"),
         ShellOperation::OpenWith(target) => shell_execute(&target, "openas"),
-        ShellOperation::RunAction { target, action, args, zip_program } => {
-            execute_run_action(target, action, args, zip_program)
-        }
+        ShellOperation::RunAction {
+            target,
+            action,
+            args,
+            zip_program,
+        } => execute_run_action(target, action, args, zip_program),
     }
 }
 
@@ -458,10 +461,10 @@ impl ComApartment {
 fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, ShellError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::{
-        ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST, SEE_MASK_NOCLOSEPROCESS,
-    };
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_INVOKEIDLIST, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let kind = target.validate()?;
@@ -691,7 +694,8 @@ mod tests {
     #[test]
     fn run_action_rejects_unknown_action_id() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "not_real".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(target, "not_real".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("unknown action"));
     }
@@ -710,7 +714,8 @@ mod tests {
     #[test]
     fn run_action_open_with_rejects_directory() {
         let dir = ActionTarget::new(TargetKind::Directory, r"C:\Windows");
-        let err = execute_run_action(dir, "open_with".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(dir, "open_with".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for files"));
     }
@@ -718,7 +723,8 @@ mod tests {
     #[test]
     fn run_action_locate_app_rejects_file() {
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(file, "locate_app".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(file, "locate_app".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for applications"));
     }
@@ -726,7 +732,8 @@ mod tests {
     #[test]
     fn run_action_run_as_admin_rejects_file() {
         let file = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(file, "run_as_admin".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(file, "run_as_admin".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
         assert!(err.message.contains("only available for applications"));
     }
@@ -736,7 +743,8 @@ mod tests {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
         // rename/copy_to/move_to without args return TargetInvalid.
         for action in ["rename", "copy_to", "move_to"] {
-            let err = execute_run_action(target.clone(), action.into(), Default::default(), None).unwrap_err();
+            let err = execute_run_action(target.clone(), action.into(), Default::default(), None)
+                .unwrap_err();
             assert_eq!(
                 err.kind,
                 ShellErrorKind::TargetInvalid,
@@ -746,14 +754,16 @@ mod tests {
         // zip on a nonexistent source: fails because either the source or
         // output path is invalid/permission-denied. The point is it does
         // not return Unsupported (routing reached file_ops).
-        let err = execute_run_action(target.clone(), "zip".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(target.clone(), "zip".into(), Default::default(), None).unwrap_err();
         assert_ne!(err.kind, ShellErrorKind::Unsupported);
     }
 
     #[test]
     fn run_action_rename_without_args_errors() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "rename".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(target, "rename".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("new_name"));
     }
@@ -761,7 +771,8 @@ mod tests {
     #[test]
     fn run_action_copy_to_without_args_errors() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "copy_to".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(target, "copy_to".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("destination"));
     }
@@ -769,7 +780,8 @@ mod tests {
     #[test]
     fn run_action_move_to_without_args_errors() {
         let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        let err = execute_run_action(target, "move_to".into(), Default::default(), None).unwrap_err();
+        let err =
+            execute_run_action(target, "move_to".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("destination"));
     }

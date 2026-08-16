@@ -61,14 +61,22 @@ impl WindowEntry {
     /// HWND — handles are recycled by Windows, so a persisted handle would eventually
     /// point at an unrelated window.
     pub fn history_key(&self) -> String {
-        format!("{}|{}", self.app_name.to_lowercase(), normalize_title(&self.title))
+        format!(
+            "{}|{}",
+            self.app_name.to_lowercase(),
+            normalize_title(&self.title)
+        )
     }
 }
 
 /// Collapses whitespace and case so a title whose suffix churns (`* file.txt - Editor`)
 /// still matches its history entry.
 pub fn normalize_title(title: &str) -> String {
-    title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// `DWM_CLOAKED_*` bits, redeclared so the pure filter and its tests compile on
@@ -228,7 +236,11 @@ impl WindowSnapshotStore {
             if generation == 0 || generation != guard.generation {
                 return Err(ResolveError::StaleGeneration);
             }
-            guard.entries.get(index).cloned().ok_or(ResolveError::Malformed)?
+            guard
+                .entries
+                .get(index)
+                .cloned()
+                .ok_or(ResolveError::Malformed)?
         };
 
         let live = probe.probe(entry.handle).ok_or(ResolveError::WindowGone)?;
@@ -240,13 +252,15 @@ impl WindowSnapshotStore {
         }
         // The title may legitimately change while the window stays the same (tab switch,
         // dirty marker), so only the app identity is required to hold.
-        if !live.app_name.is_empty()
-            && !live.app_name.eq_ignore_ascii_case(&entry.app_name)
-        {
+        if !live.app_name.is_empty() && !live.app_name.eq_ignore_ascii_case(&entry.app_name) {
             return Err(ResolveError::IdentityChanged);
         }
         Ok(WindowEntry {
-            title: if live.title.trim().is_empty() { entry.title.clone() } else { live.title },
+            title: if live.title.trim().is_empty() {
+                entry.title.clone()
+            } else {
+                live.title
+            },
             is_minimized: live.is_minimized,
             ..entry
         })
@@ -272,9 +286,9 @@ mod platform {
     };
     use windows::Win32::UI::Shell::IVirtualDesktopManager;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindow, GetWindowLongW, GetClassNameW, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-        GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
+        EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, GWL_EXSTYLE,
+        GW_OWNER, WS_EX_TOOLWINDOW,
     };
 
     /// The other-desktop oracle, created once per enumeration.
@@ -308,7 +322,10 @@ mod platform {
                      will be listed",
                 );
             }
-            Self { manager, need_uninit }
+            Self {
+                manager,
+                need_uninit,
+            }
         }
 
         /// True only on a positive "not on the current desktop" answer.
@@ -430,8 +447,7 @@ mod platform {
         if pid == 0 {
             return None;
         }
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
         let mut buffer = vec![0u16; MAX_PATH as usize];
         let mut size = buffer.len() as u32;
         let result = unsafe {
@@ -536,28 +552,40 @@ mod tests {
 
     #[test]
     fn invisible_window_is_filtered() {
-        let window = RawWindow { is_visible: false, ..switchable() };
+        let window = RawWindow {
+            is_visible: false,
+            ..switchable()
+        };
         assert!(!is_switchable(&window, &[SELF_PID]));
     }
 
     #[test]
     fn untitled_and_whitespace_only_windows_are_filtered() {
         for title in ["", "   ", "\t"] {
-            let window = RawWindow { title: title.into(), ..switchable() };
+            let window = RawWindow {
+                title: title.into(),
+                ..switchable()
+            };
             assert!(!is_switchable(&window, &[SELF_PID]), "title {title:?}");
         }
     }
 
     #[test]
     fn tool_window_is_filtered() {
-        let window = RawWindow { is_tool_window: true, ..switchable() };
+        let window = RawWindow {
+            is_tool_window: true,
+            ..switchable()
+        };
         assert!(!is_switchable(&window, &[SELF_PID]));
     }
 
     #[test]
     fn app_cloaked_window_is_filtered() {
         // DWM_CLOAKED_APP means the app hid the window itself — genuinely not switchable.
-        let window = RawWindow { cloaked: CLOAKED_APP, ..switchable() };
+        let window = RawWindow {
+            cloaked: CLOAKED_APP,
+            ..switchable()
+        };
         assert!(!is_switchable(&window, &[SELF_PID]));
     }
 
@@ -622,8 +650,15 @@ mod tests {
     /// Only the exact class is excluded; a normal app whose class merely resembles it stays.
     #[test]
     fn a_normal_window_with_a_similar_class_is_kept() {
-        for class in ["Windows.UI.Core.CoreWindowHost", "CoreWindow", "Chrome_WidgetWin_1"] {
-            let window = RawWindow { class_name: class.into(), ..switchable() };
+        for class in [
+            "Windows.UI.Core.CoreWindowHost",
+            "CoreWindow",
+            "Chrome_WidgetWin_1",
+        ] {
+            let window = RawWindow {
+                class_name: class.into(),
+                ..switchable()
+            };
             assert!(is_switchable(&window, &[SELF_PID]), "class {class:?}");
         }
     }
@@ -632,7 +667,11 @@ mod tests {
     fn a_failed_desktop_query_shows_the_window_rather_than_hiding_it() {
         // DesktopOracle reports false when COM or the query fails. A shell-cloaked window
         // must then still be offered: over-showing beats silently losing the target.
-        let window = RawWindow { cloaked: CLOAKED_SHELL, is_on_other_desktop: false, ..switchable() };
+        let window = RawWindow {
+            cloaked: CLOAKED_SHELL,
+            is_on_other_desktop: false,
+            ..switchable()
+        };
         assert!(is_switchable(&window, &[SELF_PID]));
     }
 
@@ -660,32 +699,47 @@ mod tests {
 
     #[test]
     fn owned_window_is_filtered() {
-        let window = RawWindow { has_owner: true, ..switchable() };
+        let window = RawWindow {
+            has_owner: true,
+            ..switchable()
+        };
         assert!(!is_switchable(&window, &[SELF_PID]));
     }
 
     #[test]
     fn prism_own_windows_are_filtered() {
-        let window = RawWindow { pid: SELF_PID, ..switchable() };
+        let window = RawWindow {
+            pid: SELF_PID,
+            ..switchable()
+        };
         assert!(!is_switchable(&window, &[SELF_PID]));
     }
 
     #[test]
     fn null_handle_is_filtered() {
-        let window = RawWindow { handle: 0, ..switchable() };
+        let window = RawWindow {
+            handle: 0,
+            ..switchable()
+        };
         assert!(!is_switchable(&window, &[SELF_PID]));
     }
 
     #[test]
     fn minimized_window_stays_switchable() {
-        let window = RawWindow { is_minimized: true, ..switchable() };
+        let window = RawWindow {
+            is_minimized: true,
+            ..switchable()
+        };
         assert!(is_switchable(&window, &[SELF_PID]));
     }
 
     #[test]
     fn select_enforces_the_cap_and_reports_truncation() {
         let raw: Vec<RawWindow> = (0..MAX_WINDOWS + 10)
-            .map(|i| RawWindow { handle: i as u64 + 1, ..switchable() })
+            .map(|i| RawWindow {
+                handle: i as u64 + 1,
+                ..switchable()
+            })
             .collect();
         let (entries, truncated) = select(raw, &[SELF_PID]);
         assert_eq!(entries.len(), MAX_WINDOWS);
@@ -743,7 +797,10 @@ mod tests {
     fn token_minted_before_any_enumeration_cannot_validate() {
         let store = WindowSnapshotStore::new();
         let probe = FakeProbe::default();
-        assert_eq!(store.resolve("0", &probe), Err(ResolveError::StaleGeneration));
+        assert_eq!(
+            store.resolve("0", &probe),
+            Err(ResolveError::StaleGeneration)
+        );
     }
 
     #[test]
@@ -778,7 +835,13 @@ mod tests {
     fn window_hidden_since_enumeration_resolves_to_window_gone() {
         let store = WindowSnapshotStore::new();
         let token = store.publish(vec![entry()])[0].0.clone();
-        let probe = FakeProbe::with(0x1234, RawWindow { is_visible: false, ..switchable() });
+        let probe = FakeProbe::with(
+            0x1234,
+            RawWindow {
+                is_visible: false,
+                ..switchable()
+            },
+        );
         assert_eq!(store.resolve(&token, &probe), Err(ResolveError::WindowGone));
     }
 
@@ -787,7 +850,13 @@ mod tests {
         let store = WindowSnapshotStore::new();
         let token = store.publish(vec![entry()])[0].0.clone();
         // Same handle, different process: Windows reused the HWND.
-        let probe = FakeProbe::with(0x1234, RawWindow { pid: 999, ..switchable() });
+        let probe = FakeProbe::with(
+            0x1234,
+            RawWindow {
+                pid: 999,
+                ..switchable()
+            },
+        );
         assert_eq!(
             store.resolve(&token, &probe),
             Err(ResolveError::IdentityChanged)
@@ -800,7 +869,10 @@ mod tests {
         let token = store.publish(vec![entry()])[0].0.clone();
         let probe = FakeProbe::with(
             0x1234,
-            RawWindow { app_name: "calc".into(), ..switchable() },
+            RawWindow {
+                app_name: "calc".into(),
+                ..switchable()
+            },
         );
         assert_eq!(
             store.resolve(&token, &probe),
@@ -814,9 +886,14 @@ mod tests {
         let token = store.publish(vec![entry()])[0].0.clone();
         let probe = FakeProbe::with(
             0x1234,
-            RawWindow { title: "notes.txt - Notepad".into(), ..switchable() },
+            RawWindow {
+                title: "notes.txt - Notepad".into(),
+                ..switchable()
+            },
         );
-        let resolved = store.resolve(&token, &probe).expect("still the same window");
+        let resolved = store
+            .resolve(&token, &probe)
+            .expect("still the same window");
         assert_eq!(resolved.title, "notes.txt - Notepad");
     }
 
@@ -824,21 +901,41 @@ mod tests {
     fn resolve_reports_current_minimized_state() {
         let store = WindowSnapshotStore::new();
         let token = store.publish(vec![entry()])[0].0.clone();
-        let probe = FakeProbe::with(0x1234, RawWindow { is_minimized: true, ..switchable() });
-        assert!(store.resolve(&token, &probe).expect("resolves").is_minimized);
+        let probe = FakeProbe::with(
+            0x1234,
+            RawWindow {
+                is_minimized: true,
+                ..switchable()
+            },
+        );
+        assert!(
+            store
+                .resolve(&token, &probe)
+                .expect("resolves")
+                .is_minimized
+        );
     }
 
     #[test]
     fn history_key_is_stable_across_title_churn() {
-        let clean = WindowEntry { title: "report.docx - Word".into(), ..entry() };
-        let dirty = WindowEntry { title: "report.docx  -  Word".into(), ..entry() };
+        let clean = WindowEntry {
+            title: "report.docx - Word".into(),
+            ..entry()
+        };
+        let dirty = WindowEntry {
+            title: "report.docx  -  Word".into(),
+            ..entry()
+        };
         assert_eq!(clean.history_key(), dirty.history_key());
     }
 
     #[test]
     fn history_key_separates_different_apps() {
         let a = entry();
-        let b = WindowEntry { app_name: "wordpad".into(), ..entry() };
+        let b = WindowEntry {
+            app_name: "wordpad".into(),
+            ..entry()
+        };
         assert_ne!(a.history_key(), b.history_key());
     }
 
@@ -847,8 +944,16 @@ mod tests {
     #[test]
     fn two_windows_of_the_same_app_stay_distinct() {
         let raw = vec![
-            RawWindow { handle: 0x11, title: "a.txt - Notepad".into(), ..switchable() },
-            RawWindow { handle: 0x22, title: "b.txt - Notepad".into(), ..switchable() },
+            RawWindow {
+                handle: 0x11,
+                title: "a.txt - Notepad".into(),
+                ..switchable()
+            },
+            RawWindow {
+                handle: 0x22,
+                title: "b.txt - Notepad".into(),
+                ..switchable()
+            },
         ];
         let (entries, _) = select(raw, &[SELF_PID]);
         assert_eq!(entries.len(), 2, "same-app windows must not be collapsed");
@@ -869,8 +974,14 @@ mod tests {
     #[test]
     fn same_app_same_title_deliberately_shares_one_history_key() {
         let raw = vec![
-            RawWindow { handle: 0x11, ..switchable() },
-            RawWindow { handle: 0x22, ..switchable() },
+            RawWindow {
+                handle: 0x11,
+                ..switchable()
+            },
+            RawWindow {
+                handle: 0x22,
+                ..switchable()
+            },
         ];
         let (entries, _) = select(raw, &[SELF_PID]);
         assert_eq!(entries.len(), 2, "both are still separately selectable");
@@ -923,7 +1034,10 @@ mod tests {
                 token.parse::<u64>().is_ok(),
                 "token must stay numeric for TargetKind::Window validation"
             );
-            assert!(!entry.title.trim().is_empty(), "untitled window leaked through");
+            assert!(
+                !entry.title.trim().is_empty(),
+                "untitled window leaked through"
+            );
             assert_ne!(entry.pid, std::process::id(), "own window leaked through");
             assert_ne!(entry.handle, 0, "null handle leaked through");
         }
@@ -1005,7 +1119,8 @@ mod tests {
                 *counts.entry(reason).or_default() += 1;
                 if reason != "KEPT" && !window.title.trim().is_empty() {
                     let title: String = window.title.chars().take(36).collect();
-                    titled_rejects.push((reason.to_string(), format!("{} {title:?}", window.app_name)));
+                    titled_rejects
+                        .push((reason.to_string(), format!("{} {title:?}", window.app_name)));
                 }
             }
 

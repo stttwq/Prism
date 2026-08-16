@@ -17,7 +17,10 @@ static ZIP_PROGRAM: Mutex<(Option<String>, Option<ZipProgram>)> = Mutex::new((No
 #[derive(Debug, Clone)]
 enum ZipProgram {
     /// 外部可执行文件（7-Zip 或用户自定义），路径已知。
-    External { exe_path: String, is_seven_zip: bool },
+    External {
+        exe_path: String,
+        is_seven_zip: bool,
+    },
     /// 使用 Windows 内置 Shell COM。
     WindowsShell,
     /// 探测失败，无可用压缩程序。
@@ -31,7 +34,9 @@ fn get_zip_program(custom_path: Option<&str>) -> ZipProgram {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(str::to_string);
-    let mut guard = ZIP_PROGRAM.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut guard = ZIP_PROGRAM
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     if let (Some(cached_input), Some(cached)) = &*guard {
         if Some(cached_input.as_str()) == normalized.as_deref() {
             return cached.clone();
@@ -73,12 +78,12 @@ fn detect_zip_program(custom_path: Option<&str>) -> ZipProgram {
 /// 通过注册表探测已安装的 7-Zip，返回 `7z.exe` 完整路径。
 #[cfg(windows)]
 fn detect_seven_zip() -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
-        KEY_READ, REG_VALUE_TYPE,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        REG_VALUE_TYPE,
     };
-    use std::os::windows::ffi::OsStrExt;
 
     // 7-Zip 在注册表中的安装路径：HKEY_LOCAL_MACHINE\SOFTWARE\7-Zip\Path
     let subkey: Vec<u16> = OsStrExt::encode_wide(std::ffi::OsStr::new("SOFTWARE\\7-Zip"))
@@ -140,7 +145,9 @@ fn detect_seven_zip() -> Option<String> {
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         let install_dir = String::from_utf16_lossy(
-            &wide[..wide.len().saturating_sub(wide.iter().rev().take_while(|&&c| c == 0).count())],
+            &wide[..wide
+                .len()
+                .saturating_sub(wide.iter().rev().take_while(|&&c| c == 0).count())],
         );
         let install_dir = install_dir.trim_end_matches('\\');
 
@@ -256,10 +263,7 @@ fn zip_with_external(
     let mut cmd = std::process::Command::new(exe_path);
     if is_seven_zip {
         // 7z a <output.zip> <source> -aoa：a=添加，-aoa=覆盖所有（不静默，系统处理冲突确认）
-        cmd.arg("a")
-            .arg(output)
-            .arg(source)
-            .arg("-aoa");
+        cmd.arg("a").arg(output).arg(source).arg("-aoa");
     } else {
         // 自定义程序：传 source 和 output 作为参数，让用户自己处理格式
         cmd.arg(source).arg(output);
@@ -311,16 +315,21 @@ fn zip_with_shell_com(source: &str, output: &str) -> Result<ShellOutcome, ShellE
 
     // 创建空 ZIP 文件（22 字节的 ZIP 端序签名 + 0 数据）
     let empty_zip: [u8; 22] = [
-        0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     std::fs::write(output, empty_zip)
         .map_err(|e| ShellError::new(classify_io_error(&e), e.to_string()))?;
 
     // 使用 Shell.Application COM 对象
-    let shell: windows::Win32::UI::Shell::IShellDispatch =
-        unsafe { CoCreateInstance(&windows::Win32::UI::Shell::Shell, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
+    let shell: windows::Win32::UI::Shell::IShellDispatch = unsafe {
+        CoCreateInstance(
+            &windows::Win32::UI::Shell::Shell,
+            None,
+            CLSCTX_INPROC_SERVER,
+        )
+    }
+    .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
 
     unsafe {
         // NameSpace 返回 Folder 对象，参数是 VARIANT(BSTR)
@@ -396,7 +405,10 @@ mod tests {
         // 用 explorer.exe 作为假的自定义程序
         let prog = detect_zip_program(Some(r"C:\Windows\explorer.exe"));
         match prog {
-            ZipProgram::External { exe_path, is_seven_zip } => {
+            ZipProgram::External {
+                exe_path,
+                is_seven_zip,
+            } => {
                 assert_eq!(exe_path, r"C:\Windows\explorer.exe");
                 assert!(!is_seven_zip);
             }

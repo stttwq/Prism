@@ -72,10 +72,8 @@ pub(crate) fn recycle(target: &ActionTarget) -> Result<ShellOutcome, ShellError>
     // FOF_NOCONFIRMMKDIR: 创建目录不需要额外确认。
     // 不设 FOF_NOCONFIRMATION: 让 Windows 显示删除确认。
     unsafe {
-        op.SetOperationFlags(FILEOPERATION_FLAGS(
-            FOF_ALLOWUNDO.0 | FOF_NOCONFIRMMKDIR.0,
-        ))
-        .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
+        op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOF_NOCONFIRMMKDIR.0))
+            .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
         op.DeleteItem(&item, None)
             .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
     }
@@ -112,7 +110,10 @@ pub(crate) fn delete_permanent(target: &ActionTarget) -> Result<ShellOutcome, Sh
 ///
 /// `destination` 必须是已存在的目录。冲突由 Windows 标准 UI 处理。
 #[cfg(windows)]
-pub(crate) fn copy_to(target: &ActionTarget, destination: &str) -> Result<ShellOutcome, ShellError> {
+pub(crate) fn copy_to(
+    target: &ActionTarget,
+    destination: &str,
+) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_NOCONFIRMMKDIR};
 
     validate_file_target(target)?;
@@ -136,7 +137,10 @@ pub(crate) fn copy_to(target: &ActionTarget, destination: &str) -> Result<ShellO
 ///
 /// `destination` 必须是已存在的目录。冲突由 Windows 标准 UI 处理。
 #[cfg(windows)]
-pub(crate) fn move_to(target: &ActionTarget, destination: &str) -> Result<ShellOutcome, ShellError> {
+pub(crate) fn move_to(
+    target: &ActionTarget,
+    destination: &str,
+) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_NOCONFIRMMKDIR};
 
     validate_file_target(target)?;
@@ -218,7 +222,9 @@ pub(crate) fn rename(target: &ActionTarget, new_name: &str) -> Result<ShellOutco
 /// - `Err` with `COPYENGINE_S_USER_CANCELLED` (0x8027004C7): 用户取消
 /// - 其他错误: 映射到 `ShellErrorKind`
 #[cfg(windows)]
-fn perform_operations(op: &windows::Win32::UI::Shell::IFileOperation) -> Result<ShellOutcome, ShellError> {
+fn perform_operations(
+    op: &windows::Win32::UI::Shell::IFileOperation,
+) -> Result<ShellOutcome, ShellError> {
     match unsafe { op.PerformOperations() } {
         Ok(()) => Ok(ShellOutcome::Success),
         Err(e) => {
@@ -241,7 +247,9 @@ fn classify_hresult(hr: windows::core::HRESULT) -> ShellError {
     let kind = if hr == windows::core::HRESULT(0x80070005u32 as i32) {
         // E_ACCESSDENIED
         ShellErrorKind::AccessDenied
-    } else if hr == windows::core::HRESULT(0x80070002u32 as i32) || hr == windows::core::HRESULT(0x80070003u32 as i32) {
+    } else if hr == windows::core::HRESULT(0x80070002u32 as i32)
+        || hr == windows::core::HRESULT(0x80070003u32 as i32)
+    {
         // FILE_NOT_FOUND / PATH_NOT_FOUND
         ShellErrorKind::TargetInvalid
     } else if hr == windows::core::HRESULT(0x800700B7u32 as i32) {
@@ -253,13 +261,18 @@ fn classify_hresult(hr: windows::core::HRESULT) -> ShellError {
     } else {
         ShellErrorKind::System
     };
-    ShellError::new(kind, format!("IFileOperation failed: 0x{:08X}", hr.0 as u32))
+    ShellError::new(
+        kind,
+        format!("IFileOperation failed: 0x{:08X}", hr.0 as u32),
+    )
 }
 
 // ── 非 Windows 平台 stub ──────────────────────────────────────
 
 #[cfg(not(windows))]
-pub(crate) fn recycle(_target: &crate::shell::ActionTarget) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
+pub(crate) fn recycle(
+    _target: &crate::shell::ActionTarget,
+) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
     Err(crate::shell::ShellError::new(
         crate::shell::ShellErrorKind::Unsupported,
         "file operations are only available on Windows",
@@ -267,7 +280,9 @@ pub(crate) fn recycle(_target: &crate::shell::ActionTarget) -> Result<crate::she
 }
 
 #[cfg(not(windows))]
-pub(crate) fn delete_permanent(_target: &crate::shell::ActionTarget) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
+pub(crate) fn delete_permanent(
+    _target: &crate::shell::ActionTarget,
+) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
     Err(crate::shell::ShellError::new(
         crate::shell::ShellErrorKind::Unsupported,
         "file operations are only available on Windows",
@@ -275,7 +290,10 @@ pub(crate) fn delete_permanent(_target: &crate::shell::ActionTarget) -> Result<c
 }
 
 #[cfg(not(windows))]
-pub(crate) fn copy_to(_target: &crate::shell::ActionTarget, _destination: &str) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
+pub(crate) fn copy_to(
+    _target: &crate::shell::ActionTarget,
+    _destination: &str,
+) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
     Err(crate::shell::ShellError::new(
         crate::shell::ShellErrorKind::Unsupported,
         "file operations are only available on Windows",
@@ -283,7 +301,10 @@ pub(crate) fn copy_to(_target: &crate::shell::ActionTarget, _destination: &str) 
 }
 
 #[cfg(not(windows))]
-pub(crate) fn move_to(_target: &crate::shell::ActionTarget, _destination: &str) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
+pub(crate) fn move_to(
+    _target: &crate::shell::ActionTarget,
+    _destination: &str,
+) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
     Err(crate::shell::ShellError::new(
         crate::shell::ShellErrorKind::Unsupported,
         "file operations are only available on Windows",
@@ -291,7 +312,10 @@ pub(crate) fn move_to(_target: &crate::shell::ActionTarget, _destination: &str) 
 }
 
 #[cfg(not(windows))]
-pub(crate) fn rename(_target: &crate::shell::ActionTarget, _new_name: &str) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
+pub(crate) fn rename(
+    _target: &crate::shell::ActionTarget,
+    _new_name: &str,
+) -> Result<crate::shell::ShellOutcome, crate::shell::ShellError> {
     Err(crate::shell::ShellError::new(
         crate::shell::ShellErrorKind::Unsupported,
         "file operations are only available on Windows",

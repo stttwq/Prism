@@ -91,7 +91,9 @@ impl HistoryState {
     }
 
     fn lookup(&self, target: &ActionTarget) -> Option<&HistoryEntry> {
-        let position = *self.index.get(&(target.kind.clone(), target.value.clone()))?;
+        let position = *self
+            .index
+            .get(&(target.kind.clone(), target.value.clone()))?;
         self.entries.get(position)
     }
 }
@@ -259,7 +261,11 @@ impl HistoryStore {
         self.state
             .read()
             .ok()
-            .and_then(|state| state.lookup(target).map(|entry| effective_frecency(entry, now)))
+            .and_then(|state| {
+                state
+                    .lookup(target)
+                    .map(|entry| effective_frecency(entry, now))
+            })
             .unwrap_or(0)
     }
 
@@ -316,14 +322,11 @@ impl HistoryStore {
         if !self.is_enabled() {
             return None;
         }
-        self.state
-            .read()
-            .ok()
-            .and_then(|state| {
-                state
-                    .lookup(target)
-                    .map(|entry| (effective_frecency(entry, now), entry.last_used_utc))
-            })
+        self.state.read().ok().and_then(|state| {
+            state
+                .lookup(target)
+                .map(|entry| (effective_frecency(entry, now), entry.last_used_utc))
+        })
     }
 
     #[cfg(test)]
@@ -485,10 +488,11 @@ fn read_history_file(path: &Path, now: u64) -> Result<Vec<HistoryEntry>, History
         std::io::ErrorKind::NotFound => HistoryFileError::NotFound,
         _ => HistoryFileError::Io,
     })?;
-    let envelope = serde_json::from_slice::<VersionedEnvelope<HistoryData>>(&bytes).map_err(|_| {
-        isolate(path, now);
-        HistoryFileError::Corrupt
-    })?;
+    let envelope =
+        serde_json::from_slice::<VersionedEnvelope<HistoryData>>(&bytes).map_err(|_| {
+            isolate(path, now);
+            HistoryFileError::Corrupt
+        })?;
     match envelope.into_compatible() {
         Ok(data) => Ok(data.entries),
         Err(error) if error.starts_with("schema version") => {
@@ -574,7 +578,10 @@ mod tests {
             .record_at(&target("C:\\recent"), HistoryUse::Reveal, None, 20_000_000)
             .unwrap();
         // v2 不再按时间剪枝：闲置再久的条目也保留，只能被容量 LRU 挤出。
-        assert!(store.entries().iter().any(|entry| entry.target == "C:\\old"));
+        assert!(store
+            .entries()
+            .iter()
+            .any(|entry| entry.target == "C:\\old"));
         assert_eq!(store.score_at(&target("C:\\recent"), 20_000_000), 2);
         std::fs::write(dir.join(LEGACY_HISTORY_FILE), b"{}").unwrap();
         store.clear().unwrap();
@@ -643,7 +650,10 @@ mod tests {
         // v2 已被上一例隔离改名，此时 v1 损坏同样隔离，不阻塞启动。
         std::fs::write(dir.join(LEGACY_HISTORY_FILE), b"not-json").unwrap();
         let legacy_corrupt = HistoryStore::load_at(&dir, true, 44);
-        assert_eq!(legacy_corrupt.diagnostic(), Some(HistoryDiagnostic::Corrupt));
+        assert_eq!(
+            legacy_corrupt.diagnostic(),
+            Some(HistoryDiagnostic::Corrupt)
+        );
         assert!(legacy_corrupt.entries().is_empty());
         assert!(dir.join("history-v1.corrupt-44.json").exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -696,7 +706,10 @@ mod tests {
         // 旧计数 3×4+1×2=14 换算成 frecency 初值；last_used=now → 衰减为零。
         assert_eq!(store.score_at(&target("C:\\proj\\config.json"), now), 14);
         let half = FRECENCY_HALF_LIFE_SECS as u64;
-        assert_eq!(store.score_at(&target("C:\\proj\\config.json"), now + half), 7);
+        assert_eq!(
+            store.score_at(&target("C:\\proj\\config.json"), now + half),
+            7
+        );
         // 迁移先发生在内存：首个动作才落 v2 文件，v1 原文件保留。
         assert!(!dir.join(HISTORY_FILE).exists());
         store

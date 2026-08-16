@@ -35,7 +35,10 @@ pub fn event(level: &str, event: &str, elapsed_ms: Option<u128>, generation: Opt
     let Some(logger) = guard.as_mut() else {
         return;
     };
-    if logger.write(level, event, None, elapsed_ms, generation).is_err() {
+    if logger
+        .write(level, event, None, elapsed_ms, generation)
+        .is_err()
+    {
         *guard = None;
     }
 }
@@ -352,10 +355,7 @@ mod tests {
         let redacted = sanitize(r"C:\Users\小明的电脑\Documents\文件.txt");
         assert!(redacted.contains("<user>"), "{redacted}");
         assert!(!redacted.contains("小明的电脑"), "{redacted}");
-        assert!(
-            redacted.contains("Documents/文件.txt"),
-            "{redacted}"
-        );
+        assert!(redacted.contains("Documents/文件.txt"), "{redacted}");
     }
 
     #[test]
@@ -390,8 +390,7 @@ mod tests {
 
     #[test]
     fn event_without_detail_has_no_detail_field() {
-        let dir =
-            std::env::temp_dir().join(format!("prism-log-no-detail-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("prism-log-no-detail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init("test_no_detail", &dir);

@@ -475,7 +475,15 @@ impl VolumeIndex {
     }
 
     pub fn search(&self, query: &str, max: usize) -> Vec<IndexHit> {
-        search_volumes(std::slice::from_ref(self), query, max, &[], None, &QueryFilters::none()).items
+        search_volumes(
+            std::slice::from_ref(self),
+            query,
+            max,
+            &[],
+            None,
+            &QueryFilters::none(),
+        )
+        .items
     }
 
     /// Bounded, memo-free descendant check. Use [`RootFilter`] when many records are
@@ -821,7 +829,11 @@ impl QueryFilters {
             return false;
         }
         let ext = file_extension(name);
-        ext.is_some_and(|e| self.exts.iter().any(|target| target.eq_ignore_ascii_case(e)))
+        ext.is_some_and(|e| {
+            self.exts
+                .iter()
+                .any(|target| target.eq_ignore_ascii_case(e))
+        })
     }
 
     /// High-cost path check: requires a constructed full path. All path substrings must
@@ -1086,7 +1098,9 @@ mod tests {
         volume.prepare_initial_capacity(3_000_000, 150_000).unwrap();
         assert_eq!(volume.nodes.len(), 3_000_001);
         // 超过 16,777,216 上限仍拒绝（内存护栏）。
-        assert!(volume.prepare_initial_capacity(16_777_216, 16_777_216).is_err());
+        assert!(volume
+            .prepare_initial_capacity(16_777_216, 16_777_216)
+            .is_err());
     }
 
     #[test]
@@ -1389,9 +1403,7 @@ mod tests {
         // 桶不越过 class：前缀匹配无历史仍先于子串匹配满桶。
         assert!(rank(MatchKind::Literal, 1, 9, u32::MAX) < rank(MatchKind::Literal, 2, 0, 0));
         // 桶不越过 kind：字面匹配无历史仍先于拼音匹配满桶。
-        assert!(
-            rank(MatchKind::Literal, 2, 9, u32::MAX) < rank(MatchKind::FullPinyin, 0, 0, 0)
-        );
+        assert!(rank(MatchKind::Literal, 2, 9, u32::MAX) < rank(MatchKind::FullPinyin, 0, 0, 0));
     }
 
     /// C:\project\{sub\deep.txt, near.txt} plus C:\other\deep.txt, and D:\project\deep.txt.
@@ -1799,7 +1811,8 @@ mod tests {
         // A directory to test that ext filters exclude directories.
         vol.upsert(frn(300, 1), frn(10, 1), "notes", true).unwrap();
         // Files under a directory with a space in the path.
-        vol.upsert(frn(301, 1), frn(5, 0), "Project X", true).unwrap();
+        vol.upsert(frn(301, 1), frn(5, 0), "Project X", true)
+            .unwrap();
         vol.upsert(frn(302, 1), frn(301, 1), "design.pdf", false)
             .unwrap();
         IndexState {
@@ -1814,7 +1827,11 @@ mod tests {
         let state = filter_fixture();
         let filters = QueryFilters::new(vec!["pdf".into()], vec![]);
         let outcome = state.search_in_root_filtered("file", 8, &[], None, &filters);
-        assert_eq!(outcome.items.len(), 8, "should return full max=8 of pdf files");
+        assert_eq!(
+            outcome.items.len(),
+            8,
+            "should return full max=8 of pdf files"
+        );
         assert!(
             outcome.items.iter().all(|item| item.name.ends_with(".pdf")),
             "all results must be pdf"
@@ -1830,11 +1847,7 @@ mod tests {
         let state = filter_fixture();
         let filters = QueryFilters::new(vec!["txt".into(), "pdf".into()], vec![]);
         let outcome = state.search_in_root_filtered("file", 1000, &[], None, &filters);
-        assert_eq!(
-            outcome.items.len(),
-            40,
-            "all 20 txt + 20 pdf should match"
-        );
+        assert_eq!(outcome.items.len(), 40, "all 20 txt + 20 pdf should match");
     }
 
     #[test]

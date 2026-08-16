@@ -325,7 +325,14 @@ impl PinyinSidecar {
         max: usize,
         exclusion_paths: &[String],
     ) -> PinyinSearchOutcome {
-        self.search_in_root(index, query, max, exclusion_paths, None, &QueryFilters::none())
+        self.search_in_root(
+            index,
+            query,
+            max,
+            exclusion_paths,
+            None,
+            &QueryFilters::none(),
+        )
     }
 
     /// Pinyin candidates are filtered by the same root rule as the literal path, before
@@ -372,7 +379,13 @@ impl PinyinSidecar {
                 if key_is_literal(index, record.key, query) {
                     continue;
                 }
-                if !key_passes_filters(index, record.key, filters, has_path_filter, &mut path_constructions) {
+                if !key_passes_filters(
+                    index,
+                    record.key,
+                    filters,
+                    has_path_filter,
+                    &mut path_constructions,
+                ) {
                     continue;
                 }
                 matched_count = matched_count.saturating_add(1);
@@ -393,7 +406,13 @@ impl PinyinSidecar {
                 if key_is_literal(index, *key, query) {
                     continue;
                 }
-                if !key_passes_filters(index, *key, filters, has_path_filter, &mut path_constructions) {
+                if !key_passes_filters(
+                    index,
+                    *key,
+                    filters,
+                    has_path_filter,
+                    &mut path_constructions,
+                ) {
                     continue;
                 }
                 matched_count = matched_count.saturating_add(1);
@@ -839,7 +858,8 @@ mod tests {
         // a rename outside it does not leak in.
         sidecar.apply_delta(0, 11, Some("支付宝")).unwrap();
         sidecar.apply_delta(0, 12, Some("支付宝")).unwrap();
-        let delta_scoped = sidecar.search_in_root(&index, "zfb", 8, &[], root, &QueryFilters::none());
+        let delta_scoped =
+            sidecar.search_in_root(&index, "zfb", 8, &[], root, &QueryFilters::none());
         assert_eq!(delta_scoped.items.len(), 1, "{:?}", delta_scoped.items);
         assert_eq!(delta_scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(delta_scoped.matched_count, 1);

@@ -118,17 +118,17 @@ impl ActionId {
     /// Segoe Fluent Icons 字形码。无图标返回空字符串。
     fn icon_glyph(self) -> &'static str {
         match self {
-            Self::OpenFolder => "\u{E8DA}",   // OpenFolderHorizontal
+            Self::OpenFolder => "\u{E8DA}", // OpenFolderHorizontal
             Self::Copy | Self::CopyPath | Self::CopyAppPath | Self::CopyTo => "\u{E8C8}", // Copy
             Self::Cut | Self::MoveTo => "\u{E8C6}", // Cut
             Self::Properties | Self::AppProperties => "\u{E946}", // Page / Properties
-            Self::OpenWith => "\u{E7B7}",     // OpenWith
-            Self::Rename => "\u{E8AC}",       // Rename
-            Self::Recycle => "\u{E74D}",      // Delete (recycle)
+            Self::OpenWith => "\u{E7B7}",   // OpenWith
+            Self::Rename => "\u{E8AC}",     // Rename
+            Self::Recycle => "\u{E74D}",    // Delete (recycle)
             Self::DeletePermanent => "\u{E74D}", // Delete (permanent)
-            Self::Zip => "\u{E7F8}",          // ZipFolder
-            Self::LocateApp => "\u{E8DA}",    // OpenFolderHorizontal
-            Self::RunAsAdmin => "\u{E7EF}",   // Shield / Admin
+            Self::Zip => "\u{E7F8}",        // ZipFolder
+            Self::LocateApp => "\u{E8DA}",  // OpenFolderHorizontal
+            Self::RunAsAdmin => "\u{E7EF}", // Shield / Admin
         }
     }
 
@@ -160,7 +160,12 @@ impl ActionId {
     fn is_mutation(self) -> bool {
         matches!(
             self,
-            Self::Rename | Self::CopyTo | Self::MoveTo | Self::Recycle | Self::DeletePermanent | Self::Zip
+            Self::Rename
+                | Self::CopyTo
+                | Self::MoveTo
+                | Self::Recycle
+                | Self::DeletePermanent
+                | Self::Zip
         )
     }
 }
@@ -237,7 +242,9 @@ fn action_item(id: ActionId) -> ActionItem {
 /// broker 在此处重新解析 `ActionId`，未知 id 被拒。mutation 动作在第一批
 /// 尚未接入 Shell worker，显式返回 `Unsupported`。
 pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), String> {
-    let id = action.parse::<ActionId>().map_err(|_| format!("未知动作：{action}"))?;
+    let id = action
+        .parse::<ActionId>()
+        .map_err(|_| format!("未知动作：{action}"))?;
     validate_path(path)?;
     match id {
         ActionId::OpenFolder => reveal_in_explorer(path),
@@ -252,7 +259,9 @@ pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), String> 
         | ActionId::OpenWith
         | ActionId::LocateApp
         | ActionId::AppProperties
-        | ActionId::RunAsAdmin => Err(format!("{action} 由 Shell 路由直接处理，不应进入 run_action_direct")),
+        | ActionId::RunAsAdmin => Err(format!(
+            "{action} 由 Shell 路由直接处理，不应进入 run_action_direct"
+        )),
         ActionId::Rename
         | ActionId::CopyTo
         | ActionId::MoveTo
@@ -586,7 +595,14 @@ mod tests {
     #[test]
     fn mutation_actions_are_not_yet_implemented() {
         let path = r"C:\Windows\explorer.exe";
-        for action in ["rename", "copy_to", "move_to", "recycle", "delete_permanent", "zip"] {
+        for action in [
+            "rename",
+            "copy_to",
+            "move_to",
+            "recycle",
+            "delete_permanent",
+            "zip",
+        ] {
             let err = run_action_direct(path, action).unwrap_err();
             assert!(
                 err.contains("尚未实现"),
@@ -598,7 +614,13 @@ mod tests {
     #[test]
     fn properties_and_open_with_are_routed_not_direct() {
         let path = r"C:\Windows\explorer.exe";
-        for action in ["properties", "open_with", "locate_app", "app_properties", "run_as_admin"] {
+        for action in [
+            "properties",
+            "open_with",
+            "locate_app",
+            "app_properties",
+            "run_as_admin",
+        ] {
             let err = run_action_direct(path, action).unwrap_err();
             assert!(
                 err.contains("Shell 路由直接处理"),
