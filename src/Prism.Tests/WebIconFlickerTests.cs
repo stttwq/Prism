@@ -128,15 +128,15 @@ public sealed class WebRowIdentityTests
         public Task StartAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<SearchResponse> SearchAsync(string query, int max, SearchContext context, CancellationToken ct = default)
             => throw new InvalidOperationException("web mode must not hit the broker");
-        public Task ExecuteAsync(ActionTarget target, CancellationToken ct = default) => Task.CompletedTask;
-        public Task RevealAsync(ActionTarget target, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ExecuteAsync(ActionTarget target, string? query = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task RevealAsync(ActionTarget target, string? query = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<IReadOnlyList<ActionItem>> GetActionsAsync(ActionTarget target, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<ActionItem>>([]);
-        public Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default) => Task.CompletedTask;
-        public Task RunActionAsync(ActionTarget target, string action, ActionArgs args, CancellationToken ct = default) => Task.CompletedTask;
+        public Task RunActionAsync(ActionTarget target, string action, string? query = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task RunActionAsync(ActionTarget target, string action, ActionArgs args, string? query = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<WindowHandleInfo> ResolveWindowAsync(ActionTarget target, CancellationToken ct = default)
             => throw new NotSupportedException();
-        public Task RecordWindowSwitchAsync(ActionTarget target, CancellationToken ct = default) => Task.CompletedTask;
+        public Task RecordWindowSwitchAsync(ActionTarget target, string? query = null, CancellationToken ct = default) => Task.CompletedTask;
     }
 
     private sealed class ManualTimerFactory : IDebounceTimerFactory

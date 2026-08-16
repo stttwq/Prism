@@ -96,6 +96,10 @@ pub enum Request {
         id: Option<String>,
         #[serde(default)]
         target: Option<ActionTarget>,
+        /// 触发本次动作的查询文本（查询记忆的记录侧输入）。缺失或 null 等于
+        /// 无查询上下文，旧前端逐字节兼容。
+        #[serde(default)]
+        query: Option<String>,
     },
     /// 打开文件所在文件夹并选中。
     Reveal {
@@ -103,8 +107,10 @@ pub enum Request {
         id: Option<String>,
         #[serde(default)]
         target: Option<ActionTarget>,
+        #[serde(default)]
+        query: Option<String>,
     },
-    /// 请求某文件的动作列表（→ 键动作面板）。
+    /// 请求某文件的动作列表（→ 键动作面板）。不写历史，无 query。
     Actions {
         #[serde(default)]
         id: Option<String>,
@@ -121,6 +127,8 @@ pub enum Request {
         /// 动作参数：copy_to/move_to 携带 destination，rename 携带 new_name。
         #[serde(default)]
         args: Option<ActionArgs>,
+        #[serde(default)]
+        query: Option<String>,
     },
     /// 设置页保存后热重载网页引擎列表（步骤 8）。
     ReloadEngines {
@@ -137,7 +145,11 @@ pub enum Request {
     /// 在这里做第一次复核；只有 WPF 回报成功后才允许写成功历史。
     ResolveWindow { target: ActionTarget },
     /// G5：WPF 激活成功后回报，broker 据此写窗口历史。失败路径不发本消息。
-    RecordWindowSwitch { target: ActionTarget },
+    RecordWindowSwitch {
+        target: ActionTarget,
+        #[serde(default)]
+        query: Option<String>,
+    },
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -514,26 +526,34 @@ async fn dispatch_non_search(
             version: VERSION.to_string(),
             build_id: crate::build_id(),
         },
-        Request::Execute { id, target } => {
+        Request::Execute { id, target, query } => {
             run_shell(
                 shell,
                 ShellOperation::Open(resolve_target(target, id, None)),
                 history,
+                query.as_deref().and_then(query_pick_key),
             )
             .await
         }
-        Request::Reveal { id, target } => {
+        Request::Reveal { id, target, query } => {
             run_shell(
                 shell,
                 ShellOperation::Reveal(resolve_target(target, id, Some(TargetKind::File))),
                 history,
+                query.as_deref().and_then(query_pick_key),
             )
             .await
         }
         Request::Actions { id, target } => {
             list_actions(resolve_target(target, id, Some(TargetKind::File)))
         }
-        Request::RunAction { id, target, action, args } => {
+        Request::RunAction {
+            id,
+            target,
+            action,
+            args,
+            query,
+        } => {
             run_shell(
                 shell,
                 ShellOperation::RunAction {
@@ -543,6 +563,7 @@ async fn dispatch_non_search(
                     zip_program: preferences.zip_program(),
                 },
                 history,
+                query.as_deref().and_then(query_pick_key),
             )
             .await
         }
@@ -588,11 +609,16 @@ async fn dispatch_non_search(
         Request::ResolveWindow { target } => {
             resolve_window(&target, windows, &crate::window_list::SystemWindowProbe)
         }
-        Request::RecordWindowSwitch { target } => {
+        Request::RecordWindowSwitch { target, query } => {
             // Synchronous resolve consumes the `probe` borrow before any await.
             match record_window_switch(&target, windows, &crate::window_list::SystemWindowProbe) {
                 Ok(history_target) => {
-                    write_window_history(history_target, history).await;
+                    write_window_history(
+                        history_target,
+                        history,
+                        query.as_deref().and_then(query_pick_key),
+                    )
+                    .await;
                     Response::Status {
                         is_indexing: false,
                         cancelled: false,
@@ -672,10 +698,16 @@ fn record_window_switch(
 /// Async continuation: writes the resolved history target to disk via
 /// `spawn_blocking` so the tokio worker is not stalled by synchronous file I/O.
 /// Takes only owned data so no non-`Sync` reference crosses the await boundary.
-async fn write_window_history(history_target: ActionTarget, history: &Arc<HistoryStore>) {
+async fn write_window_history(
+    history_target: ActionTarget,
+    history: &Arc<HistoryStore>,
+    query_key: Option<String>,
+) {
     let history = history.clone();
-    match tokio::task::spawn_blocking(move || history.record(&history_target, HistoryUse::Execute))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        history.record_with_query(&history_target, HistoryUse::Execute, query_key.as_deref())
+    })
+    .await
     {
         Ok(Err(error)) => log(format!("窗口历史写入失败：{error}")),
         Err(error) => log(format!("history spawn_blocking failed: {error}")),
@@ -831,6 +863,15 @@ fn has_query_filters(filters: &[SearchFilter]) -> bool {
     filters
         .iter()
         .any(|f| f.field == "ext" || f.field == "path")
+}
+
+/// 查询记忆键：剥掉窗口模式前缀 `>` 与 `ext:`/`path:` 过滤词，再做存储侧
+/// 归一化。记录侧（动作请求）与检索侧（search_service 的 pick 查找）共用，
+/// 保证 `report ext:pdf` 与 `report` 落到同一条记忆上；纯过滤词/空白 → None。
+fn query_pick_key(raw: &str) -> Option<String> {
+    let stripped = raw.trim_start().trim_start_matches('>').trim_start();
+    let (name_query, _) = parse_query(stripped);
+    crate::history::normalized_query_key(&name_query)
 }
 
 /// 一次搜索请求的查询部分（与共享状态分开传递，避免参数表无限膨胀）。
@@ -1180,16 +1221,13 @@ async fn search_service(
     };
     // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
     // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
-    let pick_flags: Option<Vec<bool>> = if name_query.trim().is_empty() {
-        None
-    } else {
-        Some(
-            ranked
-                .iter()
-                .map(|item| history.query_pick(&item.target, &name_query))
-                .collect(),
-        )
-    };
+    let pick_key = query_pick_key(query);
+    let pick_flags: Option<Vec<bool>> = pick_key.as_ref().map(|key| {
+        ranked
+            .iter()
+            .map(|item| history.query_pick(&item.target, key))
+            .collect()
+    });
     sort_search_results_with_picks(&mut ranked, pick_flags.as_deref());
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
@@ -1739,6 +1777,7 @@ async fn run_shell(
     shell: &Arc<ShellExecutor>,
     operation: ShellOperation,
     history: &Arc<HistoryStore>,
+    query_key: Option<String>,
 ) -> Response {
     let history_record = match &operation {
         ShellOperation::Open(target)
@@ -1747,21 +1786,26 @@ async fn run_shell(
         ShellOperation::Reveal(target) => Some((target.clone(), HistoryUse::Reveal)),
         ShellOperation::RunAction { target, .. } => Some((target.clone(), HistoryUse::Execute)),
     };
-    finish_shell_response(shell.execute(operation).await, history_record, history).await
+    finish_shell_response(shell.execute(operation).await, history_record, history, query_key).await
 }
 
 async fn finish_shell_response(
     outcome: Result<ShellOutcome, ShellError>,
     history_record: Option<(ActionTarget, HistoryUse)>,
     history: &Arc<HistoryStore>,
+    query_key: Option<String>,
 ) -> Response {
     match outcome {
         Ok(ShellOutcome::Success) => {
             if let Some((target, usage)) = history_record {
-                // history.record() does synchronous disk I/O (persist). Offload it to a
-                // blocking thread so the tokio worker is not stalled.
+                // history.record_with_query() does synchronous disk I/O (persist).
+                // Offload it to a blocking thread so the tokio worker is not stalled.
                 let history = history.clone();
-                match tokio::task::spawn_blocking(move || history.record(&target, usage)).await {
+                match tokio::task::spawn_blocking(move || {
+                    history.record_with_query(&target, usage, query_key.as_deref())
+                })
+                .await
+                {
                     Ok(Err(_)) => log("history write failed"),
                     Err(error) => log(format!("history spawn_blocking failed: {error}")),
                     Ok(Ok(())) => {}
@@ -2042,7 +2086,7 @@ mod window_protocol_tests {
             &AlwaysLive(live_window()),
         )
         .expect("should resolve");
-        write_window_history(history_target, &history).await;
+        write_window_history(history_target, &history, None).await;
         let key = ActionTarget::new(TargetKind::Window, entry().history_key());
         assert!(history.score(&key) > 0);
         // The handle must not be what got persisted.
@@ -2322,7 +2366,8 @@ mod protocol_tests {
             legacy,
             Request::Execute {
                 id: Some(_),
-                target: None
+                target: None,
+                ..
             }
         ));
 
@@ -2334,7 +2379,8 @@ mod protocol_tests {
             typed,
             Request::Execute {
                 id: None,
-                target: Some(ActionTarget { ref kind, .. })
+                target: Some(ActionTarget { ref kind, .. }),
+                ..
             } if kind == "web"
         ));
     }
@@ -2724,7 +2770,7 @@ mod protocol_tests {
         let record = || Some((target.clone(), HistoryUse::Execute));
 
         let cancelled =
-            finish_shell_response(Ok(ShellOutcome::Cancelled), record(), &history).await;
+            finish_shell_response(Ok(ShellOutcome::Cancelled), record(), &history, None).await;
         assert!(matches!(
             cancelled,
             Response::Status {
@@ -2741,13 +2787,14 @@ mod protocol_tests {
             }),
             record(),
             &history,
+            None,
         )
         .await;
         assert!(matches!(failed, Response::Error { .. }));
         assert_eq!(history.score(&target), 0);
 
         let success =
-            finish_shell_response(Ok(ShellOutcome::Success), record(), &history).await;
+            finish_shell_response(Ok(ShellOutcome::Success), record(), &history, None).await;
         assert!(matches!(
             success,
             Response::Status {
@@ -2756,6 +2803,103 @@ mod protocol_tests {
             }
         ));
         assert_eq!(history.score(&target), 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 动作请求携带可选 query（查询记忆的记录侧输入）。缺失、null、有值
+    /// 三种形态都必须解码——旧前端永远不发这个字段。
+    #[test]
+    fn action_query_field_is_optional_and_backward_compatible() {
+        let legacy: Request = serde_json::from_str(
+            r#"{"type":"execute","target":{"kind":"file","value":"C:\\a"}}"#,
+        )
+        .unwrap();
+        match legacy {
+            Request::Execute { query, .. } => assert_eq!(query, None),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let explicit_null: Request = serde_json::from_str(
+            r#"{"type":"execute","target":{"kind":"file","value":"C:\\a"},"query":null}"#,
+        )
+        .unwrap();
+        match explicit_null {
+            Request::Execute { query, .. } => assert_eq!(query, None),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let with_query: Request = serde_json::from_str(
+            r#"{"type":"run_action","target":{"kind":"file","value":"C:\\a"},"action":"copy","query":"Report ext:pdf"}"#,
+        )
+        .unwrap();
+        match with_query {
+            Request::RunAction { query, .. } => {
+                assert_eq!(query.as_deref(), Some("Report ext:pdf"))
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let window: Request = serde_json::from_str(
+            r#"{"type":"record_window_switch","target":{"kind":"window","value":"7"},"query":">win"}"#,
+        )
+        .unwrap();
+        match window {
+            Request::RecordWindowSwitch { query, .. } => {
+                assert_eq!(query.as_deref(), Some(">win"))
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    /// 查询记忆键归一化：剥 `>` 前缀与过滤词，大小写/空白归一；
+    /// 纯过滤词或空白没有记忆意义。
+    #[test]
+    fn query_pick_key_strips_prefixes_filters_and_normalizes() {
+        assert_eq!(query_pick_key("Report ext:pdf").as_deref(), Some("report"));
+        assert_eq!(query_pick_key("  >Word  ").as_deref(), Some("word"));
+        assert_eq!(query_pick_key("report").as_deref(), Some("report"));
+        assert_eq!(query_pick_key("ext:pdf"), None);
+        assert_eq!(query_pick_key("   "), None);
+    }
+
+    /// 成功动作带上查询键 → 写入 query 子表，`query_pick` 能查到；
+    /// 查询键缺失（旧前端）时只记 frecency。
+    #[tokio::test]
+    async fn successful_action_with_query_records_pick_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-ipc-history-pick-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let history = Arc::new(HistoryStore::load(&dir, true));
+        let target = ActionTarget::new(TargetKind::File, r"C:\pick.txt");
+
+        let with_query = finish_shell_response(
+            Ok(ShellOutcome::Success),
+            Some((target.clone(), HistoryUse::Execute)),
+            &history,
+            Some("conf".to_string()),
+        )
+        .await;
+        assert!(matches!(with_query, Response::Status { .. }));
+        assert!(history.query_pick(&target, "conf"));
+        assert!(!history.query_pick(&target, "other"));
+
+        let legacy = finish_shell_response(
+            Ok(ShellOutcome::Success),
+            Some((
+                ActionTarget::new(TargetKind::File, r"C:\legacy.txt"),
+                HistoryUse::Execute,
+            )),
+            &history,
+            None,
+        )
+        .await;
+        assert!(matches!(legacy, Response::Status { .. }));
+        assert!(!history.query_pick(
+            &ActionTarget::new(TargetKind::File, r"C:\legacy.txt"),
+            "conf"
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2774,6 +2918,7 @@ mod protocol_tests {
                     kind: "future".into(),
                     value: "opaque".into(),
                 }),
+                query: None,
             },
             &default_engines(),
             &shell,

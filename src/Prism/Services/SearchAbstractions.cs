@@ -43,17 +43,20 @@ public interface ISearchClient
         int max,
         SearchContext context,
         CancellationToken ct = default);
-    Task ExecuteAsync(ActionTarget target, CancellationToken ct = default);
-    Task RevealAsync(ActionTarget target, CancellationToken ct = default);
+    /// <summary>打开/执行选中项。query = 触发本次动作的查询文本（查询记忆），null 表示无查询上下文。</summary>
+    Task ExecuteAsync(ActionTarget target, string? query = null, CancellationToken ct = default);
+
+    /// <summary>在资源管理器中定位文件。query 含义同 <see cref="ExecuteAsync"/>。</summary>
+    Task RevealAsync(ActionTarget target, string? query = null, CancellationToken ct = default);
     Task<IReadOnlyList<ActionItem>> GetActionsAsync(ActionTarget target, CancellationToken ct = default);
-    Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default);
-    Task RunActionAsync(ActionTarget target, string action, ActionArgs args, CancellationToken ct = default);
+    Task RunActionAsync(ActionTarget target, string action, string? query = null, CancellationToken ct = default);
+    Task RunActionAsync(ActionTarget target, string action, ActionArgs args, string? query = null, CancellationToken ct = default);
 
     /// <summary>G5：把枚举 token 换成已复核的句柄，交给前台进程激活。</summary>
     Task<WindowHandleInfo> ResolveWindowAsync(ActionTarget target, CancellationToken ct = default);
 
     /// <summary>G5：激活成功后回报，由 broker 写窗口历史。失败路径不得调用。</summary>
-    Task RecordWindowSwitchAsync(ActionTarget target, CancellationToken ct = default);
+    Task RecordWindowSwitchAsync(ActionTarget target, string? query = null, CancellationToken ct = default);
 }
 
 /// <summary>

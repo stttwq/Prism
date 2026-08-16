@@ -315,16 +315,16 @@ public sealed class PipeClient : ISearchClient, IDisposable
             ? parsed
             : null;
 
-    /// <summary>打开文件/文件夹/程序。</summary>
-    public async Task ExecuteAsync(ActionTarget target, CancellationToken ct = default)
+    /// <summary>打开文件/文件夹/程序。query 随动作上报（查询记忆），null 线路上等价于缺失。</summary>
+    public async Task ExecuteAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "execute", target = TargetPayload(target) }, ct).ConfigureAwait(false);
+        await SendAsync(new { type = "execute", target = TargetPayload(target), query }, ct).ConfigureAwait(false);
     }
 
-    /// <summary>在资源管理器中定位文件。</summary>
-    public async Task RevealAsync(ActionTarget target, CancellationToken ct = default)
+    /// <summary>在资源管理器中定位文件。query 含义同 <see cref="ExecuteAsync"/>。</summary>
+    public async Task RevealAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "reveal", target = TargetPayload(target) }, ct).ConfigureAwait(false);
+        await SendAsync(new { type = "reveal", target = TargetPayload(target), query }, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -375,18 +375,23 @@ public sealed class PipeClient : ISearchClient, IDisposable
     }
 
     /// <summary>执行动作面板中的某一项。</summary>
-    public async Task RunActionAsync(ActionTarget target, string action, CancellationToken ct = default)
+    public async Task RunActionAsync(ActionTarget target, string action, string? query = null, CancellationToken ct = default)
     {
-        await RunActionAsync(target, action, ActionArgs.Empty, ct).ConfigureAwait(false);
+        await RunActionAsync(target, action, ActionArgs.Empty, query, ct).ConfigureAwait(false);
     }
 
-    /// <summary>执行动作面板中的某一项，携带动作参数（destination/new_name）。</summary>
-    public async Task RunActionAsync(ActionTarget target, string action, ActionArgs args, CancellationToken ct = default)
+    /// <summary>执行动作面板中的某一项，携带动作参数（destination/new_name）与查询文本。</summary>
+    public async Task RunActionAsync(
+        ActionTarget target,
+        string action,
+        ActionArgs args,
+        string? query = null,
+        CancellationToken ct = default)
     {
         object payload;
         if (args is { Destination: null, NewName: null })
         {
-            payload = new { type = "run_action", target = TargetPayload(target), action };
+            payload = new { type = "run_action", target = TargetPayload(target), action, query };
         }
         else
         {
@@ -397,7 +402,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 (not null, not null) => new { destination = args.Destination, new_name = args.NewName },
                 _ => null,
             };
-            payload = new { type = "run_action", target = TargetPayload(target), action, args = argsObj };
+            payload = new { type = "run_action", target = TargetPayload(target), action, args = argsObj, query };
         }
         await SendAsync(payload, ct).ConfigureAwait(false);
     }
@@ -419,11 +424,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
         return ParseWindowHandle(resp);
     }
 
-    /// <summary>G5：激活成功后回报，由 broker 写窗口历史。</summary>
-    public async Task RecordWindowSwitchAsync(ActionTarget target, CancellationToken ct = default)
+    /// <summary>G5：激活成功后回报，由 broker 写窗口历史。query 为窗口模式的当前查询文本。</summary>
+    public async Task RecordWindowSwitchAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
     {
         await SendAsync(
-            new { type = "record_window_switch", target = TargetPayload(target) },
+            new { type = "record_window_switch", target = TargetPayload(target), query },
             ct,
             QueryReadTimeout).ConfigureAwait(false);
     }

@@ -986,12 +986,12 @@ public sealed class SearchViewModelTests
             LastQuery = query;
             return _responses.Dequeue();
         }
-        public Task ExecuteAsync(ActionTarget target, CancellationToken ct = default)
+        public Task ExecuteAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
         {
             LastTarget = target;
             return Task.CompletedTask;
         }
-        public Task RevealAsync(ActionTarget target, CancellationToken ct = default)
+        public Task RevealAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
         {
             LastTarget = target;
             return Task.CompletedTask;
@@ -1006,6 +1006,7 @@ public sealed class SearchViewModelTests
         public Task RunActionAsync(
             ActionTarget target,
             string action,
+            string? query = null,
             CancellationToken ct = default)
         {
             LastTarget = target;
@@ -1016,6 +1017,7 @@ public sealed class SearchViewModelTests
             ActionTarget target,
             string action,
             ActionArgs args,
+            string? query = null,
             CancellationToken ct = default)
         {
             LastTarget = target;
@@ -1048,7 +1050,7 @@ public sealed class SearchViewModelTests
             return Task.FromResult(ResolvedWindow);
         }
 
-        public Task RecordWindowSwitchAsync(ActionTarget target, CancellationToken ct = default)
+        public Task RecordWindowSwitchAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
         {
             RecordCalls.Add(target);
             if (RecordFailure is not null)

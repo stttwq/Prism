@@ -371,7 +371,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.ExecuteAsync(item.ExecutionTarget).ConfigureAwait(true);
+            await _pipe.ExecuteAsync(item.ExecutionTarget, _state.Query).ConfigureAwait(true);
             HideRequested?.Invoke();
         }
         catch (Exception ex)
@@ -419,7 +419,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.RecordWindowSwitchAsync(item.ExecutionTarget).ConfigureAwait(true);
+            await _pipe.RecordWindowSwitchAsync(item.ExecutionTarget, _state.Query).ConfigureAwait(true);
         }
         catch
         {
@@ -437,7 +437,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.RevealAsync(item.ExecutionTarget).ConfigureAwait(true);
+            await _pipe.RevealAsync(item.ExecutionTarget, _state.Query).ConfigureAwait(true);
             HideRequested?.Invoke();
         }
         catch (Exception ex)
@@ -582,6 +582,7 @@ public sealed class SearchViewModel
                     target.ExecutionTarget,
                     action.Id,
                     new ActionArgs { Destination = destination },
+                    _state.Query,
                     CancellationToken.None).ConfigureAwait(true);
                 _state.StatusMessage = action.Id == "copy_to" ? "复制完成，正在刷新…" : "移动完成，正在刷新…";
             }
@@ -595,7 +596,7 @@ public sealed class SearchViewModel
 
         try
         {
-            await _pipe.RunActionAsync(target.ExecutionTarget, action.Id).ConfigureAwait(true);
+            await _pipe.RunActionAsync(target.ExecutionTarget, action.Id, _state.Query).ConfigureAwait(true);
             // mutation 动作（recycle/delete_permanent/zip）保留窗口等待 generation 刷新；
             // 其余成功动作隐藏 Prism。
             if (HideAfterSuccessActions.Contains(action.Id))
@@ -677,6 +678,7 @@ public sealed class SearchViewModel
                 target.ExecutionTarget,
                 "rename",
                 new ActionArgs { NewName = newName.Trim() },
+                _state.Query,
                 CancellationToken.None).ConfigureAwait(true);
             _state.RenameTarget = null;
             _state.RenameNewName = null;

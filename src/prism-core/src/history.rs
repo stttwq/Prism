@@ -184,6 +184,17 @@ impl HistoryStore {
         self.record_at(target, usage, None, now_utc())
     }
 
+    /// 带查询记忆的动作记录：`query` 为已归一化的查询键；None = 调用方没有
+    /// 查询上下文（旧前端），只记 frecency 不记 query 子表。
+    pub fn record_with_query(
+        &self,
+        target: &ActionTarget,
+        usage: HistoryUse,
+        query: Option<&str>,
+    ) -> Result<(), String> {
+        self.record_at(target, usage, query, now_utc())
+    }
+
     pub(crate) fn record_at(
         &self,
         target: &ActionTarget,
@@ -378,8 +389,9 @@ fn record_query_stat(entry: &mut HistoryEntry, raw_query: &str, now: u64) {
 }
 
 /// 键归一化：trim → 小写 → 截 32 字符；空串/NUL 不记录。调用方（broker
-/// 记录链路）先做查询语法级归一化（剥 ext:/path: 等），这里是存储侧兜底。
-fn normalized_query_key(raw: &str) -> Option<String> {
+/// 记录链路）先做查询语法级归一化（剥 > 模式前缀与 ext:/path: 等），
+/// 这里是存储侧兜底，幂等。
+pub(crate) fn normalized_query_key(raw: &str) -> Option<String> {
     let key: String = raw
         .trim()
         .to_lowercase()
