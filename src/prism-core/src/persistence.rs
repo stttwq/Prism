@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
-pub const HISTORY_SCHEMA_VERSION: u32 = 1;
+pub const HISTORY_SCHEMA_VERSION: u32 = 2;
 pub const FAVICON_METADATA_SCHEMA_VERSION: u32 = 1;
 
 pub trait VersionedData {
@@ -47,6 +47,24 @@ pub struct HistoryData {
     pub entries: Vec<HistoryEntry>,
 }
 
+/// v2：记录某个规范化查询串选中过该 target（写入侧在 history.rs 里做键归一化）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryStat {
+    pub query: String,
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub last_used_utc: u64,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub kind: String,
@@ -59,14 +77,21 @@ pub struct HistoryEntry {
     pub destination_count: u32,
     #[serde(default)]
     pub last_used_utc: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub first_used_utc: u64,
+    /// 衰减加权分 ×1000 定点存储：事件时更新、读取时按 last_utc 惰性衰减。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub frecency_milli: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<QueryStat>,
 }
 
 impl VersionedData for HistoryData {
     const SCHEMA_VERSION: u32 = HISTORY_SCHEMA_VERSION;
 
     fn validate(&self) -> Result<(), String> {
-        if self.entries.len() > 500 {
-            return Err("history contains more than 500 entries".into());
+        if self.entries.len() > 5000 {
+            return Err("history contains more than 5000 entries".into());
         }
         for entry in &self.entries {
             if !matches!(
@@ -80,6 +105,14 @@ impl VersionedData for HistoryData {
                 || entry.target.len() > 32 * 1024
             {
                 return Err("history contains an invalid target".into());
+            }
+            if entry.queries.len() > 8 {
+                return Err("history entry contains more than 8 query stats".into());
+            }
+            for stat in &entry.queries {
+                if stat.query.is_empty() || stat.query.contains('\0') || stat.query.len() > 128 {
+                    return Err("history entry contains an invalid query stat".into());
+                }
             }
         }
         Ok(())
@@ -125,8 +158,57 @@ mod tests {
     #[test]
     fn writer_validates_before_serializing_new_shape() {
         let data = HistoryData {
-            entries: vec![HistoryEntry::default(); 501],
+            entries: vec![HistoryEntry::default(); 5001],
         };
         assert!(VersionedEnvelope::new(data).is_err());
+    }
+
+    #[test]
+    fn query_stats_are_bounded_and_nonempty() {
+        let entry = |queries: Vec<QueryStat>| HistoryData {
+            entries: vec![HistoryEntry {
+                kind: "file".into(),
+                target: r"C:\x".into(),
+                queries,
+                ..HistoryEntry::default()
+            }],
+        };
+        let nine = (0..9)
+            .map(|index| QueryStat {
+                query: format!("q{index}"),
+                count: 1,
+                last_used_utc: 0,
+            })
+            .collect();
+        assert!(VersionedEnvelope::new(entry(nine)).is_err());
+
+        let empty = vec![QueryStat::default()];
+        assert!(VersionedEnvelope::new(entry(empty)).is_err());
+
+        let overlong = vec![QueryStat {
+            query: "x".repeat(129),
+            ..QueryStat::default()
+        }];
+        assert!(VersionedEnvelope::new(entry(overlong)).is_err());
+
+        let valid = vec![QueryStat {
+            query: "conf".into(),
+            count: 2,
+            last_used_utc: 42,
+        }];
+        assert!(VersionedEnvelope::new(entry(valid)).is_ok());
+    }
+
+    #[test]
+    fn v1_entries_decode_into_the_v2_shape_with_defaults() {
+        let envelope: VersionedEnvelope<HistoryData> = serde_json::from_str(
+            r#"{"schema_version":1,"data":{"entries":[{"kind":"file","target":"C:\\a","execute_count":2,"last_used_utc":9}]}}"#,
+        )
+        .unwrap();
+        let data = envelope.into_compatible().unwrap();
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].frecency_milli, 0);
+        assert!(data.entries[0].queries.is_empty());
+        assert_eq!(data.entries[0].first_used_utc, 0);
     }
 }
