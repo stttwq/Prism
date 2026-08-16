@@ -137,13 +137,17 @@ public partial class SearchWindow : Window
     }
 
     /// <summary>由 App 在启动时注入 ViewModel、图标缓存与主题监听。</summary>
-    public void Attach(SearchViewModel vm, IconCache icons, ThemeWatcher? theme = null)
+    public void Attach(
+        SearchViewModel vm,
+        IconCache icons,
+        ThemeWatcher? theme = null,
+        WebIconProvider? webIcons = null)
     {
         _vm = vm;
         _icons = icons;
         _theme = theme;
         Results.SetIconCache(icons);
-        Results.SetWebIconProvider(new WebIconProvider());
+        Results.SetWebIconProvider(webIcons ?? new WebIconProvider());
         vm.HideRequested += () =>
         {
             if (Dispatcher.CheckAccess()) HideAnimated();

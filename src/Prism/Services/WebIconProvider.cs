@@ -18,12 +18,21 @@ namespace Prism.Services;
 public sealed class WebIconProvider
 {
     private readonly FaviconCache? _faviconCache;
+    /// <summary>origin → 是否允许联网获取（读设置里的 FaviconGrants）。</summary>
+    private readonly Func<string, bool>? _isGranted;
     private readonly ImageSource _genericIcon;
     private readonly Dictionary<string, ImageSource> _builtInIcons = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// 成功解析的 favicon 内存缓存：同一 origin 恒定返回同一实例，
+    /// ResultList 按引用比较即可零重赋（防逐键闪烁），下载完成后
+    /// <see cref="Invalidate"/> 清空、下一次装饰自动换上新图标。
+    /// </summary>
+    private readonly Dictionary<string, ImageSource> _resolved = new(StringComparer.OrdinalIgnoreCase);
 
-    public WebIconProvider(FaviconCache? faviconCache = null)
+    public WebIconProvider(FaviconCache? faviconCache = null, Func<string, bool>? isGranted = null)
     {
         _faviconCache = faviconCache;
+        _isGranted = isGranted;
         _genericIcon = CreateGenericIcon();
         _genericIcon.Freeze();
         // 预建并冻结内置引擎图标，避免每次 GetIcon 重建导致 UI 闪烁。
@@ -40,8 +49,11 @@ public sealed class WebIconProvider
         }
     }
 
+    /// <summary>下载完成后清空解析缓存：下一次取图标重新读磁盘，让新 favicon 立即可见。</summary>
+    public void Invalidate() => _resolved.Clear();
+
     /// <summary>
-    /// 获取引擎图标。优先内置图标，其次 favicon 缓存，最后通用图标。
+    /// 获取引擎图标。优先内置图标，其次（已授权的）favicon 缓存，最后通用图标。
     /// </summary>
     /// <param name="url">引擎 URL（用于提取 origin 查 favicon 缓存，或推断内置引擎）。</param>
     /// <param name="engineName">引擎显示名（可选，用于精确匹配内置图标）。</param>
@@ -52,16 +64,23 @@ public sealed class WebIconProvider
         if (name is not null && _builtInIcons.TryGetValue(name, out var cached))
             return cached;
 
-        // 自定义引擎：查 favicon 缓存
+        // 自定义引擎：查 favicon 缓存（必须已授权该 origin）
         if (_faviconCache is not null)
         {
             var origin = FaviconCache.NormalizeOrigin(url);
-            if (origin is not null)
+            if (origin is not null && _isGranted?.Invoke(origin) != false)
             {
-                // 检查是否已授权
-                var granted = _faviconCache.GetFavicon(origin, granted: true);
-                if (granted is not null)
-                    return granted;
+                if (_resolved.TryGetValue(origin, out var hit))
+                    return hit;
+                var favicon = _faviconCache.GetFavicon(origin, granted: true);
+                if (favicon is not null)
+                {
+                    favicon.Freeze();
+                    _resolved[origin] = favicon;
+                    return favicon;
+                }
+                // 未命中（尚未下载/损坏）继续回退通用图标；不做负缓存——
+                // 下载完成后无需 Invalidate 也能在下一次装饰时拿到。
             }
         }
 

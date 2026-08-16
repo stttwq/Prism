@@ -80,6 +80,8 @@ public sealed class FaviconCache
 
     /// <summary>
     /// 下载并缓存 favicon。下载前验证 MIME、大小、实际格式和像素尺寸。
+    /// 直接下载 <c>/favicon.ico</c> 失败（404 / 格式不符）时回退 DuckDuckGo
+    /// 图标聚合服务（域名只发给 duckduckgo.com，不引入 Google）。
     /// 失败、拒绝或损坏返回 null。
     /// </summary>
     public async Task<ImageSource?> DownloadFaviconAsync(
@@ -90,7 +92,26 @@ public sealed class FaviconCache
         if (key is null)
             return null;
 
-        var faviconUrl = $"https://{key}/favicon.ico";
+        var host = key[(key.IndexOf("://", StringComparison.Ordinal) + 3)..];
+        var sources = new[]
+        {
+            $"https://{key}/favicon.ico",
+            $"https://icons.duckduckgo.com/ip3/{host}.ico",
+        };
+        foreach (var faviconUrl in sources)
+        {
+            var downloaded = await TryDownloadAsync(key, faviconUrl, ct).ConfigureAwait(false);
+            if (downloaded is not null)
+                return downloaded;
+        }
+        return null;
+    }
+
+    private async Task<ImageSource?> TryDownloadAsync(
+        string key,
+        string faviconUrl,
+        CancellationToken ct)
+    {
         try
         {
             var resp = await _http.GetAsync(faviconUrl, HttpCompletionOption.ResponseHeadersRead, ct)

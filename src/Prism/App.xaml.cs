@@ -39,6 +39,10 @@ public partial class App : Application
     private TrayService? _tray;
     private ThemeWatcher? _theme;
     private SingleInstance? _singleInstance;
+    /// <summary>G8：favicon 磁盘缓存（含联网下载），数据目录与 settings.json 同级。</summary>
+    private FaviconCache? _favicons;
+    /// <summary>G8：搜索结果的网页图标提供器（授权门控走 _hostSettings）。</summary>
+    private WebIconProvider? _webIcons;
     private bool _currentDirectorySearchEnabled = true;
     /// <summary>宿主 adapter 读取的设置快照；保存设置后更新，adapter 的 IsEnabled 委托读这里。</summary>
     private Settings _hostSettings = Settings.Default;
@@ -65,6 +69,7 @@ public partial class App : Application
         _store = new SettingsStore();
         var settings = _store.Load();
         _hostSettings = settings;
+        _favicons = new FaviconCache(_store.DataDir);
 
         _autoStart = new AutoStartService();
         try
@@ -147,7 +152,11 @@ public partial class App : Application
         // 注入带设置驱动开关的真实 adapter 矩阵；SystemFileDialog 仍是占位。
         var scope = new HostScopeController(HostAdapterCatalog.Create(() => _hostSettings));
         _searchWindow = new SearchWindow(new IndexerGenerationClient(), scope);
-        _searchWindow.Attach(_vm, _icons, _theme);
+        // 自定义引擎图标走 favicon 缓存 + 授权门控（内置引擎仍是矢量单例）。
+        _webIcons = new WebIconProvider(
+            _favicons,
+            origin => _hostSettings.FaviconGrants.ContainsKey(origin));
+        _searchWindow.Attach(_vm, _icons, _theme, _webIcons);
         // 窗口是懒创建的，创建时补上设置里的当前目录搜索总开关。
         _searchWindow.Scope.SetCurrentDirectoryEnabled(_currentDirectorySearchEnabled);
         return _searchWindow;
@@ -181,7 +190,8 @@ public partial class App : Application
             onClearHistory: ClearBackendHistoryAsync,
             onWebSettingsChanged: (engines, suggestionsEnabled) =>
                 _vm?.UpdateWebSettings(engines, suggestionsEnabled),
-            onRequestFaviconGrant: RequestFaviconGrant);
+            onRequestFaviconGrant: RequestFaviconGrant,
+            onFaviconGranted: DownloadFavicon);
         _settingsWindow = new SettingsWindow(vm);
         _settingsWindow.Closed += (_, _) =>
         {
@@ -191,6 +201,31 @@ public partial class App : Application
         };
         _settingsWindow.Show();
         _settingsWindow.Activate();
+    }
+
+    /// <summary>
+    /// G8：授权成功后异步下载 favicon。下载落盘 + 图标内存缓存失效后，
+    /// 搜索结果下一次装饰自动换上新图标；失败静默保持通用图标。
+    /// </summary>
+    private void DownloadFavicon(string origin)
+    {
+        var cache = _favicons;
+        if (cache is null) return;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await cache.DownloadFaviconAsync(origin).ConfigureAwait(false);
+            }
+            catch
+            {
+                // 下载失败静默回退通用图标，不打扰用户。
+            }
+            finally
+            {
+                _webIcons?.Invalidate();
+            }
+        });
     }
 
     private void ApplySettings(Settings settings)

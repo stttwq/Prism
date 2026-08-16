@@ -362,11 +362,14 @@ public partial class ResultList : UserControl
                 {
                     // Key on the engine, not the URL: the URL carries the query, so keying on
                     // it would reassign Source on every keystroke — a visible icon flicker.
+                    // GetIcon 对同一 origin 返回稳定实例（通用/内置是冻结单例、favicon 走
+                    // 内存缓存），引用比较即可：favicon 下载完成后下一次按键自动换上，其余时刻零重赋。
                     var webKey = "web:" + _webIcons.IconKey(item.ExecuteId);
-                    if (!Equals(icon.Tag as string, webKey))
+                    var next = _webIcons.GetIcon(item.ExecuteId);
+                    if (!Equals(icon.Tag as string, webKey) || !ReferenceEquals(icon.Source, next))
                     {
                         icon.Tag = webKey;
-                        icon.Source = _webIcons.GetIcon(item.ExecuteId);
+                        icon.Source = next;
                     }
                 }
                 else

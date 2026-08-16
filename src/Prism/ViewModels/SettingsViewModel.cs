@@ -24,6 +24,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly Action<IReadOnlyList<WebEngine>, bool>? _onWebSettingsChanged;
     /// <summary>G8：自定义引擎 origin 变化时弹出 favicon 授权对话框。返回 true=授权。</summary>
     private readonly Func<string, bool>? _onRequestFaviconGrant;
+    /// <summary>G8：授权成功后触发 favicon 下载（App 持有 FaviconCache，完成后刷新图标缓存）。</summary>
+    private readonly Action<string>? _onFaviconGranted;
 
     private bool _autoStartEnabled;
     private HotkeyMode _hotkeyMode;
@@ -50,7 +52,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Func<bool, bool, Task>? onPreferencesChanged = null,
         Func<Task>? onClearHistory = null,
         Action<IReadOnlyList<WebEngine>, bool>? onWebSettingsChanged = null,
-        Func<string, bool>? onRequestFaviconGrant = null)
+        Func<string, bool>? onRequestFaviconGrant = null,
+        Action<string>? onFaviconGranted = null)
     {
         _store = store;
         _autoStart = autoStart;
@@ -60,6 +63,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onClearHistory = onClearHistory;
         _onWebSettingsChanged = onWebSettingsChanged;
         _onRequestFaviconGrant = onRequestFaviconGrant;
+        _onFaviconGranted = onFaviconGranted;
 
         var settings = store.Load();
         _autoStartEnabled = settings.AutoStart;
@@ -511,6 +515,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 [origin] = new FaviconGrant(origin, DateTimeOffset.UtcNow.ToString("o")),
             };
             _store.Save(disk with { FaviconGrants = grants });
+
+            // 触发下载：缓存落盘 + 图标内存缓存失效后，搜索结果下一次装饰即换上真图标。
+            _onFaviconGranted?.Invoke(origin);
         }
     }
 
