@@ -543,6 +543,46 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    /// M7：入站行长上限。超过 1MB 的行必须让连接断开，
+    /// 而不是被无限缓冲撑爆服务内存。
+    #[tokio::test]
+    async fn oversized_request_line_disconnects_the_client() {
+        let pipe_name = format!(r"\\.\pipe\prism-indexer-oversize-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&pipe_name)
+            .unwrap();
+        let state = ServiceState::new();
+        let server_task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            assert!(handle_connection(server, state).await.is_err());
+        });
+
+        let pipe = ClientOptions::new().open(&pipe_name).unwrap();
+        let (reader, mut writer) = tokio::io::split(pipe);
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+
+        let hello = serde_json::to_string(&IndexerRequest::Hello {
+            protocol: crate::INDEXER_PROTOCOL,
+        })
+        .unwrap();
+        writer.write_all(format!("{hello}\n").as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+        read_response(&mut lines).await.unwrap();
+
+        let huge = vec![b'a'; 2 * 1024 * 1024];
+        // 服务端在累积超过 1MB 时即断开：客户端后续写入可能得到 BrokenPipe，忽略。
+        let _ = writer.write_all(&huge).await;
+        let _ = writer.write_all(b"\n").await;
+        let _ = writer.flush().await;
+
+        // 服务端断开：读到 EOF 或 IO 错误，绝不能收到超长行的"响应"。
+        let closed = lines.next_line().await;
+        assert!(matches!(closed, Ok(None)) || closed.is_err());
+        server_task.await.unwrap();
+    }
+
     /// A partially built index answers searches instead of being short-circuited to an
     /// empty reply. Before per-volume publishing this state could not occur, so the
     /// `!status.ready` early return covered every build; now it must not swallow the

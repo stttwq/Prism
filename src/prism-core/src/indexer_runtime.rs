@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc, Notify};
 
@@ -1393,11 +1393,11 @@ pub(crate) async fn handle_connection(
     state: Arc<ServiceState>,
 ) -> Result<(), String> {
     let (reader, mut writer) = tokio::io::split(pipe);
-    let mut lines = BufReader::new(reader).lines();
+    // 有界逐行读（1MB 上限）：无上限的 lines() 会让任意本地进程灌超长行撑爆内存。
+    let mut lines = crate::ipc::BoundedLineReader::new(reader);
     let hello = lines
         .next_line()
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
         .ok_or("client closed before hello")?;
     match serde_json::from_str::<IndexerRequest>(&hello) {
         Ok(IndexerRequest::Hello { protocol }) if protocol == INDEXER_PROTOCOL => {
@@ -1414,7 +1414,8 @@ pub(crate) async fn handle_connection(
             return Ok(());
         }
     }
-    while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim().to_string();
         let response = match serde_json::from_str::<IndexerRequest>(&line) {
             // `status()` takes `index.read()` synchronously. Calling it directly
             // on a worker thread lets a USN flood (watcher holding `index.write()`)

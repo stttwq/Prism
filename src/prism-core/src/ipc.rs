@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
@@ -350,6 +350,67 @@ pub async fn serve(
     }
 }
 
+/// 入站单行长度上限：合法请求是 KB 级；无上限的逐行读会让任意本地进程
+/// 连上管道灌超长行撑爆内存。
+const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+/// 有界逐行读取器：分块读入、跨调用保留未换行的残留字节、超限即报错。
+/// 替代无上限累积的 `BufReader::lines()`。
+pub(crate) struct BoundedLineReader<R: tokio::io::AsyncRead + Unpin> {
+    reader: BufReader<R>,
+    carry: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> BoundedLineReader<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            carry: Vec::with_capacity(512),
+        }
+    }
+
+    /// 读下一行（含换行符前的内容）。EOF 且无残留返回 None；
+    /// 单行超过 [`MAX_REQUEST_LINE_BYTES`] 返回 Err（调用方应断开）。
+    pub(crate) async fn next_line(&mut self) -> Result<Option<String>, String> {
+        loop {
+            if let Some(pos) = self.carry.iter().position(|byte| *byte == b'\n') {
+                // 上限检查必须同样覆盖"换行符已到"的分支，否则超长行会被整行取出。
+                if pos > MAX_REQUEST_LINE_BYTES {
+                    return Err("请求行超过 1MB 上限".to_string());
+                }
+                let mut line: Vec<u8> = self.carry.drain(..=pos).collect();
+                line.pop(); // \n
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(
+                    String::from_utf8(line).map_err(|_| "请求不是有效的 UTF-8".to_string())?,
+                ));
+            }
+            if self.carry.len() > MAX_REQUEST_LINE_BYTES {
+                return Err("请求行超过 1MB 上限".to_string());
+            }
+            let mut chunk = [0u8; 8192];
+            let read = self
+                .reader
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("读取请求失败：{error}"))?;
+            if read == 0 {
+                if self.carry.is_empty() {
+                    return Ok(None);
+                }
+                // 最后一行没有换行符：仍按一行处理（与 lines() 行为一致）。
+                let line = std::mem::take(&mut self.carry);
+                return Ok(Some(
+                    String::from_utf8(line).map_err(|_| "请求不是有效的 UTF-8".to_string())?,
+                ));
+            }
+            self.carry.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
 /// 单个连接的收发循环：逐行读入 JSON 请求，分发后逐行写回 JSON 响应。
 async fn handle_connection(
     pipe: NamedPipeServer,
@@ -362,9 +423,25 @@ async fn handle_connection(
 ) -> std::io::Result<()> {
     log("前端已连接");
     let (reader, mut writer) = tokio::io::split(pipe);
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = BoundedLineReader::new(reader);
 
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = match lines.next_line().await {
+        Ok(option) => option,
+        Err(message) => {
+            // 超长/损坏的入站行：回一条错误说明后断开连接。
+            let response = Response::Error {
+                message,
+                category: None,
+            };
+            if let Ok(mut buf) = serde_json::to_vec(&response) {
+                buf.push(b'\n');
+                let _ = writer.write_all(&buf).await;
+                let _ = writer.flush().await;
+            }
+            log("入站请求行异常，断开连接");
+            return Ok(());
+        }
+    } {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -971,11 +1048,25 @@ async fn search_service(
     // round-trip. Checked before the empty-query branch because an empty window query is
     // meaningful (recent windows) while an empty global query is not.
     if mode == SearchMode::Window {
-        return window_results(
-            query,
-            window_search(query, max, windows, history, preferences),
-            history,
-        );
+        // EnumWindows 里的 GetWindowTextW/OpenProcess 是跨进程阻塞调用，挂死窗口会
+        // 无限期卡住线程——绝不能占用 2 个 tokio worker 之一（会连管道 accept 一起堵）。
+        // 与下方 history_file_candidates 同一模式：闭包只进 Arc 克隆 + owned 数据。
+        let windows_for_blocking = windows.clone();
+        let history_for_blocking = history.clone();
+        let preferences_for_blocking = preferences.clone();
+        let window_query = query.to_string();
+        let entries = tokio::task::spawn_blocking(move || {
+            window_search(
+                &window_query,
+                max,
+                &windows_for_blocking,
+                &history_for_blocking,
+                &preferences_for_blocking,
+            )
+        })
+        .await
+        .unwrap_or_default();
+        return window_results(query, entries, history);
     }
     // G4 empty input: host context shows recent file/dir under root from history only.
     // No apps, web, or full-index scan — empty indexer queries are meaningless and expensive.
@@ -2046,6 +2137,54 @@ mod window_protocol_tests {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_preserves_remainders_and_rejects_oversized_lines() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut reader = BoundedLineReader::new(server);
+        let writer_task = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut client, b"first\r\nsecond\n")
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+            // 单行超过 1MB：读取器必须报错而不是继续累积。
+            let huge = vec![b'x'; MAX_REQUEST_LINE_BYTES + 10];
+            tokio::io::AsyncWriteExt::write_all(&mut client, &huge)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut client, b"\n")
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+        });
+
+        assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("first"));
+        assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("second"));
+        assert!(
+            reader.next_line().await.is_err(),
+            "oversized line must be an error, not a buffered string"
+        );
+        let _ = writer_task.await;
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_handles_eof_without_trailing_newline() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut reader = BoundedLineReader::new(server);
+        tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut client, b"tail-no-newline")
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+            drop(client);
+        });
+
+        assert_eq!(
+            reader.next_line().await.unwrap().as_deref(),
+            Some("tail-no-newline")
+        );
+        assert_eq!(reader.next_line().await.unwrap(), None);
+    }
 
     #[test]
     fn legacy_and_typed_action_requests_both_decode() {
