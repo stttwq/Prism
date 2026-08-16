@@ -51,7 +51,8 @@ pub fn search<'a>(apps: &'a [AppEntry], query: &str, max: usize) -> Vec<&'a AppE
 }
 
 /// Scan Start Menu shortcuts on the broker-owned STA Shell worker.
-pub async fn load(shared: SharedApps, shell: std::sync::Arc<crate::shell::ShellExecutor>) {
+/// 返回是否成功——失败由调用方（main 的重试循环）决定何时再试。
+pub async fn load(shared: SharedApps, shell: std::sync::Arc<crate::shell::ShellExecutor>) -> bool {
     let started = std::time::Instant::now();
     match shell.scan_apps().await {
         Ok(apps) => {
@@ -64,8 +65,12 @@ pub async fn load(shared: SharedApps, shell: std::sync::Arc<crate::shell::ShellE
             if let Ok(mut g) = shared.write() {
                 *g = apps;
             }
+            true
         }
-        Err(error) => crate::log(format!("app catalog scan failed: {}", error.message)),
+        Err(error) => {
+            crate::log(format!("app catalog scan failed: {}", error.message));
+            false
+        }
     }
 }
 

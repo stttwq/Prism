@@ -23,7 +23,8 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", 
 # 目录遍历（降级路径全盘扫描）
 walkdir = "2"
 # 索引磁盘缓存：紧凑二进制序列化，no_std 友好、体积小
-postcard = { version = "1", features = ["alloc"] }
+# use-std 启用 to_io：checkpoint 直接流式写入文件，不再生成整份序列化 Vec（内存峰值 3x→2x）
+postcard = { version = "1", features = ["alloc", "use-std"] }
 pinyin = { version = "0.10.0", default-features = false, features = ["plain"] }
 windows-service = "0.8"
 
@@ -51,7 +52,7 @@ windows = { version = "0.58", features = [
 ] }
 
 [profile.release]
-opt-level = "z"     # 体积优先，配合 100MB 内存护栏
+opt-level = 3       # 搜索热路径吞吐优先（对标 Everything 的响应速度）；体积增大约 1-2MB
 lto = true
 codegen-units = 1
 panic = "abort"

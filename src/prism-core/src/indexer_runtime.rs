@@ -473,6 +473,15 @@ impl ServiceState {
         }
     }
 
+    /// 降级恢复：瞬时故障（如 checkpoint 写盘失败）事后自愈时清除提示，
+    /// 前端的「文件索引不可用」随下一次成功 checkpoint 自动消失。
+    fn clear_error(&self) {
+        self.degraded.store(false, Ordering::Release);
+        if let Ok(mut message) = self.message.write() {
+            *message = None;
+        }
+    }
+
     fn search(
         &self,
         query: &str,
@@ -711,15 +720,21 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                     .map_err(|error| format!("rebuild task: {error}"))?;
                 match rebuilt {
                     Ok((index, descriptors)) => {
-                        if let Err(error) = index_cache::save(&index, &data_dir) {
-                            logging::event_detail("error", "rebuild_save_failed", &error, None, None);
-                            return Err(error);
+                        // 缓存写失败按可降级故障处理：新索引已在内存，先发布继续服务；
+                        // 旧缓存 + USN 前滚保证重启安全。退出会丢弃热索引并触发
+                        // SCM 重启循环，代价远大于一次降级提示。
+                        let save_error = index_cache::save(&index, &data_dir).err();
+                        if let Some(error) = &save_error {
+                            logging::event_detail("error", "rebuild_save_failed", error, None, None);
                         }
                         state.set_pinyin_status(PinyinStatus::Building);
                         state.publish(index);
+                        if let Some(error) = save_error {
+                            state.set_error(format!("index cache save failed: {error}"));
+                        }
                         if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
                             logging::event_detail("error", "rebuild_pinyin_failed", &error, None, None);
-                            return Err(error);
+                            state.set_error(format!("pinyin rebuild failed: {error}"));
                         }
                         start_watchers(state.clone(), descriptors, stop.clone(), epoch.clone(), rebuild_tx.clone());
                         last_checkpoint = Instant::now();
@@ -733,25 +748,42 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 {
                     if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
                         logging::event_detail("error", "maintenance_pinyin_failed", &error, None, None);
-                        return Err(error);
+                        // 内部重建失败已自限为 5 秒节拍重试；这里只可能是任务级故障，降级不退出。
+                        state.set_error(format!("pinyin rebuild failed: {error}"));
                     }
                 }
+                // Everything 模式：低频持久化 + USN 前滚兜底。
+                // 6 小时 / 50 万事件覆盖绝大多数会话，落盘开销降为原先的 1/6；
+                // 崩溃恢复由缓存里的 next_usn 继续读日志补齐（日志包装走既有重建路径）。
                 let checkpoint_due = state.index.read().ok().and_then(|guard| {
-                    guard.as_ref().map(|index| index.events_since_checkpoint >= 100_000)
-                }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(60 * 60);
+                    guard.as_ref().map(|index| index.events_since_checkpoint >= 500_000)
+                }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(6 * 60 * 60);
                 if checkpoint_due {
-                    if let Err(error) = checkpoint_async(state.clone(), data_dir.clone()).await {
-                        logging::event_detail("error", "maintenance_checkpoint_failed", &error, None, None);
-                        return Err(error);
+                    match checkpoint_async(state.clone(), data_dir.clone()).await {
+                        Ok(()) => {
+                            state.clear_error();
+                            last_checkpoint = Instant::now();
+                        }
+                        Err(error) => {
+                            logging::event_detail("error", "maintenance_checkpoint_failed", &error, None, None);
+                            // 磁盘满 / 杀软锁文件等瞬时故障：内存索引继续服务搜索，不退出。
+                            // last_checkpoint 前移还避免了 50 万事件路径每 5 秒重试刷爆日志，
+                            // 下一个 6 小时节拍自然重试；成功后 clear_error 撤销提示。
+                            state.set_error(format!("index checkpoint failed: {error}"));
+                            last_checkpoint = Instant::now();
+                        }
                     }
-                    last_checkpoint = Instant::now();
                 }
             }
         }
     }
 
     epoch.fetch_add(1, Ordering::AcqRel);
-    checkpoint_async(state.clone(), data_dir.clone()).await?;
+    if let Err(error) = checkpoint_async(state.clone(), data_dir.clone()).await {
+        // 用户要求停止就是停止：退出 checkpoint 失败只记一条降级日志，
+        // 不变成失败退出码去触发一次毫无意义的 SCM 自动重启。
+        logging::event_detail("error", "shutdown_checkpoint_failed", &error, None, None);
+    }
     pipe_task.abort();
     Ok(())
 }
@@ -788,7 +820,12 @@ async fn acquire_initial_index(
     let (descriptors, records_estimate) = match cached {
         CachedLoad::Hit { index, descriptors } => {
             publish_cached_index(state, index);
-            load_pinyin_from_live(state.clone()).await?;
+            // 拼音加载的任务级故障（JoinError）不该带着完好的缓存索引一起退出：
+            // 内部失败已自降级为字面搜索，这里补一层降级提示即可。
+            if let Err(error) = load_pinyin_from_live(state.clone()).await {
+                logging::event_detail("error", "cached_pinyin_load_failed", &error, None, None);
+                state.set_error(format!("pinyin load failed: {error}"));
+            }
             return Ok(InitialIndex {
                 descriptors,
                 watchers_started: false,
@@ -806,6 +843,8 @@ async fn acquire_initial_index(
     }
 
     state.progress.begin(descriptors.len(), records_estimate);
+    // 二次重试后仍失败的卷：跳过并记录，绝不拖垮其余卷（全部失败才算真失败）。
+    let mut failed_volumes: Vec<String> = Vec::new();
 
     for descriptor in &descriptors {
         if stop.is_requested() {
@@ -827,7 +866,25 @@ async fn acquire_initial_index(
         .await
         .map_err(|error| format!("volume build task: {error}"))?;
 
-        let volume = built?;
+        let volume = match built {
+            Ok(volume) => volume,
+            Err(error) => {
+                logging::event_detail(
+                    "error",
+                    "initial_build_volume_failed",
+                    &format!("{}: {error}", descriptor.mount_path),
+                    None,
+                    None,
+                );
+                log(format!(
+                    "skipping {} after retry: {error}",
+                    descriptor.mount_path
+                ));
+                failed_volumes.push(format!("{}: {error}", descriptor.mount_path));
+                state.progress.volume_done();
+                continue;
+            }
+        };
         if stop.is_requested() {
             log("first build stopped before publishing the completed volume; no v5 cache was written");
             return Ok(InitialIndex {
@@ -850,8 +907,28 @@ async fn acquire_initial_index(
         log(format!("first build published {}", descriptor.mount_path));
     }
 
+    // 全部卷都失败：没有任何可服务的索引，交回真失败（SCM 兜底重启）。
+    if failed_volumes.len() >= descriptors.len() {
+        return Err(format!(
+            "every volume build failed: {}",
+            failed_volumes.join("; ")
+        ));
+    }
+
     persist_first_build_with(state, |snapshot| index_cache::save(snapshot, data_dir))?;
-    rebuild_pinyin_from_live(state.clone()).await?;
+    if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
+        logging::event_detail("error", "first_build_pinyin_failed", &error, None, None);
+        state.set_error(format!("pinyin rebuild failed: {error}"));
+    }
+    if !failed_volumes.is_empty() {
+        let message = format!(
+            "skipped {} volume(s) during first build: {}",
+            failed_volumes.len(),
+            failed_volumes.join("; ")
+        );
+        logging::event_detail("error", "initial_build_skipped_volumes", &message, None, None);
+        state.set_error(message);
+    }
     Ok(InitialIndex {
         descriptors,
         watchers_started: true,

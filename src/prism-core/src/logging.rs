@@ -129,6 +129,8 @@ pub fn sanitize(text: &str) -> String {
         return normalized;
     }
     // Match patterns like "C:/Users/XXX/" (any single drive letter).
+    // 按 UTF-8 序列复制：非 ASCII（如中文路径/用户名）原样保留，只有 ASCII
+    // 字节参与脱敏匹配——旧实现逐字节 `as char` 会把中文拆成乱码。
     let bytes = normalized.as_bytes();
     let mut out = String::with_capacity(normalized.len());
     let mut i = 0;
@@ -153,10 +155,23 @@ pub fn sanitize(text: &str) -> String {
             }
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let end = (i + utf8_sequence_len(bytes[i])).min(bytes.len());
+        // 输入是合法 &str 且 i 始终落在字符边界上，切片安全。
+        out.push_str(&normalized[i..end]);
+        i = end;
     }
     out
+}
+
+/// UTF-8 首字节 → 序列长度（ASCII 为 1）。
+fn utf8_sequence_len(byte: u8) -> usize {
+    match byte {
+        b if b < 0x80 => 1,
+        b if b & 0xE0 == 0xC0 => 2,
+        b if b & 0xF0 == 0xE0 => 3,
+        b if b & 0xF8 == 0xF0 => 4,
+        _ => 1,
+    }
 }
 
 impl RollingLogger {
@@ -325,6 +340,22 @@ mod tests {
         assert!(result.contains("<user>"), "{result}");
         assert!(!result.contains("bob"), "{result}");
         assert!(!result.contains("alice"), "{result}");
+    }
+
+    #[test]
+    fn sanitize_preserves_chinese_text_and_redacts_chinese_usernames() {
+        // 中文路径必须原样保留（旧实现按 Latin-1 重编码成乱码）。
+        let plain = sanitize(r"D:\资料\项目文档\会议纪要.txt");
+        assert_eq!(plain, "D:/资料/项目文档/会议纪要.txt");
+
+        // 中文用户名同样要脱敏，且脱敏后的其余部分不乱码。
+        let redacted = sanitize(r"C:\Users\小明的电脑\Documents\文件.txt");
+        assert!(redacted.contains("<user>"), "{redacted}");
+        assert!(!redacted.contains("小明的电脑"), "{redacted}");
+        assert!(
+            redacted.contains("Documents/文件.txt"),
+            "{redacted}"
+        );
     }
 
     #[test]

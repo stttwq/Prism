@@ -31,7 +31,17 @@ async fn main() {
     {
         let apps = apps.clone();
         let shell = shell.clone();
-        tokio::spawn(async move { apps::load(apps, shell).await });
+        // 开始菜单被安装器短暂锁住等瞬时故障会导致应用搜索永久为空；
+        // 30 秒退避重试（最多 5 次）兜住首次扫描的窗口期。
+        tokio::spawn(async move {
+            for attempt in 1..=5 {
+                if apps::load(apps.clone(), shell.clone()).await {
+                    return;
+                }
+                crate::log(format!("app catalog scan retry {attempt}/5 in 30s"));
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
     }
 
     log(format!("broker pipe listening at {PIPE_NAME}"));

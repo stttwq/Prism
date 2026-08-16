@@ -51,18 +51,25 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
     let path = cache_path(data_dir);
     let temporary = data_dir.join(format!("{CACHE_FILE}.tmp"));
-    let bytes = postcard::to_allocvec(&CacheEnvelope {
-        magic: *CACHE_MAGIC,
-        version: CACHE_VERSION,
-        state,
-    })
-    .map_err(|error| format!("encode v5 cache: {error}"))?;
-    let mut file = std::fs::File::create(&temporary)
+    let file = std::fs::File::create(&temporary)
         .map_err(|error| format!("create {}: {error}", temporary.display()))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
+    // 流式序列化直接写文件（分块缓冲）：大索引 checkpoint 时不再与索引本体
+    // 之外再生成一份完整的序列化 Vec —— 内存峰值从 3x 降到 2x。
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+    postcard::to_io(
+        &CacheEnvelope {
+            magic: *CACHE_MAGIC,
+            version: CACHE_VERSION,
+            state,
+        },
+        &mut writer,
+    )
+    .map_err(|error| format!("encode v5 cache: {error}"))?;
+    writer
+        .flush()
+        .and_then(|()| writer.get_ref().sync_all())
         .map_err(|error| format!("write {}: {error}", temporary.display()))?;
-    drop(file);
+    drop(writer);
     crate::fs_util::atomic_replace(&temporary, &path, "cache")
 }
 

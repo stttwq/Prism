@@ -7,10 +7,11 @@
 //! 无论哪条路径，输出固定 `.zip`，冲突交给系统确认。
 
 use crate::shell::{ActionTarget, ShellError, ShellErrorKind, ShellOutcome, TargetKind};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
-/// 缓存探测结果，避免每次压缩都查注册表/文件系统。
-static ZIP_PROGRAM: OnceLock<ZipProgram> = OnceLock::new();
+/// 缓存 (探测输入, 结果)：custom_path 与缓存输入一致时复用，变化即重新探测——
+/// 否则用户在设置里改压缩程序后要重启 broker 才生效。
+static ZIP_PROGRAM: Mutex<(Option<String>, Option<ZipProgram>)> = Mutex::new((None, None));
 
 /// 探测到的压缩程序。
 #[derive(Debug, Clone)]
@@ -24,11 +25,21 @@ enum ZipProgram {
     None,
 }
 
-/// 获取缓存的压缩程序探测结果。首次调用时执行探测。
+/// 获取缓存的压缩程序探测结果；探测输入（custom_path）变化时重新探测。
 fn get_zip_program(custom_path: Option<&str>) -> ZipProgram {
-    ZIP_PROGRAM
-        .get_or_init(|| detect_zip_program(custom_path))
-        .clone()
+    let normalized = custom_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    let mut guard = ZIP_PROGRAM.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let (Some(cached_input), Some(cached)) = &*guard {
+        if Some(cached_input.as_str()) == normalized.as_deref() {
+            return cached.clone();
+        }
+    }
+    let detected = detect_zip_program(normalized.as_deref());
+    *guard = (normalized, Some(detected.clone()));
+    detected
 }
 
 /// 探测可用的压缩程序。按优先级：

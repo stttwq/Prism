@@ -531,7 +531,14 @@ impl VolumeIndex {
                 continue;
             }
             let start = slot.name_off as usize;
-            let end = self.names[start..]
+            // 与上方预检同样的防御：越界的 name_off 返回 Err 走压缩失败 →
+            // watcher 报错 → 重建的安全路径，而不是直接切片 panic
+            // （release 是 panic=abort，整进程静默消失）。
+            let name_bytes = self
+                .names
+                .get(start..)
+                .ok_or_else(|| format!("name offset {start} out of range"))?;
+            let end = name_bytes
                 .iter()
                 .position(|byte| *byte == 0)
                 .map(|offset| start + offset)
@@ -551,11 +558,12 @@ impl VolumeIndex {
         frns: impl IntoIterator<Item = u64>,
     ) -> Result<MutationSnapshot, String> {
         let mut slots = Vec::new();
+        // 去重用 HashSet：一批 USN 记录数千条，原先的线性扫描是 O(n²)
+        // （且发生在 index 写锁内）。
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for frn in frns {
             let (record, _) = Self::split_frn(frn)?;
-            if record as usize >= self.nodes.len()
-                || slots.iter().any(|(saved, _)| *saved == record)
-            {
+            if record as usize >= self.nodes.len() || !seen.insert(record) {
                 continue;
             }
             slots.push((record, self.nodes[record as usize]));
