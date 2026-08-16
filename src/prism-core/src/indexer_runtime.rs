@@ -925,7 +925,17 @@ async fn acquire_initial_index(
         ));
     }
 
-    persist_first_build_with(state, |snapshot| index_cache::save(snapshot, data_dir))?;
+    // S1：首建落盘失败与 rebuild 分支同款降级——热索引已在内存，先继续服务。
+    // persist_first_build_with 已照常发布 first_build_complete，所以 6 小时
+    // maintenance checkpoint（或停机 checkpoint）会真实重试落盘，成功后
+    // clear_error 撤销降级提示；致命退出只会丢弃热索引并触发 SCM 重启
+    // （两次全盘 MFT 重扫后服务躺死）。
+    if let Err(error) =
+        persist_first_build_with(state, |snapshot| index_cache::save(snapshot, data_dir))
+    {
+        logging::event_detail("error", "first_build_save_failed", &error, None, None);
+        state.set_error(format!("index cache save failed: {error}"));
+    }
     if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
         logging::event_detail("error", "first_build_pinyin_failed", &error, None, None);
         state.set_error(format!("pinyin rebuild failed: {error}"));
@@ -959,11 +969,15 @@ where
         let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
         guard.as_ref().cloned().ok_or("index is not ready")?
     };
-    save(&snapshot)?;
-    // `building=false` is externally observable. Publish it only after the durable cache
-    // exists, otherwise clients can observe a completed build that is not restart-safe.
+    let save_result = save(&snapshot);
+    // S1：走到这里首建已在内存完成（或跳过的卷已被记录），落盘失败是可降级故障。
+    // `building=false` 与 R2 门必须照常发布——否则 checkpoint() 会被
+    // first_build_is_complete 拦成返回 Ok 的静默空操作，run() 还会把空操作当
+    // 成功去 clear_error（假恢复），缓存从此永远写不出去。持久化失败交回调用方
+    // set_error 标记。中途被打断的首建不会进入本函数，R2 门对部分索引的保护
+    // 不变；只有拿到快照前的失败（锁中毒/无索引）仍按致命错误传播。
     state.finish_first_build();
-    Ok(())
+    save_result
 }
 
 fn publish_cached_index(state: &ServiceState, index: IndexState) {
@@ -1680,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn first_build_reports_complete_only_after_cache_save_succeeds() {
+    fn first_build_save_runs_before_completion_is_visible() {
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
 
@@ -1699,17 +1713,49 @@ mod tests {
         assert!(state.first_build_is_complete());
     }
 
+    /// S1：落盘失败不再向上致命传播。错误交回调用方 set_error 降级，但首建
+    /// 完成状态与 R2 门必须照常发布——否则 checkpoint 重试被拦成空操作。
     #[test]
-    fn failed_first_build_cache_save_does_not_publish_completion() {
+    fn failed_first_build_cache_save_degrades_but_opens_the_checkpoint_gate() {
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
 
         let error = persist_first_build_with(&state, |_| Err("cache save failed".into()))
-            .expect_err("save failure must propagate");
+            .expect_err("save failure is still reported for set_error");
 
         assert_eq!(error, "cache save failed");
-        assert!(state.status().building);
-        assert!(!state.first_build_is_complete());
+        assert!(
+            !state.status().building,
+            "the in-memory build is complete; only persistence is pending"
+        );
+        assert!(
+            state.first_build_is_complete(),
+            "the R2 gate must open so the checkpoint retry is real"
+        );
+    }
+
+    /// S1 的回归锚：落盘失败后的 checkpoint（6 小时节拍或停机路径）必须真实
+    /// 重试写盘。旧语义下 R2 门保持关闭，checkpoint 返回 Ok 却什么都没写，
+    /// run() 随即 clear_error——用户看到"恢复"，实际永不落盘（假恢复）。
+    #[test]
+    fn checkpoint_really_retries_after_a_failed_first_build_save() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
+
+        let dir = std::env::temp_dir().join(format!("prism-s1-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        persist_first_build_with(&state, |_| Err("cache save failed".into())).unwrap_err();
+        assert!(!index_cache::cache_path(&dir).exists());
+
+        checkpoint(&state, &dir).unwrap();
+        assert!(
+            index_cache::cache_path(&dir).exists(),
+            "the gate must be open so the checkpoint retries the save"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
