@@ -1,6 +1,8 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
 using Prism.Models;
 
 namespace Prism.Controls;
@@ -43,6 +45,7 @@ public partial class SearchHeader : UserControl
     /// <summary>刷新范围标签：不可见时隐藏，可见时显示当前目录或全局。</summary>
     public void SetScope(bool visible, string label, string tooltip)
     {
+        var wasVisible = ScopeChip.Visibility == Visibility.Visible;
         ScopeChip.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
         ScopeChip.Content = label;
         ScopeChip.ToolTip = string.IsNullOrEmpty(tooltip) ? null : tooltip;
@@ -50,6 +53,24 @@ public partial class SearchHeader : UserControl
         System.Windows.Automation.AutomationProperties.SetName(
             ScopeChip,
             string.IsNullOrEmpty(tooltip) ? label : $"{label}。{tooltip}");
+
+        // 隐藏→可见的跃迁做一次淡入 + 左滑入场（120ms）。
+        // 已知限制：输入框的横向占位仍会瞬移——彻底消除需重排列布局，不做。
+        if (visible && !wasVisible)
+        {
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+            ScopeChip.BeginAnimation(
+                OpacityProperty,
+                new DoubleAnimation(0, 1, System.TimeSpan.FromMilliseconds(120)) { EasingFunction = ease });
+            if (ScopeChip.RenderTransform is not TranslateTransform slide)
+            {
+                slide = new TranslateTransform();
+                ScopeChip.RenderTransform = slide;
+            }
+            slide.BeginAnimation(
+                TranslateTransform.XProperty,
+                new DoubleAnimation(-8, 0, System.TimeSpan.FromMilliseconds(120)) { EasingFunction = ease });
+        }
     }
 
     private void OnScopeChipClick(object sender, RoutedEventArgs e) =>

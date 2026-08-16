@@ -210,7 +210,7 @@ public partial class SearchWindow : Window
         ApplyScopeUi();
         ApplyState(_vm?.State, animatePanel: false);
 
-        PositionWindow();
+        PositionWindow(foreground);
         Opacity = 0;
         Show();
         SyncGenerationPolling();
@@ -539,9 +539,13 @@ public partial class SearchWindow : Window
         UpdateCardClip();
     }
 
-    private void PositionWindow()
+    /// <summary>
+    /// 在呼出前的前台窗口所在显示器居中、顶部 25%——副屏工作时不再跳回主屏。
+    /// 采样失败（零句柄/枚举失败）回退主屏工作区，行为与旧版一致。
+    /// </summary>
+    private void PositionWindow(IntPtr foreground)
     {
-        var screen = SystemParameters.WorkArea;
+        var screen = ForegroundInterop.GetWorkAreaForWindow(foreground);
         Left = screen.Left + (screen.Width - Width) / 2;
         Top = screen.Top + screen.Height * 0.25;
     }
@@ -772,7 +776,19 @@ public partial class SearchWindow : Window
                 || !string.IsNullOrEmpty(state.StatusMessage));
         var showActions = state.Mode == PanelMode.Actions;
 
-        Divider.Visibility = (showResults || showActions) ? Visibility.Visible : Visibility.Collapsed;
+        // 分隔线从隐藏变可见时淡入（隐藏仍瞬时收起）。
+        var showDivider = showResults || showActions;
+        if (showDivider && Divider.Visibility != Visibility.Visible)
+        {
+            Divider.Visibility = Visibility.Visible;
+            Divider.BeginAnimation(
+                OpacityProperty,
+                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100)));
+        }
+        else if (!showDivider && Divider.Visibility == Visibility.Visible)
+        {
+            Divider.Visibility = Visibility.Collapsed;
+        }
 
         if (showActions)
         {

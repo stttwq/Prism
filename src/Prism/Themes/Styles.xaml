@@ -119,14 +119,58 @@
                         <Setter.Value>
                             <ControlTemplate TargetType="ListBoxItem">
                                 <Border x:Name="Bd" Background="Transparent" Padding="0">
-                                    <ContentPresenter/>
+                                    <Grid>
+                                        <!-- 双层高亮：选中与悬停各占一层、由各自唯一的触发器持有动画，
+                                             规避多触发器写同一属性时退出互踩的闪烁。 -->
+                                        <Border x:Name="HighlightSelected"
+                                                Background="{DynamicResource BgItemSelected}"
+                                                Opacity="0"/>
+                                        <Border x:Name="HighlightHover"
+                                                Background="{DynamicResource BgItemSelected}"
+                                                Opacity="0"/>
+                                        <ContentPresenter/>
+                                    </Grid>
                                 </Border>
                                 <ControlTemplate.Triggers>
                                     <Trigger Property="IsSelected" Value="True">
-                                        <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                                        <Trigger.EnterActions>
+                                            <BeginStoryboard>
+                                                <Storyboard>
+                                                    <DoubleAnimation Storyboard.TargetName="HighlightSelected"
+                                                                     Storyboard.TargetProperty="Opacity"
+                                                                     To="1" Duration="0:0:0.10"/>
+                                                </Storyboard>
+                                            </BeginStoryboard>
+                                        </Trigger.EnterActions>
+                                        <Trigger.ExitActions>
+                                            <BeginStoryboard>
+                                                <Storyboard>
+                                                    <DoubleAnimation Storyboard.TargetName="HighlightSelected"
+                                                                     Storyboard.TargetProperty="Opacity"
+                                                                     To="0" Duration="0:0:0.10"/>
+                                                </Storyboard>
+                                            </BeginStoryboard>
+                                        </Trigger.ExitActions>
                                     </Trigger>
                                     <Trigger Property="IsMouseOver" Value="True">
-                                        <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                                        <Trigger.EnterActions>
+                                            <BeginStoryboard>
+                                                <Storyboard>
+                                                    <DoubleAnimation Storyboard.TargetName="HighlightHover"
+                                                                     Storyboard.TargetProperty="Opacity"
+                                                                     To="0.55" Duration="0:0:0.10"/>
+                                                </Storyboard>
+                                            </BeginStoryboard>
+                                        </Trigger.EnterActions>
+                                        <Trigger.ExitActions>
+                                            <BeginStoryboard>
+                                                <Storyboard>
+                                                    <DoubleAnimation Storyboard.TargetName="HighlightHover"
+                                                                     Storyboard.TargetProperty="Opacity"
+                                                                     To="0" Duration="0:0:0.10"/>
+                                                </Storyboard>
+                                            </BeginStoryboard>
+                                        </Trigger.ExitActions>
                                     </Trigger>
                                 </ControlTemplate.Triggers>
                             </ControlTemplate>

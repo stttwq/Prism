@@ -78,6 +78,13 @@ public sealed class HotkeyService : IDisposable
         // 低级键盘钩子的 hMod 传当前 exe 的模块句柄即可（GetModuleHandle(null)），
         // 省去 Process/MainModule 的创建与释放，避免每次 Apply 泄漏 Process 对象。
         _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
+        if (_hook == IntPtr.Zero)
+        {
+            // 双击 Ctrl 本就是兜底模式，无可再降级——但绝不能静默死亡：
+            // 至少留下可诊断的痕迹（DebugView / 调试器输出）。
+            System.Diagnostics.Debug.WriteLine(
+                "[Prism] 低级键盘钩子安装失败，双击 Ctrl 呼出将不可用（Apply 重新应用可恢复）");
+        }
     }
 
     private IntPtr HookCallback(int code, IntPtr w, IntPtr l)

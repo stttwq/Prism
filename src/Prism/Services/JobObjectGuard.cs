@@ -36,11 +36,18 @@ internal sealed class JobObjectGuard : IDisposable
         try
         {
             Marshal.StructureToPtr(extended, ptr, false);
-            SetInformationJobObject(
-                _jobHandle,
-                JobObjectExtendedLimitInformation,
-                ptr,
-                (uint)length);
+            // KILL_ON_JOB_CLOSE 没设置成功 = 孤儿进程保护形同虚设（Prism 崩溃后
+            // broker 会继续占管道）。行为保持"尽力而为"，但失败必须留下痕迹。
+            if (!SetInformationJobObject(
+                    _jobHandle,
+                    JobObjectExtendedLimitInformation,
+                    ptr,
+                    (uint)length))
+            {
+                var error = Marshal.GetLastWin32Error();
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Prism] JobObject 限制设置失败（Win32 {error}），孤儿进程保护未生效");
+            }
         }
         finally
         {

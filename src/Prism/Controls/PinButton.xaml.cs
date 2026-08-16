@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 
 namespace Prism.Controls;
 
@@ -55,7 +56,18 @@ public partial class PinButton : UserControl
     {
         // 固定时箭头变为"钉住"态：略深背景 + 旋转 0°；未固定保持 45° 斜箭头。
         if (Arrow is null || Bd is null) return;
-        Arrow.RenderTransform = new RotateTransform(IsPinned ? 0 : 45);
+        if (Arrow.RenderTransform is not RotateTransform rotate)
+        {
+            rotate = new RotateTransform(IsPinned ? 0 : 45);
+            Arrow.RenderTransform = rotate;
+        }
+        // 省略 From：从当前（动画中的）角度平滑续接到新目标。
+        rotate.BeginAnimation(
+            RotateTransform.AngleProperty,
+            new DoubleAnimation(IsPinned ? 0 : 45, System.TimeSpan.FromMilliseconds(150))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            });
         Arrow.Opacity = IsPinned ? 1.0 : 0.75;
         Bd.Background = IsPinned
             ? (TryFindResource("BgItemSelected") as Brush) ?? Bd.Background

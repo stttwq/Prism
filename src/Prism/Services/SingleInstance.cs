@@ -75,10 +75,12 @@ internal sealed class SingleInstance : IDisposable
             NamedPipeServerStream? server = null;
             try
             {
-                // first_pipe_instance=true 保证只有一个监听者；回收后重建下一个实例。
+                // FirstPipeInstance 声明独占：我们已持有单实例互斥锁，
+                // 正常情况下不存在第二个监听者。
                 server = new NamedPipeServerStream(
                     PipeName, PipeDirection.In, 1,
-                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance);
                 await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
 
                 using var reader = new StreamReader(server, new UTF8Encoding(false));
@@ -96,7 +98,16 @@ internal sealed class SingleInstance : IDisposable
             }
             catch
             {
-                // 单个连接异常不应终止监听循环。
+                // 单个连接/构造异常不应终止监听循环，但也不能零退避空转烧满一核
+                //（构造持续失败时每秒重试一次；取消令牌驱动，正常路径零延迟）。
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
             finally
             {

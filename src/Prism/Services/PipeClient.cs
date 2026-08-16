@@ -615,6 +615,10 @@ public sealed class PipeClient : ISearchClient, IDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        // 释放旧 Process 对象持有的进程句柄再启动新的：
+        // broker 崩溃循环下 watchdog 每 15 秒重拉一次，不 Dispose 会持续累积句柄。
+        try { _backend?.Dispose(); } catch { /* 已释放/已退出 */ }
+        _backend = null;
         _backend = Process.Start(psi)
             ?? throw new IOException("启动 prism-core.exe 失败");
 
