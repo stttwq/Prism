@@ -95,11 +95,27 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// frecency 使用桶：≥64→3 / ≥16→2 / ≥4→1 / 否则 0（约一次近期使用的门槛）。
+/// 分桶而非连续值：防止高频老条目永久霸榜，也保证桶内仍由匹配质量决胜。
+/// 索引器侧 history_score 恒 0，桶比较恒等——此函数只影响 broker 最终排序。
+fn usage_tier(score: u32) -> u8 {
+    if score >= 64 {
+        3
+    } else if score >= 16 {
+        2
+    } else if score >= 4 {
+        1
+    } else {
+        0
+    }
+}
+
 impl Ord for MatchMetadata {
     fn cmp(&self, other: &Self) -> Ordering {
         self.kind
             .cmp(&other.kind)
             .then(self.class.cmp(&other.class))
+            .then(usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
             .then(self.position.cmp(&other.position))
             .then(other.history_score.cmp(&self.history_score))
             .then(self.score.cmp(&other.score))
@@ -1355,6 +1371,27 @@ mod tests {
         let same_tier_without_history = rank(MatchKind::FullPinyin, 1, 0, 0);
         let same_tier_with_history = rank(MatchKind::FullPinyin, 1, 0, 20);
         assert!(same_tier_with_history < same_tier_without_history);
+    }
+
+    #[test]
+    fn usage_tier_crosses_position_but_not_class_or_kind() {
+        let rank = |kind, class, position, history_score| MatchMetadata {
+            kind,
+            class,
+            position,
+            score: 10,
+            history_score,
+        };
+        // 达到桶阈值（≥4）的高频使用越过 position：晚期匹配但常用的排前。
+        assert!(rank(MatchKind::Literal, 2, 5, 100) < rank(MatchKind::Literal, 2, 0, 0));
+        // 未达桶阈值（<4）的微弱历史不越过 position——同 position 才由它决胜。
+        assert!(rank(MatchKind::Literal, 2, 0, 3) < rank(MatchKind::Literal, 2, 5, 3));
+        // 桶不越过 class：前缀匹配无历史仍先于子串匹配满桶。
+        assert!(rank(MatchKind::Literal, 1, 9, u32::MAX) < rank(MatchKind::Literal, 2, 0, 0));
+        // 桶不越过 kind：字面匹配无历史仍先于拼音匹配满桶。
+        assert!(
+            rank(MatchKind::Literal, 2, 9, u32::MAX) < rank(MatchKind::FullPinyin, 0, 0, 0)
+        );
     }
 
     /// C:\project\{sub\deep.txt, near.txt} plus C:\other\deep.txt, and D:\project\deep.txt.

@@ -45,6 +45,9 @@ pub enum HistoryDiagnostic {
 pub struct HistoryWeight {
     pub target: ActionTarget,
     pub score: u32,
+    /// MRU 列表（空查询等）按时间而不是分数排序需要它。`weights()` 按
+    /// last_used 降序返回，与内部条目顺序一致。
+    pub last_used_utc: u64,
 }
 
 enum HistoryFileError {
@@ -181,7 +184,7 @@ impl HistoryStore {
         self.record_at(target, usage, None, now_utc())
     }
 
-    fn record_at(
+    pub(crate) fn record_at(
         &self,
         target: &ActionTarget,
         usage: HistoryUse,
@@ -249,20 +252,22 @@ impl HistoryStore {
             .unwrap_or(0)
     }
 
-    /// 该 target 是否被这个（已规范化的）查询串选中过。broker 排序接线前允许
-    /// dead_code（查询记忆置顶在后续改动接入）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 该 target 是否被这个查询串选中过。入参先做与记录侧相同的键归一化
+    /// （trim→小写→截断），调用方传剥掉过滤词的 name query 即可。
     pub fn query_pick(&self, target: &ActionTarget, query: &str) -> bool {
-        if !self.is_enabled() || query.is_empty() {
+        if !self.is_enabled() {
             return false;
         }
+        let Some(key) = normalized_query_key(query) else {
+            return false;
+        };
         self.state
             .read()
             .ok()
             .and_then(|state| {
                 state
                     .lookup(target)
-                    .map(|entry| entry.queries.iter().any(|stat| stat.query == query))
+                    .map(|entry| entry.queries.iter().any(|stat| stat.query == key))
             })
             .unwrap_or(false)
     }
@@ -284,10 +289,30 @@ impl HistoryStore {
                             value: entry.target.clone(),
                         },
                         score: effective_frecency(entry, now),
+                        last_used_utc: entry.last_used_utc,
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 读取时的 (有效分, last_used)。窗口空查询等 MRU 列表需要时间而不是分数。
+    pub fn usage(&self, target: &ActionTarget) -> Option<(u32, u64)> {
+        self.usage_at(target, now_utc())
+    }
+
+    pub(crate) fn usage_at(&self, target: &ActionTarget, now: u64) -> Option<(u32, u64)> {
+        if !self.is_enabled() {
+            return None;
+        }
+        self.state
+            .read()
+            .ok()
+            .and_then(|state| {
+                state
+                    .lookup(target)
+                    .map(|entry| (effective_frecency(entry, now), entry.last_used_utc))
+            })
     }
 
     #[cfg(test)]
@@ -477,7 +502,7 @@ fn isolate(path: &Path, now: u64) {
     let _ = std::fs::rename(path, destination);
 }
 
-fn now_utc() -> u64 {
+pub(crate) fn now_utc() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

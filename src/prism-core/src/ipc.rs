@@ -1099,6 +1099,9 @@ async fn search_service(
             pinyin_enabled,
             &exclusions,
             root_clone.as_deref(),
+            // 注入上限 = 结果槽位数：注入再多也会在最终截断时被丢弃，
+            // 同时把每次按键的磁盘 stat 次数压到命中且可展示的条目。
+            result_slots,
         )
     })
     .await
@@ -1175,7 +1178,19 @@ async fn search_service(
             pinyin_status: None,
         },
     };
-    sort_search_results(&mut ranked);
+    // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
+    // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
+    let pick_flags: Option<Vec<bool>> = if name_query.trim().is_empty() {
+        None
+    } else {
+        Some(
+            ranked
+                .iter()
+                .map(|item| history.query_pick(&item.target, &name_query))
+                .collect(),
+        )
+    };
+    sort_search_results_with_picks(&mut ranked, pick_flags.as_deref());
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
     items.extend(ranked);
@@ -1247,16 +1262,14 @@ async fn empty_query_results(
         Some(root) if history.is_enabled() => {
             let weights = history.weights();
             let root_owned = root.to_owned();
-            let mut items = tokio::task::spawn_blocking(move || {
-                history_file_candidates("", &weights, false, &exclusions, Some(&root_owned))
+            // weights() 按 last_used 降序返回，候选保持该顺序（真 MRU）：
+            // 收集满 max 个磁盘上仍存在的路径即停——既不再对全部条目做
+            // 磁盘 stat，也不再按频次分数重排。
+            tokio::task::spawn_blocking(move || {
+                history_file_candidates("", &weights, false, &exclusions, Some(&root_owned), max)
             })
             .await
-            .unwrap_or_default();
-            // Rank by history first; compare_search_results already prefers higher
-            // history_score within the same match tier, which empty-query items share.
-            sort_search_results(&mut items);
-            items.truncate(max);
-            items
+            .unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -1335,18 +1348,28 @@ async fn search_index_with_root_fallback(
 ///
 /// When `root` is set (empty-query host context), only paths under that root survive and
 /// the path must still exist on disk. Non-empty query search leaves `root` as `None` so
-/// the G2 title-match injection path is unchanged.
+/// the G2 title-match injection path is unchanged. `limit` caps how many existing-path
+/// candidates are returned (collect-and-stop) so neither match filtering nor disk stats
+/// scale with the history store size.
+///
+/// 非空查询：标题/拼音匹配（纯内存）先做，只有命中的条目才做磁盘 stat——
+/// 每次按键的 stat 次数从「全部条目」降到「命中条目」。空查询无法用名字
+/// 过滤，靠 `limit` 收集即停（`weights()` 已按 last_used 降序）。
 fn history_file_candidates(
     query: &str,
     weights: &[HistoryWeight],
     pinyin_enabled: bool,
     exclusions: &[String],
     root: Option<&str>,
+    limit: usize,
 ) -> Vec<SearchResult> {
     let empty_query = query.is_empty();
     let root_normalized = root.map(normalize_path_prefix);
     let mut candidates = Vec::new();
     for weight in weights {
+        if candidates.len() >= limit {
+            break;
+        }
         if weight.target.kind != "file" && weight.target.kind != "directory" {
             continue;
         }
@@ -1359,11 +1382,6 @@ fn history_file_candidates(
                 continue;
             }
         }
-        // 只返回磁盘上仍存在的路径（file 或 directory）。rename/move/delete 后
-        // 旧路径不再存在，不应作为历史候选出现在搜索结果中。
-        if !std::path::Path::new(&weight.target.value).exists() {
-            continue;
-        }
         let Some(title) = std::path::Path::new(&weight.target.value)
             .file_name()
             .and_then(|name| name.to_str())
@@ -1371,8 +1389,8 @@ fn history_file_candidates(
             continue;
         };
         let (metadata, match_spans) = if empty_query {
-            // No literal query to rank against: same match tier for every row so history
-            // score alone decides order (see MatchMetadata::cmp).
+            // No literal query to rank against: same match tier for every row so
+            // the caller's order (MRU) decides.
             (
                 MatchMetadata {
                     kind: MatchKind::Literal,
@@ -1394,6 +1412,12 @@ fn history_file_candidates(
         } else {
             continue;
         };
+        // 只返回磁盘上仍存在的路径（file 或 directory）。rename/move/delete 后
+        // 旧路径不再存在，不应作为历史候选出现在搜索结果中。放在名字匹配
+        // 之后：只有已成为候选的路径才花一次磁盘 stat。
+        if !std::path::Path::new(&weight.target.value).exists() {
+            continue;
+        }
         candidates.push(SearchResult {
             kind: if weight.target.kind == "directory" {
                 SearchResultKind::Folder
@@ -1549,7 +1573,14 @@ fn window_search(
 ) -> Vec<SearchResult> {
     let self_pids = [std::process::id()];
     let published = crate::window_list::enumerate_and_publish(windows, &self_pids);
-    rank_window_list(&published, query, max, history, preferences)
+    rank_window_list(
+        &published,
+        query,
+        max,
+        history,
+        preferences,
+        crate::history::now_utc(),
+    )
 }
 
 /// 排名部分与枚举分开，因为 `enumerate_and_publish` 直接打真实桌面，测试进不去。
@@ -1560,32 +1591,17 @@ fn rank_window_list(
     max: usize,
     history: &Arc<HistoryStore>,
     preferences: &Arc<BrokerPreferences>,
+    now: u64,
 ) -> Vec<SearchResult> {
     let trimmed = query.trim();
-    let mut ranked: Vec<SearchResult> = Vec::new();
+    if trimmed.is_empty() {
+        return recent_windows(published, max, history, now);
+    }
 
+    let mut ranked: Vec<SearchResult> = Vec::new();
     for (token, entry) in published {
         let history_target = ActionTarget::new(TargetKind::Window, entry.history_key());
         let history_score = history.score(&history_target);
-        if trimmed.is_empty() {
-            // 空输入只显示「用过 + 现在还在」的窗口，已关闭的自然不在枚举里。
-            if history_score == 0 {
-                continue;
-            }
-            ranked.push(window_result(
-                entry,
-                token,
-                Some(MatchMetadata {
-                    kind: MatchKind::Literal,
-                    class: 0,
-                    position: 0,
-                    score: 0,
-                    history_score,
-                }),
-                Vec::new(),
-            ));
-            continue;
-        }
         if let Some((metadata, spans)) =
             rank_window(entry, trimmed, preferences.pinyin_enabled(), history_score)
         {
@@ -1596,6 +1612,50 @@ fn rank_window_list(
     sort_search_results(&mut ranked);
     ranked.truncate(max);
     ranked
+}
+
+/// 空查询 = 「用过（有效分>0，即 frecency 未衰减尽）∩ 现在还在」的最近窗口，
+/// 按 last_used 降序。时间优先于分数：五分钟前切过一次的窗口，排在上周
+/// 高频使用的窗口前面——「最近使用的窗口」就该由时间说了算。
+fn recent_windows(
+    published: &[(String, crate::window_list::WindowEntry)],
+    max: usize,
+    history: &Arc<HistoryStore>,
+    now: u64,
+) -> Vec<SearchResult> {
+    let mut ranked: Vec<(u64, SearchResult)> = Vec::new();
+    for (token, entry) in published {
+        let history_target = ActionTarget::new(TargetKind::Window, entry.history_key());
+        let Some((history_score, last_used)) = history.usage_at(&history_target, now) else {
+            continue;
+        };
+        if history_score == 0 {
+            continue;
+        }
+        ranked.push((
+            last_used,
+            window_result(
+                entry,
+                token,
+                Some(MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: 0,
+                    history_score,
+                }),
+                Vec::new(),
+            ),
+        ));
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.title.to_lowercase().cmp(&right.1.title.to_lowercase()))
+    });
+    ranked.truncate(max);
+    ranked.into_iter().map(|(_, result)| result).collect()
 }
 
 fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
@@ -1629,36 +1689,41 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 /// Sorts results by `compare_search_results` but pre-computes the lowercased title
 /// once per item instead of once per comparison (O(n) vs O(n log n) allocations).
 fn sort_search_results(items: &mut [SearchResult]) {
+    sort_search_results_with_picks(items, None);
+}
+
+/// `picks` 与 items 对齐：true = 该项被当前（规范化）查询串选中过，在
+/// kind 层级内、class 之前排最前（查询记忆置顶）。标志只活在 broker 排序里，
+/// 不进 MatchMetadata、不进序列化。kind 仍最先比较：拼音命中的 picked 项
+/// 不能越过字面命中的未 picked 项。
+fn sort_search_results_with_picks(items: &mut [SearchResult], picks: Option<&[bool]>) {
     // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
     // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
     let mut indices: Vec<usize> = (0..items.len()).collect();
     indices.sort_by(|&a, &b| {
-        items[a]
-            .match_metadata
-            .cmp(&items[b].match_metadata)
+        metadata_kind(&items[a])
+            .cmp(&metadata_kind(&items[b]))
+            .then_with(|| match picks {
+                Some(picks) => picks[b].cmp(&picks[a]),
+                None => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| items[a].match_metadata.cmp(&items[b].match_metadata))
             .then_with(|| lowercased[a].cmp(&lowercased[b]))
             .then_with(|| items[a].subtitle.cmp(&items[b].subtitle))
             .then(items[a].kind.cmp(&items[b].kind))
     });
-    // Apply the permutation in-place.
-    let mut visited = vec![false; items.len()];
-    for i in 0..items.len() {
-        if visited[i] {
-            continue;
-        }
-        let mut j = i;
-        while !visited[j] {
-            visited[j] = true;
-            let target = indices[j];
-            if target != j {
-                items.swap(j, target);
-                j = target;
-            } else {
-                break;
-            }
-        }
+    // 按排好的下标顺序重建列表。旧实现用环跟随原地交换，但环长为 2 时会
+    // 交换两次自相抵消（相邻换位恰是最常见的环），列表等于没排；3 元素环
+    // 则产出乱序。按序重建无环、无特例。
+    let sorted: Vec<SearchResult> = indices.iter().map(|&index| items[index].clone()).collect();
+    for (slot, sorted_item) in items.iter_mut().zip(sorted) {
+        *slot = sorted_item;
     }
+}
+
+fn metadata_kind(item: &SearchResult) -> Option<MatchKind> {
+    item.match_metadata.map(|metadata| metadata.kind)
 }
 fn list_actions(target: ActionTarget) -> Response {
     match crate::actions::list_actions(&target) {
@@ -1831,6 +1896,15 @@ mod window_protocol_tests {
             .join(format!("prism-window-history-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Arc::new(HistoryStore::load(&dir, true))
+    }
+
+    /// history.record() 用真实墙钟写入，读取侧注入同一个"现在"才能保证
+    /// 衰减 Δt≈0（大数值 now 会把有效分衰减成 0）。
+    fn now_utc_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     // --- old-reader compatibility -------------------------------------------------
@@ -2078,6 +2152,7 @@ mod window_protocol_tests {
             20,
             &history,
             &Arc::new(BrokerPreferences::new(true)),
+            now_utc_secs(),
         );
 
         assert_eq!(results.len(), 1, "the never-used window must not be listed");
@@ -2101,17 +2176,70 @@ mod window_protocol_tests {
         // 还开着：列出来。
         let present = vec![("10".to_owned(), closed.clone())];
         assert_eq!(
-            rank_window_list(&present, "", 20, &history, &preferences).len(),
+            rank_window_list(&present, "", 20, &history, &preferences, now_utc_secs()).len(),
             1,
             "control: while enumerated it is listed"
         );
 
         // 关掉后本次枚举为空，历史条目仍在磁盘上。
-        let results = rank_window_list(&[], "", 20, &history, &preferences);
+        let results = rank_window_list(&[], "", 20, &history, &preferences, now_utc_secs());
         assert!(
             results.is_empty(),
             "history must not resurrect a window that is gone"
         );
+    }
+
+    /// 空查询窗口列表按 last_used（MRU）排序：最近用过一次的窗口排在
+    /// 更早高频使用的窗口前面——「最近使用的窗口」由时间而不是分数决定。
+    #[test]
+    fn empty_query_windows_order_by_recency_not_score() {
+        let history = history_store("recent-order");
+        let frequent_but_old = entry();
+        let recent = WindowEntry {
+            handle: 0xA02,
+            title: "笔记.txt - Notepad".into(),
+            app_name: "notepad".into(),
+            ..entry()
+        };
+        let now = 1_800_000_000u64;
+        for _ in 0..5 {
+            history
+                .record_at(
+                    &ActionTarget::new(TargetKind::Window, frequent_but_old.history_key()),
+                    HistoryUse::Execute,
+                    None,
+                    now - 500_000,
+                )
+                .unwrap();
+        }
+        history
+            .record_at(
+                &ActionTarget::new(TargetKind::Window, recent.history_key()),
+                HistoryUse::Execute,
+                None,
+                now - 10_000,
+            )
+            .unwrap();
+
+        let published = vec![
+            ("10".to_owned(), frequent_but_old),
+            ("11".to_owned(), recent),
+        ];
+        let results = rank_window_list(
+            &published,
+            "",
+            20,
+            &history,
+            &Arc::new(BrokerPreferences::new(true)),
+            now,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].title.contains("笔记.txt"),
+            "recently-used window ranks first despite the lower usage score"
+        );
+        assert!(results[1].title.contains("报告.docx"));
     }
 
     #[test]
@@ -2244,8 +2372,9 @@ mod protocol_tests {
         let weights = vec![HistoryWeight {
             target: ActionTarget::new(TargetKind::File, &zeta_str),
             score: 4,
+            last_used_utc: 1_000,
         }];
-        let mut candidates = history_file_candidates("ta", &weights, true, &[], None);
+        let mut candidates = history_file_candidates("ta", &weights, true, &[], None, 8);
         candidates.push(SearchResult {
             kind: SearchResultKind::File,
             title: "beta.txt".into(),
@@ -2267,9 +2396,7 @@ mod protocol_tests {
 
         // Exclusion path must use the real temp dir path.
         let exclusion = late_dir.to_str().unwrap().to_string();
-        assert!(
-            history_file_candidates("ta", &weights, true, &[exclusion], None).is_empty()
-        );
+        assert!(history_file_candidates("ta", &weights, true, &[exclusion], None, 8).is_empty());
 
         // Cleanup
         let _ = std::fs::remove_file(&zeta_path);
@@ -2315,46 +2442,55 @@ mod protocol_tests {
         let root_other_str = root_other_file.to_string_lossy().replace('/', "\\");
         let root_self_str = root_str.clone();
 
+        // weights 按 last_used 降序构造（与 weights() 的返回契约一致）：
+        // 空查询候选保持输入顺序 = MRU，收集满 limit 个现存路径即停。
         let weights = vec![
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::Window, "12345"),
+                score: 99,
+                last_used_utc: 999,
+            },
+            // Window history must never surface on the empty-query file path.
             HistoryWeight {
                 target: ActionTarget::new(TargetKind::File, &outside_str),
                 score: 40,
+                last_used_utc: 900,
             },
             HistoryWeight {
                 target: ActionTarget::new(TargetKind::File, &outside_same_str),
                 score: 30,
+                last_used_utc: 850,
             },
             HistoryWeight {
                 target: ActionTarget::new(TargetKind::File, &gone_str),
                 score: 20,
+                last_used_utc: 800,
             },
             HistoryWeight {
                 target: ActionTarget::new(TargetKind::File, &root_other_str),
                 score: 18,
-            },
-            HistoryWeight {
-                target: ActionTarget::new(TargetKind::File, &inside_str),
-                score: 8,
+                last_used_utc: 750,
             },
             HistoryWeight {
                 target: ActionTarget::new(TargetKind::Directory, &folder_str),
                 score: 12,
+                last_used_utc: 700,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &inside_str),
+                score: 8,
+                last_used_utc: 600,
             },
             // The root directory itself is a valid empty-query hit.
             HistoryWeight {
                 target: ActionTarget::new(TargetKind::Directory, &root_self_str),
                 score: 6,
-            },
-            // Window history must never surface on the empty-query file path.
-            HistoryWeight {
-                target: ActionTarget::new(TargetKind::Window, "12345"),
-                score: 99,
+                last_used_utc: 500,
             },
         ];
 
-        let mut candidates =
-            history_file_candidates("", &weights, false, &[], Some(root_str.as_str()));
-        candidates.sort_by(compare_search_results);
+        let candidates =
+            history_file_candidates("", &weights, false, &[], Some(root_str.as_str()), 8);
         assert_eq!(
             candidates
                 .iter()
@@ -2369,7 +2505,7 @@ mod protocol_tests {
         assert_eq!(
             candidates[0].kind,
             SearchResultKind::Folder,
-            "higher history score wins among empty-query rows"
+            "MRU order: folder was used most recently among empty-query rows"
         );
         assert!(
             !candidates
@@ -2380,7 +2516,7 @@ mod protocol_tests {
 
         // Non-empty query must still use title matching and ignore the root filter arg
         // when callers pass None (G2 injection path).
-        let named = history_file_candidates("inside", &weights, false, &[], None);
+        let named = history_file_candidates("inside", &weights, false, &[], None, 8);
         assert!(named.iter().any(|item| item.execute_id == inside_str));
         assert!(
             named.iter().any(|item| item.execute_id == outside_same_str),
@@ -2502,6 +2638,79 @@ mod protocol_tests {
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
             ["literal", "full-history", "full-no-history", "initials"]
+        );
+    }
+
+    /// 查询记忆置顶：picked 项在同 kind 内排最前（越过 class），但不能越过
+    /// kind 层级（字面命中的未 picked 项仍先于拼音命中的 picked 项）。
+    #[test]
+    fn query_pick_promotes_within_kind_but_not_across() {
+        let item = |kind: MatchKind, title: &str, class: u8| SearchResult {
+            kind: SearchResultKind::File,
+            title: title.into(),
+            subtitle: title.into(),
+            execute_id: title.into(),
+            target: ActionTarget::new(TargetKind::File, title),
+            match_spans: Vec::new(),
+            match_metadata: Some(MatchMetadata {
+                kind,
+                class,
+                position: 0,
+                score: 10,
+                history_score: 0,
+            }),
+        };
+        // "plain" 是精确命中（class 0），"picked" 是子串命中（class 2）：
+        // 没有 pick 时 plain 必须在前——先验证基准序。
+        let mut baseline = vec![item(MatchKind::Literal, "plain", 0), item(MatchKind::Literal, "picked", 2)];
+        sort_search_results(&mut baseline);
+        assert_eq!(
+            baseline.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            ["plain", "picked"],
+            "baseline: exact match beats substring without picks"
+        );
+
+        let mut items = vec![
+            item(MatchKind::Literal, "plain", 0),
+            item(MatchKind::Literal, "picked", 2),
+            item(MatchKind::FullPinyin, "pinyin", 0),
+        ];
+        let picks = vec![false, true, true];
+        sort_search_results_with_picks(&mut items, Some(&picks));
+        assert_eq!(
+            items.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            ["picked", "plain", "pinyin"],
+            "picked literal ranks first; picked pinyin must not cross the kind tier"
+        );
+    }
+
+    /// 旧的原地置换在 2/3 元素环上会自抵消或乱序：三档排序必须真正落位。
+    #[test]
+    fn sort_search_results_orders_items_across_match_tiers() {
+        let item = |kind: MatchKind, title: &str, class: u8| SearchResult {
+            kind: SearchResultKind::File,
+            title: title.into(),
+            subtitle: title.into(),
+            execute_id: title.into(),
+            target: ActionTarget::new(TargetKind::File, title),
+            match_spans: Vec::new(),
+            match_metadata: Some(MatchMetadata {
+                kind,
+                class,
+                position: 0,
+                score: 10,
+                history_score: 0,
+            }),
+        };
+        let mut items = vec![
+            item(MatchKind::FullPinyin, "pinyin", 0),
+            item(MatchKind::Literal, "substring", 2),
+            item(MatchKind::Literal, "exact", 0),
+        ];
+        sort_search_results(&mut items);
+        assert_eq!(
+            items.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            ["exact", "substring", "pinyin"]
         );
     }
 
