@@ -203,7 +203,30 @@ impl ServiceState {
         self.set_pinyin_status(PinyinStatus::Building);
     }
 
-    fn load_pinyin(&self, index: &IndexState) {
+    /// Loads the pinyin sidecar without holding the index read lock during the
+    /// expensive mmap + deserialization + validation phase.
+    ///
+    /// The index identity hash is computed under a brief read lock, then the
+    /// lock is released.  If the index changed (USN events applied) during the
+    /// load, the sidecar's delta mechanism catches up on install — so a strict
+    /// generation match is not enforced here.  The identity hash guards against
+    /// structural changes (volume set / names pool content) that the delta
+    /// mechanism cannot reconcile.
+    fn load_pinyin_outside_lock(&self) {
+        // A rebuild is in progress or a previous load already failed and queued
+        // a rebuild — let the maintenance loop handle it rather than racing.
+        if self.pinyin_status() == PinyinStatus::Building
+            || self.pinyin_needs_rebuild.load(Ordering::Acquire)
+        {
+            return;
+        }
+        self.load_pinyin_outside_lock_force();
+    }
+
+    /// Like `load_pinyin_outside_lock` but bypasses the Building/needs_rebuild
+    /// guard.  Used by the initial cache-hit path (`load_pinyin_from_live`) which
+    /// must transition out of the `Building` state set by `begin_pinyin_rebuild`.
+    fn load_pinyin_outside_lock_force(&self) {
         if !self.pinyin_enabled.load(Ordering::Acquire) {
             self.release_pinyin();
             return;
@@ -221,7 +244,21 @@ impl ServiceState {
             self.set_pinyin_status(PinyinStatus::Missing);
             return;
         };
-        match PinyinSidecar::load(&data_dir, index) {
+        // Read lock only to compute identity + generation, then release.
+        let (identity, volume_count) = {
+            let Ok(guard) = self.index.read() else {
+                return;
+            };
+            let Some(index) = guard.as_ref() else {
+                return;
+            };
+            (
+                crate::pinyin_sidecar::index_identity(index),
+                u16::try_from(index.volumes.len()).unwrap_or(u16::MAX),
+            )
+        };
+        // Lock-free: mmap + postcard deserialize + validate_disk.
+        match PinyinSidecar::load_with_identity(&data_dir, identity, volume_count) {
             Ok(sidecar) => {
                 if !self.pinyin_enabled.load(Ordering::Acquire) {
                     self.release_pinyin();
@@ -241,19 +278,6 @@ impl ServiceState {
                 self.pinyin_needs_rebuild.store(true, Ordering::Release);
             }
         }
-    }
-
-    fn ensure_pinyin_loaded(&self, index: &IndexState) {
-        if self.pinyin.read().is_ok_and(|sidecar| sidecar.is_some()) {
-            self.set_pinyin_status(PinyinStatus::Ready);
-            return;
-        }
-        if self.pinyin_status() == PinyinStatus::Building
-            || self.pinyin_needs_rebuild.load(Ordering::Acquire)
-        {
-            return;
-        }
-        self.load_pinyin(index);
     }
 
     fn rebuild_pinyin(&self, index: &IndexState, data_dir: &Path) {
@@ -294,11 +318,9 @@ impl ServiceState {
     }
 
     fn load_pinyin_from_live(&self) {
-        if let Ok(index) = self.index.read() {
-            if let Some(index) = index.as_ref() {
-                self.load_pinyin(index);
-            }
-        }
+        // Force-load: bypass the Building/needs_rebuild guard so the initial
+        // cache-hit path can transition from Building to Ready/Missing/Corrupt.
+        self.load_pinyin_outside_lock_force();
     }
 
     fn rebuild_pinyin_from_live(&self) {
@@ -499,16 +521,19 @@ impl ServiceState {
                 })
             }
         };
+        // H2a: pinyin sidecar load (mmap + deserialize + validate) is done
+        // *outside* the index read lock so USN watchers can acquire the write
+        // lock during the load.  If the sidecar is already loaded this is a
+        // fast check-and-return; if not, the search proceeds with literal-only
+        // results and the maintenance loop retries the load.
+        if self.pinyin_enabled.load(Ordering::Acquire) {
+            self.load_pinyin_outside_lock();
+        }
         let guard = self.index.read().map_err(|_| "index lock is poisoned")?;
         let state = guard.as_ref().ok_or("file index is not ready")?;
         // M6 (audit): search is read-only w.r.t. the pinyin flag. The stored
         // preference (set by SetPinyinEnabled) decides whether pinyin results
         // are included; a search never flips the flag or releases the sidecar.
-        // The lazy load below only loads (never disables), so the first search
-        // after startup still populates the sidecar if the flag is true.
-        if self.pinyin_enabled.load(Ordering::Acquire) {
-            self.ensure_pinyin_loaded(state);
-        }
         let pinyin_enabled = self.pinyin_enabled.load(Ordering::Acquire);
         let root_bound = match root {
             Some(root) => match RootScope::resolve(state, root) {
@@ -1508,13 +1533,9 @@ pub(crate) async fn handle_connection(
                 match tokio::task::spawn_blocking(move || {
                     if enabled {
                         state_for_task.pinyin_enabled.store(true, Ordering::Release);
-                        // Load the sidecar if the index is already built; if not,
-                        // the maintenance loop / first search will lazy-load it.
-                        if let Ok(guard) = state_for_task.index.read() {
-                            if let Some(index) = guard.as_ref() {
-                                state_for_task.ensure_pinyin_loaded(index);
-                            }
-                        }
+                        // H2a: load outside the index read lock to avoid
+                        // blocking USN watchers during mmap + deserialize.
+                        state_for_task.load_pinyin_outside_lock();
                     } else {
                         state_for_task.release_pinyin();
                     }

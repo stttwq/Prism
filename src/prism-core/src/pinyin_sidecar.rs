@@ -235,6 +235,24 @@ impl PinyinSidecar {
     }
 
     pub fn load(data_dir: &Path, index: &IndexState) -> Result<Self, LoadError> {
+        let identity = index_identity(index);
+        let volume_count = u16::try_from(index.volumes.len()).unwrap_or(u16::MAX);
+        Self::load_with_identity(data_dir, identity, volume_count)
+    }
+
+    /// Loads and validates the sidecar without holding the index read lock
+    /// during the expensive mmap + deserialization phase.
+    ///
+    /// Callers compute `identity` and `volume_count` under the read lock, then
+    /// release the lock before calling this.  If the index changed between the
+    /// snapshot and installation the delta mechanism catches up, so a strict
+    /// generation match at install time is not required — only the identity
+    /// hash must match the on-disk sidecar.
+    pub fn load_with_identity(
+        data_dir: &Path,
+        identity: u64,
+        volume_count: u16,
+    ) -> Result<Self, LoadError> {
         let path = path(data_dir);
         #[cfg(windows)]
         let mapping = MappedFile::open(&path)?;
@@ -253,7 +271,7 @@ impl PinyinSidecar {
             kind: LoadErrorKind::Corrupt,
             message: error.to_string(),
         })?;
-        validate_disk(&disk, index)?;
+        validate_disk_with(&disk, identity, volume_count)?;
         // 反序列化完成后 mapping 立即随本地变量 drop：mmap 与堆拷贝双份常驻
         // 等于白占一份内存（大卷可达百 MB），而这里的字节此后再无读取。
         Ok(Self {
@@ -614,7 +632,11 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE_NAME)
 }
 
-fn validate_disk(disk: &SidecarDisk, index: &IndexState) -> Result<(), LoadError> {
+fn validate_disk_with(
+    disk: &SidecarDisk,
+    identity: u64,
+    volume_count: u16,
+) -> Result<(), LoadError> {
     if disk.magic != MAGIC || disk.schema_version != SCHEMA_VERSION {
         return Err(LoadError {
             kind: LoadErrorKind::VersionMismatch,
@@ -627,9 +649,7 @@ fn validate_disk(disk: &SidecarDisk, index: &IndexState) -> Result<(), LoadError
             message: "pinyin dictionary version mismatch".into(),
         });
     }
-    if disk.index_identity != index_identity(index)
-        || usize::from(disk.volume_count) != index.volumes.len()
-    {
+    if disk.index_identity != identity || disk.volume_count != volume_count {
         return Err(LoadError {
             kind: LoadErrorKind::IndexMismatch,
             message: "pinyin sidecar index identity mismatch".into(),
@@ -657,7 +677,11 @@ fn validate_disk(disk: &SidecarDisk, index: &IndexState) -> Result<(), LoadError
     Ok(())
 }
 
-fn index_identity(index: &IndexState) -> u64 {
+/// Computes the identity hash for an index state.
+///
+/// Made `pub(crate)` so callers can pre-compute the hash under a read lock
+/// and then release the lock before the expensive mmap + deserialization.
+pub(crate) fn index_identity(index: &IndexState) -> u64 {
     let mut hash = FNV_OFFSET;
     for volume in &index.volumes {
         hash_bytes(&mut hash, volume.volume_id.guid.as_bytes());
