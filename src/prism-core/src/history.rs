@@ -6,6 +6,7 @@
 //! (`QueryStat`, for query-aware ranking). Reads apply lazy decay from
 //! `last_used_utc`; no background timers.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -74,9 +75,59 @@ impl HistoryFileError {
 /// `entries` 始终按 `last_used_utc` 降序（prune 维护）；`index` 是
 /// (kind, target) → 下标的查找表——5000 条容量下 score()/query_pick()
 /// 不能承受逐候选的线性扫描。
+///
+/// 审计 P2：键从 `(String, String)` 改成 interned 单串 `kind + '\0' + value`。
+/// 查找侧配合线程局部缓冲（[`with_composed_key`]）借出 `&str`，走
+/// `HashMap<String, _>` 的 `Borrow<str>` 通道——每击键 600-1000 次查找不再
+/// 各分配两个 String。
 struct HistoryState {
     entries: Vec<HistoryEntry>,
-    index: HashMap<(String, String), usize>,
+    index: HashMap<String, usize>,
+}
+
+/// 复合键分隔符。`is_recordable` 拒绝含 NUL 的 value，kind 取自固定白名单
+/// （file/directory/application/window），因此 NUL 不可能出现在两侧内容里，
+/// 键无歧义。
+const KEY_SEPARATOR: char = '\0';
+
+fn write_composed_key(kind: &str, value: &str, buffer: &mut String) {
+    buffer.clear();
+    buffer.reserve(kind.len() + 1 + value.len());
+    buffer.push_str(kind);
+    buffer.push(KEY_SEPARATOR);
+    buffer.push_str(value);
+}
+
+fn composed_key(kind: &str, value: &str) -> String {
+    let mut key = String::new();
+    write_composed_key(kind, value, &mut key);
+    key
+}
+
+thread_local! {
+    /// 查找专用缓冲：只在 [`with_composed_key`] 内借出，闭包里不再嵌套调用，
+    /// 所以 borrow_mut 不会重入。
+    static LOOKUP_KEY: RefCell<String> = RefCell::new(String::with_capacity(160));
+}
+
+fn with_composed_key<R>(kind: &str, value: &str, action: impl FnOnce(&str) -> R) -> R {
+    LOOKUP_KEY.with(|cell| {
+        let mut buffer = cell.borrow_mut();
+        write_composed_key(kind, value, &mut buffer);
+        action(buffer.as_str())
+    })
+}
+
+/// 同一套 interned 复合键对 broker 侧的 dedup 集合开放（审计 P6）：注入历史
+/// 候选与索引结果的去重集合用它做键，不再逐条构造 `(String, String)` 元组。
+pub(crate) fn target_key(kind: &str, value: &str) -> String {
+    composed_key(kind, value)
+}
+
+/// [`target_key`] 的零分配查找侧：借出线程局部缓冲里的键。闭包内不得再调用
+/// 本函数或 [`HistoryStore`] 的查找方法（同一缓冲会被重入借用）。
+pub(crate) fn with_target_key<R>(kind: &str, value: &str, action: impl FnOnce(&str) -> R) -> R {
+    with_composed_key(kind, value, action)
 }
 
 impl HistoryState {
@@ -91,18 +142,18 @@ impl HistoryState {
     }
 
     fn lookup(&self, target: &ActionTarget) -> Option<&HistoryEntry> {
-        let position = *self
-            .index
-            .get(&(target.kind.clone(), target.value.clone()))?;
+        let position = with_composed_key(&target.kind, &target.value, |key| {
+            self.index.get(key).copied()
+        })?;
         self.entries.get(position)
     }
 }
 
-fn build_index(entries: &[HistoryEntry]) -> HashMap<(String, String), usize> {
+fn build_index(entries: &[HistoryEntry]) -> HashMap<String, usize> {
     entries
         .iter()
         .enumerate()
-        .map(|(position, entry)| ((entry.kind.clone(), entry.target.clone()), position))
+        .map(|(position, entry)| (composed_key(&entry.kind, &entry.target), position))
         .collect()
 }
 
@@ -211,13 +262,13 @@ impl HistoryStore {
             .state
             .write()
             .map_err(|_| "history lock is poisoned".to_string())?;
-        let key = (target.kind.clone(), target.value.clone());
+        let key = composed_key(&target.kind, &target.value);
         let position = match state.index.get(&key).copied() {
             Some(position) => position,
             None => {
                 state.entries.push(HistoryEntry {
-                    kind: key.0.clone(),
-                    target: key.1.clone(),
+                    kind: target.kind.clone(),
+                    target: target.value.clone(),
                     ..HistoryEntry::default()
                 });
                 let position = state.entries.len() - 1;
@@ -278,6 +329,16 @@ impl HistoryStore {
         let Some(key) = normalized_query_key(query) else {
             return false;
         };
+        self.query_pick_by_key(target, &key)
+    }
+
+    /// 直传已归一化键的版本（审计 P8）：一次搜索里整批候选共用同一个键，
+    /// 逐条重复归一化只是重复分配。归一化幂等，所以与 [`Self::query_pick`]
+    /// 对同一查询串的判定完全一致；调用方须传 [`normalized_query_key`] 的输出。
+    pub fn query_pick_by_key(&self, target: &ActionTarget, key: &str) -> bool {
+        if !self.is_enabled() || key.is_empty() {
+            return false;
+        }
         self.state
             .read()
             .ok()
@@ -798,8 +859,49 @@ mod tests {
         assert!(store.query_pick(&doc, "q7"));
         assert!(!store.query_pick(&doc, "conf"));
         assert!(!store.query_pick(&doc, "never"));
+        // P8：直传归一化键与走归一化外壳的判定必须一致（键归一化幂等）。
+        assert!(store.query_pick_by_key(&doc, "q7"));
+        assert!(store.query_pick_by_key(&doc, &normalized_query_key(" Q7 ").unwrap()));
+        assert!(!store.query_pick_by_key(&doc, "conf"));
+        assert!(!store.query_pick_by_key(&doc, ""));
         store.set_enabled(false);
         assert!(!store.query_pick(&doc, "q7"));
+        assert!(!store.query_pick_by_key(&doc, "q7"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// P2：interned 单串键不能让「kind 尾巴 + value 头」拼成同一个键。
+    /// `'\0'` 分隔符 + `is_recordable` 拒 NUL 是这条不变量的依据。
+    #[test]
+    fn interned_index_key_does_not_collide_across_kinds() {
+        assert_ne!(
+            composed_key("file", "directory"),
+            composed_key("filedirectory", "")
+        );
+        assert_ne!(composed_key("file", "\\a"), composed_key("file\\", "a"));
+
+        let dir = test_dir("interned-key");
+        let store = HistoryStore::load_at(&dir, true, 1_000_000);
+        let file = ActionTarget {
+            kind: "file".into(),
+            value: "C:\\same".into(),
+        };
+        let directory = ActionTarget {
+            kind: "directory".into(),
+            value: "C:\\same".into(),
+        };
+        store
+            .record_at(&file, HistoryUse::Execute, None, 1_000_000)
+            .unwrap();
+        // 同 value 不同 kind 是两条独立记录，查找不得串台。
+        assert_eq!(store.score_at(&file, 1_000_000), 4);
+        assert_eq!(store.score_at(&directory, 1_000_000), 0);
+        store
+            .record_at(&directory, HistoryUse::Reveal, None, 1_000_000)
+            .unwrap();
+        assert_eq!(store.score_at(&file, 1_000_000), 4);
+        assert_eq!(store.score_at(&directory, 1_000_000), 2);
+        assert_eq!(store.entries().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

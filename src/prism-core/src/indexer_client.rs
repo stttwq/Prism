@@ -27,7 +27,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::Mutex;
 
@@ -95,6 +95,11 @@ pub struct SearchReply {
 // Persistent connection — the long-lived pipe to the indexer service.
 // ---------------------------------------------------------------------------
 
+/// 响应方向的单行上限（审计 P12）：与入站请求的 1MB 上限**不同**——一次
+/// `max=1000` 的搜索返回上千条长路径，合法响应本来就会超过 1MB，复用 1MB 会
+/// 把正常搜索误杀。8MB 足够容纳协议上限的结果集，同时仍拦住失控/恶意的无尽行。
+const MAX_INDEXER_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 /// A long-lived connection to the indexer with its own reader/writer halves.
 ///
 /// The connection is established lazily on first use and reused for every
@@ -102,14 +107,14 @@ pub struct SearchReply {
 /// the holder is dropped and the next caller creates a fresh connection.
 struct PersistentConnection {
     writer: tokio::io::WriteHalf<NamedPipeClient>,
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<NamedPipeClient>>>,
+    lines: crate::ipc::BoundedLineReader<tokio::io::ReadHalf<NamedPipeClient>>,
 }
 
 impl PersistentConnection {
     async fn connect(pipe_name: &str) -> Result<Self, String> {
         let pipe = connect_pipe(pipe_name).await?;
         let (reader, writer) = tokio::io::split(pipe);
-        let lines = BufReader::new(reader).lines();
+        let lines = crate::ipc::BoundedLineReader::with_limit(reader, MAX_INDEXER_LINE_BYTES);
         Ok(Self { writer, lines })
     }
 
@@ -131,8 +136,7 @@ impl PersistentConnection {
         let line = self
             .lines
             .next_line()
-            .await
-            .map_err(|error| error.to_string())?
+            .await?
             .ok_or("indexer service closed the connection")?;
         serde_json::from_str(&line).map_err(|error| format!("invalid indexer response: {error}"))
     }
@@ -446,7 +450,7 @@ async fn search_pipe_inner(
 ) -> Result<SearchReply, SearchFailure> {
     let pipe = connect_pipe(pipe_name).await?;
     let (reader, mut writer) = tokio::io::split(pipe);
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = crate::ipc::BoundedLineReader::with_limit(reader, MAX_INDEXER_LINE_BYTES);
 
     write_request(
         &mut writer,
@@ -547,13 +551,12 @@ async fn write_request<W: AsyncWriteExt + Unpin>(
 }
 
 #[cfg(test)]
-async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut tokio::io::Lines<R>,
+async fn read_response<R: tokio::io::AsyncRead + Unpin>(
+    lines: &mut crate::ipc::BoundedLineReader<R>,
 ) -> Result<IndexerResponse, String> {
     let line = lines
         .next_line()
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
         .ok_or("indexer service closed the connection")?;
     serde_json::from_str(&line).map_err(|error| format!("invalid indexer response: {error}"))
 }
@@ -667,7 +670,7 @@ mod tests {
 
         let pipe = ClientOptions::new().open(&pipe_name).unwrap();
         let (reader, mut writer) = tokio::io::split(pipe);
-        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let mut lines = crate::ipc::BoundedLineReader::with_limit(reader, MAX_INDEXER_LINE_BYTES);
 
         let hello = serde_json::to_string(&IndexerRequest::Hello {
             protocol: crate::INDEXER_PROTOCOL,

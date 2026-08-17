@@ -20,34 +20,76 @@ pub struct AppEntry {
     pub launch_path: String,
     /// 解析出的目标路径（失败则为 launch_path），作副标题。
     pub target_path: String,
+    /// 预编码的紧凑拼音（审计 P5）：扫描时编码一次，搜索热路径只做匹配，不再
+    /// 为每次击键逐字分配读音 String。`None` = 名字里没有汉字，永不拼音匹配。
+    ///
+    /// 只活在内存里（清单每次启动/刷新都重扫），所以拼音词典版本
+    /// (`PINYIN_DICTIONARY_VERSION`) 变化自然生效，无需缓存失效逻辑。
+    pub pinyin: Option<Vec<u8>>,
 }
 
 /// 共享程序清单。
 pub type SharedApps = Arc<RwLock<Vec<AppEntry>>>;
 
-/// 在清单中做子串搜索，最多 `max` 条。
-/// 排序：完全匹配 > 前缀匹配 > 包含；同级按名称短优先。
-pub fn search<'a>(apps: &'a [AppEntry], query: &str, max: usize) -> Vec<&'a AppEntry> {
-    if query.is_empty() || max == 0 {
-        return Vec::new();
+/// 在清单中做子串搜索，最多 `max` 条，并返回**全部**命中条数。
+///
+/// 排序：完全匹配 > 前缀匹配 > 包含；同级按名称短优先，同级同长按清单顺序
+/// （清单按小写名排序，所以结果确定）。
+///
+/// 审计 P10：命中集合只保留 top-N（有界插入），不再为了拿总数先用
+/// `usize::MAX` 物化全部命中——`matched_count` 的精确计数语义由第二个
+/// 返回值继续保证。
+pub fn search_ranked<'a>(
+    apps: &'a [AppEntry],
+    query: &str,
+    max: usize,
+) -> (Vec<&'a AppEntry>, u64) {
+    if query.is_empty() {
+        return (Vec::new(), 0);
     }
     let q = query.to_lowercase();
-    let mut scored: Vec<(u8, usize, &AppEntry)> = apps
-        .iter()
-        .filter_map(|a| {
-            if a.name_lower == q {
-                Some((0u8, a.name.len(), a))
-            } else if a.name_lower.starts_with(&q) {
-                Some((1, a.name.len(), a))
-            } else if a.name_lower.contains(&q) {
-                Some((2, a.name.len(), a))
-            } else {
-                None
+    let mut matched = 0u64;
+    // 有界 top-N：按 (rank, name.len()) 升序保持，满了就与末位比较。
+    // 「不优于末位则丢弃」等价于稳定排序后 take(max)——同键的靠后条目本来就排在后面。
+    let mut kept: Vec<((u8, usize), &AppEntry)> = Vec::with_capacity(max.min(64));
+    for app in apps {
+        let Some(rank) = match_rank(app, &q) else {
+            continue;
+        };
+        matched = matched.saturating_add(1);
+        if max == 0 {
+            continue;
+        }
+        let key = (rank, app.name.len());
+        if kept.len() >= max {
+            if key >= kept[kept.len() - 1].0 {
+                continue;
             }
-        })
-        .collect();
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().take(max).map(|(_, _, e)| e).collect()
+            kept.pop();
+        }
+        let position = kept.partition_point(|(existing, _)| *existing <= key);
+        kept.insert(position, (key, app));
+    }
+    (kept.into_iter().map(|(_, app)| app).collect(), matched)
+}
+
+/// 命中等级：0 完全匹配、1 前缀、2 包含；未命中 None。`query_lower` 须已小写。
+fn match_rank(app: &AppEntry, query_lower: &str) -> Option<u8> {
+    if app.name_lower == query_lower {
+        Some(0)
+    } else if app.name_lower.starts_with(query_lower) {
+        Some(1)
+    } else if app.name_lower.contains(query_lower) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// 只要 top-N 的旧签名（测试与外部调用方沿用）。
+#[cfg(test)]
+pub fn search<'a>(apps: &'a [AppEntry], query: &str, max: usize) -> Vec<&'a AppEntry> {
+    search_ranked(apps, query, max).0
 }
 
 /// Scan Start Menu shortcuts on the broker-owned STA Shell worker.
@@ -183,6 +225,8 @@ fn app_from_lnk(path: &Path, resolver: Option<&mut LnkResolver>) -> Option<AppEn
 
     Some(AppEntry {
         name_lower: name.to_lowercase(),
+        // 拼音只在扫描时编码一次（审计 P5）。
+        pinyin: crate::pinyin::encode_compact(&name),
         name,
         launch_path,
         target_path,
@@ -275,36 +319,38 @@ impl Drop for LnkResolver {
 mod tests {
     use super::*;
 
+    fn app(name: &str, launch_path: &str, target_path: &str) -> AppEntry {
+        AppEntry {
+            name: name.into(),
+            name_lower: name.to_lowercase(),
+            pinyin: crate::pinyin::encode_compact(name),
+            launch_path: launch_path.into(),
+            target_path: target_path.into(),
+        }
+    }
+
     fn sample_apps() -> Vec<AppEntry> {
         vec![
-            AppEntry {
-                name: "微信".into(),
-                name_lower: "微信".into(),
-                launch_path: r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\微信.lnk"
-                    .into(),
-                target_path: r"C:\Program Files\Tencent\WeChat\WeChat.exe".into(),
-            },
-            AppEntry {
-                name: "WeChat".into(),
-                name_lower: "wechat".into(),
-                launch_path: r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\WeChat.lnk"
-                    .into(),
-                target_path: r"C:\Program Files\Tencent\WeChat\WeChat.exe".into(),
-            },
-            AppEntry {
-                name: "Clash Party".into(),
-                name_lower: "clash party".into(),
-                launch_path: r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Clash Party.lnk"
-                    .into(),
-                target_path: r"C:\Apps\clash.exe".into(),
-            },
-            AppEntry {
-                name: "Chrome".into(),
-                name_lower: "chrome".into(),
-                launch_path: r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Chrome.lnk"
-                    .into(),
-                target_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
-            },
+            app(
+                "微信",
+                r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\微信.lnk",
+                r"C:\Program Files\Tencent\WeChat\WeChat.exe",
+            ),
+            app(
+                "WeChat",
+                r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\WeChat.lnk",
+                r"C:\Program Files\Tencent\WeChat\WeChat.exe",
+            ),
+            app(
+                "Clash Party",
+                r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Clash Party.lnk",
+                r"C:\Apps\clash.exe",
+            ),
+            app(
+                "Chrome",
+                r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Chrome.lnk",
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            ),
         ]
     }
 
@@ -330,14 +376,60 @@ mod tests {
         let apps = sample_apps();
         // 加一条前缀更长的
         let mut apps = apps;
-        apps.push(AppEntry {
-            name: "Chrome Beta".into(),
-            name_lower: "chrome beta".into(),
-            launch_path: r"C:\x\Chrome Beta.lnk".into(),
-            target_path: r"C:\x\chrome-beta.exe".into(),
-        });
+        apps.push(app(
+            "Chrome Beta",
+            r"C:\x\Chrome Beta.lnk",
+            r"C:\x\chrome-beta.exe",
+        ));
         let r = search(&apps, "chrome", 10);
         assert_eq!(r[0].name, "Chrome");
+    }
+
+    /// P10：截断后的 top-N 与「全量物化再排序取前 N」等价，且总数仍精确。
+    #[test]
+    fn ranked_top_n_matches_full_materialization_and_counts_all() {
+        let mut apps = sample_apps();
+        apps.push(app("Chrome Beta", r"C:\x\Chrome Beta.lnk", r"C:\x\cb.exe"));
+        apps.push(app(
+            "Chrome Canary",
+            r"C:\x\Chrome Canary.lnk",
+            r"C:\x\cc.exe",
+        ));
+        for query in ["c", "ch", "chrome", "微信", "zzz", ""] {
+            let full: Vec<&str> = search_ranked(&apps, query, usize::MAX)
+                .0
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect();
+            for max in 0..=full.len() + 1 {
+                let (top, total) = search_ranked(&apps, query, max);
+                let names: Vec<&str> = top.iter().map(|app| app.name.as_str()).collect();
+                assert_eq!(
+                    names,
+                    full.iter().copied().take(max).collect::<Vec<_>>(),
+                    "{query} / {max}"
+                );
+                // 总数与 max 无关（max=0 也照数）。
+                assert_eq!(total as usize, full.len(), "{query} / {max}");
+            }
+        }
+    }
+
+    /// P5：拼音在扫描时预编码，匹配走紧凑字节，与即时 `match_name` 判定一致。
+    #[test]
+    fn precomputed_pinyin_matches_the_on_the_fly_encoder() {
+        let apps = sample_apps();
+        let wechat = apps.iter().find(|app| app.name == "微信").unwrap();
+        let encoded = wechat.pinyin.as_deref().expect("含汉字应有预编码拼音");
+        let normalized = crate::pinyin::normalize_query("wx").unwrap();
+        assert_eq!(
+            crate::pinyin::match_compact_normalized(encoded, normalized.as_bytes()),
+            crate::pinyin::match_name("微信", "wx")
+        );
+        // 纯拉丁名不编码，拼音通道对它永远沉默。
+        let chrome = apps.iter().find(|app| app.name == "Chrome").unwrap();
+        assert!(chrome.pinyin.is_none());
+        assert!(crate::pinyin::match_name("Chrome", "chrome").is_none());
     }
 
     #[test]

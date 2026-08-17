@@ -522,27 +522,45 @@ const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 
 /// 有界逐行读取器：分块读入、跨调用保留未换行的残留字节、超限即报错。
 /// 替代无上限累积的 `BufReader::lines()`。
+///
+/// 上限按方向配置（审计 P12）：入站请求走 [`MAX_REQUEST_LINE_BYTES`]（1MB），
+/// indexer 响应方向另设更宽的上限——1000 条长路径结果合法地超过 1MB。
 pub(crate) struct BoundedLineReader<R: tokio::io::AsyncRead + Unpin> {
     reader: BufReader<R>,
     carry: Vec<u8>,
+    max_line_bytes: usize,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> BoundedLineReader<R> {
     pub(crate) fn new(reader: R) -> Self {
+        Self::with_limit(reader, MAX_REQUEST_LINE_BYTES)
+    }
+
+    /// 自定上限的构造（审计 P12）：调用方按方向选择合适的上限。
+    pub(crate) fn with_limit(reader: R, max_line_bytes: usize) -> Self {
         Self {
             reader: BufReader::new(reader),
             carry: Vec::with_capacity(512),
+            max_line_bytes,
         }
     }
 
+    fn too_long(&self) -> String {
+        // 向上取整到 MB：不足 1MB 的上限也不会显示成「0MB」。
+        format!(
+            "数据行超过 {}MB 上限",
+            self.max_line_bytes.div_ceil(1024 * 1024)
+        )
+    }
+
     /// 读下一行（含换行符前的内容）。EOF 且无残留返回 None；
-    /// 单行超过 [`MAX_REQUEST_LINE_BYTES`] 返回 Err（调用方应断开）。
+    /// 单行超过本读取器的上限返回 Err（调用方应断开）。
     pub(crate) async fn next_line(&mut self) -> Result<Option<String>, String> {
         loop {
             if let Some(pos) = self.carry.iter().position(|byte| *byte == b'\n') {
                 // 上限检查必须同样覆盖"换行符已到"的分支，否则超长行会被整行取出。
-                if pos > MAX_REQUEST_LINE_BYTES {
-                    return Err("请求行超过 1MB 上限".to_string());
+                if pos > self.max_line_bytes {
+                    return Err(self.too_long());
                 }
                 let mut line: Vec<u8> = self.carry.drain(..=pos).collect();
                 line.pop(); // \n
@@ -553,8 +571,8 @@ impl<R: tokio::io::AsyncRead + Unpin> BoundedLineReader<R> {
                     String::from_utf8(line).map_err(|_| "请求不是有效的 UTF-8".to_string())?,
                 ));
             }
-            if self.carry.len() > MAX_REQUEST_LINE_BYTES {
-                return Err("请求行超过 1MB 上限".to_string());
+            if self.carry.len() > self.max_line_bytes {
+                return Err(self.too_long());
             }
             let mut chunk = [0u8; 8192];
             let read = self
@@ -611,6 +629,11 @@ async fn handle_connection(
     log("前端已连接");
     let (reader, mut writer) = tokio::io::split(pipe);
     let mut lines = BoundedLineReader::new(reader);
+    // 审计 P15：响应序列化缓冲在整条连接生命期内复用，每次响应不再新建 Vec。
+    // 偶发的超大响应（"more" 模式 300 项）不长期占着容量：写完超过 `RESPONSE_BUFFER_KEEP`
+    // 就缩回去。
+    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
+    const RESPONSE_BUFFER_KEEP: usize = 256 * 1024;
 
     let mut first_line = true;
     loop {
@@ -630,9 +653,10 @@ async fn handle_connection(
                     message,
                     category: None,
                 };
-                if let Ok(mut buf) = serde_json::to_vec(&response) {
-                    buf.push(b'\n');
-                    let _ = writer.write_all(&buf).await;
+                out.clear();
+                if serde_json::to_writer(&mut out, &response).is_ok() {
+                    out.push(b'\n');
+                    let _ = writer.write_all(&out).await;
                     let _ = writer.flush().await;
                 }
                 log("入站请求行异常，断开连接");
@@ -678,12 +702,20 @@ async fn handle_connection(
             },
         };
 
-        let mut buf = serde_json::to_vec(&response).unwrap_or_else(|e| {
-            format!("{{\"type\":\"error\",\"message\":\"序列化失败:{e}\"}}").into_bytes()
-        });
-        buf.push(b'\n');
-        writer.write_all(&buf).await?;
+        out.clear();
+        if let Err(error) = serde_json::to_writer(&mut out, &response) {
+            // 序列化中途失败：丢掉半截字节，回一条自造的错误行（与旧行为一致）。
+            out.clear();
+            out.extend_from_slice(
+                format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}").as_bytes(),
+            );
+        }
+        out.push(b'\n');
+        writer.write_all(&out).await?;
         writer.flush().await?;
+        if out.capacity() > RESPONSE_BUFFER_KEEP {
+            out = Vec::with_capacity(8 * 1024);
+        }
     }
 
     log("前端断开连接");
@@ -1114,27 +1146,34 @@ struct SearchArgs<'a> {
 /// Apps are only searched when there is no root scope and no query filters — a
 /// directory scope means "files under this root", and filters mean "files only".
 /// Returns the app results and a count of how many matched (for `matched_count`).
+///
+/// 热路径分配（审计批次 4）：字面命中只降幂一次（P9）、名单只取 top-N 但总数
+/// 精确（P10）、拼音走清单里预编码的紧凑字节且查询只归一化一次（P5）。
 fn collect_app_results(
     apps: &SharedApps,
     name_query: &str,
     history: &Arc<HistoryStore>,
     pinyin_enabled: bool,
+    limit: usize,
 ) -> (Vec<SearchResult>, u64) {
     let mut ranked = Vec::new();
-    let mut app_match_count = 0u64;
     let Ok(apps_guard) = apps.read() else {
-        return (ranked, app_match_count);
+        return (ranked, 0);
     };
-    let app_matches = crate::apps::search(&apps_guard, name_query, usize::MAX);
-    app_match_count = app_matches.len() as u64;
+    let (app_matches, mut app_match_count) =
+        crate::apps::search_ranked(&apps_guard, name_query, limit);
+    let query_lower = name_query.to_lowercase();
     let mut literal_targets = std::collections::HashSet::new();
     for app in app_matches {
         literal_targets.insert(app.launch_path.clone());
         let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
-        let mut metadata = rank_title(&app.name, name_query);
-        if let Some(metadata) = metadata.as_mut() {
-            metadata.history_score = history.score(&target);
-        }
+        let (metadata, spans) = match literal_match_lowered(&app.name, &query_lower) {
+            Some((mut metadata, spans)) => {
+                metadata.history_score = history.score(&target);
+                (Some(metadata), spans)
+            }
+            None => (None, Vec::new()),
+        };
         ranked.push(SearchResult {
             kind: SearchResultKind::App,
             title: app.name.clone(),
@@ -1145,34 +1184,42 @@ fn collect_app_results(
             },
             execute_id: app.launch_path.clone(),
             target,
-            match_spans: match_spans(&app.name, name_query),
+            match_spans: spans,
             match_metadata: metadata,
         });
     }
     if pinyin_enabled {
-        for app in apps_guard.iter() {
-            if literal_targets.contains(&app.launch_path) {
-                continue;
+        // 查询归一化一次；清单侧的编码在扫描时就做好了。
+        if let Some(normalized) = crate::pinyin::normalize_query(name_query) {
+            for app in apps_guard.iter() {
+                if literal_targets.contains(&app.launch_path) {
+                    continue;
+                }
+                let Some(encoded) = app.pinyin.as_deref() else {
+                    continue;
+                };
+                let Some(matched) =
+                    crate::pinyin::match_compact_normalized(encoded, normalized.as_bytes())
+                else {
+                    continue;
+                };
+                let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
+                let metadata = pinyin_metadata(&matched, history.score(&target));
+                ranked.push(SearchResult {
+                    kind: SearchResultKind::App,
+                    title: app.name.clone(),
+                    subtitle: if app.target_path != app.launch_path {
+                        app.target_path.clone()
+                    } else {
+                        app.launch_path.clone()
+                    },
+                    execute_id: app.launch_path.clone(),
+                    target,
+                    match_spans: matched.spans,
+                    match_metadata: Some(metadata),
+                });
+                app_match_count = app_match_count.saturating_add(1);
             }
-            let Some(matched) = crate::pinyin::match_name(&app.name, name_query) else {
-                continue;
-            };
-            let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
-            let metadata = pinyin_metadata(&matched, history.score(&target));
-            ranked.push(SearchResult {
-                kind: SearchResultKind::App,
-                title: app.name.clone(),
-                subtitle: if app.target_path != app.launch_path {
-                    app.target_path.clone()
-                } else {
-                    app.launch_path.clone()
-                },
-                execute_id: app.launch_path.clone(),
-                target: target.clone(),
-                match_spans: matched.spans,
-                match_metadata: Some(metadata),
-            });
-            app_match_count = app_match_count.saturating_add(1);
         }
     }
     (ranked, app_match_count)
@@ -1197,24 +1244,28 @@ struct IndexerReplyFields {
 /// Merges indexer items into `ranked`, skipping any whose target already appears in
 /// `injected_history_targets` (history candidates injected earlier). Returns the
 /// diagnostic fields the response needs.
+///
+/// 审计 P6：dedup 集合的键是 history 侧同一套 interned 单串（`kind + '\0' + value`），
+/// 查找走线程局部缓冲，不再为每条索引结果构造 `(String, String)` 元组。
 fn process_indexer_reply(
     reply: crate::indexer_client::SearchReply,
     query: &str,
     history: &Arc<HistoryStore>,
-    injected_history_targets: &HashSet<(String, String)>,
+    injected_history_targets: &HashSet<String>,
     app_resolved_paths: &HashSet<String>,
     ranked: &mut Vec<SearchResult>,
 ) -> IndexerReplyFields {
+    let query_lower = query.to_lowercase();
     for item in reply.items {
         let kind = if item.is_directory {
             TargetKind::Directory
         } else {
             TargetKind::File
         };
-        // Dedup check: borrow the kind/value as owned strings for the HashSet lookup
-        // without cloning into a separate ActionTarget first.
         let kind_str = kind.as_str();
-        if injected_history_targets.contains(&(kind_str.to_string(), item.path.clone())) {
+        if crate::history::with_target_key(kind_str, &item.path, |key| {
+            injected_history_targets.contains(key)
+        }) {
             continue;
         }
         // Cross-kind dedup: if a Start Menu app already resolved to this file path
@@ -1227,6 +1278,16 @@ fn process_indexer_reply(
         // it into the SearchResult — avoiding the previous target.clone().
         let target = ActionTarget::new(kind, &item.path);
         let history_score = history.score(&target);
+        // P9：索引器没带 spans/metadata 时的字面回退只降幂一次，两者共用同一次匹配。
+        let (fallback_metadata, fallback_spans) =
+            if item.match_spans.is_none() || item.match_metadata.is_none() {
+                match literal_match_lowered(&item.name, &query_lower) {
+                    Some((metadata, spans)) => (Some(metadata), Some(spans)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
         ranked.push(SearchResult {
             kind: if item.is_directory {
                 SearchResultKind::Folder
@@ -1237,13 +1298,9 @@ fn process_indexer_reply(
             subtitle: item.path.clone(),
             target,
             execute_id: item.path,
-            match_spans: item
-                .match_spans
-                .unwrap_or_else(|| match_spans(&item.name, query)),
+            match_spans: item.match_spans.or(fallback_spans).unwrap_or_default(),
             match_metadata: {
-                let mut metadata = item
-                    .match_metadata
-                    .or_else(|| rank_title(&item.name, query));
+                let mut metadata = item.match_metadata.or(fallback_metadata);
                 if let Some(metadata) = metadata.as_mut() {
                     metadata.history_score = history_score;
                 }
@@ -1371,13 +1428,10 @@ async fn search_service(
     })
     .await
     .unwrap_or_default();
-    let injected_history_targets: HashSet<_> = history_candidates
+    let injected_history_targets: HashSet<String> = history_candidates
         .iter()
         .map(|candidate| {
-            (
-                candidate.target.kind.clone(),
-                candidate.target.value.clone(),
-            )
+            crate::history::target_key(&candidate.target.kind, &candidate.target.value)
         })
         .collect();
     ranked.extend(history_candidates);
@@ -1388,8 +1442,17 @@ async fn search_service(
     let mut app_match_count = 0u64;
     let mut app_resolved_paths: HashSet<String> = HashSet::new();
     if result_slots > 0 && root.is_none() && !has_filters {
-        let (app_results, count) =
-            collect_app_results(apps, &name_query, history, preferences.pinyin_enabled());
+        let (app_results, count) = collect_app_results(
+            apps,
+            &name_query,
+            history,
+            preferences.pinyin_enabled(),
+            // P10：字面命中只物化候选上限条，不再 usize::MAX 全量。候选按
+            // (class, 名字长度) 取前 N——与最终排序的首两级（kind→class）同向，
+            // 并沿用索引器那条「3× 槽位」的放宽约定，让重度使用但排位靠后的
+            // 程序仍能活到 broker 重排。matched_count 仍是精确总数。
+            app_candidate_slots(result_slots),
+        );
         app_match_count = count;
         // Collect resolved target paths so indexer file results pointing to the same
         // .exe can be deduped (e.g. "Wub_x64.lnk" → "Wub_x64.exe").
@@ -1455,7 +1518,8 @@ async fn search_service(
     let pick_flags: Option<Vec<bool>> = pick_key.as_ref().map(|key| {
         ranked
             .iter()
-            .map(|item| history.query_pick(&item.target, key))
+            // P8：键已由 query_pick_key 归一化，直传避免逐条重复归一化分配。
+            .map(|item| history.query_pick_by_key(&item.target, key))
             .collect()
     });
     sort_search_results_with_picks(&mut ranked, pick_flags.as_deref());
@@ -1564,6 +1628,15 @@ async fn empty_query_results(
     }
 }
 
+/// 程序清单的候选上限（审计 P10）：与索引器同一条「3× 槽位」放宽约定，另设
+/// 64 条下限，避免槽位很小时把常用程序挤掉。上限 MAX_SEARCH_RESULTS 是全局
+/// 结果量的天花板，程序候选不必超过它。
+fn app_candidate_slots(result_slots: usize) -> usize {
+    result_slots
+        .saturating_mul(3)
+        .clamp(64, crate::indexer_ipc::MAX_SEARCH_RESULTS)
+}
+
 /// 索引器请求量 = 3× 结果槽位，上限 MAX_SEARCH_RESULTS（索引器会拒绝更大值），
 /// 下限 1（槽位被 web 行占尽时也保持合法请求）。
 fn indexer_request_max(result_slots: usize) -> usize {
@@ -1640,7 +1713,16 @@ fn history_file_candidates(
     limit: usize,
 ) -> Vec<SearchResult> {
     let empty_query = query.is_empty();
-    let root_normalized = root.map(normalize_path_prefix);
+    // P9：查询只降幂一次，标题匹配的 metadata 与 spans 同源产出。
+    let query_lower = query.to_lowercase();
+    // P13：root 与排除表都只做一次切片级归一化（去空白/去尾部分隔符），
+    // 分隔符统一与大小写折叠在比较时逐字节完成——循环里不再有分配。
+    let root_normalized = root.map(trimmed_path);
+    let exclusions: Vec<&str> = exclusions
+        .iter()
+        .map(|excluded| trimmed_path(excluded))
+        .filter(|excluded| !excluded.is_empty())
+        .collect();
     let mut candidates = Vec::new();
     for weight in weights {
         if candidates.len() >= limit {
@@ -1649,10 +1731,10 @@ fn history_file_candidates(
         if weight.target.kind != "file" && weight.target.kind != "directory" {
             continue;
         }
-        if path_is_excluded(&weight.target.value, exclusions) {
+        if path_is_excluded(&weight.target.value, &exclusions) {
             continue;
         }
-        if let Some(root) = root_normalized.as_deref() {
+        if let Some(root) = root_normalized {
             // Prefix boundary: `root` and `root\child` match, `rootOther` does not.
             if !path_is_under_root(&weight.target.value, root) {
                 continue;
@@ -1677,9 +1759,9 @@ fn history_file_candidates(
                 },
                 Vec::new(),
             )
-        } else if let Some(mut metadata) = rank_title(title, query) {
+        } else if let Some((mut metadata, spans)) = literal_match_lowered(title, &query_lower) {
             metadata.history_score = weight.score;
-            (metadata, match_spans(title, query))
+            (metadata, spans)
         } else if pinyin_enabled {
             let Some(matched) = crate::pinyin::match_name(title, query) else {
                 continue;
@@ -1711,32 +1793,49 @@ fn history_file_candidates(
     candidates
 }
 
-fn normalize_path_prefix(value: &str) -> String {
-    value
-        .trim()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_owned()
+/// 归一化的**无分配**部分（审计 P13）：去首尾空白 + 去尾部分隔符。分隔符统一
+/// （`/`→`\`）与大小写折叠改由比较函数逐字节完成，所以整条判断不再分配。
+fn trimmed_path(value: &str) -> &str {
+    value.trim().trim_end_matches(['\\', '/'])
+}
+
+/// 路径字节的归一化形态：`/` 视作 `\`，ASCII 大小写折叠。非 ASCII 字节原样比较，
+/// 与 `eq_ignore_ascii_case` 的语义一致。
+fn normalized_path_byte(byte: u8) -> u8 {
+    if byte == b'/' {
+        b'\\'
+    } else {
+        byte.to_ascii_lowercase()
+    }
+}
+
+fn path_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(l, r)| normalized_path_byte(*l) == normalized_path_byte(*r))
 }
 
 /// True when `path` is `root` itself or a descendant (`root\...`), case-insensitive.
 /// Sibling prefixes such as `C:\rootOther` must not match `C:\root`.
+///
+/// 零分配：两侧都只做切片级归一化，逐字节比较（每次击键 × 每条排除项都会走
+/// 到这里，旧实现在这里分配两个 String）。
 fn path_is_under_root(path: &str, root: &str) -> bool {
-    let normalized = normalize_path_prefix(path);
-    let root = normalize_path_prefix(root);
+    let path = trimmed_path(path).as_bytes();
+    let root = trimmed_path(root).as_bytes();
     if root.is_empty() {
         return false;
     }
-    normalized.eq_ignore_ascii_case(&root)
-        || normalized.get(root.len()..).is_some_and(|suffix| {
-            suffix.starts_with('\\')
-                && normalized
-                    .get(..root.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&root))
-        })
+    if path.len() <= root.len() {
+        return path.len() == root.len() && path_bytes_eq(path, root);
+    }
+    let (prefix, rest) = path.split_at(root.len());
+    matches!(rest.first(), Some(b'\\' | b'/')) && path_bytes_eq(prefix, root)
 }
 
-fn path_is_excluded(path: &str, exclusions: &[String]) -> bool {
+fn path_is_excluded(path: &str, exclusions: &[&str]) -> bool {
     exclusions
         .iter()
         .any(|excluded| path_is_under_root(path, excluded))
@@ -1796,11 +1895,13 @@ fn rank_window(
         }
     };
 
-    if let Some(mut metadata) = rank_title(&entry.title, query) {
+    // P9：查询只降幂一次，两个来源共用；metadata 与 spans 同源产出。
+    let query_lower = query.to_lowercase();
+    if let Some((mut metadata, spans)) = literal_match_lowered(&entry.title, &query_lower) {
         metadata.history_score = history_score;
-        consider(metadata, match_spans(&entry.title, query));
+        consider(metadata, spans);
     }
-    if let Some(mut metadata) = rank_title(&entry.app_name, query) {
+    if let Some((mut metadata, _)) = literal_match_lowered(&entry.app_name, &query_lower) {
         metadata.history_score = history_score;
         // 命中在应用名上，标题不染色。
         consider(metadata, Vec::new());
@@ -1936,11 +2037,15 @@ fn recent_windows(
     ranked.into_iter().map(|(_, result)| result).collect()
 }
 
-fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
+/// 字面匹配的单次降幂实现（审计 P9）：metadata 与高亮 spans 共用同一个小写串，
+/// 调用方还能把 `query_lower` 提到循环外，一次搜索只降幂一次查询。
+///
+/// UTF-16 偏移必须在**小写串**上算：大小写转换会改变码元数（如 'İ'），在原串上
+/// 数偏移会与前端的高亮错位。
+fn literal_match_lowered(title: &str, query_lower: &str) -> Option<(MatchMetadata, Vec<i32>)> {
     let title_lower = title.to_lowercase();
-    let query_lower = query.to_lowercase();
-    let byte_position = title_lower.find(&query_lower)?;
-    Some(MatchMetadata {
+    let byte_position = title_lower.find(query_lower)?;
+    let metadata = MatchMetadata {
         kind: MatchKind::Literal,
         class: if title_lower == query_lower {
             0
@@ -1952,7 +2057,23 @@ fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
         position: title_lower[..byte_position].encode_utf16().count() as u32,
         score: title.encode_utf16().count() as u32,
         history_score: 0,
-    })
+    };
+    // 空查询不产生高亮（与旧 match_spans 的空查询短路一致），但仍是一次匹配。
+    let spans = if query_lower.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            metadata.position as i32,
+            query_lower.encode_utf16().count() as i32,
+        ]
+    };
+    Some((metadata, spans))
+}
+
+/// 只要 metadata 的旧签名（测试沿用；生产路径一律走 `literal_match_lowered`）。
+#[cfg(test)]
+fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
+    literal_match_lowered(title, &query.to_lowercase()).map(|(metadata, _)| metadata)
 }
 
 #[cfg(test)]
@@ -2122,19 +2243,15 @@ fn reload_engines(mut engines: Vec<WebEngine>, shared: &SharedEngines) -> Respon
 
 /// 执行选中项：http(s) URL 用默认浏览器打开；否则按文件/程序路径处理。
 /// URL 不走文件路径校验（绝对路径检查会误拒 `https://...`）。
+/// 只要 spans 的旧签名（测试沿用；生产路径一律走 `literal_match_lowered`）。
+#[cfg(test)]
 fn match_spans(title: &str, query: &str) -> Vec<i32> {
     if query.is_empty() {
         return Vec::new();
     }
-    let title_lower = title.to_lowercase();
-    let query_lower = query.to_lowercase();
-    let Some(byte_pos) = title_lower.find(&query_lower) else {
-        return Vec::new();
-    };
-    // 字节偏移 → UTF-16 码元偏移。在小写串上计算，避免大小写改变码元数导致错位。
-    let start_u16 = title_lower[..byte_pos].encode_utf16().count();
-    let len_u16 = query_lower.encode_utf16().count();
-    vec![start_u16 as i32, len_u16 as i32]
+    literal_match_lowered(title, &query.to_lowercase())
+        .map(|(_, spans)| spans)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2602,6 +2719,47 @@ mod protocol_tests {
             Some("tail-no-newline")
         );
         assert_eq!(reader.next_line().await.unwrap(), None);
+    }
+
+    /// P12 的核心断言：同一条 2MB 数据行，走入站 1MB 上限被拒，走响应方向的
+    /// 放宽上限被接受。只测「超限报错」的旧断言对「把正常大响应也误杀」是绿的，
+    /// 所以这里做同字节的 A/B。
+    #[tokio::test]
+    async fn response_direction_limit_accepts_lines_the_request_limit_rejects() {
+        let payload = vec![b'y'; 2 * 1024 * 1024];
+        assert!(
+            payload.len() > MAX_REQUEST_LINE_BYTES,
+            "A/B 前提：载荷必须超过入站上限，否则两侧都会通过"
+        );
+
+        let feed = |limit: usize| {
+            let payload = payload.clone();
+            async move {
+                // 64KB 管道缓冲：2MB 载荷不至于变成几万次 64 字节唤醒。
+                let (mut client, server) = tokio::io::duplex(64 * 1024);
+                let mut reader = BoundedLineReader::with_limit(server, limit);
+                let writer_task = tokio::spawn(async move {
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut client, &payload).await;
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut client, b"\n").await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut client).await;
+                });
+                let line = reader.next_line().await;
+                // 拒绝分支下读取器提前放弃，写入方仍阻塞在未排空的管道上——
+                // 这里绝不能 await 它，否则测试挂死。
+                writer_task.abort();
+                line
+            }
+        };
+
+        let rejected = feed(MAX_REQUEST_LINE_BYTES).await;
+        assert!(rejected.is_err(), "2MB 行在 1MB 上限下必须被拒");
+
+        let accepted = feed(8 * 1024 * 1024).await;
+        assert_eq!(
+            accepted.unwrap().map(|line| line.len()),
+            Some(2 * 1024 * 1024),
+            "响应方向的放宽上限必须完整放行同一条行"
+        );
     }
 
     #[test]
