@@ -4,6 +4,8 @@
 //! 自定义引擎从共享 `settings.json` 的 `WebEngines` 字段加载（见 `config`）。
 //! 匹配时按关键词长度降序，保证 `bi` 优先于 `b`。
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ipc::{SearchResult, SearchResultKind};
@@ -64,15 +66,15 @@ impl WebHit {
             format!("在 {} 中搜索：{}", self.engine_name, self.query_terms)
         };
         // 副标题展示最终 URL，便于用户确认将打开的地址。
-        let subtitle = self.url.clone();
+        let url_arc = Arc::from(self.url.as_str());
         let target =
             crate::shell::ActionTarget::new(crate::shell::TargetKind::Web, self.url.clone());
         let match_spans = match_spans_in_title(&title, &self.query_terms);
         SearchResult {
             kind: SearchResultKind::Web,
-            title,
-            subtitle,
-            execute_id: self.url,
+            title: Arc::from(title.as_str()),
+            subtitle: Arc::clone(&url_arc),
+            execute_id: url_arc,
             target,
             match_spans,
             match_metadata: None,

@@ -281,10 +281,12 @@ pub enum SearchResultKind {
 pub struct SearchResult {
     /// "app" | "file" | "folder" | "web"（"more" 行由前端生成）。
     pub kind: SearchResultKind,
-    pub title: String,
-    pub subtitle: String,
+    /// 审计 P7：路径字段改 Arc<str>，共享同一路径的多个字段（subtitle /
+    /// execute_id / target.value）从 String clone 变为 refcount++。
+    pub title: Arc<str>,
+    pub subtitle: Arc<str>,
     /// 回传后端用于 execute/reveal/actions 的标识。
-    pub execute_id: String,
+    pub execute_id: Arc<str>,
     /// Typed execution contract. `execute_id` remains for old readers only.
     pub target: ActionTarget,
     /// 标题中要染蓝的区间，扁平数组 [start,len,start,len,...]。
@@ -1182,13 +1184,13 @@ fn collect_app_results(
         };
         ranked.push(SearchResult {
             kind: SearchResultKind::App,
-            title: app.name.clone(),
+            title: Arc::from(app.name.as_str()),
             subtitle: if app.target_path != app.launch_path {
-                app.target_path.clone()
+                Arc::from(app.target_path.as_str())
             } else {
-                app.launch_path.clone()
+                Arc::from(app.launch_path.as_str())
             },
-            execute_id: app.launch_path.clone(),
+            execute_id: Arc::from(app.launch_path.as_str()),
             target,
             match_spans: spans,
             match_metadata: metadata,
@@ -1213,13 +1215,13 @@ fn collect_app_results(
                 let metadata = pinyin_metadata(&matched, history.score(&target));
                 ranked.push(SearchResult {
                     kind: SearchResultKind::App,
-                    title: app.name.clone(),
+                    title: Arc::from(app.name.as_str()),
                     subtitle: if app.target_path != app.launch_path {
-                        app.target_path.clone()
+                        Arc::from(app.target_path.as_str())
                     } else {
-                        app.launch_path.clone()
+                        Arc::from(app.launch_path.as_str())
                     },
-                    execute_id: app.launch_path.clone(),
+                    execute_id: Arc::from(app.launch_path.as_str()),
                     target,
                     match_spans: matched.spans,
                     match_metadata: Some(metadata),
@@ -1294,16 +1296,17 @@ fn process_indexer_reply(
             } else {
                 (None, None)
             };
+        let path_arc = Arc::from(item.path.as_str());
         ranked.push(SearchResult {
             kind: if item.is_directory {
                 SearchResultKind::Folder
             } else {
                 SearchResultKind::File
             },
-            title: item.name.clone(),
-            subtitle: item.path.clone(),
+            title: Arc::from(item.name.as_str()),
+            subtitle: Arc::clone(&path_arc),
             target,
-            execute_id: item.path,
+            execute_id: path_arc,
             match_spans: item.match_spans.or(fallback_spans).unwrap_or_default(),
             match_metadata: {
                 let mut metadata = item.match_metadata.or(fallback_metadata);
@@ -1467,7 +1470,7 @@ async fn search_service(
                 && !r.subtitle.is_empty()
                 && !r.subtitle.eq_ignore_ascii_case(&r.execute_id)
             {
-                app_resolved_paths.insert(r.subtitle.clone());
+                app_resolved_paths.insert(r.subtitle.as_ref().to_owned());
             }
         }
         ranked.extend(app_results);
@@ -1782,15 +1785,16 @@ fn history_file_candidates(
         if !std::path::Path::new(&weight.target.value).exists() {
             continue;
         }
+        let value_arc = Arc::from(weight.target.value.as_str());
         candidates.push(SearchResult {
             kind: if weight.target.kind == "directory" {
                 SearchResultKind::Folder
             } else {
                 SearchResultKind::File
             },
-            title: title.to_owned(),
-            subtitle: weight.target.value.clone(),
-            execute_id: weight.target.value.clone(),
+            title: Arc::from(title),
+            subtitle: Arc::clone(&value_arc),
+            execute_id: Arc::clone(&value_arc),
             target: weight.target.clone(),
             match_spans,
             match_metadata: Some(metadata),
@@ -1932,12 +1936,13 @@ fn window_result(
     metadata: Option<MatchMetadata>,
     match_spans: Vec<i32>,
 ) -> SearchResult {
+    let token_arc = Arc::from(token);
     SearchResult {
         kind: SearchResultKind::Window,
-        title: entry.title.clone(),
-        subtitle: entry.app_name.clone(),
+        title: Arc::from(entry.title.as_str()),
+        subtitle: Arc::from(entry.app_name.as_str()),
         // execute_id 对窗口没有旧读者语义，与 target.value 保持一致即可。
-        execute_id: token.to_owned(),
+        execute_id: Arc::clone(&token_arc),
         target: ActionTarget::new(TargetKind::Window, token),
         match_spans,
         match_metadata: metadata,
@@ -2838,14 +2843,14 @@ mod protocol_tests {
         candidates.push(SearchResult {
             kind: SearchResultKind::File,
             title: "beta.txt".into(),
-            subtitle: beta_str.clone(),
-            execute_id: beta_str.clone(),
+            subtitle: Arc::from(beta_str.as_str()),
+            execute_id: Arc::from(beta_str.as_str()),
             target: ActionTarget::new(TargetKind::File, &beta_str),
             match_spans: match_spans("beta.txt", "ta"),
             match_metadata: rank_title("beta.txt", "ta"),
         });
         candidates.sort_by(compare_search_results);
-        assert_eq!(candidates[0].title, "zeta.txt");
+        assert_eq!(&*candidates[0].title, "zeta.txt");
         assert_eq!(
             candidates[0]
                 .match_metadata
@@ -2954,7 +2959,7 @@ mod protocol_tests {
         assert_eq!(
             candidates
                 .iter()
-                .map(|item| item.execute_id.as_str())
+                .map(|item| &*item.execute_id)
                 .collect::<Vec<_>>(),
             [
                 folder_str.as_str(),
@@ -2977,9 +2982,9 @@ mod protocol_tests {
         // Non-empty query must still use title matching and ignore the root filter arg
         // when callers pass None (G2 injection path).
         let named = history_file_candidates("inside", &weights, false, &[], None, 8);
-        assert!(named.iter().any(|item| item.execute_id == inside_str));
+        assert!(named.iter().any(|item| &*item.execute_id == inside_str));
         assert!(
-            named.iter().any(|item| item.execute_id == outside_same_str),
+            named.iter().any(|item| &*item.execute_id == outside_same_str),
             "without a root filter, sibling trees still inject on title match"
         );
 
@@ -3022,7 +3027,7 @@ mod protocol_tests {
         match with_root {
             Response::Results { items, .. } => {
                 assert_eq!(items.len(), 1);
-                assert_eq!(items[0].execute_id, file_str);
+                assert_eq!(&*items[0].execute_id, file_str);
             }
             other => panic!("expected results, got {other:?}"),
         }
@@ -3093,7 +3098,7 @@ mod protocol_tests {
         assert_eq!(
             items
                 .iter()
-                .map(|item| item.title.as_str())
+                .map(|item| &*item.title)
                 .collect::<Vec<_>>(),
             ["literal", "full-history", "full-no-history", "initials"]
         );
@@ -3128,7 +3133,7 @@ mod protocol_tests {
         assert_eq!(
             baseline
                 .iter()
-                .map(|entry| entry.title.as_str())
+                .map(|entry| &*entry.title)
                 .collect::<Vec<_>>(),
             ["plain", "picked"],
             "baseline: exact match beats substring without picks"
@@ -3144,7 +3149,7 @@ mod protocol_tests {
         assert_eq!(
             items
                 .iter()
-                .map(|entry| entry.title.as_str())
+                .map(|entry| &*entry.title)
                 .collect::<Vec<_>>(),
             ["picked", "plain", "pinyin"],
             "picked literal ranks first; picked pinyin must not cross the kind tier"
@@ -3178,7 +3183,7 @@ mod protocol_tests {
         assert_eq!(
             items
                 .iter()
-                .map(|entry| entry.title.as_str())
+                .map(|entry| &*entry.title)
                 .collect::<Vec<_>>(),
             ["exact", "substring", "pinyin"]
         );
