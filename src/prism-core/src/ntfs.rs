@@ -243,7 +243,8 @@ mod platform {
 
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, GENERIC_WRITE,
+        HANDLE,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
@@ -538,7 +539,7 @@ mod platform {
         let mut output = vec![0u8; 256 * 1024];
         loop {
             ensure_build_continues(should_cancel)?;
-            match ioctl_buffer(handle.0, FSCTL_ENUM_USN_DATA, &input, &mut output) {
+            match ioctl_buffer_code(handle.0, FSCTL_ENUM_USN_DATA, &input, &mut output) {
                 Ok(bytes) if bytes >= 8 => {
                     let (next, batch) = parse_usn_buffer(&output[..bytes])?;
                     on_records(batch.len() as u64);
@@ -549,8 +550,19 @@ mod platform {
                     input.StartFileReferenceNumber = next as u64;
                 }
                 Ok(_) => break,
-                Err(_error) if !records.is_empty() => break,
-                Err(error) => return Err(error),
+                Err(error) if error.win32_code() == ERROR_HANDLE_EOF.0 => break,
+                Err(error) => {
+                    // M1 (audit): a mid-enumeration IO error is NOT the normal
+                    // end (that is ERROR_HANDLE_EOF, handled above). Propagate so
+                    // the volume routes through the existing failed_volumes /
+                    // degraded chain instead of looking silently complete.
+                    log(format!(
+                        "MFT enumeration failed: {} (collected {} records)",
+                        error.message,
+                        records.len()
+                    ));
+                    return Err(error.message);
+                }
             }
         }
         Ok(records)
@@ -621,6 +633,54 @@ mod platform {
         Ok(returned as usize)
     }
 
+    /// An ioctl failure carrying both the formatted message and the raw HRESULT,
+    /// so callers can branch on the Win32 error code without string matching.
+    /// Only used by [`enumerate_mft`], which needs to distinguish
+    /// `ERROR_HANDLE_EOF` (the normal end of `FSCTL_ENUM_USN_DATA`) from real
+    /// failures. The shared [`ioctl_buffer`] still returns `String` to avoid
+    /// touching its many call sites.
+    struct IoctlError {
+        message: String,
+        hresult: i32,
+    }
+
+    impl IoctlError {
+        /// The low 16 bits of an HRESULT in the `0x80070000` (FACILITY_WIN32)
+        /// range hold the original Win32 error code.
+        fn win32_code(&self) -> u32 {
+            (self.hresult & 0xFFFF) as u32
+        }
+    }
+
+    /// Same as [`ioctl_buffer`] but returns a typed error carrying the raw
+    /// HRESULT. Used only by the MFT enumeration loop, where `ERROR_HANDLE_EOF`
+    /// must be distinguished from genuine failures (audit M1).
+    fn ioctl_buffer_code<T>(
+        handle: HANDLE,
+        code: u32,
+        input: &T,
+        output: &mut [u8],
+    ) -> Result<usize, IoctlError> {
+        let mut returned = 0u32;
+        unsafe {
+            DeviceIoControl(
+                handle,
+                code,
+                Some(input as *const T as *const c_void),
+                std::mem::size_of::<T>() as u32,
+                Some(output.as_mut_ptr() as *mut c_void),
+                output.len() as u32,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|error| IoctlError {
+            message: format!("DeviceIoControl {code:#x}: {error} ({})", error.code().0),
+            hresult: error.code().0,
+        })?;
+        Ok(returned as usize)
+    }
+
     fn wide(value: &str) -> Vec<u16> {
         Path::new(value)
             .as_os_str()
@@ -635,6 +695,36 @@ mod platform {
             .position(|unit| *unit == 0)
             .unwrap_or(value.len());
         String::from_utf16_lossy(&value[..end])
+    }
+
+    #[cfg(test)]
+    mod ioctl_error_tests {
+        use super::*;
+
+        /// M1 (audit): `ERROR_HANDLE_EOF` is the normal end of
+        /// `FSCTL_ENUM_USN_DATA`. The HRESULT→Win32 extraction must map it
+        /// back to Win32 code 38 so the enumeration loop can treat it as a
+        /// successful termination rather than a swallowed error.
+        #[test]
+        fn handle_eof_hresult_maps_to_win32_38() {
+            let error = IoctlError {
+                message: "DeviceIoControl 0x900b8: ...".into(),
+                // HRESULT_FROM_WIN32(ERROR_HANDLE_EOF=38) = 0x80070026
+                hresult: 0x80070026u32 as i32,
+            };
+            assert_eq!(error.win32_code(), ERROR_HANDLE_EOF.0);
+            assert_eq!(error.win32_code(), 38);
+        }
+
+        #[test]
+        fn real_ioctl_error_maps_to_its_win32_code() {
+            // ERROR_NOT_FOUND (1248) as HRESULT_FROM_WIN32 = 0x800704E0
+            let error = IoctlError {
+                message: "DeviceIoControl 0x900b8: ...".into(),
+                hresult: 0x800704E0u32 as i32,
+            };
+            assert_eq!(error.win32_code(), 1248);
+        }
     }
 }
 
