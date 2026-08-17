@@ -57,6 +57,8 @@ pub struct VolumeIndex {
     pub names: Vec<u8>,
     #[serde(skip)]
     initial_name_bytes: usize,
+    #[serde(skip)]
+    dead_name_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +351,7 @@ impl VolumeIndex {
             nodes,
             names: Vec::new(),
             initial_name_bytes: 0,
+            dead_name_bytes: 0,
         })
     }
 
@@ -356,6 +359,7 @@ impl VolumeIndex {
         self.nodes.shrink_to_fit();
         self.names.shrink_to_fit();
         self.initial_name_bytes = self.names.len();
+        self.dead_name_bytes = 0;
     }
 
     pub(crate) fn prepare_initial_capacity(
@@ -414,6 +418,17 @@ impl VolumeIndex {
             return Ok(ApplyOutcome::RebuildRequired);
         }
         let keep_name = is_directory || !excluded;
+        // Track dead bytes when overwriting an existing present name.
+        if old.flags & FLAG_PRESENT != 0 && old.name_off != NO_NAME {
+            let old_name_len = self.names.get(old.name_off as usize..).and_then(|tail| {
+                tail.iter()
+                    .position(|byte| *byte == 0)
+                    .map(|offset| offset + 1)
+            });
+            if let Some(len) = old_name_len {
+                self.dead_name_bytes = self.dead_name_bytes.saturating_add(len);
+            }
+        }
         let name_off = if keep_name {
             self.append_name(name)?
         } else {
@@ -436,6 +451,16 @@ impl VolumeIndex {
             return Ok(());
         };
         if slot.flags & FLAG_PRESENT != 0 && slot.sequence == sequence {
+            if slot.name_off != NO_NAME {
+                let name_len = self.names.get(slot.name_off as usize..).and_then(|tail| {
+                    tail.iter()
+                        .position(|byte| *byte == 0)
+                        .map(|offset| offset + 1)
+                });
+                if let Some(len) = name_len {
+                    self.dead_name_bytes = self.dead_name_bytes.saturating_add(len);
+                }
+            }
             slot.flags &= !FLAG_PRESENT;
             slot.name_off = NO_NAME;
         }
@@ -539,17 +564,24 @@ impl VolumeIndex {
 
     pub fn compact_names_if_needed(&mut self) -> Result<bool, String> {
         let threshold = (8 * 1024 * 1024usize).max(self.initial_name_bytes / 4);
-        let live_bytes: usize = self
-            .nodes
-            .iter()
-            .filter(|slot| slot.flags & FLAG_PRESENT != 0 && slot.name_off != NO_NAME)
-            .filter_map(|slot| self.name_at(slot.name_off).ok())
-            .map(|name| name.len() + 1)
-            .sum();
-        if self.names.len().saturating_sub(live_bytes) <= threshold {
+        // Fast path: use the dead-name counter accumulated by delete/upsert
+        // instead of scanning every node on every USN batch.  The counter is
+        // serde-skipped (starts at 0 after a cache load), so add a fallback:
+        // if the pool has grown far past its initial size the counter may be
+        // underreporting, and a full scan is the safe thing to do.
+        let needs_compact = if self.dead_name_bytes > threshold {
+            true
+        } else {
+            self.names.len()
+                > self
+                    .initial_name_bytes
+                    .saturating_add(threshold.saturating_mul(2))
+        };
+        if !needs_compact {
             return Ok(false);
         }
-        let mut replacement = Vec::with_capacity(live_bytes);
+        let mut live_bytes: usize = 0;
+        let mut replacement = Vec::with_capacity(self.names.len());
         for slot in &mut self.nodes {
             if slot.flags & FLAG_PRESENT == 0 || slot.name_off == NO_NAME {
                 continue;
@@ -570,10 +602,15 @@ impl VolumeIndex {
             let offset = u32::try_from(replacement.len()).map_err(|_| "name pool exceeds u32")?;
             replacement.extend_from_slice(&self.names[start..end]);
             replacement.push(0);
+            live_bytes = live_bytes.saturating_add(end - start + 1);
             slot.name_off = offset;
         }
         replacement.shrink_to_fit();
         self.names = replacement;
+        self.dead_name_bytes = 0;
+        // Refresh initial_name_bytes so the fallback threshold tracks the
+        // compacted baseline rather than the original build size.
+        self.initial_name_bytes = live_bytes;
         Ok(true)
     }
 

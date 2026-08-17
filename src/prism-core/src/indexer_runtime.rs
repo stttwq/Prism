@@ -1251,10 +1251,12 @@ fn watch_volume(
             let events_before = index.events_since_checkpoint;
             index.events_since_checkpoint = index.events_since_checkpoint.saturating_add(changed);
             if changed > 0 && events_before / 10_000 != index.events_since_checkpoint / 10_000 {
-                for volume in &mut index.volumes {
-                    if volume.compact_names_if_needed()? {
-                        log(format!("compacted name pool for {}", volume.mount_path));
-                    }
+                // H2b: only compact the volume that received USN events — each
+                // watcher is per-volume, so only its own deletes/upserts produce
+                // dead name bytes.  Compacting all volumes here held the write
+                // lock for O(total nodes) instead of O(one volume's nodes).
+                if volume.compact_names_if_needed()? {
+                    log(format!("compacted name pool for {}", volume.mount_path));
                 }
             }
             if changed > 0 {
