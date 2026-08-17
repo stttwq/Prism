@@ -99,7 +99,9 @@ public partial class SearchHeader : UserControl
         var actions = mode == PanelMode.Actions;
         ModeLabel.Visibility = actions ? Visibility.Visible : Visibility.Collapsed;
         ModeDivider.Visibility = actions ? Visibility.Visible : Visibility.Collapsed;
-        Placeholder.Text = "搜索应用和文件";
+        // 审计 U3：动作模式下输入框筛选的是动作列表，占位文案必须跟着换，
+        // 否则用户会以为还能在这里搜文件（此前恒为"搜索应用和文件"）。
+        Placeholder.Text = actions ? "输入以筛选动作" : "搜索应用和文件";
         UpdatePlaceholder();
     }
 
