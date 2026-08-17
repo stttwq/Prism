@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -163,6 +164,11 @@ pub struct HistoryStore {
     enabled: AtomicBool,
     state: RwLock<HistoryState>,
     diagnostic: RwLock<Option<HistoryDiagnostic>>,
+    /// 审计 P1：weights 快照缓存。record_at 写入后用 `invalidate_weights()`
+    /// 置空；weights() 在缓存命中时直接 Arc clone（refcount++），消除每击键
+    /// 全量 clone 5000 条的开销。用独立 Mutex 不依赖 RwLock 写锁——
+    /// 多读者可并发检查缓存，仅在 miss 时持锁重建。
+    weights_cache: Mutex<Option<Arc<[HistoryWeight]>>>,
 }
 
 impl HistoryStore {
@@ -191,6 +197,7 @@ impl HistoryStore {
             enabled: AtomicBool::new(enabled),
             state: RwLock::new(HistoryState::from_entries(entries)),
             diagnostic: RwLock::new(diagnostic),
+            weights_cache: Mutex::new(None),
         }
     }
 
@@ -220,6 +227,9 @@ impl HistoryStore {
             .map_err(|_| "history lock is poisoned".to_string())?;
         state.entries.clear();
         state.rebuild_index();
+        if let Ok(mut cache) = self.weights_cache.lock() {
+            *cache = None;
+        }
         for file in [&self.path, &self.legacy_path] {
             match std::fs::remove_file(file) {
                 Ok(()) => {}
@@ -309,6 +319,10 @@ impl HistoryStore {
             }
             state.entries.clone()
         };
+        // 条目已变更：weights 快照缓存失效，下次 weights() 重建。
+        if let Ok(mut cache) = self.weights_cache.lock() {
+            *cache = None;
+        }
         // 锁外：JSON 编码 + fsync + atomic_replace。写锁已释放，不阻塞搜索。
         persist(&self.path, &entries_snapshot)
     }
@@ -362,12 +376,23 @@ impl HistoryStore {
             .unwrap_or(false)
     }
 
-    pub fn weights(&self) -> Vec<HistoryWeight> {
+    /// 返回权重快照。缓存命中时仅 refcount++（零 clone）；miss 时在读锁内
+    /// 重建并缓存。record_at / clear 写入后缓存失效。
+    /// 审计 P1：从每击键全量 clone 5000 条改为 Arc 快照发布。
+    pub fn weights(&self) -> Arc<[HistoryWeight]> {
         if !self.is_enabled() {
-            return Vec::new();
+            return Arc::from([]);
         }
+        // 快路径：缓存命中直接 clone Arc（refcount++）。
+        if let Ok(cache) = self.weights_cache.lock() {
+            if let Some(snapshot) = cache.as_ref() {
+                return Arc::clone(snapshot);
+            }
+        }
+        // 慢路径：读锁内重建。
         let now = now_utc();
-        self.state
+        let snapshot: Arc<[HistoryWeight]> = self
+            .state
             .read()
             .map(|state| {
                 state
@@ -381,9 +406,17 @@ impl HistoryStore {
                         score: effective_frecency(entry, now),
                         last_used_utc: entry.last_used_utc,
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
+                    .into()
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|_| Arc::from([]));
+        // 缓存：try_lock 避免在锁竞争时阻塞——miss 时多一次重建是无害的（幂等）。
+        if let Ok(mut cache) = self.weights_cache.lock() {
+            if cache.is_none() {
+                *cache = Some(Arc::clone(&snapshot));
+            }
+        }
+        snapshot
     }
 
     /// 读取时的 (有效分, last_used)。窗口空查询等 MRU 列表需要时间而不是分数。
