@@ -258,47 +258,59 @@ impl HistoryStore {
         if !self.is_enabled() || !is_recordable(target) {
             return Ok(());
         }
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| "history lock is poisoned".to_string())?;
-        let key = composed_key(&target.kind, &target.value);
-        let position = match state.index.get(&key).copied() {
-            Some(position) => position,
-            None => {
-                state.entries.push(HistoryEntry {
-                    kind: target.kind.clone(),
-                    target: target.value.clone(),
-                    ..HistoryEntry::default()
-                });
-                let position = state.entries.len() - 1;
-                state.index.insert(key, position);
-                position
+        // 锁内：内存更新 + 仅超容量时 prune。JSON 编码 + fsync 出锁后执行，
+        // 避免写锁持有期间阻塞所有搜索的 score()/weights() 读操作。
+        // （审计 P3+M3：参考 Everything "数据库全驻内存、退出才写盘" 的思路——
+        // 内存操作与持久化解耦。）
+        let entries_snapshot = {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| "history lock is poisoned".to_string())?;
+            let key = composed_key(&target.kind, &target.value);
+            let position = match state.index.get(&key).copied() {
+                Some(position) => position,
+                None => {
+                    state.entries.push(HistoryEntry {
+                        kind: target.kind.clone(),
+                        target: target.value.clone(),
+                        ..HistoryEntry::default()
+                    });
+                    let position = state.entries.len() - 1;
+                    state.index.insert(key, position);
+                    position
+                }
+            };
+            let entry = &mut state.entries[position];
+            // 事件时折算存量：frecency = frecency·exp(-Δt/τ) + w，再叠加本次计数。
+            let elapsed = now.saturating_sub(entry.last_used_utc);
+            let decayed = entry.frecency_milli as f64 * 0.001 * decay_factor(elapsed);
+            entry.frecency_milli = frecency_milli_from(decayed + usage_weight(usage));
+            match usage {
+                HistoryUse::Execute => entry.execute_count = entry.execute_count.saturating_add(1),
+                HistoryUse::Reveal => entry.reveal_count = entry.reveal_count.saturating_add(1),
+                HistoryUse::Destination => {
+                    entry.destination_count = entry.destination_count.saturating_add(1)
+                }
             }
+            entry.last_used_utc = now;
+            if entry.first_used_utc == 0 {
+                entry.first_used_utc = now;
+            }
+            if let Some(query) = query {
+                record_query_stat(entry, query, now);
+            }
+            // 仅在新增条目导致超容量时 prune（O(n log n)），日常已有条目更新不触发。
+            // 不变量复刻：entries 按 last_used 降序 + (kind,target) tie-break
+            // （prune 内部 sort_by 保证），index 由 rebuild_index 重建。
+            if state.entries.len() > MAX_ENTRIES {
+                prune(&mut state.entries);
+                state.rebuild_index();
+            }
+            state.entries.clone()
         };
-        let entry = &mut state.entries[position];
-        // 事件时折算存量：frecency = frecency·exp(-Δt/τ) + w，再叠加本次计数。
-        let elapsed = now.saturating_sub(entry.last_used_utc);
-        let decayed = entry.frecency_milli as f64 * 0.001 * decay_factor(elapsed);
-        entry.frecency_milli = frecency_milli_from(decayed + usage_weight(usage));
-        match usage {
-            HistoryUse::Execute => entry.execute_count = entry.execute_count.saturating_add(1),
-            HistoryUse::Reveal => entry.reveal_count = entry.reveal_count.saturating_add(1),
-            HistoryUse::Destination => {
-                entry.destination_count = entry.destination_count.saturating_add(1)
-            }
-        }
-        entry.last_used_utc = now;
-        if entry.first_used_utc == 0 {
-            entry.first_used_utc = now;
-        }
-        if let Some(query) = query {
-            record_query_stat(entry, query, now);
-        }
-        prune(&mut state.entries);
-        state.rebuild_index();
-        persist(&self.path, &state.entries)?;
-        Ok(())
+        // 锁外：JSON 编码 + fsync + atomic_replace。写锁已释放，不阻塞搜索。
+        persist(&self.path, &entries_snapshot)
     }
 
     pub fn score(&self, target: &ActionTarget) -> u32 {
