@@ -2093,7 +2093,7 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 
 /// Sorts results by `compare_search_results` but pre-computes the lowercased title
 /// once per item instead of once per comparison (O(n) vs O(n log n) allocations).
-fn sort_search_results(items: &mut [SearchResult]) {
+fn sort_search_results(items: &mut Vec<SearchResult>) {
     sort_search_results_with_picks(items, None);
 }
 
@@ -2101,7 +2101,10 @@ fn sort_search_results(items: &mut [SearchResult]) {
 /// kind 层级内、class 之前排最前（查询记忆置顶）。标志只活在 broker 排序里，
 /// 不进 MatchMetadata、不进序列化。kind 仍最先比较：拼音命中的 picked 项
 /// 不能越过字面命中的未 picked 项。
-fn sort_search_results_with_picks(items: &mut [SearchResult], picks: Option<&[bool]>) {
+///
+/// 审计 P4：重建用 `Option::take` 按序取出，零 String clone、无环特例
+/// （替代旧实现的全量 clone 重建）。
+fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&[bool]>) {
     // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
     // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
@@ -2118,12 +2121,13 @@ fn sort_search_results_with_picks(items: &mut [SearchResult], picks: Option<&[bo
             .then_with(|| items[a].subtitle.cmp(&items[b].subtitle))
             .then(items[a].kind.cmp(&items[b].kind))
     });
-    // 按排好的下标顺序重建列表。旧实现用环跟随原地交换，但环长为 2 时会
-    // 交换两次自相抵消（相邻换位恰是最常见的环），列表等于没排；3 元素环
-    // 则产出乱序。按序重建无环、无特例。
-    let sorted: Vec<SearchResult> = indices.iter().map(|&index| items[index].clone()).collect();
-    for (slot, sorted_item) in items.iter_mut().zip(sorted) {
-        *slot = sorted_item;
+    // 按排好的下标顺序用 Option::take 重建：每个槽位 take 一次，零 String clone。
+    // 旧实现用 clone 重建全表（每条 4-5 个 String 拷贝）；更早的环跟随原地交换
+    // 在 2/3 元素环上自抵消或乱序（aabb5fe 修复产物）。
+    let mut source: Vec<Option<SearchResult>> = items.drain(..).map(Some).collect();
+    for &index in &indices {
+        // source[index] 必然存在——每个下标恰好被 take 一次。
+        items.push(source[index].take().unwrap());
     }
 }
 
