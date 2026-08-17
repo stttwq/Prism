@@ -794,9 +794,15 @@ async fn dispatch_non_search(
             preferences
                 .pinyin_enabled
                 .store(pinyin_enabled, Ordering::Release);
-            // An empty read-only search applies the capability choice without scanning:
-            // disable releases the mmap/overlay, while enable loads the optional sidecar.
-            let _ = indexer_client::search_with_options("", 1, None, pinyin_enabled).await;
+            // M4 (audit): apply the pinyin preference via an explicit
+            // SetPinyinEnabled management command instead of the old empty-query
+            // Search side-channel. The command loads/releases the sidecar on the
+            // indexer side; failures are logged rather than swallowed.
+            if let Err(error) = indexer_client::set_pinyin_enabled(pinyin_enabled).await {
+                log(format!(
+                    "set_pinyin_enabled({pinyin_enabled}) failed: {error}"
+                ));
+            }
             Response::Status {
                 is_indexing: false,
                 cancelled: false,

@@ -39,7 +39,7 @@ pub fn build_id() -> String {
 
 pub const PIPE_NAME: &str = r"\\.\pipe\prism-core";
 pub const INDEXER_PIPE_NAME: &str = r"\\.\pipe\prism-indexer-v1";
-pub const INDEXER_PROTOCOL: u32 = 1;
+pub const INDEXER_PROTOCOL: u32 = 2;
 
 pub fn log(msg: impl AsRef<str>) {
     use std::time::{SystemTime, UNIX_EPOCH};

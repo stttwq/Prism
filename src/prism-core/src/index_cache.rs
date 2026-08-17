@@ -31,8 +31,8 @@ pub fn cache_path(data_dir: &Path) -> PathBuf {
 
 pub fn load(data_dir: &Path) -> Result<IndexState, String> {
     let path = cache_path(data_dir);
-    let file = std::fs::File::open(&path)
-        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let file =
+        std::fs::File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
     // 流式反序列化（分块缓冲）：不再把完整文件字节物化为 Vec，消除字节+结构双驻留。
     // postcard::from_io 需要 (reader, scratch_buffer)：读取器流式取字节，scratch 仅供
     // 反序列器暂存非顺序数据，常驻尺寸远小于完整文件。

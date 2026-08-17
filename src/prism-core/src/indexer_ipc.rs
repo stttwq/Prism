@@ -35,6 +35,13 @@ pub enum IndexerRequest {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+    /// Management command: flip the pinyin enabled flag and load/release the
+    /// sidecar. Search requests are read-only w.r.t. this flag (audit M4+M6):
+    /// the `pinyin_enabled` field on `Search` is still accepted (forward
+    /// compatibility) but no longer mutates global state.
+    SetPinyinEnabled {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,8 +279,8 @@ mod tests {
     #[test]
     fn protocol_version_is_explicit() {
         let request: IndexerRequest =
-            serde_json::from_str(r#"{"type":"hello","protocol":1}"#).unwrap();
-        assert!(matches!(request, IndexerRequest::Hello { protocol: 1 }));
+            serde_json::from_str(r#"{"type":"hello","protocol":2}"#).unwrap();
+        assert!(matches!(request, IndexerRequest::Hello { protocol: 2 }));
     }
 
     #[test]

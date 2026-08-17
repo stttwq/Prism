@@ -487,7 +487,6 @@ impl ServiceState {
         query: &str,
         max: usize,
         filters: Option<&[SearchFilter]>,
-        pinyin_enabled: bool,
         root: Option<&str>,
     ) -> Result<IndexerResponse, String> {
         validate_search_request(max, filters)?;
@@ -502,12 +501,15 @@ impl ServiceState {
         };
         let guard = self.index.read().map_err(|_| "index lock is poisoned")?;
         let state = guard.as_ref().ok_or("file index is not ready")?;
-        self.pinyin_enabled.store(pinyin_enabled, Ordering::Release);
-        if pinyin_enabled {
+        // M6 (audit): search is read-only w.r.t. the pinyin flag. The stored
+        // preference (set by SetPinyinEnabled) decides whether pinyin results
+        // are included; a search never flips the flag or releases the sidecar.
+        // The lazy load below only loads (never disables), so the first search
+        // after startup still populates the sidecar if the flag is true.
+        if self.pinyin_enabled.load(Ordering::Acquire) {
             self.ensure_pinyin_loaded(state);
-        } else {
-            self.release_pinyin();
         }
+        let pinyin_enabled = self.pinyin_enabled.load(Ordering::Acquire);
         let root_bound = match root {
             Some(root) => match RootScope::resolve(state, root) {
                 Ok(scope) => Some(scope.bound()),
@@ -1478,18 +1480,12 @@ pub(crate) async fn handle_connection(
                 query,
                 max,
                 filters,
-                pinyin_enabled,
                 root,
+                ..
             }) => {
                 let state = state.clone();
                 match tokio::task::spawn_blocking(move || {
-                    state.search(
-                        &query,
-                        max,
-                        filters.as_deref(),
-                        pinyin_enabled.unwrap_or(false),
-                        root.as_deref(),
-                    )
+                    state.search(&query, max, filters.as_deref(), root.as_deref())
                 })
                 .await
                 {
@@ -1503,6 +1499,30 @@ pub(crate) async fn handle_connection(
             Ok(IndexerRequest::WaitGeneration { after, timeout_ms }) => {
                 IndexerResponse::Generation {
                     generation: state.wait_generation(after, timeout_ms).await,
+                }
+            }
+            Ok(IndexerRequest::SetPinyinEnabled { enabled }) => {
+                let state_for_task = state.clone();
+                match tokio::task::spawn_blocking(move || {
+                    if enabled {
+                        state_for_task.pinyin_enabled.store(true, Ordering::Release);
+                        // Load the sidecar if the index is already built; if not,
+                        // the maintenance loop / first search will lazy-load it.
+                        if let Ok(guard) = state_for_task.index.read() {
+                            if let Some(index) = guard.as_ref() {
+                                state_for_task.ensure_pinyin_loaded(index);
+                            }
+                        }
+                    } else {
+                        state_for_task.release_pinyin();
+                    }
+                })
+                .await
+                {
+                    Ok(()) => IndexerResponse::Status(state.status()),
+                    Err(error) => IndexerResponse::Error {
+                        message: format!("set pinyin enabled task: {error}"),
+                    },
                 }
             }
             Ok(IndexerRequest::Hello { .. }) | Err(_) => IndexerResponse::Error {
@@ -1575,7 +1595,7 @@ mod tests {
         assert_eq!(status.volumes, 1);
         assert_eq!(status.generation, 1);
         assert!(state
-            .search("needle", 8, None, false, None)
+            .search("needle", 8, None, None)
             .is_ok_and(|response| matches!(response, IndexerResponse::Results { ref items, .. } if items.len() == 1)));
     }
 
@@ -1584,18 +1604,23 @@ mod tests {
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "微信"));
 
-        let literal = state.search("微信", 8, None, true, None).unwrap();
+        // pinyin_enabled defaults to true; a search with the flag on
+        // lazy-loads the sidecar (Building status) but literal matches still work.
+        let literal = state.search("微信", 8, None, None).unwrap();
         assert!(matches!(literal, IndexerResponse::Results { ref items, .. } if items.len() == 1));
         assert_eq!(state.pinyin_status(), PinyinStatus::Building);
 
-        let pinyin_without_sidecar = state.search("wx", 8, None, true, None).unwrap();
+        let pinyin_without_sidecar = state.search("wx", 8, None, None).unwrap();
         assert!(
             matches!(pinyin_without_sidecar, IndexerResponse::Results { ref items, .. } if items.is_empty())
         );
 
         let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
         *state.pinyin.write().unwrap() = Some(PinyinSidecar::build(&snapshot).unwrap());
-        let disabled = state.search("微信", 8, None, false, None).unwrap();
+        // M6 (audit): search is read-only w.r.t. the pinyin flag. Disabling is
+        // now done via SetPinyinEnabled / release_pinyin directly, not via search().
+        state.release_pinyin();
+        let disabled = state.search("微信", 8, None, None).unwrap();
         assert!(matches!(disabled, IndexerResponse::Results { ref items, .. } if items.len() == 1));
         assert!(state.pinyin.read().unwrap().is_none());
         assert_eq!(state.pinyin_status(), PinyinStatus::Disabled);
@@ -1623,7 +1648,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            missing.search("微信", 8, None, true, None).unwrap(),
+            missing.search("微信", 8, None, None).unwrap(),
             IndexerResponse::Results { ref items, .. } if items.len() == 1
         ));
         assert_eq!(missing.pinyin_status(), PinyinStatus::Building);
@@ -1643,7 +1668,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            corrupt.search("微信", 8, None, true, None).unwrap(),
+            corrupt.search("微信", 8, None, None).unwrap(),
             IndexerResponse::Results { ref items, .. } if items.len() == 1
         ));
         assert_eq!(corrupt.pinyin_status(), PinyinStatus::Building);
@@ -2004,9 +2029,7 @@ mod tests {
             events_since_checkpoint: 0,
         });
 
-        let scoped = state
-            .search("needle", 8, None, false, Some(r"c:/项目/"))
-            .unwrap();
+        let scoped = state.search("needle", 8, None, Some(r"c:/项目/")).unwrap();
         let IndexerResponse::Results { items, .. } = scoped else {
             panic!("expected results for a valid root");
         };
@@ -2015,7 +2038,7 @@ mod tests {
 
         // Absent and blank roots must behave identically to the pre-root protocol.
         for root in [None, Some(""), Some("   ")] {
-            let global = state.search("needle", 8, None, false, root).unwrap();
+            let global = state.search("needle", 8, None, root).unwrap();
             let IndexerResponse::Results { items, .. } = global else {
                 panic!("expected results for {root:?}");
             };
@@ -2034,7 +2057,7 @@ mod tests {
             ("relative", RootRejection::NotAbsolute),
             (r"\\server\share", RootRejection::Unsupported),
         ] {
-            let response = state.search("needle", 8, None, false, Some(root)).unwrap();
+            let response = state.search("needle", 8, None, Some(root)).unwrap();
             match response {
                 IndexerResponse::RootUnavailable { reason, message } => {
                     assert_eq!(reason, expected, "unexpected reason for {root}");

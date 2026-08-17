@@ -415,6 +415,69 @@ pub async fn search_in_root(
     search_via_persistent(query, max, filters, pinyin_enabled, root).await
 }
 
+/// Apply the pinyin enabled preference to the indexer service via an explicit
+/// management command (audit M4+M6). Replaces the old empty-query side-channel
+/// that abused the Search request's `pinyin_enabled` field. Uses the same warm
+/// persistent connection as searches, bounded by `REQUEST_BUDGET`. Errors are
+/// returned (not swallowed) so the broker can log them.
+pub async fn set_pinyin_enabled(enabled: bool) -> Result<(), String> {
+    let conn = connection_lock().try_lock();
+    match conn {
+        Ok(mut conn) => {
+            let request = async {
+                let needs_reconnect = conn.is_none();
+                if needs_reconnect {
+                    let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
+                    handshake(&mut new_conn).await?;
+                    *conn = Some(new_conn);
+                }
+                let response = conn
+                    .as_mut()
+                    .unwrap()
+                    .exchange(&IndexerRequest::SetPinyinEnabled { enabled })
+                    .await?;
+                match response {
+                    IndexerResponse::Status(_) => Ok(()),
+                    IndexerResponse::Error { message } => Err(message),
+                    _ => Err("unexpected response to SetPinyinEnabled".into()),
+                }
+            };
+            match tokio::time::timeout(REQUEST_BUDGET, request).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    *conn = None;
+                    Err("indexer SetPinyinEnabled request timed out".into())
+                }
+            }
+        }
+        Err(_contention) => {
+            // A search is in flight on the persistent connection. Fall back to a
+            // one-off connection so the preference is applied immediately rather
+            // than queued behind an in-flight search.
+            set_pinyin_enabled_one_off(enabled).await
+        }
+    }
+}
+
+async fn set_pinyin_enabled_one_off(enabled: bool) -> Result<(), String> {
+    let request = async {
+        let mut conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
+        handshake(&mut conn).await?;
+        let response = conn
+            .exchange(&IndexerRequest::SetPinyinEnabled { enabled })
+            .await?;
+        match response {
+            IndexerResponse::Status(_) => Ok(()),
+            IndexerResponse::Error { message } => Err(message),
+            _ => Err("unexpected response to SetPinyinEnabled".into()),
+        }
+    };
+    match tokio::time::timeout(REQUEST_BUDGET, request).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err("indexer SetPinyinEnabled request timed out".into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Short-lived client — retained for tests that exercise the wire protocol
 // against a temporary pipe name (the persistent singleton is process-wide
