@@ -2984,7 +2984,9 @@ mod protocol_tests {
         let named = history_file_candidates("inside", &weights, false, &[], None, 8);
         assert!(named.iter().any(|item| &*item.execute_id == inside_str));
         assert!(
-            named.iter().any(|item| &*item.execute_id == outside_same_str),
+            named
+                .iter()
+                .any(|item| &*item.execute_id == outside_same_str),
             "without a root filter, sibling trees still inject on title match"
         );
 
@@ -3096,10 +3098,7 @@ mod protocol_tests {
         ];
         items.sort_by(compare_search_results);
         assert_eq!(
-            items
-                .iter()
-                .map(|item| &*item.title)
-                .collect::<Vec<_>>(),
+            items.iter().map(|item| &*item.title).collect::<Vec<_>>(),
             ["literal", "full-history", "full-no-history", "initials"]
         );
     }
@@ -3147,10 +3146,7 @@ mod protocol_tests {
         let picks = vec![false, true, true];
         sort_search_results_with_picks(&mut items, Some(&picks));
         assert_eq!(
-            items
-                .iter()
-                .map(|entry| &*entry.title)
-                .collect::<Vec<_>>(),
+            items.iter().map(|entry| &*entry.title).collect::<Vec<_>>(),
             ["picked", "plain", "pinyin"],
             "picked literal ranks first; picked pinyin must not cross the kind tier"
         );
@@ -3181,10 +3177,7 @@ mod protocol_tests {
         ];
         sort_search_results(&mut items);
         assert_eq!(
-            items
-                .iter()
-                .map(|entry| &*entry.title)
-                .collect::<Vec<_>>(),
+            items.iter().map(|entry| &*entry.title).collect::<Vec<_>>(),
             ["exact", "substring", "pinyin"]
         );
     }
