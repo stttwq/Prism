@@ -10,33 +10,35 @@ namespace Prism.Services;
 /// <summary>
 /// 命名管道客户端 + 后端进程守护。
 /// 第四步：search / execute / reveal；断线时抛 IOException，由调用方决定是否重连。
+///
+/// 双通道（审计 C1）：搜索/状态类请求走 <see cref="_query"/>，交互式动作
+/// （execute / reveal / run_action，可能弹属性页或复制确认对话框，合法等待任意久）
+/// 走独立的 <see cref="_action"/> 连接。broker 侧 <c>serve()</c> 本就是每连接
+/// 一个 task 的多客户端架构（且有 4 个 armed listener），前端多开一条连接零改动。
+///
+/// 语义边界：独立连接解的是"动作阻塞搜索"。"动作阻塞动作"（broker 侧唯一 STA
+/// worker + 本类每通道串行）仍然存在，归审计 S2b，不在本次范围内。
 /// </summary>
 public sealed class PipeClient : ISearchClient, IDisposable
 {
     private const string PipeName = "prism-core"; // 完整名 \\.\pipe\prism-core
     private const int ProtocolVersion = 1;
 
-    private readonly string _pipeName;
-
     private Process? _backend;
     private JobObjectGuard? _jobGuard;
-    private NamedPipeClientStream? _stream;
-    private StreamReader? _reader;
-    private StreamWriter? _writer;
-    private readonly SemaphoreSlim _ioLock = new(1, 1);
+
+    /// <summary>搜索/状态通道：全部带读超时，watchdog 只判它的活。</summary>
+    private readonly PipeChannel _query;
+
+    /// <summary>
+    /// 动作通道：无读超时（交互式对话框），按需懒连接，不参与 watchdog 判活。
+    /// 建连超时给得比搜索通道宽松——它不在每击键路径上，宁可多等也别退回搜索通道。
+    /// </summary>
+    private readonly PipeChannel _action;
 
     private System.Threading.Timer? _watchdog;
     private int _consecutiveFailures;
     private bool _wasConnected;
-
-    // ---- watchdog 判活（审计 C2）：连通 ≠ 健康，还要求最近的查询请求有响应 ----
-    // 最近一次成功读到响应（含 hello 握手）的 UTC Ticks。
-    private long _lastResponseTicks;
-    // 最近一次发出"带读超时"的查询类请求的 UTC Ticks。
-    private long _lastQuerySentTicks;
-    // 正在等待"无读超时"响应的动作类请求数（属性页/复制确认可合法等待任意久，
-    // 期间绝不能把连接判成半死去强制重建——那会杀掉在途动作交互）。
-    private int _pendingSlowActionReads;
 
     /// <summary>
     /// 后端连接状态变化通知。true=已连上，false=断开/重连失败。
@@ -47,8 +49,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>实际使用的后端可执行文件路径，供诊断显示。</summary>
     public string BackendPath { get; private set; } = "";
 
-    /// <summary>管道是否已连接。</summary>
-    public bool IsConnected => _stream is { IsConnected: true };
+    /// <summary>管道是否已连接（指搜索通道——上层的"后端可用"就是它）。</summary>
+    public bool IsConnected => _query.IsConnected;
 
     public PipeClient() : this(PipeName)
     {
@@ -57,67 +59,33 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>测试用：注入临时管道名，避免碰真实 broker 管道。</summary>
     internal PipeClient(string pipeName)
     {
-        _pipeName = pipeName;
+        _query = new PipeChannel(pipeName, "搜索通道", TimeSpan.FromMilliseconds(500));
+        _action = new PipeChannel(pipeName, "动作通道", TimeSpan.FromSeconds(2));
     }
 
     /// <summary>
     /// 先尝试连接已存在的 broker（可能是上次 Prism 留下的存活孤儿，复用它而非拉新进程），
-    /// 连不上才拉起新的 prism-core.exe。所有连接操作都在 _ioLock 内串行化，
+    /// 连不上才拉起新的 prism-core.exe。所有连接操作都在通道自己的 IO 锁内串行化，
     /// 防止 watchdog、搜索重连、首次启动三者互相 dispose 对方刚建好的 stream。
+    ///
+    /// 动作通道不在这里预连：它不在启动关键路径上，首次用到时懒连接即可，
+    /// 也避免启动期多占一个 listener 槽位。
     /// </summary>
     public async Task StartAsync(CancellationToken ct = default)
     {
         await ConnectOrReconnectAsync(ct).ConfigureAwait(false);
-        if (_stream is not { IsConnected: true })
+        if (!_query.IsConnected)
             throw new IOException("无法连接到后端");
         StartWatchdog();
     }
 
     /// <summary>
-    /// 统一的连接入口：先试已有管道，连不上拉进程再连。
-    /// _ioLock 已经串行化了所有调用者——第一个连上后，后续拿到锁会看到
-    /// _stream is { IsConnected: true } 直接返回，不需要额外的重入标志。
-    /// <paramref name="forceReconnect"/> 供 watchdog 越过该快速返回：
+    /// 搜索通道的统一连接入口：先试已有管道，连不上拉进程再连。
+    /// <paramref name="forceReconnect"/> 供 watchdog 越过"已连上"快速返回：
     /// 连通但不应答的半死连接（IsConnected 仍为 true）必须强制重建。
     /// </summary>
-    private async Task ConnectOrReconnectAsync(CancellationToken ct, bool forceReconnect = false)
-    {
-        await _ioLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            // 拿到锁后复查：可能另一个调用者已经在我们等锁期间建好了连接。
-            if (!forceReconnect && _stream is { IsConnected: true })
-                return;
-
-            DisposeStreamOnly();
-
-            // 第一优先：连已有管道。孤儿 broker 只要还活着，就复用它。
-            if (await TryConnectPipeOnlyAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false))
-                return;
-
-            // 连不上才拉新进程，拉起后立即纳入 Job Object（Prism 崩溃时 OS 自动回收）。
-            EnsureBackendRunning();
-            await ConnectInnerAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _ioLock.Release();
-        }
-    }
-
-    /// <summary>尝试连接已有 broker 管道（不拉进程）。成功返回 true。</summary>
-    private async Task<bool> TryConnectPipeOnlyAsync(TimeSpan timeout, CancellationToken ct)
-    {
-        try
-        {
-            await ConnectInnerAsync(timeout, ct).ConfigureAwait(false);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private Task ConnectOrReconnectAsync(CancellationToken ct, bool forceReconnect = false) =>
+        _query.ConnectOrReconnectAsync(ct, forceReconnect, EnsureBackendRunning);
 
     /// <summary>
     /// 启动后台 watchdog：首次 3 秒后检查，之后每 15 秒一次。
@@ -140,13 +108,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
     private async Task WatchdogTickAsync()
     {
         var forceReconnect = false;
-        if (_stream is { IsConnected: true })
+        if (_query.IsConnected)
         {
             var wedged = IsWedged(
                 isConnected: true,
-                hasPendingSlowRead: Volatile.Read(ref _pendingSlowActionReads) != 0,
-                lastQuerySentTicks: Interlocked.Read(ref _lastQuerySentTicks),
-                lastResponseTicks: Interlocked.Read(ref _lastResponseTicks),
+                hasPendingSlowRead: _query.HasPendingSlowRead,
+                lastQuerySentTicks: _query.LastQuerySentTicks,
+                lastResponseTicks: _query.LastResponseTicks,
                 now: DateTime.UtcNow,
                 queryTimeout: QueryReadTimeout,
                 grace: TimeSpan.FromSeconds(15));
@@ -215,93 +183,16 @@ public sealed class PipeClient : ISearchClient, IDisposable
     }
 
     /// <summary>
-    /// 连接命名管道，UTF-8 无 BOM，按行(\n)收发。
-    /// 调用方必须已持有 _ioLock。内部直接读写握手，不走 SendAsync（避免重入死锁）。
+    /// 连接搜索通道（UTF-8 无 BOM，按行 \n 收发）并完成握手。
     /// internal 供测试直接验证握手超时/清理路径（走 StartAsync 会拉起真实 broker）。
     /// </summary>
-    internal async Task ConnectInnerAsync(TimeSpan timeout, CancellationToken ct)
-    {
-        DisposeStreamOnly();
-
-        var stream = new NamedPipeClientStream(
-            ".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-
-        await stream.ConnectAsync((int)timeout.TotalMilliseconds, ct).ConfigureAwait(false);
-
-        var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-        _stream = stream;
-        _reader = new StreamReader(stream, utf8);
-        _writer = new StreamWriter(stream, utf8) { AutoFlush = false, NewLine = "\n" };
-
-        // 任何握手失败（超时/关闭/协议不符）都必须清掉半开的流对象，否则
-        // IsConnected 可能仍为 true，后续请求挂在一条死管道上。
-        try
-        {
-            await HandshakeAsync().ConfigureAwait(false);
-        }
-        catch
-        {
-            DisposeStreamOnly();
-            throw;
-        }
-    }
-
-    /// <summary>握手读超时（审计 C2）：broker 的 hello 是连接内联同步生成的，没有合法慢握手；3 秒读不到即视为半死连接。</summary>
-    private static readonly TimeSpan HandshakeReadTimeout = TimeSpan.FromSeconds(3);
-
-    /// <summary>
-    /// 握手直接读写——调用方已持 _ioLock，不能再调 SendAsync（它会再次 WaitAsync 导致死锁）。
-    /// 此前 hello 读无超时，broker 半死（连上不握手）时 StartAsync/快速重连会
-    /// 永久挂住并持有 _ioLock，冻结全部请求。
-    ///
-    /// 超时用 Task.WhenAny 竞速而非 CancellationToken：StreamReader.ReadLineAsync(token)
-    /// 在 NamedPipeClientStream 上不能可靠取消挂起的 overlapped I/O（.NET 已知限制）。
-    /// 超时后直接 DisposeStreamOnly——底层 stream 的 CancelIoEx 会让挂起的读立即返回。
-    /// </summary>
-    private async Task HandshakeAsync()
-    {
-        var json = JsonSerializer.Serialize(new { type = "hello", protocol = ProtocolVersion });
-        await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
-        await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-
-        var readTask = _reader!.ReadLineAsync(CancellationToken.None).AsTask();
-        var timeoutTask = Task.Delay(HandshakeReadTimeout);
-
-        string? line;
-        if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
-        {
-            line = readTask.Result;
-        }
-        else
-        {
-            // 超时：销毁底层 stream 让挂起的 ReadLineAsync 立即返回（CancelIoEx），
-            // 清理交给 ConnectInnerAsync 的 catch 块统一处理（此处已把字段清空）。
-            DisposeStreamOnly();
-            throw new IOException($"后端握手超时（{Math.Round(HandshakeReadTimeout.TotalSeconds)} 秒未收到 hello）");
-        }
-
-        if (line is null)
-            throw new IOException("后端在握手时关闭了管道");
-
-        using var doc = JsonDocument.Parse(line);
-        var root = doc.RootElement;
-        if (!root.TryGetProperty("type", out var type)
-            || type.GetString() != "hello"
-            || !root.TryGetProperty("protocol", out var protocol)
-            || !protocol.TryGetInt32(out var version)
-            || version != ProtocolVersion)
-        {
-            throw new IOException("Broker protocol version mismatch");
-        }
-
-        // 握手成功即最近一次有效响应（watchdog 判活参考）。
-        Interlocked.Exchange(ref _lastResponseTicks, DateTime.UtcNow.Ticks);
-    }
+    internal Task ConnectInnerAsync(TimeSpan timeout, CancellationToken ct) =>
+        _query.ConnectLockedAsync(timeout, ct);
 
     /// <summary>
     /// 读握手响应行，带超时（纯逻辑测试用，不涉及真实管道）。超时/EOF 都转成
-    /// IOException 上抛。生产路径走 <see cref="HandshakeAsync"/>（named pipe 需要
-    /// Dispose 促使挂死的读返回，不能单靠 CancellationToken）。
+    /// IOException 上抛。生产路径走 <see cref="PipeChannel.HandshakeAsync"/>（named pipe
+    /// 需要 Dispose 促使挂死的读返回，不能单靠 CancellationToken）。
     /// </summary>
     internal static async Task<string> ReadHandshakeLineAsync(StreamReader reader, TimeSpan timeout)
     {
@@ -449,13 +340,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>打开文件/文件夹/程序。query 随动作上报（查询记忆），null 线路上等价于缺失。</summary>
     public async Task ExecuteAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "execute", target = TargetPayload(target), query }, ct).ConfigureAwait(false);
+        await SendActionAsync(new { type = "execute", target = TargetPayload(target), query }, ct).ConfigureAwait(false);
     }
 
     /// <summary>在资源管理器中定位文件。query 含义同 <see cref="ExecuteAsync"/>。</summary>
     public async Task RevealAsync(ActionTarget target, string? query = null, CancellationToken ct = default)
     {
-        await SendAsync(new { type = "reveal", target = TargetPayload(target), query }, ct).ConfigureAwait(false);
+        await SendActionAsync(new { type = "reveal", target = TargetPayload(target), query }, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -535,7 +426,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             };
             payload = new { type = "run_action", target = TargetPayload(target), action, args = argsObj, query };
         }
-        await SendAsync(payload, ct).ConfigureAwait(false);
+        await SendActionAsync(payload, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -600,112 +491,33 @@ public sealed class PipeClient : ISearchClient, IDisposable
     }
 
     /// <summary>
-    /// 发送一条请求，读取一行响应并解析为 JSON。串行化以保证请求/响应配对。
-    /// 重要：一旦请求写出，必须把对应响应读完，绝不能因 CancellationToken 中途放弃读——
-    /// 否则管道里会残留旧响应，下一次 Search 会读到上一次的结果（表现为高亮/列表错位）。
-    /// 取消只作用于"等锁"和"业务层丢弃结果"；ViewModel 用 seq 丢弃过期 UI 更新。
-    /// 管道断开时在锁内做一次快速重连尝试（500ms），连不上才快速失败——
-    /// 不拉进程（交给 watchdog），避免阻塞搜索路径。
-    /// 读超时：查询类请求（搜索/状态/动作列表等）传入 <paramref name="readTimeout"/>，
-    /// 超时取消配对读并整条销毁流——流被丢弃后不存在孤儿响应问题，
-    /// 重连走 hello 握手重新同步。动作类请求可能弹交互式系统对话框（属性页/复制确认），
-    /// 合法等待任意久，因此不传超时、保持原有阻塞语义。
+    /// 查询/状态类请求：走搜索通道，一律带读超时。
     /// </summary>
-    private async Task<JsonElement> SendAsync(
+    private Task<JsonElement> SendAsync(
         object request,
         CancellationToken ct,
-        TimeSpan? readTimeout = null)
+        TimeSpan? readTimeout = null) =>
+        _query.SendAsync(request, ct, readTimeout);
+
+    /// <summary>
+    /// 交互式动作类请求（execute / reveal / run_action，审计 C1）：走独立的动作通道，
+    /// 无读超时——属性页/复制确认等系统对话框可以合法占住这条连接任意久，
+    /// 期间搜索通道不受影响，每击键搜索照常。
+    ///
+    /// 退化路径：动作通道连不上（broker listener 槽位耗尽、管道瞬时 BUSY 等）时
+    /// 退回搜索通道发送，行为等同修复前（动作阻塞搜索）而不是让动作彻底失败。
+    /// 退回**只在确知请求尚未写出**时发生（<see cref="PipeNotConnectedException"/>），
+    /// 协议无请求 id、按行严格配对，写出后失败绝不能重发——否则删除/复制会执行两次。
+    /// </summary>
+    private async Task<JsonElement> SendActionAsync(object request, CancellationToken ct)
     {
-        await _ioLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            // 管道断开时做一次快速重连（仅连已有管道，500ms 超时，不拉进程）。
-            // 连不上就快速失败，让用户看到错误而非卡住——watchdog 会在后台拉进程重连。
-            if (_stream is not { IsConnected: true } || _writer is null || _reader is null)
-            {
-                DisposeStreamOnly();
-                // 只尝试连已有 broker 管道，不拉进程——拉进程交给 StartAsync/watchdog。
-                await TryConnectPipeOnlyAsync(TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
-                if (_stream is not { IsConnected: true })
-                    throw new IOException("后端未连接");
-            }
-
-            CancellationTokenSource? readDeadline = null;
-            try
-            {
-                var json = JsonSerializer.Serialize(request);
-                // 写出后必须完成配对读，故读写使用 None，避免取消留下孤儿响应。
-                await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
-                await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-
-                // watchdog 判活（审计 C2）：记录"查询已发出"时刻；无超时的动作类
-                // 请求（属性页/复制确认）单独计数——它们合法等待任意久，判活必须放行。
-                var slowRead = readTimeout is null;
-                if (slowRead)
-                    Interlocked.Increment(ref _pendingSlowActionReads);
-                if (readTimeout is not null)
-                    Interlocked.Exchange(ref _lastQuerySentTicks, DateTime.UtcNow.Ticks);
-
-                string? line;
-                try
-                {
-                    if (readTimeout is { } timeout)
-                    {
-                        readDeadline = new CancellationTokenSource(timeout);
-                    }
-                    line = await _reader!.ReadLineAsync(readDeadline?.Token ?? CancellationToken.None).ConfigureAwait(false)
-                        ?? throw new IOException("后端在返回响应前关闭了管道");
-                }
-                finally
-                {
-                    if (slowRead)
-                        Interlocked.Decrement(ref _pendingSlowActionReads);
-                }
-                Interlocked.Exchange(ref _lastResponseTicks, DateTime.UtcNow.Ticks);
-
-                // 配对完成后再兑现取消，让上层丢弃结果而不破坏管道。
-                ct.ThrowIfCancellationRequested();
-
-                using var doc = JsonDocument.Parse(line);
-                var root = doc.RootElement;
-                if (root.GetProperty("type").GetString() == "error")
-                {
-                    // 业务错误：管道仍可用，只把消息抛给调用方展示。
-                    var msg = root.TryGetProperty("message", out var m) ? m.GetString() : "未知错误";
-                    throw new InvalidOperationException("后端返回错误：" + msg);
-                }
-                return root.Clone();
-            }
-            catch (OperationCanceledException) when (readDeadline?.IsCancellationRequested == true)
-            {
-                // 读超时：broker 活着但不应答。销毁整条流让协议重新同步——
-                // 这不是可复用的连接，直接按传输层失败处理。
-                DisposeStreamOnly();
-                throw new IOException($"后端响应超时（{Math.Round(readTimeout!.Value.TotalSeconds)} 秒）");
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (InvalidOperationException)
-            {
-                // 业务 error，保留连接。
-                throw;
-            }
-            catch
-            {
-                // 传输层失败：释放管道，IsConnected 变 false，watchdog 会重连。
-                DisposeStreamOnly();
-                throw;
-            }
-            finally
-            {
-                readDeadline?.Dispose();
-            }
+            return await _action.SendAsync(request, ct, readTimeout: null).ConfigureAwait(false);
         }
-        finally
+        catch (PipeNotConnectedException)
         {
-            _ioLock.Release();
+            return await _query.SendAsync(request, ct, readTimeout: null).ConfigureAwait(false);
         }
     }
 
@@ -838,31 +650,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
         return null;
     }
 
-    private void DisposeStreamOnly()
-    {
-        // NamedPipeClientStream + StreamReader 在有 pending overlapped I/O 时
-        // Dispose 可能阻塞调用线程等 I/O 归还。把三个对象的 Dispose 全丢到
-        // ThreadPool——调用线程只清引用，绝不等 I/O 完成。
-        var stream = _stream;
-        var reader = _reader;
-        var writer = _writer;
-        _stream = null;
-        _reader = null;
-        _writer = null;
-        // 先关闭 stream（CancelIoEx），再关闭 reader/writer——顺序在 ThreadPool
-        // 上执行不受调用线程影响。stream 先关让 reader 的 pending read 先被取消。
-        ThreadPool.QueueUserWorkItem(_ =>
-        {
-            try { stream?.Dispose(); } catch { }
-            try { reader?.Dispose(); } catch { }
-            try { writer?.Dispose(); } catch { }
-        });
-    }
-
     public void Dispose()
     {
         _watchdog?.Dispose();
-        DisposeStreamOnly();
+        // 两条连接都要拆（动作通道可能带着一个未完成的交互式动作，
+        // DisposeStreamOnly 走 ThreadPool，不会让退出路径等 I/O）。
+        _query.Dispose();
+        _action.Dispose();
 
         try
         {
@@ -876,7 +670,348 @@ public sealed class PipeClient : ISearchClient, IDisposable
         // 如果 Prism 崩溃走到这里，关闭 Job 句柄让 OS 回收 broker。
         _jobGuard?.Dispose();
         _jobGuard = null;
-        _ioLock.Dispose();
+    }
+
+    /// <summary>
+    /// 一条 broker 长连接：stream/reader/writer + 独立 IO 锁 + 握手 + 判活时戳。
+    /// 搜索通道与动作通道各持一个实例（审计 C1），彼此不共享任何锁，
+    /// 因此一条连接上的长时间交互不会阻塞另一条。
+    /// </summary>
+    private sealed class PipeChannel : IDisposable
+    {
+        /// <summary>握手读超时（审计 C2）：broker 的 hello 是连接内联同步生成的，没有合法慢握手；3 秒读不到即视为半死连接。</summary>
+        private static readonly TimeSpan HandshakeReadTimeout = TimeSpan.FromSeconds(3);
+
+        private readonly string _pipeName;
+
+        /// <summary>诊断用通道名（出现在异常文案里，便于区分是哪条连接断了）。</summary>
+        private readonly string _label;
+
+        /// <summary>发送前"管道已断"时的快速重连超时（只连已有管道，从不拉进程）。</summary>
+        private readonly TimeSpan _sendReconnectTimeout;
+
+        private readonly SemaphoreSlim _ioLock = new(1, 1);
+        private NamedPipeClientStream? _stream;
+        private StreamReader? _reader;
+        private StreamWriter? _writer;
+
+        // ---- watchdog 判活（审计 C2）：连通 ≠ 健康，还要求最近的查询请求有响应 ----
+        // 最近一次成功读到响应（含 hello 握手）的 UTC Ticks。
+        private long _lastResponseTicks;
+        // 最近一次发出"带读超时"的查询类请求的 UTC Ticks。
+        private long _lastQuerySentTicks;
+        // 正在等待"无读超时"响应的动作类请求数（属性页/复制确认可合法等待任意久，
+        // 期间绝不能把连接判成半死去强制重建——那会杀掉在途动作交互）。
+        private int _pendingSlowActionReads;
+
+        public PipeChannel(string pipeName, string label, TimeSpan sendReconnectTimeout)
+        {
+            _pipeName = pipeName;
+            _label = label;
+            _sendReconnectTimeout = sendReconnectTimeout;
+        }
+
+        public bool IsConnected => _stream is { IsConnected: true };
+        public long LastResponseTicks => Interlocked.Read(ref _lastResponseTicks);
+        public long LastQuerySentTicks => Interlocked.Read(ref _lastQuerySentTicks);
+        public bool HasPendingSlowRead => Volatile.Read(ref _pendingSlowActionReads) != 0;
+
+        /// <summary>
+        /// 连接入口：先试已有管道，连不上再走 <paramref name="ensureBackend"/>（可为 null：
+        /// 动作通道从不拉进程）后重连。_ioLock 串行化了所有调用者——第一个连上后，
+        /// 后续拿到锁会看到已连接直接返回，不需要额外的重入标志。
+        /// </summary>
+        public async Task ConnectOrReconnectAsync(
+            CancellationToken ct,
+            bool forceReconnect,
+            Action? ensureBackend)
+        {
+            await _ioLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                // 拿到锁后复查：可能另一个调用者已经在我们等锁期间建好了连接。
+                if (!forceReconnect && IsConnected)
+                    return;
+
+                DisposeStreamOnly();
+
+                // 第一优先：连已有管道。孤儿 broker 只要还活着，就复用它。
+                if (await TryConnectPipeOnlyAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false))
+                    return;
+
+                if (ensureBackend is null)
+                    throw new PipeNotConnectedException($"{_label}未连接");
+
+                // 连不上才拉新进程，拉起后立即纳入 Job Object（Prism 崩溃时 OS 自动回收）。
+                ensureBackend();
+                await ConnectInnerAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _ioLock.Release();
+            }
+        }
+
+        /// <summary>持锁版建连（测试直接调用；生产路径都经 ConnectOrReconnectAsync/SendAsync）。</summary>
+        public async Task ConnectLockedAsync(TimeSpan timeout, CancellationToken ct)
+        {
+            await _ioLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await ConnectInnerAsync(timeout, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _ioLock.Release();
+            }
+        }
+
+        /// <summary>尝试连接已有 broker 管道（不拉进程）。成功返回 true。</summary>
+        private async Task<bool> TryConnectPipeOnlyAsync(TimeSpan timeout, CancellationToken ct)
+        {
+            try
+            {
+                await ConnectInnerAsync(timeout, ct).ConfigureAwait(false);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 连接命名管道，UTF-8 无 BOM，按行(\n)收发。
+        /// 调用方必须已持有 _ioLock。内部直接读写握手，不走 SendAsync（避免重入死锁）。
+        /// </summary>
+        private async Task ConnectInnerAsync(TimeSpan timeout, CancellationToken ct)
+        {
+            DisposeStreamOnly();
+
+            var stream = new NamedPipeClientStream(
+                ".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+
+            await stream.ConnectAsync((int)timeout.TotalMilliseconds, ct).ConfigureAwait(false);
+
+            var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            _stream = stream;
+            _reader = new StreamReader(stream, utf8);
+            _writer = new StreamWriter(stream, utf8) { AutoFlush = false, NewLine = "\n" };
+
+            // 任何握手失败（超时/关闭/协议不符）都必须清掉半开的流对象，否则
+            // IsConnected 可能仍为 true，后续请求挂在一条死管道上。
+            try
+            {
+                await HandshakeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                DisposeStreamOnly();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// 握手直接读写——调用方已持 _ioLock，不能再调 SendAsync（它会再次 WaitAsync 导致死锁）。
+        /// 此前 hello 读无超时，broker 半死（连上不握手）时 StartAsync/快速重连会
+        /// 永久挂住并持有 _ioLock，冻结全部请求。
+        ///
+        /// 超时用 Task.WhenAny 竞速而非 CancellationToken：StreamReader.ReadLineAsync(token)
+        /// 在 NamedPipeClientStream 上不能可靠取消挂起的 overlapped I/O（.NET 已知限制）。
+        /// 超时后直接 DisposeStreamOnly——底层 stream 的 CancelIoEx 会让挂起的读立即返回。
+        /// </summary>
+        internal async Task HandshakeAsync()
+        {
+            var json = JsonSerializer.Serialize(new { type = "hello", protocol = ProtocolVersion });
+            await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+            await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+
+            var readTask = _reader!.ReadLineAsync(CancellationToken.None).AsTask();
+            var timeoutTask = Task.Delay(HandshakeReadTimeout);
+
+            string? line;
+            if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
+            {
+                line = readTask.Result;
+            }
+            else
+            {
+                // 超时：销毁底层 stream 让挂起的 ReadLineAsync 立即返回（CancelIoEx），
+                // 清理交给 ConnectInnerAsync 的 catch 块统一处理（此处已把字段清空）。
+                DisposeStreamOnly();
+                throw new IOException(
+                    $"{_label}握手超时（{Math.Round(HandshakeReadTimeout.TotalSeconds)} 秒未收到 hello）");
+            }
+
+            if (line is null)
+                throw new IOException("后端在握手时关闭了管道");
+
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("type", out var type)
+                || type.GetString() != "hello"
+                || !root.TryGetProperty("protocol", out var protocol)
+                || !protocol.TryGetInt32(out var version)
+                || version != ProtocolVersion)
+            {
+                throw new IOException("Broker protocol version mismatch");
+            }
+
+            // 握手成功即最近一次有效响应（watchdog 判活参考）。
+            Interlocked.Exchange(ref _lastResponseTicks, DateTime.UtcNow.Ticks);
+        }
+
+        /// <summary>
+        /// 发送一条请求，读取一行响应并解析为 JSON。同通道内串行化以保证请求/响应配对
+        /// （协议无请求 id，严格按行配对）。
+        /// 重要：一旦请求写出，必须把对应响应读完，绝不能因 CancellationToken 中途放弃读——
+        /// 否则管道里会残留旧响应，下一次 Search 会读到上一次的结果（表现为高亮/列表错位）。
+        /// 取消只作用于"等锁"和"业务层丢弃结果"；ViewModel 用 seq 丢弃过期 UI 更新。
+        /// 管道断开时在锁内做一次快速重连尝试，连不上抛 <see cref="PipeNotConnectedException"/>
+        /// 快速失败——不拉进程（交给 watchdog），避免阻塞搜索路径。
+        /// 读超时：查询类请求（搜索/状态/动作列表等）传入 <paramref name="readTimeout"/>，
+        /// 超时取消配对读并整条销毁流——流被丢弃后不存在孤儿响应问题，
+        /// 重连走 hello 握手重新同步。动作类请求可能弹交互式系统对话框（属性页/复制确认），
+        /// 合法等待任意久，因此不传超时；它们走独立的动作通道，占住的只是自己那条连接。
+        /// </summary>
+        public async Task<JsonElement> SendAsync(
+            object request,
+            CancellationToken ct,
+            TimeSpan? readTimeout)
+        {
+            await _ioLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                // 管道断开时做一次快速重连（仅连已有管道，不拉进程）。
+                // 连不上就快速失败，让用户看到错误而非卡住——watchdog 会在后台拉进程重连。
+                if (_stream is not { IsConnected: true } || _writer is null || _reader is null)
+                {
+                    DisposeStreamOnly();
+                    // 只尝试连已有 broker 管道，不拉进程——拉进程交给 StartAsync/watchdog。
+                    await TryConnectPipeOnlyAsync(_sendReconnectTimeout, ct).ConfigureAwait(false);
+                    if (_stream is not { IsConnected: true })
+                        throw new PipeNotConnectedException($"{_label}未连接");
+                }
+
+                CancellationTokenSource? readDeadline = null;
+                try
+                {
+                    var json = JsonSerializer.Serialize(request);
+                    // 写出后必须完成配对读，故读写使用 None，避免取消留下孤儿响应。
+                    await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+                    await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+
+                    // watchdog 判活（审计 C2）：记录"查询已发出"时刻；无超时的动作类
+                    // 请求（属性页/复制确认）单独计数——它们合法等待任意久，判活必须放行。
+                    var slowRead = readTimeout is null;
+                    if (slowRead)
+                        Interlocked.Increment(ref _pendingSlowActionReads);
+                    if (readTimeout is not null)
+                        Interlocked.Exchange(ref _lastQuerySentTicks, DateTime.UtcNow.Ticks);
+
+                    string? line;
+                    try
+                    {
+                        if (readTimeout is { } timeout)
+                        {
+                            readDeadline = new CancellationTokenSource(timeout);
+                        }
+                        line = await _reader!.ReadLineAsync(readDeadline?.Token ?? CancellationToken.None).ConfigureAwait(false)
+                            ?? throw new IOException("后端在返回响应前关闭了管道");
+                    }
+                    finally
+                    {
+                        if (slowRead)
+                            Interlocked.Decrement(ref _pendingSlowActionReads);
+                    }
+                    Interlocked.Exchange(ref _lastResponseTicks, DateTime.UtcNow.Ticks);
+
+                    // 配对完成后再兑现取消，让上层丢弃结果而不破坏管道。
+                    ct.ThrowIfCancellationRequested();
+
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+                    if (root.GetProperty("type").GetString() == "error")
+                    {
+                        // 业务错误：管道仍可用，只把消息抛给调用方展示。
+                        var msg = root.TryGetProperty("message", out var m) ? m.GetString() : "未知错误";
+                        throw new InvalidOperationException("后端返回错误：" + msg);
+                    }
+                    return root.Clone();
+                }
+                catch (OperationCanceledException) when (readDeadline?.IsCancellationRequested == true)
+                {
+                    // 读超时：broker 活着但不应答。销毁整条流让协议重新同步——
+                    // 这不是可复用的连接，直接按传输层失败处理。
+                    DisposeStreamOnly();
+                    throw new IOException($"后端响应超时（{Math.Round(readTimeout!.Value.TotalSeconds)} 秒）");
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (InvalidOperationException)
+                {
+                    // 业务 error，保留连接。
+                    throw;
+                }
+                catch
+                {
+                    // 传输层失败：释放管道，IsConnected 变 false，watchdog 会重连。
+                    // 注意这里**不能**是 PipeNotConnectedException——请求已经写出，
+                    // 换连接重发会导致动作执行两次。
+                    DisposeStreamOnly();
+                    throw;
+                }
+                finally
+                {
+                    readDeadline?.Dispose();
+                }
+            }
+            finally
+            {
+                _ioLock.Release();
+            }
+        }
+
+        private void DisposeStreamOnly()
+        {
+            // NamedPipeClientStream + StreamReader 在有 pending overlapped I/O 时
+            // Dispose 可能阻塞调用线程等 I/O 归还。把三个对象的 Dispose 全丢到
+            // ThreadPool——调用线程只清引用，绝不等 I/O 完成。
+            var stream = _stream;
+            var reader = _reader;
+            var writer = _writer;
+            _stream = null;
+            _reader = null;
+            _writer = null;
+            // 先关闭 stream（CancelIoEx），再关闭 reader/writer——顺序在 ThreadPool
+            // 上执行不受调用线程影响。stream 先关让 reader 的 pending read 先被取消。
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { stream?.Dispose(); } catch { }
+                try { reader?.Dispose(); } catch { }
+                try { writer?.Dispose(); } catch { }
+            });
+        }
+
+        public void Dispose()
+        {
+            DisposeStreamOnly();
+            _ioLock.Dispose();
+        }
+    }
+}
+
+/// <summary>
+/// 建连失败：请求**尚未写出**，因此调用方可以安全地换一条连接重发（审计 C1 的
+/// 动作通道→搜索通道退化路径）。写出之后的任何失败都用普通 <see cref="IOException"/>，
+/// 绝不可重发。
+/// </summary>
+public sealed class PipeNotConnectedException : IOException
+{
+    public PipeNotConnectedException(string message) : base(message)
+    {
     }
 }
 
