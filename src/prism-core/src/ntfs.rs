@@ -398,10 +398,7 @@ mod platform {
         let max_record = raw_records
             .iter()
             .map(|record| VolumeIndex::split_frn(record.frn).map(|value| value.0))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(root_record);
+            .try_fold(root_record, |acc, item| item.map(|value| acc.max(value)))?;
         volume.prepare_initial_capacity(max_record, raw_records.len())?;
         raw_records.sort_by_key(|record| {
             VolumeIndex::split_frn(record.frn)
