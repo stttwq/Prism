@@ -268,16 +268,19 @@ impl PinyinSidecar {
         }
         std::fs::create_dir_all(data_dir)
             .map_err(|error| format!("create pinyin directory: {error}"))?;
-        let bytes = postcard::to_allocvec(&self.disk)
-            .map_err(|error| format!("encode pinyin sidecar: {error}"))?;
         let destination = path(data_dir);
         let temporary = data_dir.join(format!("{FILE_NAME}.tmp"));
-        let mut file = std::fs::File::create(&temporary)
+        let file = std::fs::File::create(&temporary)
             .map_err(|error| format!("create pinyin temporary file: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
+        // 流式序列化直接写文件（分块缓冲），不再在堆上生成完整序列化 Vec。
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+        postcard::to_io(&self.disk, &mut writer)
+            .map_err(|error| format!("encode pinyin sidecar: {error}"))?;
+        writer
+            .flush()
+            .and_then(|()| writer.get_ref().sync_all())
             .map_err(|error| format!("write pinyin temporary file: {error}"))?;
-        drop(file);
+        drop(writer);
         crate::fs_util::atomic_replace(&temporary, &destination, "pinyin sidecar")
     }
 
