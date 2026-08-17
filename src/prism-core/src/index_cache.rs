@@ -1,6 +1,6 @@
 //! Consistent v5 machine-level snapshots with atomic replacement.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -31,13 +31,16 @@ pub fn cache_path(data_dir: &Path) -> PathBuf {
 
 pub fn load(data_dir: &Path) -> Result<IndexState, String> {
     let path = cache_path(data_dir);
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path)
-        .map_err(|error| format!("open {}: {error}", path.display()))?
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let envelope: CacheEnvelope<IndexState> =
-        postcard::from_bytes(&bytes).map_err(|error| format!("decode v5 cache: {error}"))?;
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    // 流式反序列化（分块缓冲）：不再把完整文件字节物化为 Vec，消除字节+结构双驻留。
+    // postcard::from_io 需要 (reader, scratch_buffer)：读取器流式取字节，scratch 仅供
+    // 反序列器暂存非顺序数据，常驻尺寸远小于完整文件。
+    let reader = std::io::BufReader::with_capacity(256 * 1024, file);
+    let mut scratch = [0u8; 4096];
+    let (envelope, _leftover): (CacheEnvelope<IndexState>, _) =
+        postcard::from_io((reader, scratch.as_mut_slice()))
+            .map_err(|error| format!("decode v5 cache: {error}"))?;
     if &envelope.magic != CACHE_MAGIC || envelope.version != CACHE_VERSION {
         return Err("cache is not Prism v5".into());
     }
