@@ -24,6 +24,27 @@ pub struct UsnRecord {
     pub name: String,
 }
 
+/// AUDIT-2026-08-18 R-C1: MFT 枚举的池化记录——name 不存 String 而存 (offset, len)
+/// 指向单个 `Vec<u8>` 池（UTF-8 编码后的文件名字节）。每条从 ~100-130B（含堆 String）
+/// 降到 ~40B（纯 POD），峰值砍半、分配从 O(n) 降到 O(1) 摊销。
+/// 仅用于全量 MFT 枚举路径；增量 USN 路径量小，保留 UsnRecord（含 String）不变。
+#[derive(Debug, Clone, Copy)]
+pub struct MftRecord {
+    pub frn: u64,
+    pub parent_frn: u64,
+    pub is_directory: bool,
+    pub name_offset: u32,
+    pub name_len: u32,
+}
+
+impl MftRecord {
+    /// 从 name pool 取 `&str`（UTF-8 lossy 已在入池时完成）。
+    pub fn name<'a>(&self, pool: &'a [u8]) -> &'a str {
+        let bytes = &pool[self.name_offset as usize..][..self.name_len as usize];
+        std::str::from_utf8(bytes).unwrap_or("")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VolumeDescriptor {
     pub drive_letter: char,
@@ -382,7 +403,7 @@ mod platform {
         ensure_build_continues(should_cancel)?;
         let handle = open_volume(descriptor, true)?;
         let checkpoint = query_or_create_journal(&handle)?;
-        let mut raw_records = enumerate_mft(&handle, should_cancel, on_records)?;
+        let (raw_records, name_pool) = enumerate_mft(&handle, should_cancel, on_records)?;
         ensure_build_continues(should_cancel)?;
         let root_record = raw_records
             .iter()
@@ -404,12 +425,12 @@ mod platform {
             .map(|record| VolumeIndex::split_frn(record.frn).map(|value| value.0))
             .try_fold(root_record, |acc, item| item.map(|value| acc.max(value)))?;
         volume.prepare_initial_capacity(max_record, raw_records.len())?;
-        raw_records.sort_by_key(|record| {
+        let mut pending = raw_records;
+        pending.sort_by_key(|record| {
             VolumeIndex::split_frn(record.frn)
                 .map(|v| v.0)
                 .unwrap_or(u32::MAX)
         });
-        let mut pending = raw_records;
         for _ in 0..64 {
             ensure_build_continues(should_cancel)?;
             if pending.is_empty() {
@@ -421,13 +442,14 @@ mod platform {
                 if position & 0x0fff == 0 {
                     ensure_build_continues(should_cancel)?;
                 }
-                if record.name.is_empty() {
+                let name = record.name(&name_pool);
+                if name.is_empty() {
                     continue;
                 }
                 match volume.upsert(
                     record.frn,
                     record.parent_frn,
-                    &record.name,
+                    name,
                     record.is_directory,
                 ) {
                     Ok(_) => {}
@@ -524,21 +546,22 @@ mod platform {
         Ok(())
     }
 
+    /// AUDIT-2026-08-18 R-C1: 返回池化的 MftRecord + name_pool，
+    /// 不再返回含堆 String 的 UsnRecord，降首建峰值。
     fn enumerate_mft(
         handle: &VolumeHandle,
         should_cancel: &dyn Fn() -> bool,
         on_records: &mut dyn FnMut(u64),
-    ) -> Result<Vec<UsnRecord>, String> {
+    ) -> Result<(Vec<MftRecord>, Vec<u8>), String> {
         let mut input = MFT_ENUM_DATA_V0 {
             StartFileReferenceNumber: 0,
             LowUsn: 0,
             HighUsn: i64::MAX,
         };
         // Start with a modest initial capacity and let `extend` grow it in batches.
-        // The previous 500k pre-allocation reserved ~32 MB of empty UsnRecord slots
-        // (each struct is ~64 bytes) even for small volumes; a 64k hint keeps the
-        // initial footprint low while still amortizing the first few batches.
         let mut records = Vec::with_capacity(64_000);
+        // name pool: 单一大 Vec<u8> 存所有文件名的 UTF-8 字节，O(1) 摊销分配。
+        let mut name_pool = Vec::with_capacity(8 * 1024 * 1024);
         let mut output = vec![0u8; 256 * 1024];
         loop {
             ensure_build_continues(should_cancel)?;
@@ -546,7 +569,21 @@ mod platform {
                 Ok(bytes) if bytes >= 8 => {
                     let (next, batch) = parse_usn_buffer(&output[..bytes])?;
                     on_records(batch.len() as u64);
-                    records.extend(batch);
+                    // 池化：每条 UsnRecord 的 name 转为 (offset, len) 指向 name_pool，
+                    // 然后释放 batch 的 String 分配。
+                    for record in batch {
+                        let name_bytes = record.name.as_bytes();
+                        let offset = name_pool.len() as u32;
+                        name_pool.extend_from_slice(name_bytes);
+                        let len = name_bytes.len() as u32;
+                        records.push(MftRecord {
+                            frn: record.frn,
+                            parent_frn: record.parent_frn,
+                            is_directory: record.is_directory,
+                            name_offset: offset,
+                            name_len: len,
+                        });
+                    }
                     if next as u64 <= input.StartFileReferenceNumber {
                         break;
                     }
@@ -555,10 +592,6 @@ mod platform {
                 Ok(_) => break,
                 Err(error) if error.win32_code() == ERROR_HANDLE_EOF.0 => break,
                 Err(error) => {
-                    // M1 (audit): a mid-enumeration IO error is NOT the normal
-                    // end (that is ERROR_HANDLE_EOF, handled above). Propagate so
-                    // the volume routes through the existing failed_volumes /
-                    // degraded chain instead of looking silently complete.
                     log(format!(
                         "MFT enumeration failed: {} (collected {} records)",
                         error.message,
@@ -568,7 +601,7 @@ mod platform {
                 }
             }
         }
-        Ok(records)
+        Ok((records, name_pool))
     }
 
     fn ensure_build_continues(should_cancel: &dyn Fn() -> bool) -> Result<(), String> {
