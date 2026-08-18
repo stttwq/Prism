@@ -109,8 +109,11 @@ pub fn parse_usn_buffer(buffer: &[u8]) -> Result<(i64, Vec<UsnRecord>), String> 
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        let name =
-            String::from_utf16(&utf16).map_err(|error| format!("invalid UTF-16: {error}"))?;
+        // AUDIT-2026-08-18 R-B4: NTFS 文件名允许非法代理对（文件系统不校验 Unicode 合法性），
+        // from_utf16 严格版遇到孤立代理对会 Err，让 parse_usn_buffer 整批失败 → watcher 死
+        // → 经 R-B2 放大为全盘重扫。lossy 单条降级（U+FFFD 替换非法代理对）是正确语义：
+        // 其余条目不受影响，合法文件名完全不变。
+        let name = String::from_utf16_lossy(&utf16);
         records.push(UsnRecord {
             frn: read_u64(buffer, offset + 8)?,
             parent_frn: read_u64(buffer, offset + 16)?,
@@ -740,8 +743,7 @@ pub fn discover_volumes() -> Result<Vec<VolumeDescriptor>, String> {
 mod tests {
     use super::*;
 
-    fn record(reason: u32) -> Vec<u8> {
-        let name: Vec<u16> = "hello.txt".encode_utf16().collect();
+    fn record_with_name(reason: u32, name: &[u16]) -> Vec<u8> {
         let length = (60 + name.len() * 2 + 7) & !7;
         let mut bytes = vec![0u8; 8 + length];
         bytes[..8].copy_from_slice(&99i64.to_le_bytes());
@@ -760,6 +762,38 @@ mod tests {
             bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
         }
         bytes
+    }
+
+    fn record(reason: u32) -> Vec<u8> {
+        let name: Vec<u16> = "hello.txt".encode_utf16().collect();
+        record_with_name(reason, &name)
+    }
+
+    /// R-B4: 孤立代理对（unpaired surrogate）在 NTFS 文件名中合法——文件系统不校验
+    /// Unicode 合法性。from_utf16_lossy 用 U+FFFD 替换非法代理对，单条降级而非整批失败。
+    #[test]
+    fn lossy_utf16_unpaired_surrogate_does_not_fail_batch() {
+        // 第一条：含孤立高代理 0xD800（无低代理配对）
+        let bad_name: Vec<u16> = [0x0061, 0xD800, 0x0062].to_vec(); // "a" + unpaired + "b"
+        let bad_record = record_with_name(USN_REASON_FILE_CREATE, &bad_name);
+
+        // 第二条：正常名
+        let good_name: Vec<u16> = "ok.txt".encode_utf16().collect();
+        let good_record = record_with_name(USN_REASON_FILE_CREATE, &good_name);
+
+        // 拼接：cursor + bad_record + good_record
+        let mut buffer = vec![0u8; 8];
+        buffer.copy_from_slice(&99i64.to_le_bytes());
+        buffer.extend_from_slice(&bad_record[8..]); // 跳过 bad_record 自带 cursor
+        buffer.extend_from_slice(&good_record[8..]);
+
+        let (next, records) = parse_usn_buffer(&buffer).expect("lossy decode should not fail");
+        assert_eq!(next, 99);
+        assert_eq!(records.len(), 2, "both records should parse");
+        // 第一条含 U+FFFD 替换字符
+        assert!(records[0].name.contains('\u{FFFD}'), "bad name should contain replacement char");
+        // 第二条完全正常
+        assert_eq!(records[1].name, "ok.txt");
     }
 
     #[test]
