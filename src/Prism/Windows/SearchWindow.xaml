@@ -14,6 +14,8 @@
         <!-- 主卡片：圆角 + 阴影；Clip 保证列表不溢出圆角 -->
         <Border x:Name="Card"
                 Background="{DynamicResource BgWindow}"
+                BorderBrush="{DynamicResource Divider}"
+                BorderThickness="1"
                 CornerRadius="10"
                 Effect="{DynamicResource WindowShadow}"
                 SnapsToDevicePixels="True">
