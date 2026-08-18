@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using Prism.Models;
 using Prism.Services;
 
@@ -161,7 +162,21 @@ public partial class ResultList : UserControl
 
             StatusText.Text = next;
             var show = !string.IsNullOrEmpty(next);
-            StatusText.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            if (show)
+            {
+                // A5：出现时淡入 100ms，消失瞬时——防按键周期新闪烁。
+                // 只动 Opacity 不动 Visibility：高度必须参与 UpdateListHeight，
+                // 淡入期间不得提前 Collapsed。
+                StatusText.Visibility = Visibility.Visible;
+                StatusText.BeginAnimation(OpacityProperty,
+                    new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100)));
+            }
+            else
+            {
+                StatusText.BeginAnimation(OpacityProperty, null);
+                StatusText.Opacity = 1;
+                StatusText.Visibility = Visibility.Collapsed;
+            }
             UpdateListHeight();
         }
     }

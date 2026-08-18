@@ -863,9 +863,20 @@ public partial class SearchWindow : Window
     {
         var text = message ?? "";
         ActionStatus.Text = text;
-        ActionStatus.Visibility = string.IsNullOrEmpty(text)
-            ? Visibility.Collapsed
-            : Visibility.Visible;
+        if (string.IsNullOrEmpty(text))
+        {
+            // A5：消失瞬时，防按键周期新闪烁。
+            ActionStatus.BeginAnimation(OpacityProperty, null);
+            ActionStatus.Opacity = 1;
+            ActionStatus.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            // A5：出现时淡入 100ms。
+            ActionStatus.Visibility = Visibility.Visible;
+            ActionStatus.BeginAnimation(OpacityProperty,
+                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100)));
+        }
     }
 
     private void AnimatePanelHeight(double target, bool animate)
