@@ -250,6 +250,28 @@ public sealed class PipeClientHandshakeTests
             grace: Grace));
     }
 
+    // ------------------------------------------------------------------
+    // R-A5: 首连失败也启动 watchdog
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// AUDIT-2026-08-18 R-A5: 首连失败（broker 不存在）时 watchdog 仍应 arm，
+    /// 否则只能重启 Prism 才能重连。StartAsync 现在先 StartWatchdog 再连接。
+    /// </summary>
+    [Fact]
+    public async Task StartAsync_Failure_Still_Arms_Watchdog()
+    {
+        var name = TempPipeName();
+        using var client = new PipeClient(name);
+
+        // broker 不存在：StartAsync 连不上后抛异常（可能是 IOException 或超时取消）。
+        await Assert.ThrowsAnyAsync<Exception>(() => client.StartAsync(
+            new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token));
+
+        Assert.True(client.IsWatchdogArmed, "首连失败后 watchdog 应已 arm");
+        Assert.False(client.IsConnected);
+    }
+
     /// <summary>底层读永不返回、只响应取消的流：用于驱动握手超时路径。</summary>
     private sealed class NeverCompletingStream : Stream
     {

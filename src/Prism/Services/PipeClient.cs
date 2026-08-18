@@ -52,6 +52,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>管道是否已连接（指搜索通道——上层的"后端可用"就是它）。</summary>
     public bool IsConnected => _query.IsConnected;
 
+    /// <summary>AUDIT-2026-08-18 R-A5: 测试用——首连失败后 watchdog 是否已 arm。</summary>
+    internal bool IsWatchdogArmed => _watchdog is not null;
+
     public PipeClient() : this(PipeName)
     {
     }
@@ -70,13 +73,17 @@ public sealed class PipeClient : ISearchClient, IDisposable
     ///
     /// 动作通道不在这里预连：它不在启动关键路径上，首次用到时懒连接即可，
     /// 也避免启动期多占一个 listener 槽位。
+    ///
+    /// AUDIT-2026-08-18 R-A5: watchdog 在连接之前启动——首连失败（broker 起不来/连不上）
+    /// 时不再让进程陷入"只能重启 Prism"的死局，watchdog tick 的 EnsureBackendRunning
+    /// 会在后台持续重试拉起 broker。
     /// </summary>
     public async Task StartAsync(CancellationToken ct = default)
     {
+        StartWatchdog();
         await ConnectOrReconnectAsync(ct).ConfigureAwait(false);
         if (!_query.IsConnected)
             throw new IOException("无法连接到后端");
-        StartWatchdog();
     }
 
     /// <summary>
