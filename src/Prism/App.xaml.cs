@@ -1,5 +1,8 @@
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Threading;
 using Prism.Models;
 using Prism.Services;
 using Prism.ViewModels;
@@ -51,6 +54,12 @@ public partial class App : Application
     {
         base.OnStartup(e);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        // AUDIT-2026-08-18 C-D1: 全局异常兜底。常驻托盘进程没有这三个钩子时，
+        // 任何 UI 线程未捕获异常或后台 async void 异常都会让进程无声消失。
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
 
         // 单实例守卫：必须在任何服务构造（尤其 TryStartBackendAsync）之前，
         // 防止第二个 Prism.exe 启动第二个 prism-core.exe / 注册第二个热键。
@@ -358,6 +367,63 @@ public partial class App : Application
     {
         try { Console.WriteLine(msg); } catch { /* 无控制台时忽略 */ }
         System.Diagnostics.Debug.WriteLine("[Prism] " + msg);
+    }
+
+    // ── 全局异常兜底（AUDIT-2026-08-18 C-D1）──────────────────────────────
+
+    private static string LogFilePath =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Prism", "logs", "frontend.log");
+
+    /// <summary>写异常到日志文件。10MB 截断。绝不抛出——日志不能反过来杀进程。</summary>
+    private static void LogToFile(string msg)
+    {
+        try
+        {
+            var path = LogFilePath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var info = new FileInfo(path);
+            if (info.Exists && info.Length > 10 * 1024 * 1024)
+                info.Delete();
+            File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}\r\n");
+        }
+        catch { /* 日志 I/O 失败不能影响进程 */ }
+    }
+
+    private static void LogException(string source, Exception ex)
+    {
+        LogToFile($"{source}: {ex.GetType().Name}: {ex.Message}\r\n{ex.StackTrace}");
+        // 同步输出到调试通道，方便开发期即时看到。
+        System.Diagnostics.Debug.WriteLine($"[Prism] {source}: {ex}");
+    }
+
+    private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        try { LogException("DispatcherUnhandledException", e.Exception); }
+        catch { /* 吞掉日志异常 */ }
+        // 标记已处理：进程不退出，让用户至少有日志可查。
+        e.Handled = true;
+    }
+
+    private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        try { LogException("UnobservedTaskException", e.Exception); }
+        catch { /* 吞掉日志异常 */ }
+        e.SetObserved();
+    }
+
+    private static void OnDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        // AppDomain 级异常无法阻止退出，但至少留一条遗言。
+        try
+        {
+            var msg = e.ExceptionObject is Exception ex
+                ? $"{ex.GetType().Name}: {ex.Message}\r\n{ex.StackTrace}"
+                : e.ExceptionObject?.ToString() ?? "unknown";
+            LogToFile($"AppDomain.UnhandledException (isTerminating={e.IsTerminating}): {msg}");
+        }
+        catch { /* 无法记日志就静默 */ }
     }
 
     protected override void OnExit(ExitEventArgs e)

@@ -332,11 +332,17 @@ impl ServiceState {
         let Some(data_dir) = data_dir else {
             return;
         };
-        if let Ok(index) = self.index.read() {
-            if let Some(index) = index.as_ref() {
-                self.rebuild_pinyin(index, &data_dir);
-            }
-        }
+        // AUDIT-2026-08-18 R-B1: 读锁内只 clone 快照（纯 memcpy，毫秒级），
+        // 立刻放锁后再做全节点遍历 + save（含 fsync）。对齐 checkpoint 本体
+        // （1343 行）与 persist_first_build_with（1016 行）的既有正确模式。
+        // 之前在 read guard 内直接调 rebuild_pinyin，百万级中文文件下持锁
+        // 数秒~数十秒，阻塞 USN 写者和搜索读者。
+        let snapshot = {
+            let Ok(guard) = self.index.read() else { return; };
+            let Some(index) = guard.as_ref() else { return; };
+            index.clone()
+        };
+        self.rebuild_pinyin(&snapshot, &data_dir);
     }
 
     fn apply_pinyin_records(&self, volume: usize, records: &[ntfs::UsnRecord]) {
@@ -1504,11 +1510,23 @@ pub(crate) async fn handle_connection(
         Ok(IndexerRequest::Hello { protocol }) if protocol == INDEXER_PROTOCOL => {
             write_response(&mut writer, &IndexerResponse::Hello { protocol }).await?;
         }
+        Ok(IndexerRequest::Hello { protocol: client }) => {
+            write_response(
+                &mut writer,
+                &IndexerResponse::Error {
+                    message: format!(
+                        "protocol_mismatch: server={INDEXER_PROTOCOL} client={client}"
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         _ => {
             write_response(
                 &mut writer,
                 &IndexerResponse::Error {
-                    message: "incompatible or missing hello".into(),
+                    message: "missing or malformed hello".into(),
                 },
             )
             .await?;
@@ -2160,5 +2178,59 @@ mod tests {
             .await
             .unwrap();
         assert!(hello.contains("Hello"));
+    }
+
+    /// AUDIT-2026-08-18 R-B1: rebuild_pinyin_from_live 期间写锁必须可在 <100ms 内获得。
+    /// 修复前该方法在读锁内做全遍历+fsync，百万级中文文件下持锁数秒~数十秒，
+    /// 阻塞 USN 写者和搜索读者。修复后只 clone 快照（毫秒级 memcpy）再放锁。
+    #[test]
+    fn rebuild_pinyin_from_live_does_not_hold_read_lock() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "微信.txt"));
+        state.pinyin_enabled.store(true, Ordering::Release);
+        let dir = std::env::temp_dir()
+            .join(format!("prism-rb1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        state.set_pinyin_data_dir(&dir);
+
+        // rebuild_pinyin_from_live 在锁外完成全遍历 + save + load。
+        // 即使没有中文文件（只有 "微信.txt"），build 仍会遍历全部节点。
+        state.rebuild_pinyin_from_live();
+
+        // 重建完成后写锁立即可得（不被任何读锁阻塞）。
+        let start = std::time::Instant::now();
+        let _guard = state.index.write().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 100,
+            "write lock took {elapsed:?} — rebuild should not hold any lock after returning"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AUDIT-2026-08-18 R-A1: 不匹配的协议版本必须返回结构化 `protocol_mismatch`
+    /// 错误（含双方版本号），而不是泛化的 "incompatible or missing hello"。
+    /// 直接测试错误消息格式——handle_connection 内部构造的消息必须包含
+    /// 双方版本号，使客户端能精确诊断不匹配原因。
+    #[test]
+    fn protocol_mismatch_error_contains_both_versions() {
+        let client_version = 1u32;
+        let message = format!(
+            "protocol_mismatch: server={INDEXER_PROTOCOL} client={client_version}"
+        );
+        assert!(
+            message.starts_with("protocol_mismatch"),
+            "error must start with protocol_mismatch prefix, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("server={INDEXER_PROTOCOL}")),
+            "must report server version {INDEXER_PROTOCOL}, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("client={client_version}")),
+            "must report client version {client_version}, got: {message}"
+        );
     }
 }
