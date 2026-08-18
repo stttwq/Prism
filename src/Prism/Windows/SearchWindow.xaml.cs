@@ -161,10 +161,12 @@ public partial class SearchWindow : Window
             // 清空查询丢弃了结果引用，但窗口仍可见不会走 ReleaseIdleMemory。
             // 在 ApplicationIdle 上做一次轻量回收（保留扩展名图标缓存），
             // 不在 hot path 上阻塞。Trim 延迟到隐藏后统一执行。
+            // AUDIT-2026-08-18 C-D4: Optimized 常被 CLR 跳过、非阻塞不压缩——
+            // 改 Forced + blocking:true 确保真正压缩堆。
             Dispatcher.BeginInvoke(new Action(() =>
             {
                 _icons?.ClearPathKeys();
-                GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         };
         vm.State.PropertyChanged += OnStateChanged;
@@ -345,7 +347,9 @@ public partial class SearchWindow : Window
             Actions.Items = Array.Empty<ActionItem>();
             // A4：只清路径类图标键，保留 ext:/dir: 扩展名键——下次呼出扩展名图标立即可见。
             _icons?.ClearPathKeys();
-            // A4：EmptyWorkingSet + GC.Collect 延迟 3 分钟执行，避免软缺页拖慢下次呼出。
+            // AUDIT-2026-08-18 C-D4: 删除 EmptyWorkingSet 调用（只逐出工作集不降私有提交，
+            // 下次呼出软缺页变慢）。改 GC.Collect Forced + blocking:true + compacting:true
+            // 确保真正压缩堆降私有提交。窗口已隐藏不卡交互。
             // 再呼出（ShowAndFocus）会取消此 timer。
             _idleTrimTimer?.Stop();
             _idleTrimTimer = new DispatcherTimer
@@ -356,8 +360,7 @@ public partial class SearchWindow : Window
             {
                 _idleTrimTimer?.Stop();
                 _idleTrimTimer = null;
-                GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
-                App.TrimWorkingSet();
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             };
             _idleTrimTimer.Start();
         }

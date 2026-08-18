@@ -20,16 +20,6 @@ public partial class App : Application
     [DllImport("kernel32.dll")]
     private static extern bool AttachConsole(int dwProcessId);
 
-    /// <summary>
-    /// 把进程工作集还给系统（仅影响 Working Set 显示，不释放私有提交；
-    /// 适合托盘空闲时让任务管理器数字更接近真实占用）。
-    /// </summary>
-    [DllImport("psapi.dll")]
-    private static extern bool EmptyWorkingSet(IntPtr hProcess);
-
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetCurrentProcess();
-
     private SettingsStore? _store;
     private AutoStartService? _autoStart;
     private HotkeyService? _hotkey;
@@ -145,9 +135,6 @@ public partial class App : Application
         // 放在服务构造完成后、TryStartBackendAsync 之后：此时 _vm / _icons 已就绪，
         // ToggleSearchWindow 可安全懒创建搜索窗。
         _singleInstance.StartForegroundListener(Dispatcher, ToggleSearchWindow);
-
-        // 启动稳定后修剪一次工作集（后端已连上前后各可再剪）。
-        _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
     }
 
     private SearchWindow EnsureSearchWindow()
@@ -208,8 +195,6 @@ public partial class App : Application
         _settingsWindow.Closed += (_, _) =>
         {
             _settingsWindow = null;
-            // 设置窗关掉后也修剪一下工作集。
-            _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         };
         _settingsWindow.Show();
         _settingsWindow.Activate();
@@ -346,24 +331,9 @@ public partial class App : Application
             Log("（可先 cargo build --manifest-path src/prism-core/Cargo.toml）");
             _tray?.SetTooltip("Prism · 后端未连接");
         }
-        finally
-        {
-            // 后端拉起后工作集会涨一截；空闲修剪。
-            _ = Dispatcher.BeginInvoke(new Action(TrimWorkingSet), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
-        }
-    }
-
-    /// <summary>空闲时调用：缩小任务管理器显示的工作集（私有提交不变）。</summary>
-    internal static void TrimWorkingSet()
-    {
-        try
-        {
-            EmptyWorkingSet(GetCurrentProcess());
-        }
-        catch
-        {
-            // 权限/兼容失败忽略。
-        }
+        // AUDIT-2026-08-18 C-D4: 删除 finally 块里的 TrimWorkingSet——
+        // EmptyWorkingSet 只逐出工作集不降私有提交，下次呼出软缺页变慢。
+        // 后端拉起后工作集涨是正常的，不需要逐出。
     }
 
     private static void Log(string msg)
