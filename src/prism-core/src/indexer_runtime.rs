@@ -22,6 +22,18 @@ use crate::pinyin_sidecar::{LoadErrorKind, PinyinSidecar};
 use crate::root_scope::RootScope;
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 
+/// AUDIT-2026-08-18 R-B2: rebuild 请求区分单卷与全量。
+/// 单卷 watcher 出错只重建该卷并 merge_and_publish 替换，
+/// 不再 epoch+1 杀掉所有健康卷 watcher 触发全盘重扫。
+#[derive(Clone)]
+enum RebuildRequest {
+    /// 单卷重建：只重建该卷，merge_and_publish 按 volume_id 替换。
+    SingleVolume { descriptor: VolumeDescriptor, reason: String },
+    /// 全量重建（卷集合变化等）。当前无发送点，保留为未来扩展。
+    #[allow(dead_code)]
+    Full(String),
+}
+
 pub struct Shutdown {
     requested: AtomicBool,
     notify: Notify,
@@ -692,7 +704,7 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     state.set_pinyin_data_dir(&data_dir);
 
     let epoch = Arc::new(AtomicU64::new(1));
-    let (rebuild_tx, mut rebuild_rx) = mpsc::unbounded_channel::<String>();
+    let (rebuild_tx, mut rebuild_rx) = mpsc::unbounded_channel::<RebuildRequest>();
 
     let initial = acquire_initial_index(&state, &data_dir, &stop, &epoch, &rebuild_tx).await;
 
@@ -738,51 +750,103 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 return Err(error);
             }
             reason = rebuild_rx.recv() => {
-                let Some(reason) = reason else { break };
-                logging::event_detail("info", "rebuild_requested", &reason, None, None);
-                log(format!("serialized index rebuild requested: {reason}"));
+                let Some(request) = reason else { break };
+                // 清空积压：合并为只处理最新一条。
                 while rebuild_rx.try_recv().is_ok() {}
-                // H1: compete the rebuild task against shutdown so SCM Stop
-                // doesn't wait minutes for a full MFT rescan to finish.
-                let build_task = tokio::task::spawn_blocking(build_all);
-                let rebuilt = tokio::select! {
-                    result = build_task => result,
-                    _ = stop.cancelled() => {
-                        log("rebuild aborted by shutdown");
-                        break;
-                    }
-                };
-                let rebuilt = match rebuilt {
-                    Ok(inner) => inner,
-                    Err(error) => {
-                        state.set_error(format!("rebuild task: {error}"));
-                        continue;
-                    }
-                };
-                match rebuilt {
-                    Ok((index, descriptors)) => {
-                        epoch.fetch_add(1, Ordering::AcqRel);
-                        state.building.store(true, Ordering::Release);
-                        // 缓存写失败按可降级故障处理：新索引已在内存，先发布继续服务；
-                        // 旧缓存 + USN 前滚保证重启安全。退出会丢弃热索引并触发
-                        // SCM 重启循环，代价远大于一次降级提示。
-                        let save_error = index_cache::save(&index, &data_dir).err();
-                        if let Some(error) = &save_error {
-                            logging::event_detail("error", "rebuild_save_failed", error, None, None);
+                match request {
+                    RebuildRequest::Full(reason) => {
+                        logging::event_detail("info", "rebuild_requested", &reason, None, None);
+                        log(format!("serialized index rebuild requested: {reason}"));
+                        // H1: compete the rebuild task against shutdown so SCM Stop
+                        // doesn't wait minutes for a full MFT rescan to finish.
+                        let build_task = tokio::task::spawn_blocking(build_all);
+                        let rebuilt = tokio::select! {
+                            result = build_task => result,
+                            _ = stop.cancelled() => {
+                                log("rebuild aborted by shutdown");
+                                break;
+                            }
+                        };
+                        let rebuilt = match rebuilt {
+                            Ok(inner) => inner,
+                            Err(error) => {
+                                state.set_error(format!("rebuild task: {error}"));
+                                continue;
+                            }
+                        };
+                        match rebuilt {
+                            Ok((index, descriptors)) => {
+                                epoch.fetch_add(1, Ordering::AcqRel);
+                                state.building.store(true, Ordering::Release);
+                                // 缓存写失败按可降级故障处理：新索引已在内存，先发布继续服务；
+                                // 旧缓存 + USN 前滚保证重启安全。退出会丢弃热索引并触发
+                                // SCM 重启循环，代价远大于一次降级提示。
+                                let save_error = index_cache::save(&index, &data_dir).err();
+                                if let Some(error) = &save_error {
+                                    logging::event_detail("error", "rebuild_save_failed", error, None, None);
+                                }
+                                state.set_pinyin_status(PinyinStatus::Building);
+                                state.publish(index);
+                                if let Some(error) = save_error {
+                                    state.set_error(format!("index cache save failed: {error}"));
+                                }
+                                if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
+                                    logging::event_detail("error", "rebuild_pinyin_failed", &error, None, None);
+                                    state.set_error(format!("pinyin rebuild failed: {error}"));
+                                }
+                                start_watchers(state.clone(), descriptors, stop.clone(), epoch.clone(), rebuild_tx.clone());
+                                last_checkpoint = Instant::now();
+                            }
+                            Err(error) => state.set_error(error),
                         }
-                        state.set_pinyin_status(PinyinStatus::Building);
-                        state.publish(index);
-                        if let Some(error) = save_error {
-                            state.set_error(format!("index cache save failed: {error}"));
-                        }
-                        if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
-                            logging::event_detail("error", "rebuild_pinyin_failed", &error, None, None);
-                            state.set_error(format!("pinyin rebuild failed: {error}"));
-                        }
-                        start_watchers(state.clone(), descriptors, stop.clone(), epoch.clone(), rebuild_tx.clone());
-                        last_checkpoint = Instant::now();
                     }
-                    Err(error) => state.set_error(error),
+                    // AUDIT-2026-08-18 R-B2: 单卷 watcher 出错只重建该卷。
+                    // 不动 epoch（该卷 watcher 已随任务退出死亡，不需 epoch+1 杀它），
+                    // 不杀其他健康卷 watcher，不触发全盘 MFT 重扫。
+                    // 重建后 merge_and_publish 按 volume_id 替换 + start_watcher 重启该卷。
+                    RebuildRequest::SingleVolume { descriptor, reason } => {
+                        logging::event_detail("info", "volume_rebuild_requested", &reason, None, None);
+                        log(format!("single-volume rebuild requested: {reason}"));
+                        let build_descriptor = descriptor.clone();
+                        let build_task = tokio::task::spawn_blocking(move || {
+                            // 与 build_all 同款单卷重试：首次失败重试一次。
+                            match ntfs::build_volume(&build_descriptor) {
+                                Ok(volume) => Ok(volume),
+                                Err(first) => {
+                                    log(format!("MFT build retry for {}: {first}", build_descriptor.mount_path));
+                                    ntfs::build_volume(&build_descriptor).map_err(|e| {
+                                        format!("{}: {e}", build_descriptor.mount_path)
+                                    })
+                                }
+                            }
+                        });
+                        let rebuilt = tokio::select! {
+                            result = build_task => result,
+                            _ = stop.cancelled() => {
+                                log("single-volume rebuild aborted by shutdown");
+                                break;
+                            }
+                        };
+                        match rebuilt {
+                            Ok(Ok(volume)) => {
+                                state.merge_and_publish(volume);
+                                let watcher_epoch = epoch.load(Ordering::Acquire);
+                                start_watcher(
+                                    state.clone(), descriptor,
+                                    stop.clone(), epoch.clone(), rebuild_tx.clone(),
+                                    watcher_epoch,
+                                );
+                                last_checkpoint = Instant::now();
+                            }
+                            Ok(Err(error)) => {
+                                logging::event_detail("error", "volume_rebuild_failed", &error, None, None);
+                                state.set_error(error);
+                            }
+                            Err(error) => {
+                                state.set_error(format!("volume rebuild task: {error}"));
+                            }
+                        }
+                    }
                 }
             }
             _ = maintenance.tick() => {
@@ -865,7 +929,7 @@ async fn acquire_initial_index(
     data_dir: &std::path::Path,
     stop: &Arc<Shutdown>,
     epoch: &Arc<AtomicU64>,
-    rebuild_tx: &mpsc::UnboundedSender<String>,
+    rebuild_tx: &mpsc::UnboundedSender<RebuildRequest>,
 ) -> Result<InitialIndex, String> {
     let cached = tokio::task::spawn_blocking({
         let data_dir = data_dir.to_path_buf();
@@ -1214,7 +1278,7 @@ fn start_watchers(
     descriptors: Vec<VolumeDescriptor>,
     stop: Arc<Shutdown>,
     epoch: Arc<AtomicU64>,
-    rebuild_tx: mpsc::UnboundedSender<String>,
+    rebuild_tx: mpsc::UnboundedSender<RebuildRequest>,
 ) {
     let watcher_epoch = epoch.load(Ordering::Acquire);
     for descriptor in descriptors {
@@ -1240,13 +1304,16 @@ fn start_watcher(
     descriptor: VolumeDescriptor,
     stop: Arc<Shutdown>,
     epoch: Arc<AtomicU64>,
-    rebuild_tx: mpsc::UnboundedSender<String>,
+    rebuild_tx: mpsc::UnboundedSender<RebuildRequest>,
     watcher_epoch: u64,
 ) {
     tokio::task::spawn_blocking(move || {
         if let Err(error) = watch_volume(&state, &descriptor, &stop, &epoch, watcher_epoch) {
             if !stop.is_requested() && epoch.load(Ordering::Acquire) == watcher_epoch {
-                let _ = rebuild_tx.send(format!("{}: {error}", descriptor.mount_path));
+                let _ = rebuild_tx.send(RebuildRequest::SingleVolume {
+                    descriptor: descriptor.clone(),
+                    reason: format!("{}: {error}", descriptor.mount_path),
+                });
             }
         }
     });
@@ -1790,6 +1857,34 @@ mod tests {
         let status = state.status();
         assert_eq!(status.volumes, 2);
         assert_eq!(status.generation, 3);
+    }
+
+    /// AUDIT-2026-08-18 R-B2: 单卷重建（merge_and_publish）只替换该卷，
+    /// 其他健康卷的索引对象不被替换。与 publish（全量替换）形成对比。
+    #[test]
+    fn single_volume_rebuild_preserves_other_volumes() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "alpha.txt"));
+        state.merge_and_publish(test_volume("v2", "D:\\", "beta.txt"));
+        let gen_before = state.generation();
+
+        // 模拟单卷重建：只 merge_and_publish 卷 v2 的重建结果。
+        state.merge_and_publish(test_volume("v2", "D:\\", "beta_rebuilt.txt"));
+        let gen_after = state.generation();
+
+        // generation +1（merge 只递增一次），不是 publish 的 epoch+1 全量替换。
+        assert_eq!(gen_after, gen_before + 1);
+        assert_eq!(state.status().volumes, 2, "卷数不变");
+
+        // 卷 v1 的内容仍在——没被全量替换清掉。
+        let search_v1 = state.search("alpha", 8, None, None).unwrap();
+        assert!(matches!(search_v1, IndexerResponse::Results { ref items, .. } if items.len() == 1),
+            "健康卷 v1 的索引应保留");
+
+        // 卷 v2 的重建结果可见。
+        let search_v2 = state.search("beta_rebuilt", 8, None, None).unwrap();
+        assert!(matches!(search_v2, IndexerResponse::Results { ref items, .. } if items.len() == 1),
+            "重建卷 v2 的新内容应可见");
     }
 
     #[tokio::test]
