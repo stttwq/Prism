@@ -1416,17 +1416,40 @@ async fn serve(state: Arc<ServiceState>, first_pipe: NamedPipeServer) -> Result<
 
 /// One listener's accept loop: wait for a client, hand the connection to a task,
 /// then immediately re-arm this slot.
+///
+/// AUDIT-2026-08-18 R-B3: create_pipe 失败不再立即返回 Err 杀整个服务。
+/// 瞬时失败（资源不足、ACL 临时不可用）退避重试（100ms 起指数、上限 5s），
+/// 连续失败超 60s 才升级为致命——与 SCM Stop 的 wait_hint 对齐。
 async fn accept_loop(state: Arc<ServiceState>, mut server: NamedPipeServer) -> Result<(), String> {
     loop {
         server.connect().await.map_err(|error| error.to_string())?;
         let connected = server;
-        server = create_pipe(false).map_err(|error| error.to_string())?;
+        server = rearm_with_backoff().await?;
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(connected, state).await {
                 log(format!("indexer IPC client disconnected: {error}"));
             }
         });
+    }
+}
+
+/// 退避重试 create_pipe，连续失败超 60s 才返回 Err。
+async fn rearm_with_backoff() -> Result<NamedPipeServer, String> {
+    let mut backoff = Duration::from_millis(100);
+    let first_failure = Instant::now();
+    loop {
+        match create_pipe(false) {
+            Ok(server) => return Ok(server),
+            Err(error) => {
+                if first_failure.elapsed() > Duration::from_secs(60) {
+                    return Err(format!("create_pipe failed for >60s: {error}"));
+                }
+                log(format!("create_pipe retry (backoff {backoff:?}): {error}"));
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        }
     }
 }
 
