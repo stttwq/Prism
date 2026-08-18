@@ -178,6 +178,9 @@ public partial class App : Application
             win.HideAnimated();
         else
             win.ShowAndFocus();
+        // AUDIT-2026-08-18 C-D3: 呼出/隐藏时幂等重装低级键盘钩子，
+        // 应对系统因回调超时静默摘除钩子后无法恢复。
+        _hotkey?.RefreshHook();
     }
 
     private void OpenSettings()

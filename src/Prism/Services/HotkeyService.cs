@@ -52,6 +52,14 @@ public sealed class HotkeyService : IDisposable
     private const int MaxHoldMs = 300;
     private long _ctrlDownMs;
 
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D3: 低级键盘钩子被系统超时摘除后无自检重装。
+    /// 定时器 60s 兜底重装（幂等：UnhookEx + SetWindowsHookEx），
+    /// 窗口 show/hide 也可主动调 RefreshHook 立即重装。
+    /// </summary>
+    private System.Threading.Timer? _hookRefreshTimer;
+    private const int HookRefreshIntervalMs = 60_000;
+
     /// <summary>呼出事件，在 UI 线程触发。</summary>
     public event Action? Triggered;
 
@@ -63,12 +71,43 @@ public sealed class HotkeyService : IDisposable
         Uninstall();
         _mode = settings.HotkeyMode;
         if (_mode == HotkeyMode.DoubleCtrl)
+        {
             InstallLowLevelHook();
+            StartHookRefresh();
+        }
         else
             InstallRegisterHotKey(settings.ComboHotkey);
     }
 
-    public void Dispose() => Uninstall();
+    public void Dispose()
+    {
+        Uninstall();
+        _hookRefreshTimer?.Dispose();
+        _hookRefreshTimer = null;
+    }
+
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D3: 幂等重装低级键盘钩子。系统在回调超时
+    /// （LowLevelHooksTimeout，默认 ~300ms）后会静默 unhook，用户无感知。
+    /// 周期重装确保钩子存活。仅对 DoubleCtrl 模式有效。
+    /// </summary>
+    public void RefreshHook()
+    {
+        if (_mode != HotkeyMode.DoubleCtrl) return;
+        if (_hook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_hook);
+            _hook = IntPtr.Zero;
+        }
+        InstallLowLevelHook();
+    }
+
+    private void StartHookRefresh()
+    {
+        _hookRefreshTimer?.Dispose();
+        _hookRefreshTimer = new System.Threading.Timer(
+            _ => RefreshHook(), null, HookRefreshIntervalMs, HookRefreshIntervalMs);
+    }
 
     // ── Low-level hook (DoubleCtrl) ────────────────────────────────────────
 
@@ -190,6 +229,8 @@ public sealed class HotkeyService : IDisposable
 
     private void Uninstall()
     {
+        _hookRefreshTimer?.Dispose();
+        _hookRefreshTimer = null;
         if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
         if (_msgWindow is not null)
         {
