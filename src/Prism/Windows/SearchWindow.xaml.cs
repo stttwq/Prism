@@ -7,6 +7,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
 using System.Windows.Threading;
 using Prism.Models;
 using Prism.Services;
@@ -84,7 +85,7 @@ public partial class SearchWindow : Window
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero,
             _foregroundHookProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         SizeChanged += (_, _) => UpdateCardClip();
-        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; UpdateCardClip(); };
+        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; UpdateCardClip(); RestoreCardShadow(); };
         Closed += (_, _) =>
         {
             if (_foregroundHook != IntPtr.Zero) { UnhookWinEvent(_foregroundHook); _foregroundHook = IntPtr.Zero; }
@@ -899,6 +900,8 @@ public partial class SearchWindow : Window
         {
             PanelHost.BeginAnimation(HeightProperty, null);
             PanelHost.Height = target;
+            // A1②：静止状态恢复阴影（动画期间临时移除以减少逐帧栅格化开销）。
+            RestoreCardShadow();
             return;
         }
 
@@ -910,11 +913,33 @@ public partial class SearchWindow : Window
             EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
             FillBehavior = FillBehavior.Stop,
         };
+        // A1②：动画期间移除 DropShadowEffect，减少逐帧栅格化开销。
+        // 分层窗口整面重上传无法避免（需 A1① 去 AllowsTransparency），但省掉
+        // 阴影栅格化仍能显著降低逐帧 GPU 开销。动画结束后恢复。
+        Card.Effect = null;
         anim.Completed += (_, _) =>
         {
             PanelHost.Height = target;
+            RestoreCardShadow();
         };
         PanelHost.BeginAnimation(HeightProperty, anim);
+    }
+
+    private DropShadowEffect? _cachedShadow;
+
+    /// <summary>A1②：恢复 Card 的 DropShadowEffect（动画期间临时移除后恢复）。</summary>
+    private void RestoreCardShadow()
+    {
+        _cachedShadow ??= new DropShadowEffect
+        {
+            BlurRadius = 24,
+            Opacity = 0.20,
+            ShadowDepth = 6,
+            Direction = 270,
+            Color = Colors.Black,
+            RenderingBias = RenderingBias.Performance,
+        };
+        Card.Effect = _cachedShadow;
     }
 
     private void UpdateCardClip()
