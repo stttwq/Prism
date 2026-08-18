@@ -158,7 +158,7 @@
                                                 <Storyboard>
                                                     <DoubleAnimation Storyboard.TargetName="HighlightHover"
                                                                      Storyboard.TargetProperty="Opacity"
-                                                                     To="0.55" Duration="0:0:0.10"/>
+                                                                     To="0.8" Duration="0:0:0.10"/>
                                                 </Storyboard>
                                             </BeginStoryboard>
                                         </Trigger.EnterActions>
