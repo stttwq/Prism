@@ -45,7 +45,7 @@
                 <TextBlock x:Name="Glyph"
                            Grid.Column="0"
                            Text="{Binding IconGlyph}"
-                           FontFamily="Segoe MDL2 Assets"
+                           FontFamily="{DynamicResource IconFontFamily}"
                            FontSize="16"
                            Foreground="{DynamicResource TextTitle}"
                            Width="20" Height="20"
@@ -87,7 +87,7 @@
 
                 <TextBlock Grid.Column="2"
                            Text="&#xE76C;"
-                           FontFamily="Segoe MDL2 Assets"
+                           FontFamily="{DynamicResource IconFontFamily}"
                            FontSize="12"
                            Foreground="{DynamicResource TextSubtitle}"
                            VerticalAlignment="Center"

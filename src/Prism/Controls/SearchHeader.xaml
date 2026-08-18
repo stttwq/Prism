@@ -59,7 +59,7 @@
         <!-- 右侧淡灰放大镜装饰 -->
         <TextBlock Grid.Column="4"
                    Text="&#xE721;"
-                   FontFamily="Segoe MDL2 Assets"
+                   FontFamily="{DynamicResource IconFontFamily}"
                    FontSize="22"
                    Foreground="{DynamicResource TextPlaceholder}"
                    VerticalAlignment="Center"

@@ -21,7 +21,7 @@
             <!-- 45° 斜向箭头（Segoe MDL2 OpenInNewWindow / 升级箭头） -->
             <TextBlock x:Name="Arrow"
                        Text="&#xE8A7;"
-                       FontFamily="Segoe MDL2 Assets"
+                       FontFamily="{DynamicResource IconFontFamily}"
                        FontSize="12"
                        Foreground="{DynamicResource TextSubtitle}"
                        HorizontalAlignment="Center"

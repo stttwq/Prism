@@ -35,5 +35,6 @@
     <sys:Double x:Key="FontSizeAction">16</sys:Double>
     <sys:Double x:Key="FontSizeSectionLabel">15</sys:Double>
     <sys:Double x:Key="PadX">20</sys:Double>
-    <FontFamily x:Key="AppFontFamily">微软雅黑, Segoe UI</FontFamily>
+    <FontFamily x:Key="AppFontFamily">Segoe UI Variable Text, 微软雅黑, Segoe UI</FontFamily>
+    <FontFamily x:Key="IconFontFamily">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
 </ResourceDictionary>
