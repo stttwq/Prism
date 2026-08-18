@@ -50,7 +50,7 @@ fn run_service() -> Result<(), String> {
                     ServiceControlAccept::empty(),
                     ServiceExitCode::Win32(0),
                     1,
-                    Duration::from_secs(10),
+                    Duration::from_secs(30),
                 ));
             }
             handler_stop.request();

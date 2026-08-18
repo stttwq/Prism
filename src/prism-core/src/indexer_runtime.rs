@@ -733,15 +733,30 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
             }
             reason = rebuild_rx.recv() => {
                 let Some(reason) = reason else { break };
-                epoch.fetch_add(1, Ordering::AcqRel);
-                state.building.store(true, Ordering::Release);
                 logging::event_detail("info", "rebuild_requested", &reason, None, None);
                 log(format!("serialized index rebuild requested: {reason}"));
                 while rebuild_rx.try_recv().is_ok() {}
-                let rebuilt = tokio::task::spawn_blocking(build_all).await
-                    .map_err(|error| format!("rebuild task: {error}"))?;
+                // H1: compete the rebuild task against shutdown so SCM Stop
+                // doesn't wait minutes for a full MFT rescan to finish.
+                let build_task = tokio::task::spawn_blocking(build_all);
+                let rebuilt = tokio::select! {
+                    result = build_task => result,
+                    _ = stop.cancelled() => {
+                        log("rebuild aborted by shutdown");
+                        break;
+                    }
+                };
+                let rebuilt = match rebuilt {
+                    Ok(inner) => inner,
+                    Err(error) => {
+                        state.set_error(format!("rebuild task: {error}"));
+                        continue;
+                    }
+                };
                 match rebuilt {
                     Ok((index, descriptors)) => {
+                        epoch.fetch_add(1, Ordering::AcqRel);
+                        state.building.store(true, Ordering::Release);
                         // 缓存写失败按可降级故障处理：新索引已在内存，先发布继续服务；
                         // 旧缓存 + USN 前滚保证重启安全。退出会丢弃热索引并触发
                         // SCM 重启循环，代价远大于一次降级提示。
@@ -768,7 +783,14 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 if state.pinyin_needs_rebuild.swap(false, Ordering::AcqRel)
                     && state.pinyin_status() != PinyinStatus::Disabled
                 {
-                    if let Err(error) = rebuild_pinyin_from_live(state.clone()).await {
+                    // H1: compete pinyin rebuild against shutdown.
+                    let pinyin_task = rebuild_pinyin_from_live(state.clone());
+                    tokio::pin!(pinyin_task);
+                    let pinyin_result = tokio::select! {
+                        result = &mut pinyin_task => result,
+                        _ = stop.cancelled() => break,
+                    };
+                    if let Err(error) = pinyin_result {
                         logging::event_detail("error", "maintenance_pinyin_failed", &error, None, None);
                         // 内部重建失败已自限为 5 秒节拍重试；这里只可能是任务级故障，降级不退出。
                         state.set_error(format!("pinyin rebuild failed: {error}"));
@@ -781,7 +803,14 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                     guard.as_ref().map(|index| index.events_since_checkpoint >= 500_000)
                 }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(6 * 60 * 60);
                 if checkpoint_due {
-                    match checkpoint_async(state.clone(), data_dir.clone()).await {
+                    // H1: compete checkpoint against shutdown.
+                    let checkpoint_task = checkpoint_async(state.clone(), data_dir.clone());
+                    tokio::pin!(checkpoint_task);
+                    let checkpoint_result = tokio::select! {
+                        result = &mut checkpoint_task => result,
+                        _ = stop.cancelled() => break,
+                    };
+                    match checkpoint_result {
                         Ok(()) => {
                             state.clear_error();
                             last_checkpoint = Instant::now();
