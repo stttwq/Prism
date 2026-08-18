@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -50,6 +51,36 @@ public sealed class IconCache
     {
         _cache.Clear();
         while (_order.TryDequeue(out _)) { }
+    }
+
+    /// <summary>
+    /// 只清路径类键（完整路径、URL），保留 ext:/dir: 扩展名键。
+    /// 扩展名图标恒定且由 LRU 保护，保留后下次呼出扩展名图标立即可见，
+    /// 路径类图标按需重新加载。
+    /// </summary>
+    public void ClearPathKeys()
+    {
+        var keysToRemove = new List<string>();
+        foreach (var key in _cache.Keys)
+        {
+            // SizedKey = CacheKey + "@" + pixelSize；拆出 CacheKey 部分判断。
+            var atIdx = key.LastIndexOf('@');
+            var cacheKey = atIdx > 0 ? key.Substring(0, atIdx) : key;
+            // 保留 ext: 和 dir: 前缀的键（扩展名/目录类型图标恒定）。
+            if (cacheKey.StartsWith("ext:", StringComparison.OrdinalIgnoreCase)
+                || cacheKey.StartsWith("dir:", StringComparison.OrdinalIgnoreCase))
+                continue;
+            keysToRemove.Add(key);
+        }
+        foreach (var key in keysToRemove)
+            _cache.TryRemove(key, out _);
+        // 重建队列：只保留仍在缓存中的键。
+        var remaining = new List<string>();
+        while (_order.TryDequeue(out var k))
+            if (_cache.ContainsKey(k))
+                remaining.Add(k);
+        foreach (var k in remaining)
+            _order.Enqueue(k);
     }
 
     /// <summary>当前缓存条数（诊断用）。</summary>

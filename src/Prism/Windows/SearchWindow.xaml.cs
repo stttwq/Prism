@@ -40,6 +40,8 @@ public partial class SearchWindow : Window
     private double _panelTargetHeight;
     /// <summary>呼出捕获的串台序号：快速呼出/隐藏/再呼出时丢弃过期的后台识别结果。</summary>
     private int _captureSeq;
+    /// <summary>隐藏后延迟 Trim 的计时器；再呼出时取消，避免影响下次呼出响应。</summary>
+    private DispatcherTimer? _idleTrimTimer;
 
     // ── Win32 foreground hook ─────────────────────────────────────────────
     // Deactivated 事件在两个 Topmost 窗口交互时可能不触发，SetWinEventHook 以
@@ -156,12 +158,12 @@ public partial class SearchWindow : Window
         vm.IdleMemoryReleaseRequested += () =>
         {
             // 清空查询丢弃了结果引用，但窗口仍可见不会走 ReleaseIdleMemory。
-            // 在 ApplicationIdle 上做一次轻量回收 + 工作集修剪，不在 hot path 上阻塞。
+            // 在 ApplicationIdle 上做一次轻量回收（保留扩展名图标缓存），
+            // 不在 hot path 上阻塞。Trim 延迟到隐藏后统一执行。
             Dispatcher.BeginInvoke(new Action(() =>
             {
-                _icons?.Clear();
+                _icons?.ClearPathKeys();
                 GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
-                App.TrimWorkingSet();
             }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         };
         vm.State.PropertyChanged += OnStateChanged;
@@ -195,6 +197,9 @@ public partial class SearchWindow : Window
         _hiding = false;
         _ignoreDeactivate = true;
         BeginAnimation(OpacityProperty, null);
+        // A4：取消隐藏时启动的延迟 trim——再呼出不应被 GC/Trim 打断。
+        _idleTrimTimer?.Stop();
+        _idleTrimTimer = null;
 
         _vm?.ResetForShow();
         _suppressQueryEvent = true;
@@ -314,12 +319,23 @@ public partial class SearchWindow : Window
             Results.Items = Array.Empty<SearchResult>();
             Results.StatusMessage = "";
             Actions.Items = Array.Empty<ActionItem>();
-            _icons?.Clear();
-            Dispatcher.BeginInvoke(() =>
+            // A4：只清路径类图标键，保留 ext:/dir: 扩展名键——下次呼出扩展名图标立即可见。
+            _icons?.ClearPathKeys();
+            // A4：EmptyWorkingSet + GC.Collect 延迟 3 分钟执行，避免软缺页拖慢下次呼出。
+            // 再呼出（ShowAndFocus）会取消此 timer。
+            _idleTrimTimer?.Stop();
+            _idleTrimTimer = new DispatcherTimer
             {
+                Interval = TimeSpan.FromMinutes(3),
+            };
+            _idleTrimTimer.Tick += (_, _) =>
+            {
+                _idleTrimTimer?.Stop();
+                _idleTrimTimer = null;
                 GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
                 App.TrimWorkingSet();
-            }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            };
+            _idleTrimTimer.Start();
         }
         catch
         {
