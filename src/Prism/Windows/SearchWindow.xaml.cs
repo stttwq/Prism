@@ -250,13 +250,17 @@ public partial class SearchWindow : Window
     /// <summary>
     /// 后台识别宿主并回到 UI 线程应用。迟到无害：空查询下 root 到达由
     /// SetSearchContext 触发「当前目录最近使用」重搜，用户已输入则重搜自动带上 root。
+    ///
+    /// 必须在 STA 线程上执行：Explorer adapter 的 <c>Shell.Application</c> COM 调用
+    /// （<c>IShellWindows</c> 枚举 + <c>IServiceProvider</c>→<c>IShellBrowser</c> 链）
+    /// 是 STA-only 对象，线程池 MTA 线程上调用会静默返回空，导致永远拿不到当前目录。
     /// </summary>
     private async Task RunCaptureAsync(IntPtr foreground, int seq)
     {
         HostContext result;
         try
         {
-            result = await Task.Run(() => _scope.ComputeCapture(foreground)).ConfigureAwait(true);
+            result = await RunOnStaThread(() => _scope.ComputeCapture(foreground)).ConfigureAwait(true);
         }
         catch
         {
@@ -265,6 +269,25 @@ public partial class SearchWindow : Window
         // 过期结果：窗口已隐藏或已再次呼出，直接丢弃。
         if (seq != _captureSeq || !IsVisible || _hiding) return;
         _scope.ApplyCapture(result);
+    }
+
+    /// <summary>
+    /// 在后台 STA 线程上执行 <paramref name="action"/> 并等待结果。Shell COM 对象
+    /// （<c>Shell.Application</c> / <c>IShellWindows</c> / <c>IShellBrowser</c>）
+    /// 是 STA-only，线程池 MTA 线程上调用会静默返回空。
+    /// </summary>
+    private static Task<T> RunOnStaThread<T>(Func<T> action)
+    {
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sta = new Thread(() =>
+        {
+            try { tcs.SetResult(action()); }
+            catch (Exception ex) { tcs.SetException(ex); }
+        })
+        { IsBackground = true };
+        sta.SetApartmentState(ApartmentState.STA);
+        sta.Start();
+        return tcs.Task;
     }
 
     private void ForceActivate()
@@ -691,12 +714,13 @@ public partial class SearchWindow : Window
         if (string.IsNullOrWhiteSpace(path))
             path = item.ExecuteId;
 
-        // 宿主定位同样在后台线程执行：Explorer 定位含最长 2 秒的轮询、
-        // Opus 是子进程等待，绝不能挂在 UI 线程上。
+        // 宿主定位同样在后台 STA 线程执行：Explorer 定位含最长 2 秒的轮询、
+        // Opus 是子进程等待，绝不能挂在 UI 线程上。Shell COM 是 STA-only，
+        // 线程池 MTA 线程上会静默失败。
         HostRevealResult reveal;
         try
         {
-            reveal = await Task.Run(() =>
+            reveal = await RunOnStaThread(() =>
                 _scope.TryRevealInHost(path, isDirectory: item.Kind == "folder")).ConfigureAwait(true);
         }
         catch

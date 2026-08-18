@@ -114,6 +114,9 @@ public sealed class HostScopeController
     /// 纯计算宿主上下文：适配器的跨进程 COM / 子进程等待都发生在这里，
     /// 可从任意线程调用（适配器无状态，COM 对象在单次调用内创建并释放）。
     /// 不修改任何状态、不触发事件。
+    ///
+    /// 调用方必须在 STA 线程上执行：Explorer adapter 的 <c>Shell.Application</c> COM
+    /// 调用是 STA-only 对象，MTA 线程池线程上会静默返回空。
     /// </summary>
     public HostContext ComputeCapture(IntPtr foregroundWindow)
     {
