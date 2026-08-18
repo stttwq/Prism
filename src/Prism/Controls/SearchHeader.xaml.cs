@@ -45,8 +45,7 @@ public partial class SearchHeader : UserControl
     /// <summary>刷新范围标签：不可见时隐藏，可见时显示当前目录或全局。</summary>
     public void SetScope(bool visible, string label, string tooltip)
     {
-        var wasVisible = ScopeChip.Visibility == Visibility.Visible;
-        ScopeChip.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        var wasVisible = ScopeChipColumn.Width != new GridLength(0);
         ScopeChip.Content = label;
         ScopeChip.ToolTip = string.IsNullOrEmpty(tooltip) ? null : tooltip;
         // 无障碍：屏幕阅读器读到的是完整范围说明，而不是截断的目录名。
@@ -54,14 +53,45 @@ public partial class SearchHeader : UserControl
             ScopeChip,
             string.IsNullOrEmpty(tooltip) ? label : $"{label}。{tooltip}");
 
-        // 隐藏→可见的跃迁做一次淡入 + 左滑入场（120ms）。
-        // 已知限制：输入框的横向占位仍会瞬移——彻底消除需重排列布局，不做。
-        if (visible && !wasVisible)
+        if (!visible)
         {
+            ScopeChipColumn.Width = new GridLength(0);
+            ScopeChip.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ScopeChip.Visibility = Visibility.Visible;
+
+        // 隐藏→可见的跃迁：列宽从 0 平滑增长到 chip 自然宽度，同时内容淡入+左滑入场（120ms）。
+        // 消除"输入框文字瞬移"——列宽补间使文字平滑右移而非瞬移。
+        if (!wasVisible)
+        {
+            // 先设固定宽度 0 让 chip 在布局中占位，Measure 取自然宽度。
+            ScopeChip.Width = 0;
+            // Measure 用无限可用空间取自然尺寸，再恢复。
+            ScopeChip.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+            var naturalWidth = ScopeChip.DesiredSize.Width;
+
             var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+            var ms = System.TimeSpan.FromMilliseconds(120);
+
+            // chip 宽度从 0 动画到自然宽度，完成后恢复自适应。
+            var widthAnim = new DoubleAnimation(0, naturalWidth, ms)
+            {
+                EasingFunction = ease,
+                FillBehavior = FillBehavior.Stop,
+            };
+            widthAnim.Completed += (_, _) =>
+            {
+                // 恢复自适应宽度；Completed 可能不触发（被替换时），但下次设 Content 时会重算。
+                ScopeChip.Width = double.NaN;
+            };
+            ScopeChip.Width = 0;
+            ScopeChip.BeginAnimation(FrameworkElement.WidthProperty, widthAnim);
+
             ScopeChip.BeginAnimation(
                 OpacityProperty,
-                new DoubleAnimation(0, 1, System.TimeSpan.FromMilliseconds(120)) { EasingFunction = ease });
+                new DoubleAnimation(0, 1, ms) { EasingFunction = ease });
             if (ScopeChip.RenderTransform is not TranslateTransform slide)
             {
                 slide = new TranslateTransform();
@@ -69,7 +99,13 @@ public partial class SearchHeader : UserControl
             }
             slide.BeginAnimation(
                 TranslateTransform.XProperty,
-                new DoubleAnimation(-8, 0, System.TimeSpan.FromMilliseconds(120)) { EasingFunction = ease });
+                new DoubleAnimation(-8, 0, ms) { EasingFunction = ease });
+        }
+        else
+        {
+            // 已可见仅更新内容：列宽保持 Auto 让 chip 自适应新内容。
+            ScopeChip.Width = double.NaN;
+            ScopeChipColumn.Width = GridLength.Auto;
         }
     }
 
