@@ -24,16 +24,23 @@
         </Setter>
     </Style>
 
-    <!-- 4px 宽圆头细滚动条（frontend-spec.md ScrollThumb） -->
+    <!-- 4px 宽圆头细滚动条（frontend-spec.md ScrollThumb）；hover 时 thumb 变宽变圆 -->
     <Style x:Key="PrismScrollBarThumb" TargetType="Thumb">
         <Setter Property="OverridesDefaultStyle" Value="True"/>
         <Setter Property="IsTabStop" Value="False"/>
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="Thumb">
-                    <Border Background="{DynamicResource ScrollThumb}"
+                    <Border x:Name="ThumbBg"
+                            Background="{DynamicResource ScrollThumb}"
                             CornerRadius="2"
                             Margin="1"/>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="ThumbBg" Property="CornerRadius" Value="3"/>
+                            <Setter TargetName="ThumbBg" Property="Margin" Value="0"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
                 </ControlTemplate>
             </Setter.Value>
         </Setter>
