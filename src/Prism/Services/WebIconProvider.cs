@@ -49,8 +49,20 @@ public sealed class WebIconProvider
         }
     }
 
-    /// <summary>下载完成后清空解析缓存：下一次取图标重新读磁盘，让新 favicon 立即可见。</summary>
-    public void Invalidate() => _resolved.Clear();
+    /// <summary>
+    /// 下载完成后清空解析缓存：下一次取图标重新读磁盘，让新 favicon 立即可见。
+    /// AUDIT-2026-08-18 C-D2: <see cref="Invalidate"/> 被后台线程（DownloadFavicon 的
+    /// Task.Run finally 块）调用，而 <see cref="GetIcon"/> 在 UI 线程读写 <see cref="_resolved"/>。
+    /// Dictionary 非线程安全——经 Dispatcher.BeginInvoke 投递到 UI 线程清空，保持单线程语义。
+    /// </summary>
+    public void Invalidate()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess())
+            _resolved.Clear();
+        else
+            dispatcher.BeginInvoke(new Action(() => _resolved.Clear()));
+    }
 
     /// <summary>
     /// 获取引擎图标。优先内置图标，其次（已授权的）favicon 缓存，最后通用图标。
