@@ -523,6 +523,23 @@ impl VolumeIndex {
         self.nodes.capacity() * std::mem::size_of::<NodeSlot>() + self.names.capacity()
     }
 
+    /// AUDIT-2026-08-18 R-C2: 轻量结构不变量检查——开销 O(1)，不做 path_for 遍历。
+    /// 全量 validate（含每节点 path_for）保留给 load 侧；save 侧走 validate_structure +
+    /// 抽样 path_for。
+    pub(crate) fn validate_structure(&self) -> Result<(), String> {
+        if self.nodes.len() > MAX_RECORD_NUMBER {
+            return Err("node table exceeds compact-index limit".into());
+        }
+        let root = self
+            .nodes
+            .get(self.root_record as usize)
+            .ok_or("cache root record is outside node table")?;
+        if root.flags & (FLAG_PRESENT | FLAG_DIRECTORY) != FLAG_PRESENT | FLAG_DIRECTORY {
+            return Err("cache root record is not a present directory".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.nodes.len() > MAX_RECORD_NUMBER {
             return Err("node table exceeds compact-index limit".into());

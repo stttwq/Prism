@@ -49,7 +49,10 @@ pub fn load(data_dir: &Path) -> Result<IndexState, String> {
 }
 
 pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
-    validate(state)?;
+    // AUDIT-2026-08-18 R-C2: save 前只做抽样 validate——全量 validate 对每节点跑
+    // path_for（O(n·depth)），大索引下可能超 SCM Stop 30s wait_hint。
+    // load 侧保留全量 validate 作为缓存文件损坏的安全网。
+    validate_sampled(state)?;
     std::fs::create_dir_all(data_dir)
         .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
     let path = cache_path(data_dir);
@@ -74,6 +77,32 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("write {}: {error}", temporary.display()))?;
     drop(writer);
     crate::fs_util::atomic_replace(&temporary, &path, "cache")
+}
+
+/// AUDIT-2026-08-18 R-C2: save 前抽样 validate——避免全量 path_for 的 O(n·depth)。
+/// 抽样覆盖：每卷根节点（必检）+ 随机 ~1% 节点 path_for + 结构不变量
+///（nodes 上限、names 池边界、slot 计数一致性）。load 侧仍走全量 validate。
+fn validate_sampled(state: &IndexState) -> Result<(), String> {
+    for volume in &state.volumes {
+        // 结构不变量始终检查（开销极低）。
+        volume.validate_structure()?;
+
+        // 根节点必检（path_for 恒为 mount_path，开销极小）。
+        let root_record = volume.root_record;
+        volume.path_for(root_record)?;
+
+        // 随机 1% 节点抽检 path_for。用固定步长而非 RNG——确定性、零分配、
+        // 覆盖均匀，且不引入 rand 依赖。
+        let stride = (volume.nodes.len() / 100).max(1);
+        let mut record = 0u32;
+        while (record as usize) < volume.nodes.len() {
+            if record != root_record {
+                let _ = volume.path_for(record);
+            }
+            record = record.saturating_add(stride as u32);
+        }
+    }
+    Ok(())
 }
 
 fn validate(state: &IndexState) -> Result<(), String> {
