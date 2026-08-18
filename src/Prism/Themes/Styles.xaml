@@ -229,11 +229,27 @@
                             CornerRadius="4"
                             Padding="{TemplateBinding Padding}"
                             SnapsToDevicePixels="True">
-                        <ContentPresenter ContentSource="Header"
-                                          RecognizesAccessKey="True"
-                                          VerticalAlignment="Center"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <!-- 图标列：Icon 为 null 时由触发器收起 -->
+                            <ContentPresenter x:Name="IconColumn"
+                                              Grid.Column="0"
+                                              ContentSource="Icon"
+                                              VerticalAlignment="Center"
+                                              Margin="0,0,10,0"/>
+                            <ContentPresenter Grid.Column="1"
+                                              ContentSource="Header"
+                                              RecognizesAccessKey="True"
+                                              VerticalAlignment="Center"/>
+                        </Grid>
                     </Border>
                     <ControlTemplate.Triggers>
+                        <Trigger Property="Icon" Value="{x:Null}">
+                            <Setter TargetName="IconColumn" Property="Visibility" Value="Collapsed"/>
+                        </Trigger>
                         <Trigger Property="IsHighlighted" Value="True">
                             <Setter TargetName="ItemBorder"
                                     Property="Background"

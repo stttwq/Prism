@@ -438,6 +438,22 @@ public partial class SearchWindow : Window
 
             var item = new MenuItem { Header = action.Label };
             item.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuItemStyle");
+            // U7：右键菜单加图标列，与动作面板视觉统一。
+            if (!action.IsSectionHeader && !string.IsNullOrEmpty(action.IconGlyph))
+            {
+                item.Icon = new TextBlock
+                {
+                    Text = action.IconGlyph,
+                    FontFamily = (System.Windows.Media.FontFamily)FindResource("IconFontFamily"),
+                    FontSize = 14,
+                    Foreground = (Brush)FindResource("TextSubtitle"),
+                    Width = 18,
+                    Height = 18,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                    TextAlignment = TextAlignment.Center,
+                };
+            }
             item.Click += async (_, _) =>
             {
                 if (_vm is null) return;
