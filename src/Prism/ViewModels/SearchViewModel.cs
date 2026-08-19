@@ -32,13 +32,11 @@ public sealed class SearchViewModel
     /// <summary>在线联想开关（G8），默认关闭。</summary>
     private bool _suggestionsEnabled;
     private CancellationTokenSource? _searchCts;
-    /// <summary>联想请求取消令牌（G8）。查询变化时取消旧请求。</summary>
-    private CancellationTokenSource? _suggestionCts;
+    /// <summary>P4c: 网页联想的发起/取消/身份治理抽出到了 WebSearchCoordinator。</summary>
+    private readonly WebSearchCoordinator _webSuggestions;
     private int _resultLimit = InitialResultLimit;
     private string _pendingQuery = "";
     private int _searchSeq;
-    /// <summary>联想请求序列号（G8）。查询变化时 bump，丢弃迟到响应。</summary>
-    private int _suggestionSeq;
     private string _lastInputQuery = "";
     private SearchCacheEntry? _completeCache;
     private SearchContext _searchContext = SearchContext.Default;
@@ -84,6 +82,18 @@ public sealed class SearchViewModel
         _suggestions = suggestions;
         // P4a: 缺省保持 WinForms 对话框（照抄 ISuggestionService 的可选注入先例）。
         _folderPicker = folderPicker ?? new WinFormsFolderPicker();
+        // P4c: 联想结果必须回 UI 线程写 Results；无 Application（单元测试）或已在
+        // UI 线程时同步执行，否则 BeginInvoke 排队——与抽取前的行为一致。
+        _webSuggestions = new WebSearchCoordinator(suggestions, action =>
+        {
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.CheckAccess())
+            {
+                action();
+                return;
+            }
+            dispatcher.BeginInvoke(action);
+        });
         timerFactory ??= new DispatcherDebounceTimerFactory();
         _scheduler = scheduler ?? new SearchScheduler();
         _debounce = timerFactory.Create(
@@ -1060,13 +1070,8 @@ public sealed class SearchViewModel
         _searchCts = null;
     }
 
-    /// <summary>取消正在进行的联想请求（G8）。查询变化时调用。</summary>
-    private void CancelSuggestions()
-    {
-        try { _suggestionCts?.Cancel(); } catch { /* ignore */ }
-        _suggestionCts?.Dispose();
-        _suggestionCts = null;
-    }
+    /// <summary>取消正在进行的联想请求（G8）。查询变化时调用。P4c: 转发给 coordinator。</summary>
+    private void CancelSuggestions() => _webSuggestions.CancelPending();
 
     /// <summary>
     /// 网页模式搜索（G8）。直接结果同步产生，联想异步获取并追加。
@@ -1090,7 +1095,7 @@ public sealed class SearchViewModel
             Title: directTitle,
             Subtitle: directUrl,
             ExecuteId: directUrl,
-            MatchSpans: BuildWebMatchSpans(directTitle, webMode.QueryTerms))
+            MatchSpans: WebSearchCoordinator.BuildWebMatchSpans(directTitle, webMode.QueryTerms))
         {
             Target = new ActionTarget("web", directUrl),
             // 首行身份与查询词无关：标题/URL 每按一键都变，但它始终是"同一行"。
@@ -1119,103 +1124,21 @@ public sealed class SearchViewModel
         if (_suggestions is null)
             return;
 
-        // 异步发起联想请求，查询变化时取消旧请求。
-        var suggSeq = ++_suggestionSeq;
-        var cts = new CancellationTokenSource();
-        _suggestionCts = cts;
-
-        _ = Task.Run(async () =>
-        {
-            IReadOnlyList<SuggestionItem> suggestions;
-            try
+        // P4c: 联想的发起/取消/迟到丢弃全部在 WebSearchCoordinator 里。
+        // stillCurrent 三重身份（搜索序号 + 当前查询）在应用前后各查一次。
+        var seqAtFetch = seq;
+        var queryAtFetch = query;
+        _webSuggestions.FetchSuggestions(
+            webMode,
+            stillCurrent: () => seqAtFetch == _searchSeq
+                && string.Equals(queryAtFetch, _state.Query, StringComparison.Ordinal),
+            apply: suggestions =>
             {
-                suggestions = await _suggestions.GetSuggestionsAsync(
-                    webMode.EngineName, webMode.QueryTerms, cts.Token).ConfigureAwait(false);
-            }
-            catch
-            {
-                // 联想失败静默保留直接结果，不显示干扰性错误。
-                return;
-            }
-
-            // 按请求身份丢弃迟到响应：seq 不匹配说明用户已输入新查询。
-            if (suggSeq != _suggestionSeq) return;
-            if (cts.IsCancellationRequested) return;
-            if (seq != _searchSeq) return;
-            if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
-
-            // 回到 UI 线程写 Results（GetSuggestionsAsync 的续体在线程池上）。
-            // 无 Application（单元测试）或已在 UI 线程时直接应用——否则整条联想应用路径
-            // 在测试里永远不执行，行身份/闪烁这类回归就没人守。
-            var dispatcher = System.Windows.Application.Current?.Dispatcher;
-            if (dispatcher is null || dispatcher.CheckAccess())
-            {
-                ApplySuggestions();
-                return;
-            }
-
-            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            _ = dispatcher.BeginInvoke(new Action(() =>
-            {
-                try { ApplySuggestions(); }
-                finally { tcs.SetResult(); }
-            }));
-            await tcs.Task.ConfigureAwait(true);
-
-            void ApplySuggestions()
-            {
-                // 重查身份：BeginInvoke 排队期间用户可能又敲了键。
-                if (suggSeq != _suggestionSeq) return;
-                if (seq != _searchSeq) return;
-                if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
-
-                _state.Results = BuildWebRows(directResult, suggestions, webMode);
+                _state.Results = WebSearchCoordinator.BuildWebRows(directResult, suggestions, webMode);
                 _state.StatusMessage = "";
-            }
-        }, cts.Token);
+            });
     }
 #pragma warning restore CS1998
-
-    /// <summary>
-    /// 网页模式结果行：首行直接提交 + 联想行。行身份（RowKey）按槽位而非内容确定——
-    /// 内容每按一键都变，但第 N 行始终是第 N 行，ResultList 才能原地更新而不重建容器
-    /// （重建 = 图标空一帧 = 逐键闪烁）。
-    /// </summary>
-    private static List<SearchResult> BuildWebRows(
-        SearchResult directResult,
-        IReadOnlyList<SuggestionItem> suggestions,
-        WebModeResult webMode)
-    {
-        var rows = new List<SearchResult>(suggestions.Count + 1) { directResult };
-        for (var i = 0; i < suggestions.Count; i++)
-        {
-            var s = suggestions[i];
-            rows.Add(new SearchResult(
-                Kind: "web",
-                Title: s.Text,
-                Subtitle: s.Url,
-                ExecuteId: s.Url,
-                MatchSpans: BuildWebMatchSpans(s.Text, webMode.QueryTerms))
-            {
-                Target = new ActionTarget("web", s.Url),
-                RowKey = $"web:sugg:{webMode.EngineName}:{i}",
-            });
-        }
-        return rows;
-    }
-
-    /// <summary>网页模式标题中查询词的 UTF-16 匹配区间。</summary>
-    private static int[] BuildWebMatchSpans(string title, string terms)
-    {
-        if (string.IsNullOrEmpty(terms))
-            return [];
-        var idx = title.IndexOf(terms, StringComparison.OrdinalIgnoreCase);
-        if (idx < 0)
-            return [];
-        // 转换为 UTF-16 code unit 偏移（与 ipc::match_spans 约定一致）。
-        var start = title[..idx].Length;
-        return [start, terms.Length];
-    }
 
     private static bool QueryMatchesResponse(string requested, string echoed)
     {
