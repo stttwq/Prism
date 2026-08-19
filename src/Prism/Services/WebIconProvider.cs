@@ -29,6 +29,25 @@ public sealed class WebIconProvider
     /// </summary>
     private readonly Dictionary<string, ImageSource> _resolved = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D6: 负缓存——磁盘未命中/损坏的 origin 记为 null 等价物，
+    /// 后续装饰直接回通用图标，不再反复探测磁盘。<see cref="Invalidate"/> 一并清除
+    /// （下载完成后新 favicon 立即可见）。
+    /// </summary>
+    private readonly HashSet<string> _negative = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>在途探测防抖：同一 origin 的后台磁盘探测同时至多一个。</summary>
+    private readonly HashSet<string> _probing = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>后台完成回调与 UI 线程之间的互斥（后台路径读写三个表时用）。</summary>
+    private readonly object _sync = new();
+    /// <summary>测试观测：磁盘探测次数（同一未命中 origin 连续装饰只允许一次）。</summary>
+    private volatile int _diskProbes;
+
+    internal int DiskProbes => _diskProbes;
+    internal bool IsNegativeCached(string origin)
+    {
+        lock (_sync) return _negative.Contains(origin);
+    }
+
     public WebIconProvider(FaviconCache? faviconCache = null, Func<string, bool>? isGranted = null)
     {
         _faviconCache = faviconCache;
@@ -57,11 +76,19 @@ public sealed class WebIconProvider
     /// </summary>
     public void Invalidate()
     {
+        void Clear()
+        {
+            lock (_sync)
+            {
+                _resolved.Clear();
+                _negative.Clear();
+            }
+        }
         var dispatcher = Application.Current?.Dispatcher;
         if (dispatcher is null || dispatcher.CheckAccess())
-            _resolved.Clear();
+            Clear();
         else
-            dispatcher.BeginInvoke(new Action(() => _resolved.Clear()));
+            dispatcher.BeginInvoke((Action)Clear);
     }
 
     /// <summary>
@@ -84,15 +111,45 @@ public sealed class WebIconProvider
             {
                 if (_resolved.TryGetValue(origin, out var hit))
                     return hit;
-                var favicon = _faviconCache.GetFavicon(origin, granted: true);
-                if (favicon is not null)
+                // C-D6: 负缓存的未命中直接回通用图标，不再反复探测磁盘。
+                if (IsNegativeCached(origin))
+                    return _genericIcon;
+                // C-D6: 磁盘加载挪到后台线程（此前 UI 线程同步读盘）；在途探测
+                // 防抖保证同一 origin 至多一个探测。完成后回 UI 线程（无
+                // Dispatcher 的纯逻辑测试则就地）写缓存，下一次装饰自动换上。
+                bool shouldProbe;
+                lock (_sync)
+                    shouldProbe = _probing.Add(origin);
+                if (shouldProbe)
                 {
-                    favicon.Freeze();
-                    _resolved[origin] = favicon;
-                    return favicon;
+                    _diskProbes++;
+                    var cache = _faviconCache;
+                    _ = Task.Run(() =>
+                    {
+                        var favicon = cache.GetFavicon(origin, granted: true);
+                        void Finish()
+                        {
+                            lock (_sync)
+                            {
+                                _probing.Remove(origin);
+                                if (favicon is not null && !_negative.Contains(origin))
+                                {
+                                    favicon.Freeze();
+                                    _resolved[origin] = favicon;
+                                }
+                                else
+                                {
+                                    _negative.Add(origin);
+                                }
+                            }
+                        }
+                        var dispatcher = Application.Current?.Dispatcher;
+                        if (dispatcher is null || dispatcher.CheckAccess())
+                            Finish();
+                        else
+                            dispatcher.BeginInvoke((Action)Finish);
+                    });
                 }
-                // 未命中（尚未下载/损坏）继续回退通用图标；不做负缓存——
-                // 下载完成后无需 Invalidate 也能在下一次装饰时拿到。
             }
         }
 

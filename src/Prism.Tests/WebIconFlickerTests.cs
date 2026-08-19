@@ -218,3 +218,61 @@ public sealed class WebIconKeyTests
         Assert.True(a.IsFrozen);
     }
 }
+
+/// <summary>
+/// AUDIT-2026-08-18 C-D6: favicon 负缓存 + 后台磁盘探测。
+/// 同一未命中 origin 连续装饰只允许一次磁盘探测；命中负缓存后不再探测；
+/// Invalidate 清掉负缓存（下载完成后新 favicon 可见）。
+/// </summary>
+public sealed class WebIconNegativeCacheTests
+{
+    private static FaviconCache NewCache()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "prism-favicon-test-" + Guid.NewGuid().ToString("N"));
+        return new FaviconCache(dir);
+    }
+
+    private static async Task Eventually(Func<bool> condition)
+    {
+        for (var i = 0; i < 200 && !condition(); i++)
+            await Task.Delay(5);
+        Assert.True(condition());
+    }
+
+    [Fact]
+    public async Task Repeated_Decorations_Of_A_Missing_Origin_Probe_Disk_Only_Once()
+    {
+        var p = new WebIconProvider(NewCache(), isGranted: _ => true);
+        var url = "https://example.org/search?q=a";
+
+        // 连续装饰同一个未命中 origin。
+        for (var i = 0; i < 5; i++)
+            p.GetIcon(url);
+
+        // 探测必须收敛为一次，且结果进入负缓存。
+        await Eventually(() => p.IsNegativeCached("https://example.org"));
+        Assert.Equal(1, p.DiskProbes);
+
+        // 负缓存命中后继续装饰：不再有新探测，图标回通用款。
+        for (var i = 0; i < 5; i++)
+            p.GetIcon(url);
+        await Task.Delay(50);
+        Assert.Equal(1, p.DiskProbes);
+    }
+
+    [Fact]
+    public async Task Invalidate_Clears_The_Negative_Cache()
+    {
+        var p = new WebIconProvider(NewCache(), isGranted: _ => true);
+        var url = "https://example.net/search?q=a";
+        p.GetIcon(url);
+        await Eventually(() => p.IsNegativeCached("https://example.net"));
+
+        p.Invalidate();
+        Assert.False(p.IsNegativeCached("https://example.net"));
+
+        // 失效后重新装饰会再探测一次（下载完成后新 favicon 因此可见）。
+        p.GetIcon(url);
+        await Eventually(() => p.DiskProbes >= 2);
+    }
+}
