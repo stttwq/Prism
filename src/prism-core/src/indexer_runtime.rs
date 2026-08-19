@@ -1536,7 +1536,9 @@ fn create_pipe(first: bool) -> std::io::Result<NamedPipeServer> {
     // The pipe handle must be duplex for request/response traffic. Protocol decoding
     // remains read-only, while PIPE_REJECT_REMOTE_CLIENTS keeps authenticated remote
     // users out. AU also covers local launch contexts that do not carry INTERACTIVE.
-    let sddl: Vec<u16> = std::ffi::OsStr::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)")
+    // AUDIT-2026-08-18 R-A2: AU 从 GA（含 WRITE_DAC/OWNER 等危险全权）收窄为
+    // GRGW——连接管道读写数据所需的最小权限；SYSTEM/管理员保留完全控制。
+    let sddl: Vec<u16> = std::ffi::OsStr::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)")
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();

@@ -333,6 +333,98 @@ struct BrokerShared {
     windows: Arc<crate::window_list::WindowSnapshotStore>,
 }
 
+/// 当前进程用户 SID（字符串，如 S-1-5-21-...）。管道 ACL 需要，只取一次。
+fn current_user_sid() -> std::io::Result<&'static str> {
+    use std::sync::OnceLock;
+    static SID: OnceLock<Result<String, std::io::Error>> = OnceLock::new();
+    SID.get_or_init(|| unsafe {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(std::io::Error::other)?;
+        let mut needed = 0u32;
+        // 长度探测调用预期以 ERROR_INSUFFICIENT_BUFFER 失败并回填 needed。
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            return Err(std::io::Error::other("GetTokenInformation sizing failed"));
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .map_err(std::io::Error::other)?;
+        let _ = CloseHandle(token);
+        let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+        let mut sid_string = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut sid_string)
+            .map_err(std::io::Error::other)?;
+        let len = PCWSTR(sid_string.0).len();
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_string.0, len));
+        let _ = LocalFree(HLOCAL(sid_string.0 as _));
+        Ok(sid)
+    })
+    .as_deref()
+    .map_err(std::io::Error::other)
+}
+
+/// 建带 ACL 的 broker 管道实例（AUDIT-2026-08-18 R-A2）。
+///
+/// 此前管道无 ACL：broker 以用户身份执行删除/复制动作，任意本地进程都能
+/// 连上指挥它。现在 DACL 只授 SYSTEM 与当前用户（管理员经 SYSTEM/属主兜底），
+/// 并拒绝远程客户端。SID 获取失败则建管失败——宁可拒开也不裸奔。
+fn create_broker_pipe(pipe_name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, BOOL, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    let sid = current_user_sid()?;
+    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
+    let sddl: Vec<u16> = std::ffi::OsStr::new(&sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: BOOL(0),
+    };
+    let result = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(
+                pipe_name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+    };
+    unsafe {
+        let _ = LocalFree(HLOCAL(descriptor.0));
+    }
+    result
+}
+
 /// 管道服务主循环：创建管道实例 → 等待前端连接 → 交给连接处理器 →
 /// 立刻建下一个实例等待重连。前端崩溃/重启不影响后端。
 ///
@@ -349,9 +441,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     // 首个实例带 first_pipe_instance(true)：创建失败说明管道名已被另一个 broker
     // 持有（真双实例），唯一正确动作是退出并让 main 上报。
-    let first = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(pipe_name)?;
+    let first = create_broker_pipe(pipe_name, true)?;
 
     // One snapshot store for the whole broker: window tokens must stay comparable across
     // reconnects, and it holds only the latest enumeration.
@@ -377,7 +467,7 @@ pub async fn serve(
     // 其余 listener 在启动期一次性补齐：失败不致命（该槽位缺席时其余 listener
     // 照常服务，最坏退化为单 listener，与修复前行为一致）。
     for _ in 1..PIPE_LISTENERS {
-        match ServerOptions::new().create(pipe_name) {
+        match create_broker_pipe(pipe_name, false) {
             Ok(pipe) => {
                 ownership.instances.fetch_add(1, Ordering::Relaxed);
                 listeners.spawn(accept_loop(
@@ -489,10 +579,7 @@ async fn rearm_listener(
             let _guard = ownership.probe_lock.lock().await;
             // 拿到锁后复查：等锁期间兄弟槽位可能已经重建了实例。
             if ownership.instances.load(Ordering::Relaxed) == 0 {
-                return match ServerOptions::new()
-                    .first_pipe_instance(true)
-                    .create(pipe_name)
-                {
+                return match create_broker_pipe(pipe_name, true) {
                     Ok(server) => {
                         ownership.instances.fetch_add(1, Ordering::Relaxed);
                         Ok(server)
@@ -504,7 +591,7 @@ async fn rearm_listener(
                 };
             }
         }
-        match ServerOptions::new().create(pipe_name) {
+        match create_broker_pipe(pipe_name, false) {
             Ok(server) => {
                 ownership.instances.fetch_add(1, Ordering::Relaxed);
                 return Ok(server);
@@ -3697,6 +3784,21 @@ mod pipe_lifecycle_tests {
 
         let server = rearm_listener(&name, &ownership).await.unwrap();
         assert_eq!(ownership.instances.load(Ordering::Relaxed), 2);
+        drop(server);
+    }
+
+    /// R-A2：当前用户 SID 形如 S-1-...（管道 DACL 的原料）。
+    #[test]
+    fn current_user_sid_has_sddl_shape() {
+        let sid = super::current_user_sid().unwrap();
+        assert!(sid.starts_with("S-1-"), "SID 应为字符串形式：{sid}");
+    }
+
+    /// R-A2：带 ACL 管道可正常创建（当前用户 + SYSTEM DACL 不阻碍自身连接）。
+    #[tokio::test]
+    async fn create_broker_pipe_with_acl_succeeds() {
+        let name = temp_pipe("acl");
+        let server = super::create_broker_pipe(&name, true).unwrap();
         drop(server);
     }
 
