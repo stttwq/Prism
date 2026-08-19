@@ -1058,7 +1058,7 @@ async fn acquire_initial_index(
     .await
     .map_err(|error| format!("initial index task: {error}"))?;
 
-    let (descriptors, records_estimate) = match cached {
+    let (descriptors, records_estimate, rebuild_targets, partial_serving) = match cached {
         CachedLoad::Hit { index, descriptors } => {
             // L4：与首建循环的 stop 检查对称。停机请求已到达时不再发布缓存索引：
             // 发布会连带拼音加载，run() 的关停路径还会把刚从盘上读入的索引再做一次
@@ -1083,21 +1083,67 @@ async fn acquire_initial_index(
                 interrupted: false,
             });
         }
+        // S2: 部分命中——可回放卷先发布 + 起 watcher（与首建循环同款逐卷合并），
+        // 重建卷走下方首建循环。R2 门照常保持关闭：全部卷（含重建）落定前不写 v5。
+        CachedLoad::Partial {
+            volumes,
+            descriptors,
+            rebuild,
+            records_estimate,
+        } => {
+            if stop.is_requested() {
+                return Ok(InitialIndex {
+                    descriptors,
+                    watchers_started: false,
+                    interrupted: true,
+                });
+            }
+            let replay_descriptors: Vec<VolumeDescriptor> = descriptors
+                .iter()
+                .filter(|descriptor| {
+                    !rebuild
+                        .iter()
+                        .any(|target| target.id == descriptor.id)
+                })
+                .cloned()
+                .collect();
+            for volume in &volumes {
+                state.merge_and_publish(volume.clone());
+                state.progress.volume_done();
+            }
+            start_watchers(
+                state.clone(),
+                replay_descriptors,
+                stop.clone(),
+                epoch.clone(),
+                rebuild_tx.clone(),
+            );
+            log(format!(
+                "partial cache hit: serving {} replayable volume(s) while rebuilding",
+                volumes.len()
+            ));
+            let served = !volumes.is_empty();
+            (descriptors, records_estimate, rebuild, served)
+        }
         CachedLoad::Miss {
             descriptors,
             records_estimate,
-        } => (descriptors, records_estimate),
+        } => {
+            let rebuild = descriptors.clone();
+            (descriptors, records_estimate, rebuild, false)
+        }
     };
 
     if descriptors.is_empty() {
         return Err("no local fixed NTFS volumes were found".into());
     }
 
-    state.progress.begin(descriptors.len(), records_estimate);
+    // S2: 只重建需要重建的卷（Miss = 全部；Partial = 坏卷 + 新卷）。
+    state.progress.begin(rebuild_targets.len(), records_estimate);
     // 二次重试后仍失败的卷：跳过并记录，绝不拖垮其余卷（全部失败才算真失败）。
     let mut failed_volumes: Vec<String> = Vec::new();
 
-    for descriptor in &descriptors {
+    for descriptor in &rebuild_targets {
         if stop.is_requested() {
             log("first build stopped before completion; no v5 cache was written");
             return Ok(InitialIndex {
@@ -1158,8 +1204,9 @@ async fn acquire_initial_index(
         log(format!("first build published {}", descriptor.mount_path));
     }
 
-    // 全部卷都失败：没有任何可服务的索引，交回真失败（SCM 兜底重启）。
-    if failed_volumes.len() >= descriptors.len() {
+    // 全部重建卷都失败且没有部分命中的卷在服务：没有任何可服务的索引，交回真失败
+    // （SCM 兜底重启）。部分命中仍在服务时只记录降级，不退出。
+    if failed_volumes.len() >= rebuild_targets.len() && !partial_serving {
         return Err(format!(
             "every volume build failed: {}",
             failed_volumes.join("; ")
@@ -1249,12 +1296,60 @@ enum CachedLoad {
         index: IndexState,
         descriptors: Vec<VolumeDescriptor>,
     },
+    /// S2（FRESH-AUDIT-2026-08-19）: 部分命中——可回放卷直接服务 + 起 watcher，
+    /// 坏卷/新卷走首建循环。此前任一卷失配即整份弃缓全盘重扫（Everything 的
+    /// 语义是"fast reindexing"只重建受影响卷）。
+    Partial {
+        /// 校验通过、可直接发布的卷（已刷新 mount_path）。
+        volumes: Vec<VolumeIndex>,
+        /// 现场全部卷描述符。
+        descriptors: Vec<VolumeDescriptor>,
+        /// 需走首建循环的卷描述符（坏卷 + 现场新卷）。
+        rebuild: Vec<VolumeDescriptor>,
+        /// 进度分母用（沿用 Miss 的口径）。
+        records_estimate: Option<u64>,
+    },
     Miss {
         descriptors: Vec<VolumeDescriptor>,
         /// Record count from the rejected cache, if any, used only as a progress
         /// denominator. A first install has none and reports volume counts alone.
         records_estimate: Option<u64>,
     },
+}
+
+/// S2: 纯集合判定——缓存卷集合 vs 现场描述符集合。
+/// 返回（匹配对（缓存卷, 现场下标）, 需重建描述符, 缓存多余卷）。
+/// journal 可回放性探测由调用方对匹配对逐一执行（真实 I/O 不进纯函数，可测）。
+fn partition_volume_sets(
+    cached: Vec<VolumeIndex>,
+    descriptors: &[VolumeDescriptor],
+) -> (
+    Vec<(VolumeIndex, usize)>,
+    Vec<VolumeDescriptor>,
+    Vec<VolumeIndex>,
+) {
+    let mut matched = Vec::new();
+    let mut rebuild = Vec::new();
+    let mut dropped = Vec::new();
+    let mut consumed = vec![false; descriptors.len()];
+    for volume in cached {
+        match descriptors
+            .iter()
+            .position(|candidate| candidate.id == volume.volume_id)
+        {
+            Some(position) => {
+                consumed[position] = true;
+                matched.push((volume, position));
+            }
+            None => dropped.push(volume), // 缓存有、现场无：卷已卸载，静默丢弃
+        }
+    }
+    for (position, descriptor) in descriptors.iter().enumerate() {
+        if !consumed[position] {
+            rebuild.push(descriptor.clone()); // 现场新增卷
+        }
+    }
+    (matched, rebuild, dropped)
 }
 
 /// Discovers fixed NTFS volumes with the system volume first (R3).
@@ -1277,19 +1372,60 @@ fn load_cached(data_dir: &std::path::Path) -> CachedLoad {
     // The cache is read once here: on a hit it becomes the live index, and on a stale
     // miss its record count is the only available estimate for progress reporting.
     if let Ok(mut index) = index_cache::load(data_dir) {
-        if validate_checkpoints(&mut index, &descriptors).is_ok() {
-            index.events_since_checkpoint = 0;
-            return CachedLoad::Hit { index, descriptors };
-        }
-        log("v5 cache checkpoint is stale; rebuilding while old state remains unpublished");
-        let records = index
+        let total_cached_records = index
             .volumes
             .iter()
             .map(|volume| volume.nodes.len() as u64)
             .sum::<u64>();
-        return CachedLoad::Miss {
+        // S2: 逐卷判定。匹配卷探测 journal 可回放性；坏卷与新卷进重建列表；
+        // 已卸载的缓存卷直接丢弃。全部可回放 = Hit，部分 = Partial，全坏 = Miss。
+        let (matched, mut rebuild, _dropped) =
+            partition_volume_sets(std::mem::take(&mut index.volumes), &descriptors);
+        let mut replayable = Vec::with_capacity(matched.len());
+        for (mut volume, position) in matched {
+            let descriptor = &descriptors[position];
+            let replayable_journal = ntfs::open_volume(descriptor, false)
+                .and_then(|handle| ntfs::query_journal(&handle))
+                .is_ok_and(|journal| {
+                    journal.journal_id == volume.journal_id
+                        && volume.next_usn >= journal.first_usn
+                });
+            if replayable_journal {
+                volume.mount_path.clone_from(&descriptor.mount_path);
+                replayable.push(volume);
+            } else {
+                rebuild.push(descriptor.clone());
+            }
+        }
+        if replayable.is_empty() {
+            log("v5 cache has no replayable volume; rebuilding while old state remains unpublished");
+            return CachedLoad::Miss {
+                descriptors,
+                records_estimate: (total_cached_records > 0).then_some(total_cached_records),
+            };
+        }
+        if rebuild.is_empty() {
+            let mut hit_index = IndexState {
+                volumes: replayable,
+                generation: index.generation,
+                events_since_checkpoint: 0,
+            };
+            hit_index.generation = hit_index.generation.max(1);
+            return CachedLoad::Hit {
+                index: hit_index,
+                descriptors,
+            };
+        }
+        log(format!(
+            "v5 cache partial hit: {} replayable volume(s), rebuilding {}",
+            replayable.len(),
+            rebuild.len()
+        ));
+        return CachedLoad::Partial {
+            volumes: replayable,
             descriptors,
-            records_estimate: (records > 0).then_some(records),
+            rebuild,
+            records_estimate: (total_cached_records > 0).then_some(total_cached_records),
         };
     }
     CachedLoad::Miss {
@@ -1369,28 +1505,6 @@ fn build_all() -> Result<(IndexState, Vec<VolumeDescriptor>), String> {
         },
         descriptors,
     ))
-}
-
-fn validate_checkpoints(
-    index: &mut IndexState,
-    descriptors: &[VolumeDescriptor],
-) -> Result<(), String> {
-    if index.volumes.len() != descriptors.len() {
-        return Err("fixed NTFS volume set changed".into());
-    }
-    for volume in &mut index.volumes {
-        let descriptor = descriptors
-            .iter()
-            .find(|candidate| candidate.id == volume.volume_id)
-            .ok_or("cached volume identity is no longer mounted")?;
-        let handle = ntfs::open_volume(descriptor, false)?;
-        let journal = ntfs::query_journal(&handle)?;
-        if journal.journal_id != volume.journal_id || volume.next_usn < journal.first_usn {
-            return Err("cached USN checkpoint is no longer replayable".into());
-        }
-        volume.mount_path.clone_from(&descriptor.mount_path);
-    }
-    Ok(())
 }
 
 fn start_watchers(
@@ -1922,6 +2036,77 @@ mod tests {
     use crate::hierarchy::VolumeId;
     use crate::indexer_ipc::{MAX_FILTERS, MAX_FILTER_VALUE_BYTES, MAX_SEARCH_RESULTS};
     use crate::root_scope::RootRejection;
+
+    // --- S2（FRESH-AUDIT-2026-08-19）: 缓存按卷生效 -----------------------------
+
+    fn volume_with_id(tag: &str, mount: &str, name: &str, id: VolumeId) -> VolumeIndex {
+        let mut volume = test_volume(tag, mount, name);
+        volume.volume_id = id;
+        volume
+    }
+
+    /// 缓存 2 卷、现场 3 卷：2 匹配 + 新卷 E 进重建列表，无丢弃。
+    #[test]
+    fn s2_partition_two_cached_three_live() {
+        let descriptors = vec![descriptor('C'), descriptor('D'), descriptor('E')];
+        let cached = vec![
+            volume_with_id("a", "C:\\", "one.txt", descriptors[0].id.clone()),
+            volume_with_id("b", "D:\\", "two.txt", descriptors[1].id.clone()),
+        ];
+        let (matched, rebuild, dropped) =
+            partition_volume_sets(cached, &descriptors);
+        assert_eq!(matched.len(), 2);
+        assert_eq!(rebuild.len(), 1, "现场新增卷必须进重建列表");
+        assert_eq!(rebuild[0].id, descriptors[2].id);
+        assert!(dropped.is_empty());
+    }
+
+    /// 缓存 3 卷、现场 2 卷：2 匹配 + 1 丢弃（已卸载），重建列表为空。
+    #[test]
+    fn s2_partition_three_cached_two_live() {
+        let descriptors = vec![descriptor('C'), descriptor('D')];
+        let removed = descriptor('Z');
+        let cached = vec![
+            volume_with_id("a", "C:\\", "one.txt", descriptors[0].id.clone()),
+            volume_with_id("b", "D:\\", "two.txt", descriptors[1].id.clone()),
+            volume_with_id("z", "Z:\\", "gone.txt", removed.id.clone()),
+        ];
+        let (matched, rebuild, dropped) = partition_volume_sets(cached, &descriptors);
+        assert_eq!(matched.len(), 2);
+        assert!(rebuild.is_empty(), "没有新增卷则无需重建");
+        assert_eq!(dropped.len(), 1, "已卸载卷直接丢弃");
+        assert_eq!(dropped[0].volume_id, removed.id);
+    }
+
+    /// 完全不相交：全部现场卷重建，全部缓存卷丢弃。
+    #[test]
+    fn s2_partition_disjoint_sets_rebuild_everything() {
+        let descriptors = vec![descriptor('C')];
+        let cached = vec![volume_with_id(
+            "z",
+            "Z:\\",
+            "gone.txt",
+            descriptor('Z').id,
+        )];
+        let (matched, rebuild, dropped) = partition_volume_sets(cached, &descriptors);
+        assert!(matched.is_empty());
+        assert_eq!(rebuild.len(), 1);
+        assert_eq!(dropped.len(), 1);
+    }
+
+    /// 部分命中发布后：building 标志保持（R2 门未过）、两卷都可搜。
+    #[test]
+    fn s2_partial_publish_keeps_building_gate_and_serves_both_volumes() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "keep.txt"));
+        state.merge_and_publish(test_volume("v2", "D:\\", "keep2.txt"));
+        assert!(state.status().ready);
+        assert!(state.status().building, "重建未全部落定前 R2 门保持关闭");
+        assert!(!state.first_build_is_complete());
+        assert!(state
+            .search("keep", 8, None, None)
+            .is_ok_and(|r| matches!(r, IndexerResponse::Results { ref items, .. } if items.len() == 2)));
+    }
 
     fn test_volume(guid: &str, mount_path: &str, name: &str) -> VolumeIndex {
         let mut volume = VolumeIndex::new(
