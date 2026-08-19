@@ -128,7 +128,10 @@ pub fn redacted_id(message: &str) -> String {
 /// Paths without a user directory (e.g. `C:/ProgramData/Prism`) are preserved.
 pub fn sanitize(text: &str) -> String {
     let normalized = text.replace('\\', "/");
-    if normalized.len() < 12 {
+    // FRESH-AUDIT-2 G1: 旧阈值 12 + 模式条件 i+10<len 连手漏掉短用户名：
+    // "C:/Users/j"（10 字节，单字符用户名无尾斜杠）完全不脱敏。模式最小长度
+    // 是 10（盘符+":/Users/"+至少 1 字节用户名），短于它才可安全跳过。
+    if normalized.len() < 10 {
         return normalized;
     }
     // Match patterns like "C:/Users/XXX/" (any single drive letter).
@@ -139,7 +142,8 @@ pub fn sanitize(text: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         // Look for "<letter>:/Users/" at position i.
-        if i + 10 < bytes.len()
+        // 模式共 9 字节 + 至少 1 字节用户名：i+10 <= len 即可，不要求尾随字节。
+        if i + 10 <= bytes.len()
             && bytes[i + 1] == b':'
             && bytes[i + 2] == b'/'
             && &bytes[i + 3..i + 9] == b"Users/"
@@ -294,6 +298,14 @@ mod tests {
     fn panic_event_survives_a_missing_location_or_payload() {
         let text = panic_event(None, None);
         assert_eq!(text, "panic at unknown no_payload");
+    }
+
+    /// FRESH-AUDIT-2 G1: 12 字节阈值漏掉的短用户名（恰 11 字节的 "C:/Users/j"）。
+    #[test]
+    fn sanitize_redacts_single_char_username_without_trailing_slash() {
+        assert_eq!(sanitize(r"C:\Users\j"), "C:/Users/<user>");
+        assert_eq!(sanitize("C:/Users/ab"), "C:/Users/<user>");
+        assert_eq!(sanitize("short text"), "short text");
     }
 
     #[test]

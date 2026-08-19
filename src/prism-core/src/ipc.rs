@@ -2202,8 +2202,12 @@ fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
     let mut indices: Vec<usize> = (0..items.len()).collect();
     indices.sort_by(|&a, &b| {
+        // FRESH-AUDIT-2 G1: 无元数据项（注入候选等）不参与 kind 竞争——
+        // Option 的 None < Some 会把它们排到最前，反超真实命中，改为垫底。
         metadata_kind(&items[a])
-            .cmp(&metadata_kind(&items[b]))
+            .is_none()
+            .cmp(&metadata_kind(&items[b]).is_none())
+            .then_with(|| metadata_kind(&items[a]).cmp(&metadata_kind(&items[b])))
             .then_with(|| match picks {
                 Some(picks) => picks[b].cmp(&picks[a]),
                 None => std::cmp::Ordering::Equal,
@@ -2905,6 +2909,27 @@ mod protocol_tests {
         let json = serde_json::to_value(item).unwrap();
         assert_eq!(json["target"]["kind"], "file");
         assert_eq!(json["target"]["value"], r"C:\x");
+    }
+
+    /// FRESH-AUDIT-2 G1: 无匹配元数据的注入项排在真实命中之后，而不是反超到最前。
+    #[test]
+    fn sort_places_items_without_match_metadata_last() {
+        let item = |title: &str, metadata: Option<MatchMetadata>| SearchResult {
+            kind: SearchResultKind::File,
+            title: title.into(),
+            subtitle: "C:\\x".into(),
+            execute_id: "C:\\x".into(),
+            target: ActionTarget::new(TargetKind::File, "C:\\x"),
+            match_spans: Vec::new(),
+            match_metadata: metadata,
+        };
+        let mut items = vec![
+            item("injected", None),
+            item("needle.txt", rank_title("needle.txt", "ne")),
+        ];
+        sort_search_results(&mut items);
+        assert_eq!(&*items[0].title, "needle.txt");
+        assert_eq!(&*items[1].title, "injected");
     }
 
     #[test]
