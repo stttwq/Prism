@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -161,9 +161,31 @@ pub struct ServiceState {
     pinyin_data_dir: RwLock<Option<PathBuf>>,
     pinyin_needs_rebuild: AtomicBool,
     pinyin_enabled: AtomicBool,
+    /// AUDIT-2026-08-18 R-A3: 活跃连接数。每个连接一个 tokio 任务 + 1MB 行缓冲，
+    /// 无上限时任凭本地进程堆积连接即可耗尽 2 worker 的 runtime。
+    connections: AtomicUsize,
 }
 
 impl ServiceState {
+    /// AUDIT-2026-08-18 R-A3: 并发连接上限。超出者在握手前直接关闭——
+    /// 正常部署只有 broker 一条长连接 + 少量世代客户端，64 已是宽裕上限。
+    const MAX_CONNECTIONS: usize = 64;
+
+    /// 连接准入：计数未超上限则占一席并返回 true。配对的 `release_connection`
+    /// 由连接任务结束时调用。超限返回 false，调用方直接断开（握手前）。
+    fn try_admit_connection(&self) -> bool {
+        let current = self.connections.fetch_add(1, Ordering::AcqRel);
+        if current >= Self::MAX_CONNECTIONS {
+            self.connections.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn release_connection(&self) {
+        self.connections.fetch_sub(1, Ordering::AcqRel);
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             index: RwLock::new(None),
@@ -178,6 +200,7 @@ impl ServiceState {
             pinyin_data_dir: RwLock::new(None),
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
+            connections: AtomicUsize::new(0),
         })
     }
 
@@ -1492,9 +1515,20 @@ async fn accept_loop(state: Arc<ServiceState>, mut server: NamedPipeServer) -> R
         server.connect().await.map_err(|error| error.to_string())?;
         let connected = server;
         server = rearm_with_backoff().await?;
+        // R-A3：超限连接握手前直接关闭，不产生任务与行缓冲。
+        if !state.try_admit_connection() {
+            log(format!(
+                "indexer pipe connection rejected: over {} concurrent connections",
+                ServiceState::MAX_CONNECTIONS
+            ));
+            drop(connected);
+            continue;
+        }
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(connected, state).await {
+            let result = handle_connection(connected, state.clone()).await;
+            state.release_connection();
+            if let Err(error) = result {
                 log(format!("indexer IPC client disconnected: {error}"));
             }
         });
@@ -2328,6 +2362,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AUDIT-2026-08-18 R-A3: 前 64 个连接准入，第 65 个被拒；
+    /// 释放后席位恢复。超限连接在握手前即被断开，不产生任务。
+    #[test]
+    fn connection_admission_enforces_the_cap() {
+        let state = ServiceState::new();
+        for i in 0..ServiceState::MAX_CONNECTIONS {
+            assert!(
+                state.try_admit_connection(),
+                "connection {i} must be admitted"
+            );
+        }
+        assert!(
+            !state.try_admit_connection(),
+            "connection beyond the cap must be rejected"
+        );
+        state.release_connection();
+        assert!(
+            state.try_admit_connection(),
+            "released seat must be reusable"
+        );
+        state.release_connection();
     }
 
     /// AUDIT-2026-08-18 R-A1: 不匹配的协议版本必须返回结构化 `protocol_mismatch`
