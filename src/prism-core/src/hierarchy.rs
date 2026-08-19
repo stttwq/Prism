@@ -382,6 +382,15 @@ impl VolumeIndex {
         Ok(())
     }
 
+    /// M1（FRESH-AUDIT-2026-08-19）: 首建前按实测名字总字节预留 names 容量。
+    /// 此前 names 靠 upsert 里的 extend_from_slice 摊销倍增增长——60MB 的池在
+    /// 扩容瞬间会再要一份 120MB（峰值尖峰）。枚举完成时记录数与池大小都已知，
+    /// min(池大小, 记录数×64) 封顶防止病态长名池过度预留。
+    pub(crate) fn reserve_names_capacity(&mut self, estimate_bytes: usize) {
+        self.names
+            .reserve(estimate_bytes.saturating_sub(self.names.len()));
+    }
+
     pub fn split_frn(frn: u64) -> Result<(u32, u16), String> {
         let record = frn & 0x0000_ffff_ffff_ffff;
         if record > u32::MAX as u64 {
@@ -1604,6 +1613,38 @@ mod tests {
             assert_eq!(s.path, p.path);
             assert!(p.path.ends_with("sub\\") || p.path.contains("sub\\"), "{}", p.path);
         }
+    }
+
+    /// M1: 预留名字池容量后，写入不超过预留量的名字不得触发再扩容
+    /// （capacity 在 upsert 前后保持不变——倍增尖峰被消除的直接锚定）。
+    #[test]
+    fn m1_reserved_names_capacity_absorbs_upserts_without_regrowth() {
+        let mut volume = volume();
+        volume
+            .upsert(frn(10, 1), frn(5, 0), "dir", true)
+            .unwrap();
+        let estimate = 64 * 1024;
+        volume.reserve_names_capacity(estimate);
+        let capacity_after_reserve = volume.names.capacity();
+        assert!(capacity_after_reserve >= estimate);
+
+        let mut written = 0usize;
+        let mut record = 11u32;
+        while written + 32 < estimate {
+            let name = format!("f-{record:07}.dat");
+            volume
+                .upsert(frn(record, 1), frn(10, 1), &name, false)
+                .unwrap();
+            written += name.len() + 1;
+            record += 1;
+        }
+
+        assert_eq!(
+            volume.names.capacity(),
+            capacity_after_reserve,
+            "预留量内的写入不得触发再扩容"
+        );
+        assert!(volume.names.len() > estimate / 2, "布景应确实写入大量名字");
     }
 
     /// N2 实测基准（手动跑）：单卷 1.2M 记录的串行 vs 并行全扫延迟。

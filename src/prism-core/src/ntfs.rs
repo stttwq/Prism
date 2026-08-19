@@ -425,6 +425,9 @@ mod platform {
             .map(|record| VolumeIndex::split_frn(record.frn).map(|value| value.0))
             .try_fold(root_record, |acc, item| item.map(|value| acc.max(value)))?;
         volume.prepare_initial_capacity(max_record, raw_records.len())?;
+        // M1（FRESH-AUDIT-2026-08-19）: 枚举完成时名字总字节已知，预留 names
+        // 容量消除 upsert 循环的倍增扩容尖峰；记录数×64 封顶防病态长名池。
+        volume.reserve_names_capacity(name_pool.len().min(raw_records.len() * 64));
         let mut pending = raw_records;
         pending.sort_by_key(|record| {
             VolumeIndex::split_frn(record.frn)
