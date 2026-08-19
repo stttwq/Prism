@@ -165,8 +165,9 @@ public partial class App : Application
             win.HideAnimated();
         else
             win.ShowAndFocus();
-        // AUDIT-2026-08-18 C-D3: 呼出/隐藏时幂等重装低级键盘钩子，
-        // 应对系统因回调超时静默摘除钩子后无法恢复。
+        // AUDIT-2026-08-18 C-D3: 呼出/隐藏时顺手重装低级键盘钩子，系统因回调超时
+        // 摘钩后不必等 60s 定时器兜底——托盘呼出立刻自愈。重装本身被投递到钩子线程，
+        // 不在 UI 线程上装钩（见 HotkeyService 的线程说明）。
         _hotkey?.RefreshHook();
     }
 

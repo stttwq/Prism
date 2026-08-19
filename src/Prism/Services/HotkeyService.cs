@@ -40,12 +40,13 @@ public sealed class HotkeyService : IDisposable
 
     // ── State ──────────────────────────────────────────────────────────────
     private LowLevelKeyboardProc? _hookProc; // keep-alive: GC must not collect the delegate
-    private IntPtr _hook;
+    internal IntPtr _hook;
     private HwndSource? _msgWindow;
     private HotkeyMode _mode;
 
     // Double-Ctrl detection state
     private long _lastCtrlUpMs = -1;
+    internal volatile int _callbackCount;
     private bool _ctrlDown;
     private bool _otherKeyPressed;
     private const int DoubleClickMs = 400;
@@ -53,12 +54,22 @@ public sealed class HotkeyService : IDisposable
     private long _ctrlDownMs;
 
     /// <summary>
-    /// AUDIT-2026-08-18 C-D3: 低级键盘钩子被系统超时摘除后无自检重装。
-    /// 定时器 60s 兜底重装（幂等：UnhookEx + SetWindowsHookEx），
-    /// 窗口 show/hide 也可主动调 RefreshHook 立即重装。
+    /// WH_KEYBOARD_LL 的回调由系统投递到「安装钩子的那个线程」的消息队列，
+    /// 该线程必须有消息循环，否则每次按键都要等 LowLevelHooksTimeout（默认 ~300ms）
+    /// 超时，表现为全局输入卡顿 + 双击 Ctrl 完全失效。
+    /// 因此钩子跑在专用泵线程上：既不能装在线程池线程（无消息循环），
+    /// 也不装在 UI 线程（与 WPF 布局/渲染/搜索抢同一个泵，忙时回调超时会被系统摘除）。
+    /// </summary>
+    private System.Threading.Thread? _hookThread;
+    private System.Windows.Threading.Dispatcher? _hookDispatcher;
+
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D3: 低级键盘钩子被系统超时摘除后无自检重装，
+    /// 60s 定时器兜底重装（幂等：UnhookEx + SetWindowsHookEx）。
     /// </summary>
     private System.Threading.Timer? _hookRefreshTimer;
     private const int HookRefreshIntervalMs = 60_000;
+    private volatile bool _disposed;
 
     /// <summary>呼出事件，在 UI 线程触发。</summary>
     public event Action? Triggered;
@@ -81,55 +92,90 @@ public sealed class HotkeyService : IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         Uninstall();
-        _hookRefreshTimer?.Dispose();
-        _hookRefreshTimer = null;
+        _hookDispatcher?.InvokeShutdown();
+        _hookDispatcher = null;
+        _hookThread = null;
     }
 
     /// <summary>
-    /// AUDIT-2026-08-18 C-D3: 幂等重装低级键盘钩子。系统在回调超时
-    /// （LowLevelHooksTimeout，默认 ~300ms）后会静默 unhook，用户无感知。
-    /// 周期重装确保钩子存活。仅对 DoubleCtrl 模式有效。
+    /// 幂等重装低级键盘钩子，仅 DoubleCtrl 模式有效。呼出/隐藏时调用，
+    /// 系统摘钩后无需等 60s 定时器。实际安装被投递到钩子线程。
     /// </summary>
     public void RefreshHook()
     {
-        if (_mode != HotkeyMode.DoubleCtrl) return;
-        if (_hook != IntPtr.Zero)
-        {
-            UnhookWindowsHookEx(_hook);
-            _hook = IntPtr.Zero;
-        }
-        InstallLowLevelHook();
+        if (_mode == HotkeyMode.DoubleCtrl) InstallLowLevelHook();
     }
 
     private void StartHookRefresh()
     {
         _hookRefreshTimer?.Dispose();
+        // 兜底重装必须回到钩子线程执行（线程池线程装的钩子收不到回调）。
         _hookRefreshTimer = new System.Threading.Timer(
-            _ => RefreshHook(), null, HookRefreshIntervalMs, HookRefreshIntervalMs);
+            _ => InstallLowLevelHook(), null, HookRefreshIntervalMs, HookRefreshIntervalMs);
     }
 
     // ── Low-level hook (DoubleCtrl) ────────────────────────────────────────
 
-    private void InstallLowLevelHook()
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D3: 幂等（重）装低级键盘钩子。系统在回调超时
+    /// （LowLevelHooksTimeout，默认 ~300ms）后会静默 unhook，用户无感知，
+    /// 所以 60s 周期重装兜底。始终在专用钩子线程上执行。
+    /// </summary>
+    internal void InstallLowLevelHook()
     {
-        _hookProc = HookCallback;
-        // 低级键盘钩子的 hMod 传当前 exe 的模块句柄即可（GetModuleHandle(null)），
-        // 省去 Process/MainModule 的创建与释放，避免每次 Apply 泄漏 Process 对象。
-        _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
-        if (_hook == IntPtr.Zero)
+        // Dispose 与仍在飞的 timer 回调有竞争：不拦住的话回调会重建一个没人再摘的钩子。
+        if (_disposed) return;
+        EnsureHookThread();
+        _hookDispatcher?.InvokeAsync(() =>
         {
-            // 双击 Ctrl 本就是兜底模式，无可再降级——但绝不能静默死亡：
-            // 至少留下可诊断的痕迹（DebugView / 调试器输出）。
-            System.Diagnostics.Debug.WriteLine(
-                "[Prism] 低级键盘钩子安装失败，双击 Ctrl 呼出将不可用（Apply 重新应用可恢复）");
-        }
+            if (_hook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_hook);
+                _hook = IntPtr.Zero;
+            }
+            _hookProc = HookCallback;
+            // 低级键盘钩子的 hMod 传当前 exe 的模块句柄即可（GetModuleHandle(null)），
+            // 省去 Process/MainModule 的创建与释放，避免每次 Apply 泄漏 Process 对象。
+            _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
+            if (_hook == IntPtr.Zero)
+            {
+                // 双击 Ctrl 本就是兜底模式，无可再降级——但绝不能静默死亡：
+                // 至少留下可诊断的痕迹（DebugView / 调试器输出）。
+                System.Diagnostics.Debug.WriteLine(
+                    "[Prism] 低级键盘钩子安装失败，双击 Ctrl 呼出将不可用（Apply 重新应用可恢复）");
+            }
+        });
+    }
+
+    /// <summary>钩子专用泵线程：只跑 Dispatcher 循环，回调不与 WPF UI 抢同一个消息泵。</summary>
+    private void EnsureHookThread()
+    {
+        if (_hookDispatcher is not null) return;
+        using var ready = new System.Threading.ManualResetEventSlim(false);
+        _hookThread = new System.Threading.Thread(() =>
+        {
+            _hookDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            ready.Set();
+            System.Windows.Threading.Dispatcher.Run();
+        })
+        {
+            IsBackground = true,
+            Name = "PrismHotkeyHook",
+        };
+        _hookThread.SetApartmentState(System.Threading.ApartmentState.STA);
+        _hookThread.Start();
+        ready.Wait();
     }
 
     private IntPtr HookCallback(int code, IntPtr w, IntPtr l)
     {
         if (code >= 0)
         {
+            // 回调计数：钩子若装在没有消息泵的线程上，句柄非零但这里一次都不会执行。
+            // HotkeyHookThreadTests 靠它证伪「装错线程」，别的地方不读。
+            _callbackCount++;
             var kb = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(l);
             // 低级钩子里左右 Ctrl 是 0xA2/0xA3，通用 0x11 很少出现。
             bool isCtrl = kb.vkCode is VK_CONTROL or VK_LCONTROL or VK_RCONTROL;
@@ -231,14 +277,19 @@ public sealed class HotkeyService : IDisposable
     {
         _hookRefreshTimer?.Dispose();
         _hookRefreshTimer = null;
-        if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
+        // 摘钩必须回到装钩的线程上执行，否则句柄留在系统里继续吃按键。
+        if (_hook != IntPtr.Zero && _hookDispatcher is not null)
+            _hookDispatcher.Invoke(() =>
+            {
+                if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
+                _hookProc = null;
+            });
         if (_msgWindow is not null)
         {
             UnregisterHotKey(_msgWindow.Handle, HOTKEY_ID);
             _msgWindow.Dispose();
             _msgWindow = null;
         }
-        _hookProc = null;
         _lastCtrlUpMs = -1;
         _ctrlDown = false;
     }
