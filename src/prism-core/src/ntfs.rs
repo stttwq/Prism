@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hierarchy::{ApplyOutcome, VolumeId, VolumeIndex};
+use crate::hierarchy::{ApplyOutcome, VolumeError, VolumeId, VolumeIndex};
 use crate::log;
 
 pub const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
@@ -170,65 +170,68 @@ fn apply_records_inner(
     next_usn: i64,
     tolerate_unreachable: bool,
 ) -> Result<(ApplyOutcome, usize), String> {
-    let snapshot = volume.snapshot_mutations(records.iter().map(|record| record.frn))?;
-    let result = (|| {
-        let mut pending = BTreeMap::<u32, &UsnRecord>::new();
-        for record in records {
-            let record_number = VolumeIndex::split_frn(record.frn)?.0;
-            // A later event for the same slot supersedes an earlier deferred create/rename.
-            pending.remove(&record_number);
-            if record.reason & USN_REASON_FILE_DELETE != 0 {
-                // Delete is terminal when NTFS coalesces several reasons into one record.
-                volume.delete(record.frn)?;
-            } else if record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
-                match volume.upsert(
-                    record.frn,
-                    record.parent_frn,
-                    &record.name,
-                    record.is_directory,
-                ) {
-                    Ok(ApplyOutcome::Applied) => {}
-                    Ok(ApplyOutcome::RebuildRequired) => {
-                        return Ok((ApplyOutcome::RebuildRequired, 0));
+        let snapshot = volume.snapshot_mutations(records.iter().map(|record| record.frn))?;
+        let result = (|| {
+            let mut pending = BTreeMap::<u32, &UsnRecord>::new();
+            for record in records {
+                let record_number = VolumeIndex::split_frn(record.frn)?.0;
+                // A later event for the same slot supersedes an earlier deferred create/rename.
+                pending.remove(&record_number);
+                if record.reason & USN_REASON_FILE_DELETE != 0 {
+                    // Delete is terminal when NTFS coalesces several reasons into one record.
+                    volume.delete(record.frn).map_err(|e| e.to_string())?;
+                } else if record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
+                    match volume.upsert(
+                        record.frn,
+                        record.parent_frn,
+                        &record.name,
+                        record.is_directory,
+                    ) {
+                        Ok(ApplyOutcome::Applied) => {}
+                        Ok(ApplyOutcome::RebuildRequired) => {
+                            return Ok((ApplyOutcome::RebuildRequired, 0));
+                        }
+                        // F9: 类型化匹配取代文案前缀——父未到场的乱序是延迟重试，不是重建。
+                        Err(
+                            VolumeError::BrokenParentChain { .. },
+                        ) => {
+                            pending.insert(record_number, record);
+                        }
+                        Err(error) => return Err(error.to_string()),
                     }
-                    Err(error) if error.starts_with("broken parent chain") => {
-                        pending.insert(record_number, record);
+                }
+                // RENAME_OLD carries the old name. The following RENAME_NEW updates the same slot.
+            }
+
+            loop {
+                let before = pending.len();
+                let deferred = std::mem::take(&mut pending);
+                for (record_number, record) in deferred {
+                    match volume.upsert(
+                        record.frn,
+                        record.parent_frn,
+                        &record.name,
+                        record.is_directory,
+                    ) {
+                        Ok(ApplyOutcome::Applied) => {}
+                        Ok(ApplyOutcome::RebuildRequired) => {
+                            return Ok((ApplyOutcome::RebuildRequired, 0));
+                        }
+                        Err(VolumeError::BrokenParentChain { .. }) => {
+                            pending.insert(record_number, record);
+                        }
+                        Err(error) => return Err(error.to_string()),
                     }
-                    Err(error) => return Err(error),
+                }
+                if pending.is_empty() || pending.len() == before {
+                    break;
                 }
             }
-            // RENAME_OLD carries the old name. The following RENAME_NEW updates the same slot.
-        }
 
-        loop {
-            let before = pending.len();
-            let deferred = std::mem::take(&mut pending);
-            for (record_number, record) in deferred {
-                match volume.upsert(
-                    record.frn,
-                    record.parent_frn,
-                    &record.name,
-                    record.is_directory,
-                ) {
-                    Ok(ApplyOutcome::Applied) => {}
-                    Ok(ApplyOutcome::RebuildRequired) => {
-                        return Ok((ApplyOutcome::RebuildRequired, 0));
-                    }
-                    Err(error) if error.starts_with("broken parent chain") => {
-                        pending.insert(record_number, record);
-                    }
-                    Err(error) => return Err(error),
-                }
+            if !pending.is_empty() && !tolerate_unreachable {
+                let record = pending.keys().next().copied().unwrap_or_default();
+                return Err(VolumeError::BrokenParentChain { record }.to_string());
             }
-            if pending.is_empty() || pending.len() == before {
-                break;
-            }
-        }
-
-        if !pending.is_empty() && !tolerate_unreachable {
-            let record = pending.keys().next().copied().unwrap_or_default();
-            return Err(format!("broken parent chain at record {record}"));
-        }
         volume.next_usn = next_usn;
         Ok((ApplyOutcome::Applied, pending.len()))
     })();
@@ -363,9 +366,11 @@ mod platform {
     }
 
     pub fn query_or_create_journal(handle: &VolumeHandle) -> Result<JournalInfo, String> {
-        match query_journal(handle) {
+        match query_journal_code(handle) {
             Ok(info) => Ok(info),
-            Err(error) if error.contains(&ERROR_JOURNAL_NOT_ACTIVE.0.to_string()) => {
+            // F9: 类型化 HRESULT 判定取代 "错误消息 contains 错误码字符串"——
+            // IoctlError 模式（enumerate_mft 的 ERROR_HANDLE_EOF 同款）推广至此。
+            Err(error) if error.win32_code() == ERROR_JOURNAL_NOT_ACTIVE.0 => {
                 let create = CREATE_USN_JOURNAL_DATA {
                     MaximumSize: 32 * 1024 * 1024,
                     AllocationDelta: 8 * 1024 * 1024,
@@ -373,13 +378,31 @@ mod platform {
                 ioctl_in(handle.0, FSCTL_CREATE_USN_JOURNAL, &create)?;
                 query_journal(handle)
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.message),
         }
     }
 
     pub fn query_journal(handle: &VolumeHandle) -> Result<JournalInfo, String> {
-        let mut data = USN_JOURNAL_DATA_V0::default();
-        ioctl_out(handle.0, FSCTL_QUERY_USN_JOURNAL, &mut data)?;
+        query_journal_code(handle).map_err(|error| error.message)
+    }
+
+    /// F9: 携带原始 HRESULT 的查询版，供 `query_or_create_journal` 按错误码分支。
+    fn query_journal_code(handle: &VolumeHandle) -> Result<JournalInfo, IoctlError> {
+        let mut output = [0u8; std::mem::size_of::<USN_JOURNAL_DATA_V0>()];
+        let bytes = ioctl_buffer_code(
+            handle.0,
+            FSCTL_QUERY_USN_JOURNAL,
+            &(),
+            &mut output,
+        )?;
+        if bytes < std::mem::size_of::<USN_JOURNAL_DATA_V0>() {
+            return Err(IoctlError {
+                message: "FSCTL_QUERY_USN_JOURNAL returned a truncated record".into(),
+                hresult: 0,
+            });
+        }
+        // SAFETY: output 恰为 USN_JOURNAL_DATA_V0 大小且已对齐（u8 数组按值读出）。
+        let data = unsafe { std::ptr::read(output.as_ptr() as *const USN_JOURNAL_DATA_V0) };
         Ok(JournalInfo {
             journal_id: data.UsnJournalID,
             first_usn: data.FirstUsn,
@@ -456,8 +479,9 @@ mod platform {
                     record.is_directory,
                 ) {
                     Ok(_) => {}
-                    Err(error) if error.starts_with("broken parent chain") => next.push(record),
-                    Err(error) => return Err(error),
+                    // F9: 类型化匹配取代文案前缀。
+                    Err(VolumeError::BrokenParentChain { .. }) => next.push(record),
+                    Err(error) => return Err(error.to_string()),
                 }
             }
             if next.len() == before {
@@ -625,23 +649,6 @@ mod platform {
                 std::mem::size_of::<T>() as u32,
                 None,
                 0,
-                Some(&mut returned),
-                None,
-            )
-        }
-        .map_err(|error| format!("DeviceIoControl {code:#x}: {error} ({})", error.code().0))
-    }
-
-    fn ioctl_out<T>(handle: HANDLE, code: u32, output: &mut T) -> Result<(), String> {
-        let mut returned = 0u32;
-        unsafe {
-            DeviceIoControl(
-                handle,
-                code,
-                None,
-                0,
-                Some(output as *mut T as *mut c_void),
-                std::mem::size_of::<T>() as u32,
                 Some(&mut returned),
                 None,
             )

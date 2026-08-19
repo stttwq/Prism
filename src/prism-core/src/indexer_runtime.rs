@@ -2067,6 +2067,12 @@ async fn read_hello_line<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// G5（FRESH-AUDIT-2）：SetPinyinEnabled 的每连接速率限制窗口。索引服务以
+/// SYSTEM 运行、管道 ACL 允许任意本地用户连接——该命令会释放/重建拼音
+/// sidecar，无限频的反复翻转就是重建风暴。合法前端每次设置保存只发一次；
+/// 1 秒窗口足够宽松，超出按错误回绝。
+const SET_PINYIN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub(crate) async fn handle_connection(
     pipe: NamedPipeServer,
     state: Arc<ServiceState>,
@@ -2102,10 +2108,12 @@ pub(crate) async fn handle_connection(
             return Ok(());
         }
     }
+    // G5（FRESH-AUDIT-2）：SetPinyinEnabled 的每连接速率限制（见
+    // SET_PINYIN_MIN_INTERVAL 常量注释）。
+    let mut last_set_pinyin: Option<std::time::Instant> = None;
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
-        let response = match serde_json::from_str::<IndexerRequest>(&line) {
-            // `status()` takes `index.read()` synchronously. Calling it directly
+        let response = match serde_json::from_str::<IndexerRequest>(&line) {            // `status()` takes `index.read()` synchronously. Calling it directly
             // on a worker thread lets a USN flood (watcher holding `index.write()`)
             // block the whole runtime: with 2 workers, two concurrent Status
             // requests starve the accept loop and new clients get
@@ -2145,23 +2153,31 @@ pub(crate) async fn handle_connection(
                 }
             }
             Ok(IndexerRequest::SetPinyinEnabled { enabled }) => {
-                let state_for_task = state.clone();
-                match tokio::task::spawn_blocking(move || {
-                    if enabled {
-                        state_for_task.pinyin_enabled.store(true, Ordering::Release);
-                        // H2a: load outside the index read lock to avoid
-                        // blocking USN watchers during mmap + deserialize.
-                        state_for_task.load_pinyin_outside_lock();
-                    } else {
-                        state_for_task.release_pinyin();
+                // G5: 速率限制先行——拒绝时不做任何状态变更。
+                if set_pinyin_rate_limited(&mut last_set_pinyin) {
+                    IndexerResponse::Error {
+                        message: "set_pinyin_enabled is rate limited to once per second".into(),
                     }
-                })
-                .await
-                {
-                    Ok(()) => IndexerResponse::Status(state.status()),
-                    Err(error) => IndexerResponse::Error {
-                        message: format!("set pinyin enabled task: {error}"),
-                    },
+                } else {
+                    last_set_pinyin = Some(std::time::Instant::now());
+                    let state_for_task = state.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        if enabled {
+                            state_for_task.pinyin_enabled.store(true, Ordering::Release);
+                            // H2a: load outside the index read lock to avoid
+                            // blocking USN watchers during mmap + deserialize.
+                            state_for_task.load_pinyin_outside_lock();
+                        } else {
+                            state_for_task.release_pinyin();
+                        }
+                    })
+                    .await
+                    {
+                        Ok(()) => IndexerResponse::Status(state.status()),
+                        Err(error) => IndexerResponse::Error {
+                            message: format!("set pinyin enabled task: {error}"),
+                        },
+                    }
                 }
             }
             Ok(IndexerRequest::Hello { .. }) | Err(_) => IndexerResponse::Error {
@@ -2184,6 +2200,16 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
         .await
         .map_err(|error| error.to_string())?;
     writer.flush().await.map_err(|error| error.to_string())
+}
+
+/// G5: SetPinyinEnabled 的每连接速率门——窗口内第二次及以后返回 true（拒绝），
+/// 并在放行时推进时间戳。独立成函数以便单测锚定。
+fn set_pinyin_rate_limited(last: &mut Option<std::time::Instant>) -> bool {
+    if last.is_some_and(|at| at.elapsed() < SET_PINYIN_MIN_INTERVAL) {
+        return true;
+    }
+    *last = Some(std::time::Instant::now());
+    false
 }
 
 #[cfg(test)]
@@ -3078,6 +3104,18 @@ mod tests {
             .await
             .unwrap();
         assert!(hello.contains("Hello"));
+    }
+
+    /// G5（FRESH-AUDIT-2）：SetPinyinEnabled 每连接限速——首条放行，
+    /// 窗口内的第二条拒绝（防任意本地用户触发拼音重建风暴）。
+    #[test]
+    fn g5_set_pinyin_rate_limit_rejects_rapid_second_call() {
+        let mut last = None;
+        assert!(!set_pinyin_rate_limited(&mut last), "first call passes");
+        assert!(
+            set_pinyin_rate_limited(&mut last),
+            "immediate second call is rejected"
+        );
     }
 
     /// AUDIT-2026-08-18 R-B1: rebuild_pinyin_from_live 期间写锁必须可在 <100ms 内获得。

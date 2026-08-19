@@ -5,6 +5,47 @@ use std::collections::{BinaryHeap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+/// F9（FRESH-AUDIT-2）：类型化的卷变更错误。此前 USN 重放/首建靠
+/// "broken parent chain" 文案前缀做字符串匹配决定"延迟重试"还是"整卷重建"
+/// ——改一处文案重放就静默变重建。Display 输出与旧字符串逐字一致，
+/// 日志与上层错误文本不变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeError {
+    /// 父记录缺失/越界：重放侧据此延迟重试（子先于父到达是正常乱序）。
+    BrokenParentChain { record: u32 },
+    /// MFT 记录号超出 u32。
+    MftRecordExceedsU32(u64),
+    /// 记录号超出紧凑索引上限。
+    RecordLimit(u32),
+    /// 槽表病态稀疏。
+    SparseSlots { required: usize, present: usize },
+    /// 文件名含 NUL。
+    NameNul,
+    /// 名字池超出 u32。
+    NamePoolOverflow,
+}
+
+impl std::fmt::Display for VolumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BrokenParentChain { record } => {
+                write!(f, "broken parent chain at record {record}")
+            }
+            Self::MftRecordExceedsU32(frn) => write!(f, "MFT record {frn} exceeds u32"),
+            Self::RecordLimit(record) => {
+                write!(f, "MFT record {record} exceeds compact-index limit")
+            }
+            Self::SparseSlots { required, present } => {
+                write!(f, "MFT slot table is pathologically sparse: {required}/{present}")
+            }
+            Self::NameNul => write!(f, "file name contains NUL"),
+            Self::NamePoolOverflow => write!(f, "name pool exceeds u32"),
+        }
+    }
+}
+
+impl std::error::Error for VolumeError {}
+
 pub const FLAG_PRESENT: u16 = 0x0001;
 pub const FLAG_DIRECTORY: u16 = 0x0002;
 pub const FLAG_EXCLUDED: u16 = 0x0004;
@@ -433,13 +474,15 @@ impl VolumeIndex {
         parent_frn: u64,
         name: &str,
         is_directory: bool,
-    ) -> Result<ApplyOutcome, String> {
-        let (record, sequence) = Self::split_frn(frn)?;
-        let (parent_record, _) = Self::split_frn(parent_frn)?;
+    ) -> Result<ApplyOutcome, VolumeError> {
+        let (record, sequence) =
+            Self::split_frn(frn).map_err(|_| VolumeError::MftRecordExceedsU32(frn))?;
+        let (parent_record, _) = Self::split_frn(parent_frn)
+            .map_err(|_| VolumeError::MftRecordExceedsU32(parent_frn))?;
         if parent_record as usize >= self.nodes.len()
             || self.nodes[parent_record as usize].flags & FLAG_PRESENT == 0
         {
-            return Err(format!("broken parent chain at record {record}"));
+            return Err(VolumeError::BrokenParentChain { record });
         }
         self.ensure_slot(record)?;
 
@@ -486,8 +529,9 @@ impl VolumeIndex {
         Ok(ApplyOutcome::Applied)
     }
 
-    pub fn delete(&mut self, frn: u64) -> Result<(), String> {
-        let (record, sequence) = Self::split_frn(frn)?;
+    pub fn delete(&mut self, frn: u64) -> Result<(), VolumeError> {
+        let (record, sequence) =
+            Self::split_frn(frn).map_err(|_| VolumeError::MftRecordExceedsU32(frn))?;
         let Some(slot) = self.nodes.get_mut(record as usize) else {
             return Ok(());
         };
@@ -739,29 +783,28 @@ impl VolumeIndex {
         self.names.truncate(snapshot.names_len);
     }
 
-    fn ensure_slot(&mut self, record: u32) -> Result<(), String> {
+    fn ensure_slot(&mut self, record: u32) -> Result<(), VolumeError> {
         let required = record as usize + 1;
         if required > MAX_RECORD_NUMBER {
-            return Err(format!("MFT record {record} exceeds compact-index limit"));
+            return Err(VolumeError::RecordLimit(record));
         }
         if required > self.nodes.len() {
             // G4: 稀疏度防线改读维护计数（此前每次增长全表扫描计数）。
             let present = self.present_slots.max(1);
             if required > 65_536 && required > present.saturating_mul(32) {
-                return Err(format!(
-                    "MFT slot table is pathologically sparse: {required}/{present}"
-                ));
+                return Err(VolumeError::SparseSlots { required, present });
             }
             self.nodes.resize(required, NodeSlot::default());
         }
         Ok(())
     }
 
-    fn append_name(&mut self, name: &str) -> Result<u32, String> {
+    fn append_name(&mut self, name: &str) -> Result<u32, VolumeError> {
         if name.contains('\0') {
-            return Err("file name contains NUL".into());
+            return Err(VolumeError::NameNul);
         }
-        let offset = u32::try_from(self.names.len()).map_err(|_| "name pool exceeds u32")?;
+        let offset = u32::try_from(self.names.len())
+            .map_err(|_| VolumeError::NamePoolOverflow)?;
         self.names.extend_from_slice(name.as_bytes());
         self.names.push(0);
         // F3: 滚入追加字节（含终止符）——与全池整算在相同追加顺序下结果一致。
