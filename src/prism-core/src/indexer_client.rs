@@ -278,6 +278,13 @@ async fn search_on_persistent(
 /// 仍兜底总时限。
 static ONE_OFF_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// R-A7 测试观测用：当前持有一次性连接闸的在途请求数。与闸许可数一致，
+/// 单独设原子是因为 server 侧观测会受客户端断开后的 EOF 滞留干扰而虚高。
+static ONE_OFF_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 峰值观测（R-A7 测试断言用）：峰值 ≤ 闸许可数即并发未超标。
+static ONE_OFF_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The contention path: a one-off connection (connect → hello → status →
 /// search → drop) that never touches the process-wide singleton.  The pipe
 /// name is a parameter so tests can exercise it against a temporary pipe.
@@ -293,6 +300,8 @@ async fn search_one_off(
         .acquire()
         .await
         .map_err(|_| SearchFailure::from("one-off gate closed".to_string()))?;
+    // 拿到许可后才计在途：排队等闸的请求不计，峰值才等于真实并发连接数。
+    let _inflight = Inflight::track();
     let attempt = async {
         let mut conn = PersistentConnection::connect(pipe_name).await?;
         handshake(&mut conn).await?;
@@ -301,6 +310,27 @@ async fn search_one_off(
     tokio::time::timeout(REQUEST_BUDGET, attempt)
         .await
         .map_err(|_| SearchFailure::from("indexer request timed out".to_string()))?
+}
+
+/// 在途计数 RAII：构造 +1，drop -1，供闸测试观测峰值。
+struct Inflight {
+    _private: (),
+}
+
+impl Inflight {
+    fn track() -> Self {
+        use std::sync::atomic::Ordering;
+        let current = ONE_OFF_INFLIGHT.fetch_add(1, Ordering::AcqRel) + 1;
+        ONE_OFF_PEAK.fetch_max(current, Ordering::AcqRel);
+        Self { _private: () }
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        ONE_OFF_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Run a full search sequence (status → search) on an established connection.
@@ -754,32 +784,34 @@ mod tests {
 
         let concurrency = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server_state = state.clone();
-        let server_concurrency = concurrency.clone();
-        let server_peak = peak.clone();
         let server_pipe_name = pipe_name.clone();
-        let server_task = tokio::spawn(async move {
-            // 串行重臂的 accept 循环：同一时刻至多一个 listener armed 已足够
-            //（客户端被闸到 2 并发，轮到谁谁连）。
-            let mut served = 0usize;
-            while served < 20 {
-                let server = ServerOptions::new()
-                    .reject_remote_clients(true)
-                    .create(&server_pipe_name)
-                    .unwrap();
-                server.connect().await.unwrap();
-                served += 1;
-                let state = server_state.clone();
-                let concurrency = server_concurrency.clone();
-                let peak = server_peak.clone();
-                tokio::spawn(async move {
-                    let current = concurrency.fetch_add(1, Ordering::AcqRel) + 1;
-                    peak.fetch_max(current, Ordering::AcqRel);
-                    let _ = handle_connection(server, state).await;
-                    concurrency.fetch_sub(1, Ordering::AcqRel);
-                });
-            }
-        });
+        // 4 个常臂 listener（对齐生产 PIPE_LISTENERS 语义）：accept 后立刻重臂，
+        // 消除单 listener 重臂间隙在满套件并发负载下造成的客户端连接失败。
+        let mut listeners = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let pipe_name = server_pipe_name.clone();
+            let state = state.clone();
+            let concurrency = concurrency.clone();
+            let peak = peak.clone();
+            listeners.spawn(async move {
+                loop {
+                    let server = ServerOptions::new()
+                        .reject_remote_clients(true)
+                        .create(&pipe_name)
+                        .unwrap();
+                    server.connect().await.unwrap();
+                    let state = state.clone();
+                    let concurrency = concurrency.clone();
+                    let peak = peak.clone();
+                    tokio::spawn(async move {
+                        let current = concurrency.fetch_add(1, Ordering::AcqRel) + 1;
+                        peak.fetch_max(current, Ordering::AcqRel);
+                        let _ = handle_connection(server, state).await;
+                        concurrency.fetch_sub(1, Ordering::AcqRel);
+                    });
+                }
+            });
+        }
 
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..20 {
@@ -794,12 +826,14 @@ mod tests {
                 failures.push("one-off search failed");
             }
         }
-        server_task.abort();
+        listeners.abort_all();
         assert!(failures.is_empty(), "all 20 one-off searches must succeed");
-        let observed_peak = peak.load(Ordering::Acquire);
+        // 峰值观测在 search_one_off 内部（ONE_OFF_PEAK）：server 侧计数会因客户端
+        // 断开后的 EOF 滞留虚高，不能作为闸断言依据。
+        let observed_peak = ONE_OFF_PEAK.load(Ordering::Acquire);
         assert!(
             observed_peak <= 2,
-            "peak concurrent one-off connections {observed_peak} must stay within the gate"
+            "peak concurrent one-off searches {observed_peak} must stay within the gate"
         );
     }
 

@@ -93,14 +93,18 @@ impl BuildProgressCounters {
         self.records_scanned.store(0, Ordering::Release);
         self.records_estimate
             .store(records_estimate.unwrap_or(0), Ordering::Release);
-        if let Ok(mut guard) = self.current_volume.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut guard = self.current_volume.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *guard = None;
         }
         self.active.store(true, Ordering::Release);
     }
 
     fn begin_volume(&self, mount_path: &str) {
-        if let Ok(mut guard) = self.current_volume.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut guard = self.current_volume.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *guard = Some(mount_path.to_owned());
         }
     }
@@ -121,7 +125,9 @@ impl BuildProgressCounters {
     /// advertising stale progress just like a successful one.
     fn finish(&self) {
         self.active.store(false, Ordering::Release);
-        if let Ok(mut guard) = self.current_volume.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut guard = self.current_volume.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *guard = None;
         }
     }
@@ -205,7 +211,9 @@ impl ServiceState {
     }
 
     fn set_pinyin_data_dir(&self, data_dir: &Path) {
-        if let Ok(mut slot) = self.pinyin_data_dir.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut slot = self.pinyin_data_dir.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *slot = Some(data_dir.to_path_buf());
         }
     }
@@ -218,21 +226,27 @@ impl ServiceState {
     }
 
     fn set_pinyin_status(&self, status: PinyinStatus) {
-        if let Ok(mut current) = self.pinyin_status.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut current = self.pinyin_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *current = status;
         }
     }
 
     fn release_pinyin(&self) {
         self.pinyin_enabled.store(false, Ordering::Release);
-        if let Ok(mut sidecar) = self.pinyin.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut sidecar = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *sidecar = None;
         }
         self.set_pinyin_status(PinyinStatus::Disabled);
     }
 
     fn begin_pinyin_rebuild(&self) {
-        if let Ok(mut sidecar) = self.pinyin.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut sidecar = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *sidecar = None;
         }
         self.set_pinyin_status(PinyinStatus::Building);
@@ -299,7 +313,9 @@ impl ServiceState {
                     self.release_pinyin();
                     return;
                 }
-                if let Ok(mut current) = self.pinyin.write() {
+                // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+                let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                {
                     *current = Some(sidecar);
                 }
                 self.set_pinyin_status(PinyinStatus::Ready);
@@ -330,7 +346,9 @@ impl ServiceState {
                     self.release_pinyin();
                     return;
                 }
-                if let Ok(mut current) = self.pinyin.write() {
+                // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+                let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                {
                     *current = Some(sidecar);
                 }
                 self.set_pinyin_status(PinyinStatus::Ready);
@@ -342,7 +360,9 @@ impl ServiceState {
                     self.release_pinyin();
                     return;
                 }
-                if let Ok(mut current) = self.pinyin.write() {
+                // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+                let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                {
                     *current = None;
                 }
                 self.set_pinyin_status(PinyinStatus::Corrupt);
@@ -467,7 +487,9 @@ impl ServiceState {
     /// but incomplete index (`ready && building`). Each merge bumps the generation so
     /// front-end caches keyed on it fall out of date on their own.
     pub(crate) fn merge_and_publish(&self, volume: VolumeIndex) {
-        if let Ok(mut guard) = self.index.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut guard = self.index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             let index = guard.get_or_insert_with(IndexState::default);
             // A rebuilt volume replaces its earlier copy rather than duplicating it.
             if let Some(slot) = index
@@ -482,7 +504,9 @@ impl ServiceState {
             index.generation = index.generation.saturating_add(1);
         }
         self.degraded.store(false, Ordering::Release);
-        if let Ok(mut message) = self.message.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *message = None;
         }
         self.generation_notify.notify_waiters();
@@ -513,12 +537,16 @@ impl ServiceState {
             .and_then(|guard| guard.as_ref().map(|value| value.generation))
             .unwrap_or(0);
         state.generation = previous_generation.saturating_add(1).max(state.generation);
-        if let Ok(mut guard) = self.index.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut guard = self.index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *guard = Some(state);
         }
         self.building.store(false, Ordering::Release);
         self.degraded.store(false, Ordering::Release);
-        if let Ok(mut message) = self.message.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *message = None;
         }
         // A whole-index publish is the terminal state of both cache hits and rebuilds,
@@ -531,7 +559,9 @@ impl ServiceState {
     fn set_error(&self, error: String) {
         self.degraded.store(true, Ordering::Release);
         self.building.store(false, Ordering::Release);
-        if let Ok(mut message) = self.message.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *message = Some(error);
         }
     }
@@ -540,7 +570,9 @@ impl ServiceState {
     /// 前端的「文件索引不可用」随下一次成功 checkpoint 自动消失。
     fn clear_error(&self) {
         self.degraded.store(false, Ordering::Release);
-        if let Ok(mut message) = self.message.write() {
+        // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
             *message = None;
         }
     }
@@ -1449,7 +1481,9 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         // checkpoint can be one USN batch behind by the time the sidecar is installed.
         state.rebuild_pinyin_from_live();
     }
-    if let Ok(mut guard) = state.index.write() {
+    // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
+    let mut guard = state.index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    {
         if let Some(index) = guard.as_mut() {
             index.events_since_checkpoint = index
                 .events_since_checkpoint
