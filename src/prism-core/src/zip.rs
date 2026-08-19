@@ -262,7 +262,9 @@ fn zip_with_external(
 ) -> Result<ShellOutcome, ShellError> {
     let mut cmd = std::process::Command::new(exe_path);
     if is_seven_zip {
-        // 7z a <output.zip> <source> -aoa：a=添加，-aoa=覆盖所有（不静默，系统处理冲突确认）
+        // 7z a <output.zip> <source> -aoa：a=添加，-aoa=已存在的输出 zip 直接覆盖。
+        // 输出路径恒为 <source>.zip（zip_output_path），覆盖的是本动作上次产物；
+        // 不能去掉 -aoa——broker 是无控制台的后台进程，7z 的覆盖交互提示会永久挂死。
         cmd.arg("a").arg(output).arg(source).arg("-aoa");
     } else {
         // 自定义程序：传 source 和 output 作为参数，让用户自己处理格式

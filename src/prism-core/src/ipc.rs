@@ -1215,7 +1215,22 @@ fn normalize_ext(raw: &str) -> String {
 fn has_query_filters(filters: &[SearchFilter]) -> bool {
     filters
         .iter()
-        .any(|f| f.field == "ext" || f.field == "path")
+        .any(|filter| filter.field == "ext" || filter.field == "path")
+}
+
+/// FRESH-AUDIT-2 F4: 把请求过滤器转成历史注入同样要遵守的 ext/path 匹配器。
+/// exclude_path 不在此列（它已由 exclusion_paths 单独处理）。
+fn history_filter_set(filters: Option<&[SearchFilter]>) -> crate::hierarchy::QueryFilters {
+    let mut exts = Vec::new();
+    let mut paths = Vec::new();
+    for filter in filters.unwrap_or_default() {
+        match filter.field.as_str() {
+            "ext" => exts.push(filter.value.clone()),
+            "path" => paths.push(filter.value.clone()),
+            _ => {}
+        }
+    }
+    crate::hierarchy::QueryFilters::new(exts, paths)
 }
 
 /// 查询记忆键：剥掉窗口模式前缀 `>` 与 `ext:`/`path:` 过滤词，再做存储侧
@@ -1506,6 +1521,7 @@ async fn search_service(
     let result_slots = max.saturating_sub(items.len());
     let mut ranked = Vec::new();
     let exclusions = exclusion_paths(filters.as_deref());
+    let filter_set = history_filter_set(filters.as_deref());
     let history_weights = history.weights();
     let pinyin_enabled = preferences.pinyin_enabled();
     let root_clone = root.map(|r| r.to_owned());
@@ -1517,6 +1533,7 @@ async fn search_service(
             pinyin_enabled,
             &exclusions,
             root_clone.as_deref(),
+            &filter_set,
             // 注入上限 = 结果槽位数：注入再多也会在最终截断时被丢弃，
             // 同时把每次按键的磁盘 stat 次数压到命中且可展示的条目。
             result_slots,
@@ -1681,6 +1698,7 @@ async fn empty_query_results(
     history: &Arc<HistoryStore>,
 ) -> Response {
     let exclusions = exclusion_paths(filters);
+    let filter_set = history_filter_set(filters);
     let (root, root_rejection, root_message) = match requested_root(root) {
         Ok(root) => (root, None, None),
         Err(reason) => (None, Some(reason), Some(reason.message().to_owned())),
@@ -1694,13 +1712,25 @@ async fn empty_query_results(
             // 收集满 max 个磁盘上仍存在的路径即停——既不再对全部条目做
             // 磁盘 stat，也不再按频次分数重排。
             tokio::task::spawn_blocking(move || {
-                history_file_candidates("", &weights, false, &exclusions, Some(&root_owned), max)
+                history_file_candidates(
+                    "",
+                    &weights,
+                    false,
+                    &exclusions,
+                    Some(&root_owned),
+                    &filter_set,
+                    max,
+                )
             })
             .await
             .unwrap_or_default()
         }
         _ => Vec::new(),
     };
+
+    // FRESH-AUDIT-2 G2: is_truncated 口径统一为「结果集被截断，UI 可提供 more」。
+    // 候选收集按 limit 即停，装满 max 即意味着历史里可能还有更多条目。
+    let is_truncated = items.len() >= max;
 
     Response::Results {
         // Echo the client query unchanged (may be "" or whitespace) so the frontend
@@ -1711,7 +1741,7 @@ async fn empty_query_results(
         index_progress: None,
         index_error: None,
         index_generation: None,
-        is_truncated: false,
+        is_truncated,
         matched_count: None,
         scanned_nodes: None,
         name_candidates: None,
@@ -1806,6 +1836,9 @@ fn history_file_candidates(
     pinyin_enabled: bool,
     exclusions: &[String],
     root: Option<&str>,
+    // FRESH-AUDIT-2 F4: 历史注入与索引器同守 ext:/path: 过滤语义——
+    // `report ext:pdf` 时非 pdf 历史候选不再混入结果。
+    filter_set: &crate::hierarchy::QueryFilters,
     limit: usize,
 ) -> Vec<SearchResult> {
     let empty_query = query.is_empty();
@@ -1842,6 +1875,16 @@ fn history_file_candidates(
         else {
             continue;
         };
+        // F4: 过滤器在名字匹配之前——不匹配的候选不做拼音/磁盘 stat。
+        let is_directory = weight.target.kind == "directory";
+        if !filter_set.is_empty() {
+            if !filter_set.ext_matches(title, is_directory) {
+                continue;
+            }
+            if filter_set.has_path_filter() && !filter_set.path_matches(&weight.target.value) {
+                continue;
+            }
+        }
         let (metadata, match_spans) = if empty_query {
             // No literal query to rank against: same match tier for every row so
             // the caller's order (MRU) decides.
@@ -2951,7 +2994,15 @@ mod protocol_tests {
             score: 4,
             last_used_utc: 1_000,
         }];
-        let mut candidates = history_file_candidates("ta", &weights, true, &[], None, 8);
+        let mut candidates = history_file_candidates(
+            "ta",
+            &weights,
+            true,
+            &[],
+            None,
+            &crate::hierarchy::QueryFilters::none(),
+            8,
+        );
         candidates.push(SearchResult {
             kind: SearchResultKind::File,
             title: "beta.txt".into(),
@@ -2973,7 +3024,40 @@ mod protocol_tests {
 
         // Exclusion path must use the real temp dir path.
         let exclusion = late_dir.to_str().unwrap().to_string();
-        assert!(history_file_candidates("ta", &weights, true, &[exclusion], None, 8).is_empty());
+        assert!(history_file_candidates(
+            "ta",
+            &weights,
+            true,
+            &[exclusion],
+            None,
+            &crate::hierarchy::QueryFilters::none(),
+            8
+        )
+        .is_empty());
+
+        // FRESH-AUDIT-2 F4: ext:pdf 过滤时非 pdf 历史候选必须被过滤掉。
+        let pdf_dir = temp_dir.join("prism-history-test-f4");
+        let pdf_path = pdf_dir.join("zeta.pdf");
+        let _ = std::fs::create_dir_all(&pdf_dir);
+        let _ = std::fs::write(&pdf_path, "test");
+        let pdf_str = pdf_path.to_str().unwrap().to_string();
+        let mixed = vec![
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &pdf_str),
+                score: 4,
+                last_used_utc: 1_000,
+            },
+            HistoryWeight {
+                target: ActionTarget::new(TargetKind::File, &zeta_str),
+                score: 8,
+                last_used_utc: 2_000,
+            },
+        ];
+        let ext_pdf = crate::hierarchy::QueryFilters::new(vec!["pdf".into()], vec![]);
+        let filtered = history_file_candidates("zeta", &mixed, true, &[], None, &ext_pdf, 8);
+        assert_eq!(filtered.len(), 1, "only the .pdf history entry survives");
+        assert_eq!(&*filtered[0].title, "zeta.pdf");
+        let _ = std::fs::remove_dir_all(&pdf_dir);
 
         // Cleanup
         let _ = std::fs::remove_file(&zeta_path);
@@ -3066,8 +3150,15 @@ mod protocol_tests {
             },
         ];
 
-        let candidates =
-            history_file_candidates("", &weights, false, &[], Some(root_str.as_str()), 8);
+        let candidates = history_file_candidates(
+            "",
+            &weights,
+            false,
+            &[],
+            Some(root_str.as_str()),
+            &crate::hierarchy::QueryFilters::none(),
+            8,
+        );
         assert_eq!(
             candidates
                 .iter()
@@ -3093,7 +3184,15 @@ mod protocol_tests {
 
         // Non-empty query must still use title matching and ignore the root filter arg
         // when callers pass None (G2 injection path).
-        let named = history_file_candidates("inside", &weights, false, &[], None, 8);
+        let named = history_file_candidates(
+            "inside",
+            &weights,
+            false,
+            &[],
+            None,
+            &crate::hierarchy::QueryFilters::none(),
+            8,
+        );
         assert!(named.iter().any(|item| &*item.execute_id == inside_str));
         assert!(
             named

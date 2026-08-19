@@ -325,6 +325,7 @@ fn execute_run_action(
                     "copy_to requires a destination argument",
                 )
             })?;
+            validate_destination(&dest)?;
             crate::file_ops::copy_to(&target, &dest)
         }
         ActionId::MoveTo => {
@@ -334,6 +335,7 @@ fn execute_run_action(
                     "move_to requires a destination argument",
                 )
             })?;
+            validate_destination(&dest)?;
             crate::file_ops::move_to(&target, &dest)
         }
         ActionId::Zip => {
@@ -345,6 +347,30 @@ fn execute_run_action(
 /// zip 动作的输出路径：源路径同名 + `.zip`。
 fn zip_output_path(target: &ActionTarget) -> String {
     format!("{}.zip", target.value)
+}
+
+/// FRESH-AUDIT-2 F5: destination 与 path 类 target 同守校验——
+/// JSON `\u0000` 会让 PCWSTR 截断成意外路径，控制字符/相对路径/超长同样拒绝。
+fn validate_destination(dest: &str) -> Result<(), ShellError> {
+    if dest.is_empty() || dest.contains('\0') || dest.chars().any(char::is_control) {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "destination is invalid",
+        ));
+    }
+    if dest.len() > MAX_PATH_BYTES {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "destination is too long",
+        ));
+    }
+    if !std::path::Path::new(dest).is_absolute() {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "destination must be an absolute path",
+        ));
+    }
+    Ok(())
 }
 
 impl ActionTarget {
@@ -784,6 +810,29 @@ mod tests {
             execute_run_action(target, "move_to".into(), Default::default(), None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("destination"));
+    }
+
+    /// FRESH-AUDIT-2 F5: destination 与 target 同守输入校验——NUL/控制字符/相对路径拒绝。
+    #[test]
+    fn run_action_destination_is_validated_like_targets() {
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        for bad in ["C:\\des\u{0}t", "C:\\des\tt", "relative\\dir", ""] {
+            let err = execute_run_action(
+                target.clone(),
+                "copy_to".into(),
+                crate::ipc::ActionArgs {
+                    new_name: None,
+                    destination: Some(bad.into()),
+                },
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.kind,
+                ShellErrorKind::TargetInvalid,
+                "destination {bad:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
