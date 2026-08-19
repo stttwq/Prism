@@ -117,6 +117,8 @@ public sealed class TrayService : IDisposable
         _notify.MouseClick -= OnMouseClick;
         _notify.Visible = false;
         _notify.Icon = null;
+        // NotifyIcon.Dispose 不释放 ContextMenuStrip，需一并释放（G1 小缺口）。
+        _notify.ContextMenuStrip?.Dispose();
         _notify.Dispose();
         _ownedIcon?.Dispose();
     }

@@ -135,7 +135,8 @@ public sealed class IconCache
     }
 
     /// <summary>
-    /// 缓存键：可执行/快捷方式/目录用完整路径；其余用扩展名键，避免每文件一图。
+    /// 缓存键：可执行/快捷方式用完整路径；目录共享常量键 "dir:"（系统目录图标
+    /// 全盘一致，逐路径键化只会撑爆 LRU）；其余用扩展名键，避免每文件一图。
     /// 尺寸并入键：多显示器不同缩放的条目共存，LRU 自然淘汰。
     /// </summary>
     internal static string SizedKey(string path, int pixelSize) =>

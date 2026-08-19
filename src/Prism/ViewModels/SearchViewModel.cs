@@ -779,7 +779,9 @@ public sealed class SearchViewModel
         _state.IsWebMode = webMode is not null;
         if (webMode is not null)
         {
-            await RunWebSearchAsync(query, webMode).ConfigureAwait(true);
+            // 同步方法（G1：原 async 无 await，CS1998 伪装）：直接结果本就同步产生，
+            // 联想是 coordinator 内部的 fire-and-forget。
+            RunWebSearch(query, webMode);
             return;
         }
 
@@ -1084,8 +1086,7 @@ public sealed class SearchViewModel
     /// 网页模式搜索（G8）。直接结果同步产生，联想异步获取并追加。
     /// 直接结果不等待网络；联想 800ms 超时静默放弃。
     /// </summary>
-#pragma warning disable CS1998 // async 方法内无 await：fire-and-forget Task.Run 是故意的
-    private async Task RunWebSearchAsync(string query, WebModeResult webMode)
+    private void RunWebSearch(string query, WebModeResult webMode)
     {
         var seq = ++_searchSeq;
         CancelSearch();
@@ -1151,7 +1152,6 @@ public sealed class SearchViewModel
                 _state.StatusMessage = "";
             });
     }
-#pragma warning restore CS1998
 
     private static bool QueryMatchesResponse(string requested, string echoed)
     {
