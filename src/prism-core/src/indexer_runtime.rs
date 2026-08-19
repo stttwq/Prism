@@ -459,6 +459,30 @@ impl ServiceState {
             .unwrap_or(0)
     }
 
+    /// S5（FRESH-AUDIT-2026-08-19）: 小时级内存趋势的 detail 文本（供事件日志）。
+    /// Listary 9.65GB 泄漏正是靠用户截图才发现——有趋势沉淀，异常增长可以在
+    /// 用户报告前从日志回溯。内容只有数字与枚举名，无路径/查询，不涉脱敏。
+    pub fn memory_trend_detail(&self) -> String {
+        let index = self.index.read().ok();
+        let state = index.as_deref().and_then(Option::as_ref);
+        let memory = state.map(IndexState::memory_bytes).unwrap_or(0)
+            + self
+                .pinyin
+                .read()
+                .ok()
+                .and_then(|sidecar| sidecar.as_ref().map(PinyinSidecar::resident_bytes))
+                .unwrap_or(0);
+        format!(
+            "memory_bytes={} volumes={} events_since_checkpoint={} pinyin={:?}",
+            memory,
+            state.map(|value| value.volumes.len()).unwrap_or(0),
+            state
+                .map(|value| value.events_since_checkpoint)
+                .unwrap_or(0),
+            self.pinyin_status(),
+        )
+    }
+
     pub fn status(&self) -> IndexerStatus {
         let index = self.index.read().ok();
         let state = index.as_deref().and_then(Option::as_ref);
@@ -791,6 +815,8 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     }
 
     let mut last_checkpoint = Instant::now();
+    // S5: 每小时一行内存趋势入事件日志（趋势观测，见 memory_trend_detail）。
+    let mut last_memory_trend = Instant::now();
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -905,6 +931,18 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 }
             }
             _ = maintenance.tick() => {
+                // S5: 每小时一行内存趋势——零常驻成本（5s tick 只做一次时间比较）。
+                if last_memory_trend.elapsed() >= Duration::from_secs(3600) {
+                    let detail = state.memory_trend_detail();
+                    logging::event_detail(
+                        "info",
+                        "index_memory_trend",
+                        &detail,
+                        None,
+                        Some(state.generation()),
+                    );
+                    last_memory_trend = Instant::now();
+                }
                 if state.pinyin_needs_rebuild.swap(false, Ordering::AcqRel)
                     && state.pinyin_status() != PinyinStatus::Disabled
                 {
@@ -1827,6 +1865,23 @@ mod tests {
         assert!(state
             .search("needle", 8, None, None)
             .is_ok_and(|response| matches!(response, IndexerResponse::Results { ref items, .. } if items.len() == 1)));
+    }
+
+    /// S5: 内存趋势 detail 必须包含四个可回溯字段；空索引与已发布索引都有效。
+    #[test]
+    fn memory_trend_detail_carries_all_observability_fields() {
+        let empty = ServiceState::new();
+        let detail = empty.memory_trend_detail();
+        assert!(detail.contains("memory_bytes=0"), "{detail}");
+        assert!(detail.contains("volumes=0"), "{detail}");
+        assert!(detail.contains("events_since_checkpoint=0"), "{detail}");
+        assert!(detail.contains("pinyin="), "{detail}");
+
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
+        let detail = state.memory_trend_detail();
+        assert!(detail.contains("volumes=1"), "{detail}");
+        assert!(!detail.contains("memory_bytes=0"), "{detail}");
     }
 
     #[test]

@@ -92,6 +92,19 @@ pub fn search<'a>(apps: &'a [AppEntry], query: &str, max: usize) -> Vec<&'a AppE
     search_ranked(apps, query, max).0
 }
 
+/// S3（FRESH-AUDIT-2026-08-19）: 开始菜单扫描失败后的重试间隔。
+/// 前 5 次 30 秒（安装器锁目录的常见窗口期），之后指数退避翻倍、封顶 1 小时，
+/// **永不放弃**——此前 5 次后永久放弃会导致"装完软件搜不到应用必须重启"。
+pub fn app_scan_retry_delay(attempt: u32) -> std::time::Duration {
+    const BASE: u64 = 30;
+    const CAP: u64 = 3600;
+    if attempt <= 5 {
+        return std::time::Duration::from_secs(BASE);
+    }
+    let shift = (attempt - 5).min(16) as u32; // u64 秒内防溢出即可
+    std::time::Duration::from_secs((BASE << shift).min(CAP))
+}
+
 /// Scan Start Menu shortcuts on the broker-owned STA Shell worker.
 /// 返回是否成功——失败由调用方（main 的重试循环）决定何时再试。
 pub async fn load(shared: SharedApps, shell: std::sync::Arc<crate::shell::ShellExecutor>) -> bool {
@@ -442,6 +455,26 @@ mod tests {
     fn search_empty_query() {
         let apps = sample_apps();
         assert!(search(&apps, "", 10).is_empty());
+    }
+
+    /// S3: 重试间隔——前 5 次 30s，之后指数翻倍，封顶 1 小时，永不返回 0/无限。
+    #[test]
+    fn app_scan_retry_delay_backs_off_and_caps_at_one_hour() {
+        for attempt in 1..=5u32 {
+            assert_eq!(app_scan_retry_delay(attempt).as_secs(), 30);
+        }
+        assert_eq!(app_scan_retry_delay(6).as_secs(), 60);
+        assert_eq!(app_scan_retry_delay(7).as_secs(), 120);
+        assert_eq!(app_scan_retry_delay(8).as_secs(), 240);
+        // 单调不减且封顶 3600s（约第 13 次到位）。
+        let mut prev = 0u64;
+        for attempt in 1..=40u32 {
+            let secs = app_scan_retry_delay(attempt).as_secs();
+            assert!(secs >= prev, "attempt {attempt} 退避必须单调不减");
+            assert!(secs <= 3600);
+            prev = secs;
+        }
+        assert_eq!(prev, 3600);
     }
 
     #[test]

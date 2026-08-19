@@ -31,15 +31,22 @@ async fn main() {
     {
         let apps = apps.clone();
         let shell = shell.clone();
-        // 开始菜单被安装器短暂锁住等瞬时故障会导致应用搜索永久为空；
-        // 30 秒退避重试（最多 5 次）兜住首次扫描的窗口期。
+        // S3（FRESH-AUDIT-2026-08-19）: 开始菜单被安装器短暂锁住等瞬时故障会导致
+        // 应用搜索为空。前 5 次 30 秒重试兜住首扫窗口期，之后指数退避到 1 小时，
+        // 永不放弃——成功即停。
         tokio::spawn(async move {
-            for attempt in 1..=5 {
+            let mut attempt = 1u32;
+            loop {
                 if apps::load(apps.clone(), shell.clone()).await {
                     return;
                 }
-                crate::log(format!("app catalog scan retry {attempt}/5 in 30s"));
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let delay = apps::app_scan_retry_delay(attempt);
+                crate::log(format!(
+                    "app catalog scan retry {attempt} in {}s",
+                    delay.as_secs()
+                ));
+                attempt += 1;
+                tokio::time::sleep(delay).await;
             }
         });
     }
