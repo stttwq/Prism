@@ -83,8 +83,24 @@ internal sealed class SingleInstance : IDisposable
                     PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance);
                 await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
 
-                using var reader = new StreamReader(server, new UTF8Encoding(false));
-                var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+                // AUDIT-2026-08-18 C-D8: 读加 2s 超时。哑客户端（连上不发数据）
+                // 此前会无限期占死这个监听槽，之后所有双开唤出全部失灵。
+                // 超时后 Dispose server（取消挂起的 overlapped I/O），循环继续。
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(TimeSpan.FromSeconds(2));
+                string? line;
+                using (var reader = new StreamReader(server, new UTF8Encoding(false)))
+                {
+                    try
+                    {
+                        line = await reader.ReadLineAsync(readCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        // 读超时：哑连接，直接丢弃本连接（finally Dispose）。
+                        line = null;
+                    }
+                }
                 if (line is not null && line.Trim() == ShowCommand)
                 {
                     // fire-and-forget：在 UI 线程唤出窗口，不阻塞管道监听循环。
