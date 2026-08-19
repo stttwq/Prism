@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -20,8 +19,20 @@ public sealed class IconCache
     /// <summary>最多缓存项。扩展名合并后 128 足够覆盖常见类型 + 一批 lnk/exe。</summary>
     public const int MaxEntries = 128;
 
-    private readonly ConcurrentDictionary<string, ImageSource?> _cache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentQueue<string> _order = new();
+    // C-D5：真 LRU。旧实现用 ConcurrentDictionary + ConcurrentQueue 两个结构，
+    // 二者之间无原子性——ClearPathKeys 的 drain-重建可与 GetAsync 的 Enqueue 交错，
+    // 遗留「在字典不在队列」的不死条目使 Trim 失效；且命中不刷新顺序（实为 FIFO）。
+    // 改为单锁保护的 Dictionary + LinkedList：条目 ≤ 数百，锁粒度小、无性能顾虑。
+    // 关键纪律：LoadIcon（shell I/O）必须在锁外执行，只有插入/命中提升/清理入锁。
+    private sealed class Entry
+    {
+        public required string Key;
+        public ImageSource? Icon;
+    }
+
+    private readonly object _lock = new();
+    private readonly Dictionary<string, LinkedListNode<Entry>> _map = new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<Entry> _lru = new(); // 头=最近使用，尾=最久未用
 
     /// <summary>异步获取系统文件图标；pixelSize 按目标物理像素请求（高 DPI 下取 48/256px 源，避免拉伸发虚）。</summary>
     public Task<ImageSource?> GetAsync(string path, int pixelSize = 32, CancellationToken ct = default)
@@ -30,16 +41,34 @@ public sealed class IconCache
             return Task.FromResult<ImageSource?>(null);
 
         var key = SizedKey(path, pixelSize);
-        if (_cache.TryGetValue(key, out var hit))
-            return Task.FromResult(hit);
+        lock (_lock)
+        {
+            if (_map.TryGetValue(key, out var node))
+            {
+                // 命中：提升到链表头，刷新 recency（真 LRU）。
+                _lru.Remove(node);
+                _lru.AddFirst(node);
+                return Task.FromResult(node.Value.Icon);
+            }
+        }
 
         return Task.Run(() =>
         {
             ct.ThrowIfCancellationRequested();
             var icon = LoadIcon(path, pixelSize);
-            if (_cache.TryAdd(key, icon))
+            lock (_lock)
             {
-                _order.Enqueue(key);
+                // 复查：加载期间可能有别的线程插了同一 key——复用已有条目、丢弃本次结果，
+                // 避免重复条目，同时把它提升为最近使用。
+                if (_map.TryGetValue(key, out var existing))
+                {
+                    _lru.Remove(existing);
+                    _lru.AddFirst(existing);
+                    return existing.Value.Icon;
+                }
+                var node = new LinkedListNode<Entry>(new Entry { Key = key, Icon = icon });
+                _lru.AddFirst(node);
+                _map[key] = node;
                 TrimIfNeeded();
             }
             return icon;
@@ -49,47 +78,60 @@ public sealed class IconCache
     /// <summary>清空缓存（搜索窗隐藏后调用，把位图交还 GC）。</summary>
     public void Clear()
     {
-        _cache.Clear();
-        while (_order.TryDequeue(out _)) { }
+        lock (_lock)
+        {
+            _map.Clear();
+            _lru.Clear();
+        }
     }
 
     /// <summary>
     /// 只清路径类键（完整路径、URL），保留 ext:/dir: 扩展名键。
     /// 扩展名图标恒定且由 LRU 保护，保留后下次呼出扩展名图标立即可见，
-    /// 路径类图标按需重新加载。
+    /// 路径类图标按需重新加载。全程持同一把锁——_map 与 _lru 永不偏离。
     /// </summary>
     public void ClearPathKeys()
     {
-        var keysToRemove = new List<string>();
-        foreach (var key in _cache.Keys)
+        lock (_lock)
         {
-            // SizedKey = CacheKey + "@" + pixelSize；拆出 CacheKey 部分判断。
-            var atIdx = key.LastIndexOf('@');
-            var cacheKey = atIdx > 0 ? key.Substring(0, atIdx) : key;
-            // 保留 ext: 和 dir: 前缀的键（扩展名/目录类型图标恒定）。
-            if (cacheKey.StartsWith("ext:", StringComparison.OrdinalIgnoreCase)
-                || cacheKey.StartsWith("dir:", StringComparison.OrdinalIgnoreCase))
-                continue;
-            keysToRemove.Add(key);
+            var node = _lru.First;
+            while (node is not null)
+            {
+                var next = node.Next;
+                var key = node.Value.Key;
+                // SizedKey = CacheKey + "@" + pixelSize；拆出 CacheKey 部分判断。
+                var atIdx = key.LastIndexOf('@');
+                var cacheKey = atIdx > 0 ? key.Substring(0, atIdx) : key;
+                // 保留 ext: 和 dir: 前缀的键（扩展名/目录类型图标恒定）。
+                var keep = cacheKey.StartsWith("ext:", StringComparison.OrdinalIgnoreCase)
+                    || cacheKey.StartsWith("dir:", StringComparison.OrdinalIgnoreCase);
+                if (!keep)
+                {
+                    _lru.Remove(node);
+                    _map.Remove(key);
+                }
+                node = next;
+            }
         }
-        foreach (var key in keysToRemove)
-            _cache.TryRemove(key, out _);
-        // 重建队列：只保留仍在缓存中的键。
-        var remaining = new List<string>();
-        while (_order.TryDequeue(out var k))
-            if (_cache.ContainsKey(k))
-                remaining.Add(k);
-        foreach (var k in remaining)
-            _order.Enqueue(k);
     }
 
     /// <summary>当前缓存条数（诊断用）。</summary>
-    public int Count => _cache.Count;
+    public int Count
+    {
+        get { lock (_lock) { return _map.Count; } }
+    }
 
+    /// <summary>持锁调用。超出容量时从链表尾（最久未用）淘汰。</summary>
     private void TrimIfNeeded()
     {
-        while (_cache.Count > MaxEntries && _order.TryDequeue(out var old))
-            _cache.TryRemove(old, out _);
+        while (_map.Count > MaxEntries)
+        {
+            var oldest = _lru.Last;
+            if (oldest is null)
+                break;
+            _lru.RemoveLast();
+            _map.Remove(oldest.Value.Key);
+        }
     }
 
     /// <summary>
