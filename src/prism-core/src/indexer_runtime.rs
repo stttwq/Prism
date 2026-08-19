@@ -162,7 +162,7 @@ pub struct ServiceState {
     /// R2 persistence gate. Cleared while a first build is in flight so that no exit
     /// path can write a partial index that would later look like a complete cache.
     first_build_complete: AtomicBool,
-    pinyin: RwLock<Option<PinyinSidecar>>,
+    pinyin: RwLock<Option<Arc<PinyinSidecar>>>,
     pinyin_status: RwLock<PinyinStatus>,
     pinyin_data_dir: RwLock<Option<PathBuf>>,
     pinyin_needs_rebuild: AtomicBool,
@@ -173,6 +173,12 @@ pub struct ServiceState {
     /// S1（FRESH-AUDIT-2026-08-19）: 某卷到达名字池压缩阈值。watcher 在写锁内
     /// O(1) 立标志，maintenance tick 在锁外 clone→压缩→短锁换入。
     needs_name_compact: AtomicBool,
+    /// F2（FRESH-AUDIT-2）：单槽 RootBound 缓存 (raw root, generation, bound)。
+    /// 带 root 的搜索此前每击键都对节点表全量线性扫描解析 root（CWD 范围搜索
+    /// 是常态路径，3M 记录卷上额外 ~10ms+ 持读锁）。generation 变化即失效——
+    /// 记录号可能因 USN 重放改变，旧 bound 绝不能复用。单槽即可：同一会话里
+    /// 呼出时的 CWD 在下一次呼出前几乎不变。
+    root_bound_cache: RwLock<Option<(String, u64, crate::hierarchy::RootBound)>>,
 }
 
 impl ServiceState {
@@ -204,13 +210,13 @@ impl ServiceState {
             generation_notify: Notify::new(),
             progress: BuildProgressCounters::default(),
             first_build_complete: AtomicBool::new(false),
-            pinyin: RwLock::new(None),
-            pinyin_status: RwLock::new(PinyinStatus::Building),
+            pinyin: RwLock::new(None),            pinyin_status: RwLock::new(PinyinStatus::Building),
             pinyin_data_dir: RwLock::new(None),
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
             connections: AtomicUsize::new(0),
             needs_name_compact: AtomicBool::new(false),
+            root_bound_cache: RwLock::new(None),
         })
     }
 
@@ -320,7 +326,7 @@ impl ServiceState {
                 // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
                 let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
                 {
-                    *current = Some(sidecar);
+                    *current = Some(Arc::new(sidecar));
                 }
                 self.set_pinyin_status(PinyinStatus::Ready);
             }
@@ -353,7 +359,7 @@ impl ServiceState {
                 // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
                 let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
                 {
-                    *current = Some(sidecar);
+                    *current = Some(Arc::new(sidecar));
                 }
                 self.set_pinyin_status(PinyinStatus::Ready);
                 self.pinyin_needs_rebuild.store(false, Ordering::Release);
@@ -412,10 +418,17 @@ impl ServiceState {
             self.pinyin_needs_rebuild.store(true, Ordering::Release);
             return;
         };
-        let Some(sidecar) = sidecar_slot.as_mut() else {
+        let Some(sidecar_arc) = sidecar_slot.as_mut() else {
             self.pinyin_needs_rebuild.store(true, Ordering::Release);
             return;
         };
+        // G4（FRESH-AUDIT-2）：搜索侧只持 Arc 快照（见 search 的 clone 路径），
+        // 恰有拼音扫描在飞时这里 COW 克隆一次完整 sidecar（几 MB memcpy，罕见且
+        // 只发生在 watcher 线程）；无并发时零拷贝。换来的是 pinyin.write 永不
+        // 等一次长扫描。
+        // ponytail: COW 克隆上限=单卷 sidecar 载荷，若 USN 批次与拼音搜索高频
+        // 交叠成为瓶颈，再拆独立 delta 锁。
+        let sidecar = Arc::make_mut(sidecar_arc);
         let mut invalidate = false;
         for record in records {
             let Ok((record_number, _)) = VolumeIndex::split_frn(record.frn) else {
@@ -474,7 +487,7 @@ impl ServiceState {
                 .pinyin
                 .read()
                 .ok()
-                .and_then(|sidecar| sidecar.as_ref().map(PinyinSidecar::resident_bytes))
+                .and_then(|sidecar| sidecar.as_ref().map(|s| s.resident_bytes()))
                 .unwrap_or(0);
         format!(
             "memory_bytes={} volumes={} events_since_checkpoint={} pinyin={:?}",
@@ -501,7 +514,7 @@ impl ServiceState {
                     .pinyin
                     .read()
                     .ok()
-                    .and_then(|sidecar| sidecar.as_ref().map(PinyinSidecar::resident_bytes))
+                    .and_then(|sidecar| sidecar.as_ref().map(|s| s.resident_bytes()))
                     .unwrap_or(0),
             message: self.message.read().ok().and_then(|value| value.clone()),
             build_progress: self.progress.snapshot(),
@@ -605,6 +618,42 @@ impl ServiceState {
         }
     }
 
+    /// F2（FRESH-AUDIT-2）：带 generation 失效的单槽 RootBound 缓存解析。
+    /// 调用方持有 index 读锁（`state` 借自它）；缓存锁只在此处获取，
+    /// 与 index 锁无反向嵌套，无死序风险。generation 不匹配即重解析并覆盖。
+    fn resolve_root_bound(
+        &self,
+        state: &IndexState,
+        root: &str,
+    ) -> Result<Option<crate::hierarchy::RootBound>, IndexerResponse> {
+        {
+            let cache = self
+                .root_bound_cache
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((key, generation, bound)) = cache.as_ref() {
+                if key == root && *generation == state.generation {
+                    return Ok(Some(*bound));
+                }
+            }
+        }
+        match RootScope::resolve(state, root) {
+            Ok(scope) => {
+                let bound = scope.bound();
+                let mut cache = self
+                    .root_bound_cache
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *cache = Some((root.to_owned(), state.generation, bound));
+                Ok(Some(bound))
+            }
+            Err(rejection) => Err(IndexerResponse::RootUnavailable {
+                reason: rejection,
+                message: rejection.message().to_owned(),
+            }),
+        }
+    }
+
     fn search(
         &self,
         query: &str,
@@ -637,15 +686,9 @@ impl ServiceState {
         // are included; a search never flips the flag or releases the sidecar.
         let pinyin_enabled = self.pinyin_enabled.load(Ordering::Acquire);
         let root_bound = match root {
-            Some(root) => match RootScope::resolve(state, root) {
-                Ok(scope) => Some(scope.bound()),
-                Err(rejection) => {
-                    // The caller falls back to a global search; the reason stays explicit.
-                    return Ok(IndexerResponse::RootUnavailable {
-                        reason: rejection,
-                        message: rejection.message().to_owned(),
-                    });
-                }
+            Some(root) => match self.resolve_root_bound(state, root) {
+                Ok(bound) => bound,
+                Err(response) => return Ok(response),
             },
             None => None,
         };
@@ -692,8 +735,15 @@ impl ServiceState {
         let mut matched_count = literal_count;
         let mut path_constructions = outcome.path_constructions;
         if pinyin_enabled && literal_count < max as u64 {
-            if let Ok(sidecar) = self.pinyin.read() {
-                if let Some(sidecar) = sidecar.as_ref() {
+            // G4（FRESH-AUDIT-2）：clone Arc 快照后立刻放 pinyin 读锁——拼音全表扫
+            // 不再占住 pinyin.read()，USN 的 delta 写入不必等一次长扫描。
+            let snapshot = self
+                .pinyin
+                .read()
+                .ok()
+                .and_then(|sidecar| sidecar.clone());
+            if let Some(sidecar) = snapshot {
+                {
                     let pinyin = sidecar.search_in_root(
                         state,
                         query,
@@ -2389,7 +2439,7 @@ mod tests {
         );
 
         let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
-        *state.pinyin.write().unwrap() = Some(PinyinSidecar::build(&snapshot).unwrap());
+        *state.pinyin.write().unwrap() = Some(Arc::new(PinyinSidecar::build(&snapshot).unwrap()));
         // M6 (audit): search is read-only w.r.t. the pinyin flag. Disabling is
         // now done via SetPinyinEnabled / release_pinyin directly, not via search().
         state.release_pinyin();
@@ -2920,6 +2970,40 @@ mod tests {
                 panic!("expected results for {root:?}");
             };
             assert_eq!(items.len(), 2, "root {root:?} must not restrict anything");
+        }
+
+        // F2（FRESH-AUDIT-2）：同一 root + 同一 generation 的第二次解析命中缓存
+        //（bound 与首次一致）；generation 前进后旧缓存不得复用（结构化拒绝）。
+        {
+            let guard = state.index.read().unwrap();
+            let live = guard.as_ref().unwrap();
+            let first = state
+                .resolve_root_bound(live, r"c:/项目/")
+                .unwrap()
+                .unwrap();
+            let cached = state
+                .resolve_root_bound(live, r"c:/项目/")
+                .unwrap()
+                .unwrap();
+            assert_eq!(first, cached);
+        }
+        state.publish(IndexState {
+            volumes: vec![],
+            generation: 4,
+            events_since_checkpoint: 0,
+        });
+        {
+            let guard = state.index.read().unwrap();
+            let live = guard.as_ref().unwrap();
+            let stale = state.resolve_root_bound(live, r"c:/项目/");
+            drop(guard);
+            assert!(matches!(
+                stale,
+                Err(IndexerResponse::RootUnavailable {
+                    reason: crate::root_scope::RootRejection::VolumeNotIndexed,
+                    ..
+                })
+            ));
         }
     }
 

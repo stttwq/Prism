@@ -38,13 +38,18 @@ pub fn load(data_dir: &Path) -> Result<IndexState, String> {
     // 反序列器暂存非顺序数据，常驻尺寸远小于完整文件。
     let reader = std::io::BufReader::with_capacity(256 * 1024, file);
     let mut scratch = [0u8; 4096];
-    let (envelope, _leftover): (CacheEnvelope<IndexState>, _) =
+    let (mut envelope, _leftover): (CacheEnvelope<IndexState>, _) =
         postcard::from_io((reader, scratch.as_mut_slice()))
             .map_err(|error| format!("decode v5 cache: {error}"))?;
     if &envelope.magic != CACHE_MAGIC || envelope.version != CACHE_VERSION {
         return Err("cache is not Prism v5".into());
     }
     validate(&envelope.state)?;
+    // F3（FRESH-AUDIT-2）：指纹是 serde skip 字段，载入后整算一次
+    //（一次池线性扫，远廉于上面的全量 validate）。
+    for volume in &mut envelope.state.volumes {
+        volume.recompute_names_fingerprint();
+    }
     Ok(envelope.state)
 }
 

@@ -59,6 +59,29 @@ pub struct VolumeIndex {
     initial_name_bytes: usize,
     #[serde(skip)]
     dead_name_bytes: usize,
+    /// F3（FRESH-AUDIT-2）：names 池内容的增量指纹（serde skip——v5 字节布局不变，
+    /// 载入后由 [`VolumeIndex::recompute_names_fingerprint`] 整算一次）。
+    /// append_name 滚入、compact 后整算。pinyin 的 index_identity 用它替代
+    /// "在 index.read() 内对全池逐字节 FNV"——几十~上百 MB 池持锁 ~100ms 级。
+    #[serde(skip)]
+    pub names_fingerprint: u64,
+}
+
+/// F3: names 指纹的 FNV-1a 常量（与 pinyin_sidecar 的 FNV 族一致但独立维护，
+/// 两者不是同一个值域，不共享常量以免耦合）。
+const NAMES_FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const NAMES_FNV_PRIME: u64 = 0x100000001b3;
+
+fn fold_names_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(NAMES_FNV_PRIME);
+    }
+    hash
+}
+
+fn names_pool_fingerprint(pool: &[u8]) -> u64 {
+    fold_names_bytes(NAMES_FNV_OFFSET, pool)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +375,7 @@ impl VolumeIndex {
             names: Vec::new(),
             initial_name_bytes: 0,
             dead_name_bytes: 0,
+            names_fingerprint: NAMES_FNV_OFFSET,
         })
     }
 
@@ -650,6 +674,9 @@ impl VolumeIndex {
         replacement.shrink_to_fit();
         self.names = replacement;
         self.dead_name_bytes = 0;
+        // F3: 池被重写，指纹随之整算（identity 会变化——与旧的全池哈希行为一致，
+        // 压缩本就改变池内容，sidecar 失配走既有重建路径）。
+        self.recompute_names_fingerprint();
         // AUDIT-2026-08-18 R-C3: 槽表此前只增不减（上限 16M × 12B = 192MB/卷）。
         // 记录号是外部键、不能重映射（P4），只能在压缩时回收尾部连续的
         // tombstone/从未使用槽。尾部界必须覆盖所有在位节点自身的记录号与其
@@ -732,7 +759,16 @@ impl VolumeIndex {
         let offset = u32::try_from(self.names.len()).map_err(|_| "name pool exceeds u32")?;
         self.names.extend_from_slice(name.as_bytes());
         self.names.push(0);
+        // F3: 滚入追加字节（含终止符）——与全池整算在相同追加顺序下结果一致。
+        self.names_fingerprint = fold_names_bytes(self.names_fingerprint, name.as_bytes());
+        self.names_fingerprint = fold_names_bytes(self.names_fingerprint, &[0]);
         Ok(offset)
+    }
+
+    /// F3: 全池整算指纹。v5 缓存载入后调用（serde skip 使指纹不入盘），
+    /// 名字池压缩后调用（池内容被重写）。整算与增量滚入在相同字节序列下等值。
+    pub fn recompute_names_fingerprint(&mut self) {
+        self.names_fingerprint = names_pool_fingerprint(&self.names);
     }
 
     pub(crate) fn name_at(&self, offset: u32) -> Result<&str, String> {

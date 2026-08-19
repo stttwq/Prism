@@ -50,7 +50,9 @@ struct SidecarDisk {
     checksum: u64,
 }
 
-#[derive(Debug)]
+/// G4（FRESH-AUDIT-2）：Clone 供运行时的 Arc 快照在 USN delta 写入时 COW
+///（`Arc::make_mut`），仅在与拼音扫描并发时发生。
+#[derive(Debug, Clone)]
 pub struct PinyinSidecar {
     disk: SidecarDisk,
     delta: BTreeMap<RecordKey, Option<Vec<u8>>>,
@@ -686,15 +688,21 @@ fn validate_disk_with(
 ///
 /// Made `pub(crate)` so callers can pre-compute the hash under a read lock
 /// and then release the lock before the expensive mmap + deserialization.
+///
+/// F3（FRESH-AUDIT-2）：names 池不再逐字节滚入（几十~上百 MB 池在 index.read()
+/// 内持锁 ~100ms 级，阻塞 USN 写者）——改用 VolumeIndex 增量维护的
+/// `names_fingerprint`（append 滚入 / compact 与缓存载入整算，见 hierarchy），
+/// 并叠加 journal_id。升级后首次与旧 sidecar 必然失配，走一轮重建（一次性）。
 pub(crate) fn index_identity(index: &IndexState) -> u64 {
     let mut hash = FNV_OFFSET;
     for volume in &index.volumes {
         hash_bytes(&mut hash, volume.volume_id.guid.as_bytes());
         hash_bytes(&mut hash, &volume.volume_id.serial.to_le_bytes());
+        hash_bytes(&mut hash, &volume.journal_id.to_le_bytes());
         hash_bytes(&mut hash, &volume.root_record.to_le_bytes());
         hash_bytes(&mut hash, &(volume.nodes.len() as u64).to_le_bytes());
         hash_bytes(&mut hash, &(volume.names.len() as u64).to_le_bytes());
-        hash_bytes(&mut hash, &volume.names);
+        hash_bytes(&mut hash, &volume.names_fingerprint.to_le_bytes());
     }
     hash
 }
@@ -846,6 +854,36 @@ mod tests {
         assert_eq!(outcome.items[0].path, "C:\\微信2026");
         assert_eq!(outcome.items[0].match_spans, [0, 6]);
         assert_eq!(outcome.items[0].match_metadata.kind, MatchKind::Initials);
+    }
+
+    /// F3（FRESH-AUDIT-2）：identity 指纹的稳定性与敏感性。
+    /// - 相同追加序列 → 相同 identity（缓存载入后的整算指纹与增量滚入等值）；
+    /// - 名字池内容变化（rename 追加新名）→ identity 必变；
+    /// - v5 缓存 save/load 往返后 identity 不变（serde skip + 载入整算）。
+    #[test]
+    fn f3_index_identity_fingerprint_is_stable_and_sensitive() {
+        let first = state();
+        let mut same = state();
+        // 重建等价索引：相同追加顺序（upsert 相同名字）→ 相同指纹与 identity。
+        assert_eq!(index_identity(&first), index_identity(&same));
+
+        // 载入侧整算指纹与增量滚入等值。
+        same.volumes[0].recompute_names_fingerprint();
+        assert_eq!(index_identity(&first), index_identity(&same));
+
+        // rename 追加新名 → 内容变化 → identity 必变。
+        let mut renamed = state();
+        renamed.volumes[0].upsert(10, 5, "微信2027", false).unwrap();
+        assert_ne!(index_identity(&first), index_identity(&renamed));
+
+        // v5 往返：serde skip 使指纹归零，载入整算后 identity 与活索引一致。
+        let dir =
+            std::env::temp_dir().join(format!("prism-f3-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::index_cache::save(&first, &dir).unwrap();
+        let loaded = crate::index_cache::load(&dir).unwrap();
+        assert_eq!(index_identity(&first), index_identity(&loaded));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
