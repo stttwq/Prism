@@ -42,6 +42,19 @@ public sealed class PipeClient : ISearchClient, IDisposable
     private bool _wasConnected;
 
     /// <summary>
+    /// AUDIT-2026-08-18 C-D9: Dispose 已开始。watchdog tick 与 EnsureBackendRunning
+    /// 双重检查此标志，防止 Dispose 杀掉 broker 之后在途 tick 又拉起一个新孤儿。
+    /// </summary>
+    private volatile bool _disposed;
+
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D9: 测试用进程启动器——注入后 EnsureBackendRunning 不再
+    /// 真正 Process.Start（测试里绝不能拉起真实 prism-core）。返回 null 走既有
+    /// "启动失败"IOException 路径。
+    /// </summary>
+    internal Func<ProcessStartInfo, Process?>? ProcessStarterForTest { get; set; }
+
+    /// <summary>
     /// 后端连接状态变化通知。true=已连上，false=断开/重连失败。
     /// 由 watchdog 和首次连接触发，供上层（App）更新 UI 状态。
     /// </summary>
@@ -164,6 +177,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
     private async Task WatchdogTickAsync()
     {
+        // C-D9: Dispose 已开始就不再干活——在途 tick 排干由 Dispose(waitHandle) 保证，
+        // 这里是快速出口（排干窗口内新 tick 不会再有）。
+        if (_disposed)
+            return;
+
         var forceReconnect = false;
         if (_query.IsConnected)
         {
@@ -710,9 +728,15 @@ public sealed class PipeClient : ISearchClient, IDisposable
         };
     }
 
-    /// <summary>确保后端进程在运行；未运行则定位可执行文件并启动，并纳入 Job Object。</summary>
-    private void EnsureBackendRunning()
+    /// <summary>
+    /// 确保后端进程在运行；未运行则定位可执行文件并启动，并纳入 Job Object。
+    /// internal 供 C-D9 测试直接锚定"Dispose 后不再拉进程"。
+    /// </summary>
+    internal void EnsureBackendRunning()
     {
+        // C-D9: Dispose 进行中/已完成——绝不再拉新进程，否则 Kill 后又留下孤儿。
+        if (_disposed)
+            return;
         if (_backend is { HasExited: false })
             return;
 
@@ -731,12 +755,16 @@ public sealed class PipeClient : ISearchClient, IDisposable
         // broker 崩溃循环下 watchdog 每 15 秒重拉一次，不 Dispose 会持续累积句柄。
         try { _backend?.Dispose(); } catch { /* 已释放/已退出 */ }
         _backend = null;
-        _backend = Process.Start(psi)
+        _backend = (ProcessStarterForTest ?? Process.Start)(psi)
             ?? throw new IOException("启动 prism-core.exe 失败");
 
         // 纳入 Job Object：Prism 崩溃/被杀时 OS 自动回收 broker，不留孤儿占管道。
-        _jobGuard ??= new JobObjectGuard();
-        _jobGuard.Assign(_backend.Handle);
+        // 测试注入的 Process 对象没有真实句柄，跳过收编（测试只锚定启动次数）。
+        if (ProcessStarterForTest is null)
+        {
+            _jobGuard ??= new JobObjectGuard();
+            _jobGuard.Assign(_backend.Handle);
+        }
     }
 
     /// <summary>
@@ -798,7 +826,20 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
     public void Dispose()
     {
-        _watchdog?.Dispose();
+        // C-D9: 先立墓碑再拆 timer——tick 入口与 EnsureBackendRunning 都会检查它。
+        _disposed = true;
+
+        // C-D9: Timer.Dispose() 不等在途回调；用带等待句柄的 Dispose 排干在途 tick
+        // （tick 内部重连有 10s 上限，等待 12s 封顶），保证此后 Kill 的 broker
+        // 不会被一个迟到的 tick 重新拉活成孤儿。
+        if (_watchdog is not null)
+        {
+            using var drained = new ManualResetEvent(false);
+            _watchdog.Dispose(drained);
+            drained.WaitOne(TimeSpan.FromSeconds(12));
+            _watchdog = null;
+        }
+
         // 两条连接都要拆（动作通道可能带着一个未完成的交互式动作，
         // DisposeStreamOnly 走 ThreadPool，不会让退出路径等 I/O）。
         _query.Dispose();
