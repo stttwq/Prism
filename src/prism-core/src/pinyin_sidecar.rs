@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(index_identity(&first), index_identity(&same));
 
         // 载入侧整算指纹与增量滚入等值。
-        same.volumes[0].recompute_names_fingerprint();
+        same.volumes[0].recompute_derived_counters();
         assert_eq!(index_identity(&first), index_identity(&same));
 
         // rename 追加新名 → 内容变化 → identity 必变。

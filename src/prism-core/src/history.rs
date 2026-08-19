@@ -169,6 +169,19 @@ pub struct HistoryStore {
     /// 全量 clone 5000 条的开销。用独立 Mutex 不依赖 RwLock 写锁——
     /// 多读者可并发检查缓存，仅在 miss 时持锁重建。
     weights_cache: Mutex<Option<Arc<[HistoryWeight]>>>,
+    /// G4（FRESH-AUDIT-2）：写盘节流。动作历史每条记录都全量 JSON+fsync 太密——
+    /// 连续动作只落一次盘，脏数据由下一次到期写入或 Drop 兜底（丢失窗口 ≤ 节流间隔）。
+    persist_gate: Mutex<HistoryPersistGate>,
+}
+
+/// G4: 节流间隔。动作通常成串发生（连续打开/定位），首条立即落盘，
+/// 后续 250ms 窗口内的合并到下一次到期写入。
+const MIN_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Default)]
+struct HistoryPersistGate {
+    last: Option<std::time::Instant>,
+    dirty: bool,
 }
 
 impl HistoryStore {
@@ -198,6 +211,7 @@ impl HistoryStore {
             state: RwLock::new(HistoryState::from_entries(entries)),
             diagnostic: RwLock::new(diagnostic),
             weights_cache: Mutex::new(None),
+            persist_gate: Mutex::new(HistoryPersistGate::default()),
         }
     }
 
@@ -240,6 +254,10 @@ impl HistoryStore {
         if let Ok(mut diagnostic) = self.diagnostic.write() {
             *diagnostic = None;
         }
+        // G4: 清空后重置节流门，避免先前的脏标记在下次 record 前意外重建文件。
+        if let Ok(mut gate) = self.persist_gate.lock() {
+            *gate = HistoryPersistGate::default();
+        }
         Ok(())
     }
 
@@ -271,8 +289,8 @@ impl HistoryStore {
         // 锁内：内存更新 + 仅超容量时 prune。JSON 编码 + fsync 出锁后执行，
         // 避免写锁持有期间阻塞所有搜索的 score()/weights() 读操作。
         // （审计 P3+M3：参考 Everything "数据库全驻内存、退出才写盘" 的思路——
-        // 内存操作与持久化解耦。）
-        let entries_snapshot = {
+        // 内存操作与持久化解耦。G4 节流后快照只在真正落盘时才 clone。）
+        {
             let mut state = self
                 .state
                 .write()
@@ -317,14 +335,38 @@ impl HistoryStore {
                 prune(&mut state.entries);
                 state.rebuild_index();
             }
-            state.entries.clone()
         };
         // 条目已变更：weights 快照缓存失效，下次 weights() 重建。
         if let Ok(mut cache) = self.weights_cache.lock() {
             *cache = None;
         }
-        // 锁外：JSON 编码 + fsync + atomic_replace。写锁已释放，不阻塞搜索。
-        persist(&self.path, &entries_snapshot)
+        // G4 写盘节流：锁外判定 + 到期才 clone 全量条目并落盘（首条立即落盘）。
+        if !self.should_persist_now() {
+            return Ok(());
+        }
+        let snapshot = {
+            let Ok(state) = self.state.read() else {
+                return Ok(());
+            };
+            state.entries.clone()
+        };
+        persist(&self.path, snapshot)
+    }
+
+    /// G4: 到期判定并记账。返回 true = 本次应落盘（调用方随后 clone+persist）。
+    fn should_persist_now(&self) -> bool {
+        let Ok(mut gate) = self.persist_gate.lock() else {
+            return false;
+        };
+        gate.dirty = true;
+        let due = gate
+            .last
+            .is_none_or(|at| at.elapsed() >= MIN_PERSIST_INTERVAL);
+        if due {
+            gate.last = Some(std::time::Instant::now());
+            gate.dirty = false;
+        }
+        due
     }
 
     pub fn score(&self, target: &ActionTarget) -> u32 {
@@ -545,6 +587,21 @@ fn seed_legacy_frecency(entries: &mut [HistoryEntry]) {
     }
 }
 
+/// G4（FRESH-AUDIT-2）：Drop 兜底冲刷节流窗口内的脏数据——broker 退出时
+/// 最近 250ms 内的动作记录不丢。
+impl Drop for HistoryStore {
+    fn drop(&mut self) {
+        let gate = self.persist_gate.get_mut().unwrap_or_else(|p| p.into_inner());
+        if !gate.dirty || !self.is_enabled() {
+            return;
+        }
+        let Ok(state) = self.state.read() else {
+            return;
+        };
+        let _ = persist(&self.path, state.entries.clone());
+    }
+}
+
 fn is_recordable(target: &ActionTarget) -> bool {
     matches!(
         target.kind.as_str(),
@@ -570,13 +627,12 @@ fn prune(entries: &mut Vec<HistoryEntry>) {
     }
 }
 
-fn persist(path: &Path, entries: &[HistoryEntry]) -> Result<(), String> {
+fn persist(path: &Path, entries: Vec<HistoryEntry>) -> Result<(), String> {
     let parent = path.parent().ok_or("history path has no parent")?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create history directory: {error}"))?;
-    let envelope = VersionedEnvelope::new(HistoryData {
-        entries: entries.to_vec(),
-    })?;
+    // G4: entries 按值移动进信封，免去此前 record 侧 clone 之后这里的第二次全量 to_vec。
+    let envelope = VersionedEnvelope::new(HistoryData { entries })?;
     let bytes =
         serde_json::to_vec(&envelope).map_err(|error| format!("encode history: {error}"))?;
     let temporary = parent.join(format!("{HISTORY_FILE}.tmp"));

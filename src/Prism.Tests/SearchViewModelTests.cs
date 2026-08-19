@@ -121,6 +121,29 @@ public sealed class SearchViewModelTests
         Assert.Equal(0, client.SearchCount); // 网页模式不走本地搜索
     }
 
+    /// <summary>F7（FRESH-AUDIT-2）：动作超时 ≠ 未执行——mutation 类超时文案必须
+    /// 报"结果未知"引导核实，普通失败仍走"动作失败"。</summary>
+    [Fact]
+    public async Task MutationActionTimeoutReportsUnknownOutcome()
+    {
+        var client = new FakeSearchClient
+        {
+            RunActionException = new IOException("后端响应超时（300 秒）"),
+        };
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        var target = new SearchResult("file", "x.txt", @"C:\x.txt", @"C:\x.txt", []);
+        await vm.RunActionOnAsync(target, new ActionItem("recycle", "删除", "", false, false));
+        Assert.Contains("结果未知", state.StatusMessage);
+        Assert.DoesNotContain("动作失败", state.StatusMessage);
+
+        // 非超时异常仍是普通失败文案。
+        client.RunActionException = new IOException("管道断开");
+        await vm.RunActionOnAsync(target, new ActionItem("recycle", "删除", "", false, false));
+        Assert.Contains("动作失败", state.StatusMessage);
+    }
+
     [Fact]
     public async Task GenerationInvalidatesCacheAndLateResponseCannotOverwriteNewQuery()
     {
@@ -1213,7 +1236,7 @@ public sealed class SearchViewModelTests
         {
             LastTarget = target;
             LastActionArgs = null;
-            return Task.CompletedTask;
+            return RunActionCoreAsync();
         }
         public Task RunActionAsync(
             ActionTarget target,
@@ -1224,8 +1247,14 @@ public sealed class SearchViewModelTests
         {
             LastTarget = target;
             LastActionArgs = args;
-            return Task.CompletedTask;
+            return RunActionCoreAsync();
         }
+
+        private Task RunActionCoreAsync() =>
+            RunActionException is { } ex ? Task.FromException(ex) : Task.CompletedTask;
+
+        /// <summary>非空时 RunActionAsync 抛出该异常（F7 超时文案测试用）。</summary>
+        public Exception? RunActionException { get; set; }
 
         /// <summary>最后一次带参数调用传入的 args，用于断言 rename new_name 等。</summary>
         public ActionArgs? LastActionArgs { get; set; }

@@ -3193,11 +3193,11 @@ mod protocol_tests {
             &crate::hierarchy::QueryFilters::none(),
             8,
         );
-        assert!(named.iter().any(|item| &*item.execute_id == inside_str));
+        assert!(named.iter().any(|item| *item.execute_id == inside_str));
         assert!(
             named
                 .iter()
-                .any(|item| &*item.execute_id == outside_same_str),
+                .any(|item| *item.execute_id == outside_same_str),
             "without a root filter, sibling trees still inject on title match"
         );
 

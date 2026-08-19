@@ -59,12 +59,15 @@ pub struct VolumeIndex {
     initial_name_bytes: usize,
     #[serde(skip)]
     dead_name_bytes: usize,
-    /// F3（FRESH-AUDIT-2）：names 池内容的增量指纹（serde skip——v5 字节布局不变，
-    /// 载入后由 [`VolumeIndex::recompute_names_fingerprint`] 整算一次）。
-    /// append_name 滚入、compact 后整算。pinyin 的 index_identity 用它替代
-    /// "在 index.read() 内对全池逐字节 FNV"——几十~上百 MB 池持锁 ~100ms 级。
+    /// F3: names 指纹（serde skip 不入盘）。append 滚入、compact 整算、
+    /// 缓存载入后由 [`VolumeIndex::recompute_derived_counters`] 重算。
     #[serde(skip)]
     pub names_fingerprint: u64,
+    /// G4（FRESH-AUDIT-2）：在位节点计数（serde skip）。ensure_slot 的稀疏度
+    /// 防线此前每次增长都全表扫描计数——首建期多次增长累计 O(n²)。
+    /// upsert/delete 增减、载入后整算。
+    #[serde(skip)]
+    present_slots: usize,
 }
 
 /// F3: names 指纹的 FNV-1a 常量（与 pinyin_sidecar 的 FNV 族一致但独立维护，
@@ -376,6 +379,7 @@ impl VolumeIndex {
             initial_name_bytes: 0,
             dead_name_bytes: 0,
             names_fingerprint: NAMES_FNV_OFFSET,
+            present_slots: 1, // 根节点在 new 内即置 PRESENT
         })
     }
 
@@ -445,6 +449,10 @@ impl VolumeIndex {
             || (name.eq_ignore_ascii_case("Installer")
                 && self.node_name_is(parent_record, "Windows"));
         let old = self.nodes[record as usize];
+        // G4: 首次在位的槽位计数 +1（槽原本就在表内但非在位的复活不算增长）。
+        if old.flags & FLAG_PRESENT == 0 {
+            self.present_slots += 1;
+        }
         let crossed_boundary =
             old.flags & FLAG_PRESENT != 0 && (old.flags & FLAG_EXCLUDED != 0) != excluded;
         if crossed_boundary && is_directory {
@@ -496,6 +504,7 @@ impl VolumeIndex {
             }
             slot.flags &= !FLAG_PRESENT;
             slot.name_off = NO_NAME;
+            self.present_slots = self.present_slots.saturating_sub(1);
         }
         Ok(())
     }
@@ -676,7 +685,7 @@ impl VolumeIndex {
         self.dead_name_bytes = 0;
         // F3: 池被重写，指纹随之整算（identity 会变化——与旧的全池哈希行为一致，
         // 压缩本就改变池内容，sidecar 失配走既有重建路径）。
-        self.recompute_names_fingerprint();
+        self.recompute_derived_counters();
         // AUDIT-2026-08-18 R-C3: 槽表此前只增不减（上限 16M × 12B = 192MB/卷）。
         // 记录号是外部键、不能重映射（P4），只能在压缩时回收尾部连续的
         // tombstone/从未使用槽。尾部界必须覆盖所有在位节点自身的记录号与其
@@ -736,12 +745,8 @@ impl VolumeIndex {
             return Err(format!("MFT record {record} exceeds compact-index limit"));
         }
         if required > self.nodes.len() {
-            let present = self
-                .nodes
-                .iter()
-                .filter(|slot| slot.flags & FLAG_PRESENT != 0)
-                .count()
-                .max(1);
+            // G4: 稀疏度防线改读维护计数（此前每次增长全表扫描计数）。
+            let present = self.present_slots.max(1);
             if required > 65_536 && required > present.saturating_mul(32) {
                 return Err(format!(
                     "MFT slot table is pathologically sparse: {required}/{present}"
@@ -765,10 +770,16 @@ impl VolumeIndex {
         Ok(offset)
     }
 
-    /// F3: 全池整算指纹。v5 缓存载入后调用（serde skip 使指纹不入盘），
-    /// 名字池压缩后调用（池内容被重写）。整算与增量滚入在相同字节序列下等值。
-    pub fn recompute_names_fingerprint(&mut self) {
+    /// F3+G4: 重算派生计数（names 指纹 + 在位槽位数）。v5 缓存载入后调用
+    /// （两者都是 serde skip 字段），名字池压缩后调用（池与槽表都被重写）。
+    /// 整算与增量滚入在相同字节序列下等值。
+    pub fn recompute_derived_counters(&mut self) {
         self.names_fingerprint = names_pool_fingerprint(&self.names);
+        self.present_slots = self
+            .nodes
+            .iter()
+            .filter(|slot| slot.flags & FLAG_PRESENT != 0)
+            .count();
     }
 
     pub(crate) fn name_at(&self, offset: u32) -> Result<&str, String> {
@@ -1939,6 +1950,24 @@ mod tests {
         volume.nodes[10].parent_record = 11;
         assert!(volume.path_for(11).is_err());
         assert!(VolumeIndex::split_frn(0x0000_0001_0000_0000).is_err());
+    }
+
+    /// G4（FRESH-AUDIT-2）：在位槽位计数随 upsert/delete 增减，整算与之等值
+    ///（ensure_slot 的稀疏度防线据此免全表扫描）。
+    #[test]
+    fn g4_present_slot_counter_tracks_upserts_and_deletes() {
+        let mut volume = volume(); // 根节点 1 个在位
+        volume.upsert(frn(10, 1), frn(5, 0), "a", true).unwrap();
+        volume.upsert(frn(11, 1), frn(10, 1), "b.txt", false).unwrap();
+        assert_eq!(volume.present_slots, 3);
+        volume.delete(frn(11, 1)).unwrap();
+        assert_eq!(volume.present_slots, 2);
+        // 复活同号槽：净计数不变。
+        volume.upsert(frn(11, 1), frn(10, 1), "c.txt", false).unwrap();
+        assert_eq!(volume.present_slots, 3);
+        let before = volume.present_slots;
+        volume.recompute_derived_counters();
+        assert_eq!(volume.present_slots, before);
     }
 
     #[test]

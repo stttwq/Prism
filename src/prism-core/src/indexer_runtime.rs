@@ -152,6 +152,15 @@ impl BuildProgressCounters {
     }
 }
 
+/// F2 的解析结果：Bound = 继续搜索；Unavailable = 结构化拒绝回传调用方。
+/// （不用 Result<_, IndexerResponse>：IndexerResponse 体积大，clippy
+/// result_large_err 会拦；自定义枚举同样表达且零开销。）
+#[derive(Debug)]
+enum RootBoundOutcome {
+    Bound(Option<crate::hierarchy::RootBound>),
+    Unavailable(IndexerResponse),
+}
+
 pub struct ServiceState {
     index: RwLock<Option<IndexState>>,
     building: AtomicBool,
@@ -625,7 +634,7 @@ impl ServiceState {
         &self,
         state: &IndexState,
         root: &str,
-    ) -> Result<Option<crate::hierarchy::RootBound>, IndexerResponse> {
+    ) -> RootBoundOutcome {
         {
             let cache = self
                 .root_bound_cache
@@ -633,7 +642,7 @@ impl ServiceState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some((key, generation, bound)) = cache.as_ref() {
                 if key == root && *generation == state.generation {
-                    return Ok(Some(*bound));
+                    return RootBoundOutcome::Bound(Some(*bound));
                 }
             }
         }
@@ -645,9 +654,9 @@ impl ServiceState {
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 *cache = Some((root.to_owned(), state.generation, bound));
-                Ok(Some(bound))
+                RootBoundOutcome::Bound(Some(bound))
             }
-            Err(rejection) => Err(IndexerResponse::RootUnavailable {
+            Err(rejection) => RootBoundOutcome::Unavailable(IndexerResponse::RootUnavailable {
                 reason: rejection,
                 message: rejection.message().to_owned(),
             }),
@@ -687,8 +696,8 @@ impl ServiceState {
         let pinyin_enabled = self.pinyin_enabled.load(Ordering::Acquire);
         let root_bound = match root {
             Some(root) => match self.resolve_root_bound(state, root) {
-                Ok(bound) => bound,
-                Err(response) => return Ok(response),
+                RootBoundOutcome::Bound(bound) => bound,
+                RootBoundOutcome::Unavailable(response) => return Ok(response),
             },
             None => None,
         };
@@ -2977,14 +2986,14 @@ mod tests {
         {
             let guard = state.index.read().unwrap();
             let live = guard.as_ref().unwrap();
-            let first = state
-                .resolve_root_bound(live, r"c:/项目/")
-                .unwrap()
-                .unwrap();
-            let cached = state
-                .resolve_root_bound(live, r"c:/项目/")
-                .unwrap()
-                .unwrap();
+            let first = match state.resolve_root_bound(live, r"c:/项目/") {
+                RootBoundOutcome::Bound(bound) => bound.unwrap(),
+                other => panic!("expected a bound, got {other:?}"),
+            };
+            let cached = match state.resolve_root_bound(live, r"c:/项目/") {
+                RootBoundOutcome::Bound(bound) => bound.unwrap(),
+                other => panic!("expected a bound, got {other:?}"),
+            };
             assert_eq!(first, cached);
         }
         state.publish(IndexState {
@@ -2999,7 +3008,7 @@ mod tests {
             drop(guard);
             assert!(matches!(
                 stale,
-                Err(IndexerResponse::RootUnavailable {
+                RootBoundOutcome::Unavailable(IndexerResponse::RootUnavailable {
                     reason: crate::root_scope::RootRejection::VolumeNotIndexed,
                     ..
                 })

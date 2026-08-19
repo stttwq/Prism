@@ -48,7 +48,7 @@ pub fn load(data_dir: &Path) -> Result<IndexState, String> {
     // F3（FRESH-AUDIT-2）：指纹是 serde skip 字段，载入后整算一次
     //（一次池线性扫，远廉于上面的全量 validate）。
     for volume in &mut envelope.state.volumes {
-        volume.recompute_names_fingerprint();
+        volume.recompute_derived_counters();
     }
     Ok(envelope.state)
 }
