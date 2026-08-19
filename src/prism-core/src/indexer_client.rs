@@ -271,6 +271,13 @@ async fn search_on_persistent(
     }
 }
 
+/// AUDIT-2026-08-18 R-A7: 一次性降级连接的并发闸。
+/// 此前锁竞争降级路径无全局上限——每个并发搜索各开一条到 indexer 的短连接，
+/// 突发竞争时可同时打出几十条连接（每条占服务端任务 + 行缓冲）。许可数 2：
+/// 正常情况下该路径本身就是罕见的竞争兜底，排队等待即可，外层 REQUEST_BUDGET
+/// 仍兜底总时限。
+static ONE_OFF_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// The contention path: a one-off connection (connect → hello → status →
 /// search → drop) that never touches the process-wide singleton.  The pipe
 /// name is a parameter so tests can exercise it against a temporary pipe.
@@ -282,6 +289,10 @@ async fn search_one_off(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
+    let _permit = ONE_OFF_GATE
+        .acquire()
+        .await
+        .map_err(|_| SearchFailure::from("one-off gate closed".to_string()))?;
     let attempt = async {
         let mut conn = PersistentConnection::connect(pipe_name).await?;
         handshake(&mut conn).await?;
@@ -628,6 +639,8 @@ async fn read_response<R: tokio::io::AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use crate::hierarchy::{IndexState, VolumeId, VolumeIndex};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use crate::indexer_runtime::{handle_connection, ServiceState};
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -713,6 +726,81 @@ mod tests {
         assert_eq!(reply.items[0].path, r"C:\needle.txt");
         drop(reply);
         server_task.await.unwrap();
+    }
+
+    /// AUDIT-2026-08-18 R-A7: 并发 20 个一次性降级搜索，峰值同时打开的
+    /// 连接数不得超过 ONE_OFF_GATE 的许可数（2）。
+    #[tokio::test]
+    async fn one_off_connections_are_capped_by_the_gate() {
+        let pipe_name = format!(r"\\.\pipe\prism-indexer-gate-{}", std::process::id());
+        let state = ServiceState::new();
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "test".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "needle.txt", false).unwrap();
+        state.publish(IndexState {
+            volumes: vec![volume],
+            generation: 4,
+            events_since_checkpoint: 0,
+        });
+
+        let concurrency = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_state = state.clone();
+        let server_concurrency = concurrency.clone();
+        let server_peak = peak.clone();
+        let server_pipe_name = pipe_name.clone();
+        let server_task = tokio::spawn(async move {
+            // 串行重臂的 accept 循环：同一时刻至多一个 listener armed 已足够
+            //（客户端被闸到 2 并发，轮到谁谁连）。
+            let mut served = 0usize;
+            while served < 20 {
+                let server = ServerOptions::new()
+                    .reject_remote_clients(true)
+                    .create(&server_pipe_name)
+                    .unwrap();
+                server.connect().await.unwrap();
+                served += 1;
+                let state = server_state.clone();
+                let concurrency = server_concurrency.clone();
+                let peak = server_peak.clone();
+                tokio::spawn(async move {
+                    let current = concurrency.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(current, Ordering::AcqRel);
+                    let _ = handle_connection(server, state).await;
+                    concurrency.fetch_sub(1, Ordering::AcqRel);
+                });
+            }
+        });
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let pipe_name = pipe_name.clone();
+            tasks.spawn(async move {
+                search_one_off(&pipe_name, "needle", 10, None, false, None).await
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            if result.unwrap().is_err() {
+                failures.push("one-off search failed");
+            }
+        }
+        server_task.abort();
+        assert!(failures.is_empty(), "all 20 one-off searches must succeed");
+        let observed_peak = peak.load(Ordering::Acquire);
+        assert!(
+            observed_peak <= 2,
+            "peak concurrent one-off connections {observed_peak} must stay within the gate"
+        );
     }
 
     /// M7：入站行长上限。超过 1MB 的行必须让连接断开，
