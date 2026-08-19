@@ -1643,9 +1643,31 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         log("skipping v5 cache write: the first build has not completed");
         return Ok(());
     }
-    // Clone under the read lock (fast memcpy), then release before save(). save() calls
-    // validate() which walks every node with path_for (O(depth) per node) — holding the
-    // read lock that long blocks USN writers and starves the 2-worker async runtime.
+
+    // M2（FRESH-AUDIT-2026-08-19）: 先走逐卷流式序列化——每卷短暂持读锁、
+    // 卷间核对 generation，USN 写者只在单卷序列化期间（~百毫秒）等锁，
+    // 且写侧不再 clone 整个 IndexState（40MB 库消除 2× 峰值）。快照变化
+    // （锁竞争）重试 3 次，仍失败回落整态 clone 路径——回落路径就是修复前
+    // 的代码，天然安全网。
+    for attempt in 1..=3 {
+        match checkpoint_streaming(state, data_dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.contains(index_cache::SNAPSHOT_CHANGED) => {
+                log(format!(
+                    "streaming checkpoint raced with USN (attempt {attempt}/3): {error}"
+                ));
+            }
+            Err(error) => {
+                logging::event_detail("error", "checkpoint_save_failed", &error, None, None);
+                return Err(error);
+            }
+        }
+    }
+    log("streaming checkpoint kept racing; falling back to whole-state clone path");
+
+    // 回落：clone under the read lock (fast memcpy), then release before save(). save()
+    // calls validate() which walks every node with path_for (O(depth) per node) — holding
+    // the read lock that long blocks USN writers and starves the 2-worker async runtime.
     let snapshot = {
         let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
         guard.as_ref().cloned().ok_or("index is not ready")?
@@ -1654,6 +1676,73 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         logging::event_detail("error", "checkpoint_save_failed", &error, None, None);
         return Err(error);
     }
+    checkpoint_after_save(
+        state,
+        &SnapshotHead {
+            generation: snapshot.generation,
+            events_since_checkpoint: snapshot.events_since_checkpoint,
+            volumes: snapshot.volumes.len(),
+        },
+    )
+}
+
+/// M2: 流式 checkpoint 的一轮尝试。验证 + 头快照在一个短读锁内完成，
+/// 之后逐卷短读锁写入（卷间核对 generation，回调内完成）。
+fn checkpoint_streaming(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), String> {
+    let head = {
+        let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
+        let index = guard.as_ref().ok_or("index is not ready")?;
+        index_cache::validate_before_save(index)?;
+        SnapshotHead {
+            generation: index.generation,
+            events_since_checkpoint: index.events_since_checkpoint,
+            volumes: index.volumes.len(),
+        }
+    };
+    checkpoint_streaming_with_head(state, data_dir, head)
+}
+
+/// M2: 以给定头快照逐卷写入（测试可注入陈旧头验证世代核对）。
+fn checkpoint_streaming_with_head(
+    state: &ServiceState,
+    data_dir: &std::path::Path,
+    head: SnapshotHead,
+) -> Result<(), String> {
+    index_cache::save_streaming(
+        data_dir,
+        head.volumes,
+        head.generation,
+        head.events_since_checkpoint,
+        |position, writer| {
+            // 每卷一个短读锁：guard 只活到本卷写完。
+            let guard = state
+                .index
+                .read()
+                .map_err(|_| "index lock is poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "index is not ready".to_string())?;
+            // 卷间核对：generation 或卷数变化说明 USN/重建动过索引——本轮流式
+            // 写入作废重试，绝不把混合世代的卷写进同一个 v5 文件。
+            if index.volumes.len() != head.volumes || index.generation != head.generation {
+                return Err(format!(
+                    "{}: generation {} -> {}",
+                    index_cache::SNAPSHOT_CHANGED,
+                    head.generation,
+                    index.generation
+                ));
+            }
+            postcard::to_io(&index.volumes[position], writer)
+                .map_err(|error| format!("encode v5 volume: {error}"))?;
+            Ok(())
+        },
+    )?;
+    checkpoint_after_save(state, &head)
+}
+
+/// checkpoint 成功后的公共收尾：拼音重建 + 事件计数扣减。
+/// 扣减用的 events 计数来自**实际序列化进去的头**（流式=头快照，回落=clone 快照）。
+fn checkpoint_after_save(state: &ServiceState, head: &SnapshotHead) -> Result<(), String> {
     if state.pinyin_status() != PinyinStatus::Disabled {
         // Rebuild from the live tree under its read lock. A clone taken for the v5
         // checkpoint can be one USN batch behind by the time the sidecar is installed.
@@ -1665,10 +1754,18 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
         if let Some(index) = guard.as_mut() {
             index.events_since_checkpoint = index
                 .events_since_checkpoint
-                .saturating_sub(snapshot.events_since_checkpoint);
+                .saturating_sub(head.events_since_checkpoint);
         }
     }
     Ok(())
+}
+
+/// M2: 流式序列化用的索引头快照（在首卷写入前一次性捕获）。
+#[derive(Debug, Clone, Copy)]
+struct SnapshotHead {
+    generation: u64,
+    events_since_checkpoint: u64,
+    volumes: usize,
 }
 
 async fn checkpoint_async(state: Arc<ServiceState>, data_dir: PathBuf) -> Result<(), String> {
@@ -2413,6 +2510,82 @@ mod tests {
         tokio::task::yield_now().await;
         state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
         assert_eq!(waiter.await.unwrap(), 1);
+    }
+
+    /// M2: 流式 checkpoint 的字节流必须与整态 clone 路径（派生序列化）逐字节一致
+    /// ——v5 格式不升版、load 侧零改动的硬约束。
+    #[test]
+    fn m2_streaming_checkpoint_bytes_match_clone_path() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "alpha.txt"));
+        state.merge_and_publish(test_volume("v2", "D:\\", "beta.txt"));
+        state.finish_first_build();
+        // 让两个路径序列化同一份计数（扣减语义不属于本断言）。
+        {
+            let mut guard = state.index.write().unwrap();
+            guard.as_mut().unwrap().events_since_checkpoint = 77;
+        }
+
+        let dir_streaming = std::env::temp_dir().join(format!("prism-m2-s-{}", std::process::id()));
+        let dir_clone = std::env::temp_dir().join(format!("prism-m2-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_streaming);
+        let _ = std::fs::remove_dir_all(&dir_clone);
+
+        // 先取 clone 快照再跑 checkpoint——checkpoint 成功后会扣减 live 计数，
+        // 后取的快照 events 会变 0（那是语义差异，不是字节差异）。
+        let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
+        index_cache::save(&snapshot, &dir_clone).unwrap();
+        checkpoint(&state, &dir_streaming).unwrap(); // 内部走流式路径
+
+        let streaming_bytes = std::fs::read(index_cache::cache_path(&dir_streaming)).unwrap();
+        let clone_bytes = std::fs::read(index_cache::cache_path(&dir_clone)).unwrap();
+        assert_eq!(
+            streaming_bytes.len(),
+            clone_bytes.len(),
+            "流式与 clone 路径的字节长度必须一致"
+        );
+        assert_eq!(streaming_bytes, clone_bytes, "v5 字节流必须逐字节相同");
+
+        // 流式产物可正常加载（load 侧零改动）。
+        let loaded = index_cache::load(&dir_streaming).unwrap();
+        assert_eq!(loaded.volumes.len(), 2);
+        assert_eq!(loaded.events_since_checkpoint, 77);
+
+        let _ = std::fs::remove_dir_all(&dir_streaming);
+        let _ = std::fs::remove_dir_all(&dir_clone);
+    }
+
+    /// M2: 头快照之后 generation 变化（USN 到达）→ 流式写入必须以
+    /// SNAPSHOT_CHANGED 中止，绝不能把混合世代的卷写进同一个文件。
+    #[test]
+    fn m2_streaming_snapshot_rejects_generation_change() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "alpha.txt"));
+        state.finish_first_build();
+
+        let head = {
+            let guard = state.index.read().unwrap();
+            let index = guard.as_ref().unwrap();
+            SnapshotHead {
+                generation: index.generation,
+                events_since_checkpoint: index.events_since_checkpoint,
+                volumes: index.volumes.len(),
+            }
+        };
+        // 模拟 USN 批次到达：generation 前移。
+        {
+            let mut guard = state.index.write().unwrap();
+            guard.as_mut().unwrap().generation += 1;
+        }
+
+        let dir = std::env::temp_dir().join(format!("prism-m2-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = checkpoint_streaming_with_head(&state, &dir, head).unwrap_err();
+        assert!(
+            error.contains(index_cache::SNAPSHOT_CHANGED),
+            "错误必须带可识别的重试标记：{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

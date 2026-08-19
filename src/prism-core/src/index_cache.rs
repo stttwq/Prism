@@ -52,7 +52,7 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
     // AUDIT-2026-08-18 R-C2: save 前只做抽样 validate——全量 validate 对每节点跑
     // path_for（O(n·depth)），大索引下可能超 SCM Stop 30s wait_hint。
     // load 侧保留全量 validate 作为缓存文件损坏的安全网。
-    validate_sampled(state)?;
+    validate_before_save(state)?;
     std::fs::create_dir_all(data_dir)
         .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
     let path = cache_path(data_dir);
@@ -79,10 +79,61 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
     crate::fs_util::atomic_replace(&temporary, &path, "cache")
 }
 
+/// M2（FRESH-AUDIT-2026-08-19）: 流式 checkpoint 的重试标记。
+/// checkpoint 的逐卷写回调在世代/卷集变化时返回含此标记的错误，
+/// 调用方据此重试或回落整态 clone 路径（serde/postcard 的错误通道会丢弃
+/// 自定义消息，所以标记走我们自己的 Result<String> 而不是 Serialize::Error）。
+pub const SNAPSHOT_CHANGED: &str = "prism-snapshot-changed";
+
+/// M2: 逐卷流式写 v5。字节布局手工复刻 CacheEnvelope<IndexState> 的派生
+/// 序列化（magic 原始 8 字节 + varint 字段；与 save() 逐字节一致，由测试锚定）：
+/// `magic | version | volumes.len | volume* | generation | events_since_checkpoint`。
+/// `write_volume` 由调用方实现锁与世代核对——每卷短读锁、guard 不跨卷存活。
+pub fn save_streaming<F>(
+    data_dir: &Path,
+    volume_count: usize,
+    generation: u64,
+    events_since_checkpoint: u64,
+    mut write_volume: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, &mut std::io::BufWriter<std::fs::File>) -> Result<(), String>,
+{
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
+    let path = cache_path(data_dir);
+    let temporary = data_dir.join(format!("{CACHE_FILE}.tmp"));
+    let file = std::fs::File::create(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+    writer
+        .write_all(CACHE_MAGIC)
+        .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+    postcard::to_io(&CACHE_VERSION, &mut writer)
+        .map_err(|error| format!("encode v5 header: {error}"))?;
+    // Vec 的长度字段：postcard 对 usize 走 varint，与 varint u32 编码一致。
+    postcard::to_io(&(volume_count as u32), &mut writer)
+        .map_err(|error| format!("encode v5 header: {error}"))?;
+    for position in 0..volume_count {
+        write_volume(position, &mut writer)?;
+    }
+    postcard::to_io(&generation, &mut writer)
+        .map_err(|error| format!("encode v5 tail: {error}"))?;
+    postcard::to_io(&events_since_checkpoint, &mut writer)
+        .map_err(|error| format!("encode v5 tail: {error}"))?;
+    writer
+        .flush()
+        .and_then(|()| writer.get_ref().sync_all())
+        .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+    drop(writer);
+    crate::fs_util::atomic_replace(&temporary, &path, "cache")
+}
+
 /// AUDIT-2026-08-18 R-C2: save 前抽样 validate——避免全量 path_for 的 O(n·depth)。
 /// 抽样覆盖：每卷根节点（必检）+ 随机 ~1% 节点 path_for + 结构不变量
 ///（nodes 上限、names 池边界、slot 计数一致性）。load 侧仍走全量 validate。
-fn validate_sampled(state: &IndexState) -> Result<(), String> {
+/// M2: pub(crate) 供 checkpoint 的流式路径在短读锁内调用。
+pub(crate) fn validate_before_save(state: &IndexState) -> Result<(), String> {
     for volume in &state.volumes {
         // 结构不变量始终检查（开销极低）。
         volume.validate_structure()?;
