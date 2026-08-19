@@ -61,6 +61,41 @@ public sealed class PipeClientHandshakeTests
         Assert.Equal("{\"type\":\"hello\",\"protocol\":1}", line);
     }
 
+    /// <summary>
+    /// AUDIT-2026-08-18 R-A4: broker→前端方向的行长必须有上限。
+    /// 超长行（无换行、超过 MaxResponseLineChars）必须抛 IOException（协议损坏
+    /// → 调用方销毁连接走重连），而不是被 ReadLineAsync 无限吞内存。
+    /// 流故意给出远超上限的字节量；实现每 4KB 检查一次，远早于流耗尽即应触发。
+    /// </summary>
+    [Fact]
+    public async Task Oversized_Response_Line_Is_Rejected_As_Protocol_Corruption()
+    {
+        // 16MB 上限 + 余量：ReadAsync 按 4KB 块推进，读到上限即抛。
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(
+            new string('x', (PipeClient.MaxResponseLineChars / 8192 + 4) * 8192)));
+        using var reader = new StreamReader(stream, new UTF8Encoding(false));
+        var lines = new PipeClient.BoundedLineReader(reader);
+
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => lines.ReadLineAsync(CancellationToken.None));
+
+        Assert.Contains("协议损坏", error.Message);
+    }
+
+    /// <summary>R-A4：有界读的行语义与 ReadLineAsync 对齐——\n 终止、\r\n 吃掉 \r、无尾换行的最后一行也返回。</summary>
+    [Fact]
+    public async Task Bounded_Read_Matches_ReadLine_Semantics()
+    {
+        using var reader = new StreamReader(
+            new MemoryStream("a\r\nb\nc"u8.ToArray()), new UTF8Encoding(false));
+        var lines = new PipeClient.BoundedLineReader(reader);
+
+        Assert.Equal("a", await lines.ReadLineAsync(CancellationToken.None));
+        Assert.Equal("b", await lines.ReadLineAsync(CancellationToken.None));
+        Assert.Equal("c", await lines.ReadLineAsync(CancellationToken.None));
+        Assert.Null(await lines.ReadLineAsync(CancellationToken.None));
+    }
+
     // ------------------------------------------------------------------
     // ConnectInnerAsync（临时管道名 + 假 broker）
     // ------------------------------------------------------------------

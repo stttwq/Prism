@@ -197,6 +197,85 @@ public sealed class PipeClient : ISearchClient, IDisposable
         _query.ConnectLockedAsync(timeout, ct);
 
     /// <summary>
+    /// 单行最大字符数（AUDIT-2026-08-18 R-A4）。broker 入站已有 1MB 有界读、
+    /// indexer 响应 8MB；此前唯独 broker→前端方向用无上限的 ReadLineAsync，
+    /// 任意本地进程若能写管道即可灌超长行撑爆前端内存。超限按协议损坏处理
+    /// （IOException → 销毁连接走重连），与传输层失败同路径。
+    /// </summary>
+    internal const int MaxResponseLineChars = 16 * 1024 * 1024;
+
+    /// <summary>
+    /// 有界逐行读：语义对齐 StreamReader.ReadLineAsync（按 \n 分行、吃 \r\n、
+    /// EOF 返回 null），超过 <see cref="MaxResponseLineChars"/> 抛 IOException。
+    /// StreamReader.ReadAsync 一旦返回就把整块字符消费掉了——换行之后同块的
+    /// 尾巴必须留在本实例里供下一次 ReadLine 使用，所以有界读必须是有状态的
+    /// 每连接一个对象（挂在 PipeChannel 上，随流一起销毁重建）。
+    /// </summary>
+    internal sealed class BoundedLineReader
+    {
+        private readonly StreamReader _reader;
+        private readonly char[] _pending = new char[4096];
+        private int _pendingStart, _pendingCount;
+
+        public BoundedLineReader(StreamReader reader) => _reader = reader;
+
+        public async Task<string?> ReadLineAsync(CancellationToken ct)
+        {
+            var line = new System.Text.StringBuilder();
+            var buffer = new char[4096];
+            while (true)
+            {
+                // 先用掉上次读完换行后剩下的尾巴。
+                if (_pendingCount > 0)
+                {
+                    var split = Array.IndexOf(_pending, '\n', _pendingStart, _pendingCount);
+                    if (split >= 0)
+                    {
+                        line.Append(_pending, _pendingStart, split - _pendingStart);
+                        _pendingCount -= split - _pendingStart + 1;
+                        _pendingStart = split + 1;
+                        return TrimCarriageReturn(line);
+                    }
+                    line.Append(_pending, _pendingStart, _pendingCount);
+                    _pendingStart = _pendingCount = 0;
+                }
+                CheckCap(line);
+                int read = await _reader.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false);
+                if (read == 0)
+                    return line.Length == 0 ? null : TrimCarriageReturn(line);
+                var newline = Array.IndexOf(buffer, '\n', 0, read);
+                if (newline >= 0)
+                {
+                    line.Append(buffer, 0, newline);
+                    // 换行后的同块尾巴留给下一次调用。
+                    var tail = read - newline - 1;
+                    if (tail > 0)
+                    {
+                        Array.Copy(buffer, newline + 1, _pending, 0, tail);
+                        _pendingStart = 0;
+                        _pendingCount = tail;
+                    }
+                    return TrimCarriageReturn(line);
+                }
+                line.Append(buffer, 0, read);
+                CheckCap(line);
+            }
+        }
+
+        private static string TrimCarriageReturn(System.Text.StringBuilder line)
+        {
+            var result = line.ToString();
+            return result.EndsWith('\r') ? result[..^1] : result;
+        }
+
+        private static void CheckCap(System.Text.StringBuilder line)
+        {
+            if (line.Length > MaxResponseLineChars)
+                throw new IOException($"响应行超过 {MaxResponseLineChars} 字符上限——协议损坏，销毁连接");
+        }
+    }
+
+    /// <summary>
     /// 读握手响应行，带超时（纯逻辑测试用，不涉及真实管道）。超时/EOF 都转成
     /// IOException 上抛。生产路径走 <see cref="PipeChannel.HandshakeAsync"/>（named pipe
     /// 需要 Dispose 促使挂死的读返回，不能单靠 CancellationToken）。
@@ -207,7 +286,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
         string? line;
         try
         {
-            line = await reader.ReadLineAsync(deadline.Token).ConfigureAwait(false);
+            line = await new BoundedLineReader(reader).ReadLineAsync(deadline.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
@@ -700,6 +779,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
         private readonly SemaphoreSlim _ioLock = new(1, 1);
         private NamedPipeClientStream? _stream;
         private StreamReader? _reader;
+        private BoundedLineReader? _lineReader;
         private StreamWriter? _writer;
 
         // ---- watchdog 判活（审计 C2）：连通 ≠ 健康，还要求最近的查询请求有响应 ----
@@ -803,6 +883,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
             _stream = stream;
             _reader = new StreamReader(stream, utf8);
+            _lineReader = new BoundedLineReader(_reader);
             _writer = new StreamWriter(stream, utf8) { AutoFlush = false, NewLine = "\n" };
 
             // 任何握手失败（超时/关闭/协议不符）都必须清掉半开的流对象，否则
@@ -833,7 +914,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
             await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
 
-            var readTask = _reader!.ReadLineAsync(CancellationToken.None).AsTask();
+            var readTask = _lineReader!.ReadLineAsync(CancellationToken.None);
             var timeoutTask = Task.Delay(HandshakeReadTimeout);
 
             string? line;
@@ -923,7 +1004,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
                         {
                             readDeadline = new CancellationTokenSource(timeout);
                         }
-                        line = await _reader!.ReadLineAsync(readDeadline?.Token ?? CancellationToken.None).ConfigureAwait(false)
+                        line = await _lineReader!.ReadLineAsync(readDeadline?.Token ?? CancellationToken.None).ConfigureAwait(false)
                             ?? throw new IOException("后端在返回响应前关闭了管道");
                     }
                     finally
@@ -991,6 +1072,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             var writer = _writer;
             _stream = null;
             _reader = null;
+            _lineReader = null;
             _writer = null;
             // 先关闭 stream（CancelIoEx），再关闭 reader/writer——顺序在 ThreadPool
             // 上执行不受调用线程影响。stream 先关让 reader 的 pending read 先被取消。
