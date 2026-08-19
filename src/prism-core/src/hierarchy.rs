@@ -975,6 +975,17 @@ fn file_extension(name: &str) -> Option<&str> {
     Some(&name[last_dot + 1..])
 }
 
+/// N2（FRESH-AUDIT-2026-08-19）: 触发并行扫描的最小总槽位数。
+/// 低于此值起线程的开销超过收益（本机 1.2M 记录远超此阈值）。
+const PARALLEL_SCAN_MIN_SLOTS: usize = 512 * 1024;
+
+/// N2: 每个扫描块的槽位上限。256K 足够摊薄任务粒度，又不至于让单块过长。
+const SCAN_CHUNK_SLOTS: usize = 256 * 1024;
+
+/// N2: 单次搜索的并行度封顶。tokio blocking 池默认 512 线程 = 64 连接上限 × 8，
+/// 恰好贴边——这里封 8 并给文档注明组合约束（broker 实际只有 1 条长连接）。
+const SCAN_MAX_THREADS: usize = 8;
+
 fn search_volumes(
     volumes: &[VolumeIndex],
     query: &str,
@@ -982,6 +993,160 @@ fn search_volumes(
     exclusion_paths: &[String],
     root: Option<RootBound>,
     filters: &QueryFilters,
+) -> SearchOutcome {
+    search_volumes_impl(
+        volumes,
+        query,
+        max,
+        exclusion_paths,
+        root,
+        filters,
+        PARALLEL_SCAN_MIN_SLOTS,
+    )
+}
+
+/// 单块扫描的累积器（N2：串行/并行路径共用一套判定逻辑）。
+struct ScanAccumulator<'a> {
+    heap: BinaryHeap<RankedCandidate<'a>>,
+    scanned_nodes: u64,
+    name_candidates: u64,
+    matched_count: u64,
+    /// 诊断计数：串行与并行路径的计数语义不同（并行按块局部堆计数），
+    /// 只用于粗粒度观测，不参与等价性断言。
+    entered_top_k: u64,
+    path_constructions: u64,
+}
+
+impl<'a> ScanAccumulator<'a> {
+    fn new(max: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(max),
+            scanned_nodes: 0,
+            name_candidates: 0,
+            matched_count: 0,
+            entered_top_k: 0,
+            path_constructions: 0,
+        }
+    }
+
+    /// 归并另一个累积器：候选按与串行路径完全相同的堆规则进入全局堆，
+    /// 因此全局 Top-K 与串行结果逐元素一致（某元素在全局 Top-K 内 ⟹ 它在其
+    /// 所在块自己的 Top-K 内，归并不丢候选）。
+    fn merge_from(&mut self, other: ScanAccumulator<'a>, max: usize) {
+        for candidate in other.heap {
+            if self.heap.len() < max {
+                self.heap.push(candidate);
+                self.entered_top_k = self.entered_top_k.saturating_add(1);
+            } else if self.heap.peek().is_some_and(|worst| candidate < *worst) {
+                self.heap.pop();
+                self.heap.push(candidate);
+                self.entered_top_k = self.entered_top_k.saturating_add(1);
+            }
+        }
+        self.scanned_nodes = self.scanned_nodes.saturating_add(other.scanned_nodes);
+        self.name_candidates = self.name_candidates.saturating_add(other.name_candidates);
+        self.matched_count = self.matched_count.saturating_add(other.matched_count);
+        self.entered_top_k = self.entered_top_k.saturating_add(other.entered_top_k);
+        self.path_constructions = self
+            .path_constructions
+            .saturating_add(other.path_constructions);
+    }
+}
+
+/// 扫描单个卷的一段连续槽位（N2 抽出，串行/并行共用，判定逻辑与抽出前逐行一致）。
+/// 参数多是刻意的：全部是热路径的直接输入，包一层上下文结构体只增加间接层。
+#[allow(clippy::too_many_arguments)]
+fn scan_slot_range<'a>(
+    volumes: &'a [VolumeIndex],
+    volume_index: usize,
+    range: std::ops::Range<usize>,
+    query_lower: &str,
+    exclusions: &[NormalizedExclusion],
+    root_filter: &mut Option<RootFilter>,
+    filters: &QueryFilters,
+    has_path_filter: bool,
+    max: usize,
+    acc: &mut ScanAccumulator<'a>,
+) {
+    let volume = &volumes[volume_index];
+    for record in range {
+        let Some(slot) = volume.nodes.get(record) else {
+            continue;
+        };
+        acc.scanned_nodes = acc.scanned_nodes.saturating_add(1);
+        if slot.flags & (FLAG_PRESENT | FLAG_EXCLUDED) != FLAG_PRESENT
+            || slot.name_off == NO_NAME
+        {
+            continue;
+        }
+        acc.name_candidates = acc.name_candidates.saturating_add(1);
+        let Ok(name) = volume.name_at(slot.name_off) else {
+            continue;
+        };
+        let Some(metadata) = match_metadata(name, query_lower) else {
+            continue;
+        };
+        if root_filter
+            .as_mut()
+            .is_some_and(|filter| !filter.accepts(volume_index, volume, record as u32))
+        {
+            continue;
+        }
+        if exclusions
+            .iter()
+            .any(|exclusion| exclusion.matches(volume, record as u32))
+        {
+            continue;
+        }
+        // G7: ext filter — low cost, checks the name only. Applied before path
+        // construction and before the Top-K heap.
+        let is_directory = slot.flags & FLAG_DIRECTORY != 0;
+        if !filters.ext_matches(name, is_directory) {
+            continue;
+        }
+        // G7: path filter — high cost, needs a constructed full path. Only run
+        // when a path filter is present; still before the Top-K heap so
+        // `is_truncated` describes the filtered set only.
+        if has_path_filter {
+            acc.path_constructions = acc.path_constructions.saturating_add(1);
+            let path = match volume.path_for(record as u32) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if !filters.path_matches(&path) {
+                continue;
+            }
+        }
+        acc.matched_count = acc.matched_count.saturating_add(1);
+        let candidate = RankedCandidate {
+            volume_index,
+            mount_path: &volume.mount_path,
+            record: record as u32,
+            name,
+            is_directory,
+            metadata,
+        };
+        if acc.heap.len() < max {
+            acc.heap.push(candidate);
+            acc.entered_top_k = acc.entered_top_k.saturating_add(1);
+        } else if acc.heap.peek().is_some_and(|worst| candidate < *worst) {
+            acc.heap.pop();
+            acc.heap.push(candidate);
+            acc.entered_top_k = acc.entered_top_k.saturating_add(1);
+        }
+    }
+}
+
+/// `search_volumes` 的可注入阈值版本（N2 等价性测试用 threshold=0 强制并行 /
+/// usize::MAX 强制串行做逐字节比对）。
+fn search_volumes_impl(
+    volumes: &[VolumeIndex],
+    query: &str,
+    max: usize,
+    exclusion_paths: &[String],
+    root: Option<RootBound>,
+    filters: &QueryFilters,
+    parallel_threshold: usize,
 ) -> SearchOutcome {
     // G7: an empty name query normally means "no search", but when ext:/path:
     // filters are present the empty name matches every candidate (match_metadata
@@ -1003,84 +1168,44 @@ fn search_volumes(
         .iter()
         .filter_map(|path| NormalizedExclusion::parse(path))
         .collect();
-    let mut heap = BinaryHeap::with_capacity(max);
-    let mut root_filter = root.map(RootFilter::new);
-    let mut scanned_nodes = 0u64;
-    let mut name_candidates = 0u64;
-    let mut matched_count = 0u64;
-    let mut entered_top_k = 0u64;
-    let mut path_constructions = 0u64;
     let has_path_filter = filters.has_path_filter();
-    for (volume_index, volume) in volumes.iter().enumerate() {
-        for (record, slot) in volume.nodes.iter().enumerate() {
-            scanned_nodes = scanned_nodes.saturating_add(1);
-            if slot.flags & (FLAG_PRESENT | FLAG_EXCLUDED) != FLAG_PRESENT
-                || slot.name_off == NO_NAME
-            {
-                continue;
-            }
-            name_candidates = name_candidates.saturating_add(1);
-            let Ok(name) = volume.name_at(slot.name_off) else {
-                continue;
-            };
-            let Some(metadata) = match_metadata(name, &query_lower) else {
-                continue;
-            };
-            if root_filter
-                .as_mut()
-                .is_some_and(|filter| !filter.accepts(volume_index, volume, record as u32))
-            {
-                continue;
-            }
-            if exclusions
-                .iter()
-                .any(|exclusion| exclusion.matches(volume, record as u32))
-            {
-                continue;
-            }
-            // G7: ext filter — low cost, checks the name only. Applied before path
-            // construction and before the Top-K heap.
-            let is_directory = slot.flags & FLAG_DIRECTORY != 0;
-            if !filters.ext_matches(name, is_directory) {
-                continue;
-            }
-            // G7: path filter — high cost, needs a constructed full path. Only run
-            // when a path filter is present; still before the Top-K heap so
-            // `is_truncated` describes the filtered set only.
-            if has_path_filter {
-                path_constructions = path_constructions.saturating_add(1);
-                let path = match volume.path_for(record as u32) {
-                    Ok(path) => path,
-                    Err(_) => continue,
-                };
-                if !filters.path_matches(&path) {
-                    continue;
-                }
-            }
-            matched_count = matched_count.saturating_add(1);
-            let candidate = RankedCandidate {
-                volume_index,
-                mount_path: &volume.mount_path,
-                record: record as u32,
-                name,
-                is_directory,
-                metadata,
-            };
-            if heap.len() < max {
-                heap.push(candidate);
-                entered_top_k = entered_top_k.saturating_add(1);
-            } else if heap.peek().is_some_and(|worst| candidate < *worst) {
-                heap.pop();
-                heap.push(candidate);
-                entered_top_k = entered_top_k.saturating_add(1);
-            }
-        }
-    }
 
-    let ranked = heap.into_sorted_vec();
+    let total_slots: usize = volumes.iter().map(|volume| volume.nodes.len()).sum();
+    let mut acc = if total_slots >= parallel_threshold {
+        parallel_scan(
+            volumes,
+            &query_lower,
+            &exclusions,
+            root,
+            filters,
+            has_path_filter,
+            max,
+        )
+    } else {
+        let mut acc = ScanAccumulator::new(max);
+        let mut root_filter = root.map(RootFilter::new);
+        for volume_index in 0..volumes.len() {
+            let len = volumes[volume_index].nodes.len();
+            scan_slot_range(
+                volumes,
+                volume_index,
+                0..len,
+                &query_lower,
+                &exclusions,
+                &mut root_filter,
+                filters,
+                has_path_filter,
+                max,
+                &mut acc,
+            );
+        }
+        acc
+    };
+
+    let ranked = acc.heap.into_sorted_vec();
     // Path construction for surviving candidates: counted separately from the path-filter
     // constructions above (which only ran when a path filter was present).
-    path_constructions = path_constructions.saturating_add(ranked.len() as u64);
+    acc.path_constructions = acc.path_constructions.saturating_add(ranked.len() as u64);
     let items = ranked
         .into_iter()
         .filter_map(|candidate| {
@@ -1095,13 +1220,111 @@ fn search_volumes(
         .collect();
     SearchOutcome {
         items,
-        is_truncated: matched_count > max as u64,
-        scanned_nodes,
-        name_candidates,
-        matched_count,
-        entered_top_k,
-        path_constructions,
+        is_truncated: acc.matched_count > max as u64,
+        scanned_nodes: acc.scanned_nodes,
+        name_candidates: acc.name_candidates,
+        matched_count: acc.matched_count,
+        entered_top_k: acc.entered_top_k,
+        path_constructions: acc.path_constructions,
     }
+}
+
+/// N2: 分块并行扫描。块 = 卷内连续 256K 槽（不跨卷——卷的挂载路径/父链独立）；
+/// worker 从原子游标取块；每 worker 一份 RootFilter（memo 判定是绝对值，不依赖
+/// 扫描顺序，分 worker 与单实例语义一致）；块内只读共享 `&[VolumeIndex]`，
+/// 不新增锁。归并保持与串行完全相同的堆规则，全局 Top-K 与串行结果一致
+/// （RankedCandidate::Ord 是全序，无并列歧义）。
+fn parallel_scan<'a>(
+    volumes: &'a [VolumeIndex],
+    query_lower: &str,
+    exclusions: &[NormalizedExclusion],
+    root: Option<RootBound>,
+    filters: &QueryFilters,
+    has_path_filter: bool,
+    max: usize,
+) -> ScanAccumulator<'a> {
+    let mut chunks: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+    for (volume_index, volume) in volumes.iter().enumerate() {
+        let len = volume.nodes.len();
+        let mut start = 0;
+        while start < len {
+            let end = (start + SCAN_CHUNK_SLOTS).min(len);
+            chunks.push((volume_index, start..end));
+            start = end;
+        }
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, SCAN_MAX_THREADS)
+        .min(chunks.len());
+    if worker_count <= 1 {
+        // 块太少或单核：就地串行，不起线程。
+        let mut acc = ScanAccumulator::new(max);
+        let mut root_filter = root.map(RootFilter::new);
+        for (volume_index, range) in chunks {
+            scan_slot_range(
+                volumes,
+                volume_index,
+                range,
+                query_lower,
+                exclusions,
+                &mut root_filter,
+                filters,
+                has_path_filter,
+                max,
+                &mut acc,
+            );
+        }
+        return acc;
+    }
+
+    let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..worker_count)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = ScanAccumulator::new(max);
+                    let mut root_filter = root.map(RootFilter::new);
+                    loop {
+                        let index =
+                            next_chunk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if index >= chunks.len() {
+                            break;
+                        }
+                        let (volume_index, range) = &chunks[index];
+                        scan_slot_range(
+                            volumes,
+                            *volume_index,
+                            range.clone(),
+                            query_lower,
+                            exclusions,
+                            &mut root_filter,
+                            filters,
+                            has_path_filter,
+                            max,
+                            &mut local,
+                        );
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(acc) => acc,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut global = ScanAccumulator::new(max);
+    for local in results {
+        global.merge_from(local, max);
+    }
+    global
 }
 
 struct NormalizedExclusion {
@@ -1245,6 +1468,149 @@ mod tests {
         let both = QueryFilters::new(vec![], vec!["program".into(), "数据".into()]);
         assert!(both.path_matches("C:\\Program Files\\数据"));
         assert!(!both.path_matches("C:\\Program Files\\docs"));
+    }
+
+    // --- N2（FRESH-AUDIT-2026-08-19）: 并行扫描等价性与确定性 ------------------
+
+    /// 构造大规模合成卷：一个目录 + 海量文件（含中文名/大小写/目录混合）。
+    fn dense_volume(mount: &str, count: usize) -> VolumeIndex {
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: format!("vol-{mount}"),
+                serial: 7,
+            },
+            format!("{mount}\\"),
+            9,
+            10,
+            5,
+        )
+        .unwrap();
+        volume
+            .prepare_initial_capacity((count + 16) as u32, count)
+            .unwrap();
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
+        for i in 0..count {
+            let record = 11 + i as u32;
+            let name = match i % 4 {
+                0 => format!("file-{i:06}.txt"),
+                1 => format!("FILE-{i:06}.PDF"),
+                2 => format!("文档-{i:06}"),
+                _ => format!("Mixed{i:06}Dir"),
+            };
+            volume
+                .upsert(frn(record, 1), frn(10, 1), &name, i % 16 == 15)
+                .unwrap();
+        }
+        volume
+    }
+
+    /// 并行与串行结果逐元素一致（Top-K 归并的正确性锚定）。
+    #[test]
+    fn n2_parallel_scan_matches_serial_results() {
+        let volumes = vec![dense_volume("C:", 30_000)];
+        let filters = QueryFilters::none();
+        for query in ["file", "文档", "mixed", "file-0000"] {
+            let serial = search_volumes_impl(
+                &volumes, query, 8, &[], None, &filters, usize::MAX,
+            );
+            let parallel = search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
+            assert_eq!(parallel.items.len(), serial.items.len(), "query={query}");
+            for (p, s) in parallel.items.iter().zip(serial.items.iter()) {
+                assert_eq!(p.name, s.name, "query={query}");
+                assert_eq!(p.path, s.path, "query={query}");
+                assert_eq!(p.is_directory, s.is_directory, "query={query}");
+                assert_eq!(p.match_metadata, s.match_metadata, "query={query}");
+            }
+            assert_eq!(parallel.is_truncated, serial.is_truncated);
+            assert_eq!(parallel.scanned_nodes, serial.scanned_nodes);
+            assert_eq!(parallel.name_candidates, serial.name_candidates);
+            assert_eq!(parallel.matched_count, serial.matched_count);
+            assert_eq!(parallel.path_constructions, serial.path_constructions);
+        }
+    }
+
+    /// 多卷 + 块边界：小卷不足一块、大卷跨多块，结果仍与串行一致。
+    #[test]
+    fn n2_parallel_scan_chunk_boundaries_across_volumes() {
+        let volumes = vec![
+            dense_volume("C:", 40_000),
+            dense_volume("D:", 100), // 不足一块
+        ];
+        let filters = QueryFilters::none();
+        let serial = search_volumes_impl(&volumes, "file", 16, &[], None, &filters, usize::MAX);
+        let parallel = search_volumes_impl(&volumes, "file", 16, &[], None, &filters, 1);
+        assert_eq!(parallel.items.len(), serial.items.len());
+        for (p, s) in parallel.items.iter().zip(serial.items.iter()) {
+            assert_eq!((p.name.clone(), p.path.clone()), (s.name.clone(), s.path.clone()));
+        }
+        assert_eq!(parallel.matched_count, serial.matched_count);
+        assert_eq!(parallel.scanned_nodes, serial.scanned_nodes);
+    }
+
+    /// 并行路径确定性：同一输入两次运行结果完全相同（RankedCandidate 全序）。
+    #[test]
+    fn n2_parallel_scan_is_deterministic() {
+        let volumes = vec![dense_volume("C:", 12_000)];
+        let filters = QueryFilters::none();
+        let first = search_volumes_impl(&volumes, "file", 8, &[], None, &filters, 1);
+        let second = search_volumes_impl(&volumes, "file", 8, &[], None, &filters, 1);
+        assert_eq!(first.items.len(), second.items.len());
+        for (a, b) in first.items.iter().zip(second.items.iter()) {
+            assert_eq!((a.name.as_str(), a.path.as_str()), (b.name.as_str(), b.path.as_str()));
+        }
+    }
+
+    /// 根范围过滤在并行路径下语义不变（每 worker 一份 RootFilter，memo 判定绝对）。
+    #[test]
+    fn n2_parallel_scan_preserves_root_filter_semantics() {
+        let mut volumes = vec![dense_volume("C:", 8_000)];
+        // 把 100..200 号记录搬到 record 2000 的子目录下，构造第二棵子树。
+        volumes[0]
+            .upsert(frn(2000, 1), frn(10, 1), "sub", true)
+            .unwrap();
+        for i in 100..200u32 {
+            volumes[0]
+                .upsert(frn(3000 + i, 1), frn(2000, 1), &format!("file-{i:06}.txt"), false)
+                .unwrap();
+        }
+        let root = Some(RootBound {
+            volume_index: 0,
+            root_record: frn(2000, 1) as u32,
+        });
+        let filters = QueryFilters::none();
+        let serial =
+            search_volumes_impl(&volumes, "file", 32, &[], root, &filters, usize::MAX);
+        let parallel = search_volumes_impl(&volumes, "file", 32, &[], root, &filters, 1);
+        assert!(!serial.items.is_empty());
+        assert_eq!(serial.matched_count, parallel.matched_count);
+        assert_eq!(serial.items.len(), parallel.items.len());
+        for (s, p) in serial.items.iter().zip(parallel.items.iter()) {
+            assert_eq!(s.path, p.path);
+            assert!(p.path.ends_with("sub\\") || p.path.contains("sub\\"), "{}", p.path);
+        }
+    }
+
+    /// N2 实测基准（手动跑）：单卷 1.2M 记录的串行 vs 并行全扫延迟。
+    /// 运行：cargo test --lib n2_scan_benchmark -- --ignored --nocapture
+    #[test]
+    #[ignore = "基准测试：约需十几秒构建合成卷，仅在需要实测数据时手动运行"]
+    fn n2_scan_benchmark() {
+        let volumes = vec![dense_volume("C:", 1_200_000)];
+        let filters = QueryFilters::none();
+        for query in ["file", "文档"] {
+            let serial_start = std::time::Instant::now();
+            let serial = search_volumes_impl(&volumes, query, 8, &[], None, &filters, usize::MAX);
+            let serial_ms = serial_start.elapsed().as_millis();
+            let parallel_start = std::time::Instant::now();
+            let parallel =
+                search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
+            let parallel_ms = parallel_start.elapsed().as_millis();
+            assert_eq!(parallel.items.len(), serial.items.len());
+            println!(
+                "n2 benchmark query={query} serial={serial_ms}ms parallel={parallel_ms}ms matched={}",
+                serial.matched_count
+            );
+        }
     }
 
     fn volume() -> VolumeIndex {
