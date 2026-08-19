@@ -144,11 +144,17 @@ pub(crate) fn validate_before_save(state: &IndexState) -> Result<(), String> {
 
         // 随机 1% 节点抽检 path_for。用固定步长而非 RNG——确定性、零分配、
         // 覆盖均匀，且不引入 rand 依赖。
+        // 随机 1% 节点抽检 path_for。用固定步长而非 RNG——确定性、零分配、
+        // 覆盖均匀，且不引入 rand 依赖。
+        // FRESH-AUDIT-2 F1: 抽样失败必须中止保存（原 `let _ =` 丢弃结果，损坏父链
+        // 照常写入 v5）。墓碑槽跳过——父已删子仍在是 USN 重放的合法中间态，
+        // path_for 对非 PRESENT 记录必然报错（见 validate() 同款处理）。
         let stride = (volume.nodes.len() / 100).max(1);
         let mut record = 0u32;
         while (record as usize) < volume.nodes.len() {
-            if record != root_record {
-                let _ = volume.path_for(record);
+            let slot = &volume.nodes[record as usize];
+            if record != root_record && slot.flags & crate::hierarchy::FLAG_PRESENT != 0 {
+                volume.path_for(record)?;
             }
             record = record.saturating_add(stride as u32);
         }
@@ -208,5 +214,27 @@ mod tests {
         .unwrap();
         let decoded: CacheEnvelope<IndexState> = postcard::from_bytes(&bytes).unwrap();
         assert_ne!(&decoded.magic, CACHE_MAGIC);
+    }
+
+    /// FRESH-AUDIT-2 F1: 抽样 path_for 失败必须让 validate_before_save 报错，
+    /// 不允许损坏父链（结构校验捕捉不到的环）写入 v5。
+    #[test]
+    fn f1_validate_before_save_rejects_broken_parent_chain() {
+        let mut st = state();
+        let volume = &mut st.volumes[0];
+        let root_frn = volume.root_record as u64;
+        volume.upsert(1, root_frn, "a", true).unwrap();
+        volume.upsert(2, 1, "b", true).unwrap();
+
+        // 环：a↔b。两者都是 present 目录，validate_structure 不拦截；
+        // 只有抽样 path_for 能发现（表现为深度耗尽或显式环报错）。
+        volume.nodes[1].parent_record = 2;
+        volume.nodes[2].parent_record = 1;
+
+        let err = validate_before_save(&st).unwrap_err();
+        assert!(
+            err.contains("cycle") || err.contains("exceeds depth"),
+            "unexpected error: {err}"
+        );
     }
 }
