@@ -117,6 +117,57 @@ public sealed class WebModeDetectorTests
     }
 }
 
+/// <summary>网址直开判定（小问题 Q3）。</summary>
+public sealed class DirectUrlDetectionTests
+{
+    [Theory]
+    [InlineData("example.com", "https://example.com")]
+    [InlineData("www.baidu.com", "https://www.baidu.com")]
+    [InlineData("example.com:8080/x?q=1#f", "https://example.com:8080/x?q=1#f")]
+    [InlineData("https://example.com", "https://example.com")]
+    [InlineData("http://example.com", "http://example.com")]
+    [InlineData("ftp://files.example.com", "ftp://files.example.com")]
+    [InlineData("localhost", "http://localhost")]
+    [InlineData("localhost:3000/dev", "http://localhost:3000/dev")]
+    public void Url_Like_Terms_Open_Directly(string input, string expected)
+    {
+        Assert.Equal(expected, WebModeDetector.TryGetDirectUrl(input));
+    }
+
+    [Theory]
+    [InlineData("3.14")]          // 版本号/小数：末段数字
+    [InlineData("1.2.3")]
+    [InlineData("hello world")]   // 含空白
+    [InlineData("C:\\x\\y")]      // Windows 路径
+    [InlineData("server")]        // 无点主机名
+    [InlineData("example.")]      // 空 TLD
+    [InlineData("example.com:")]  // 空端口
+    [InlineData("example.com:abc")]
+    [InlineData("-bad.com")]      // label 起始连字符
+    [InlineData("天 气")]         // 含空白（中文）
+    [InlineData("what is 2+2")]
+    public void Non_Url_Terms_Return_Null(string input)
+    {
+        Assert.Null(WebModeDetector.TryGetDirectUrl(input));
+    }
+
+    [Fact]
+    public void Null_Or_Empty_Returns_Null()
+    {
+        Assert.Null(WebModeDetector.TryGetDirectUrl(null));
+        Assert.Null(WebModeDetector.TryGetDirectUrl(""));
+        Assert.Null(WebModeDetector.TryGetDirectUrl("   "));
+    }
+
+    [Fact]
+    public void Scheme_Must_Be_Well_Formed()
+    {
+        Assert.Null(WebModeDetector.TryGetDirectUrl("1http://example.com"));
+        Assert.Null(WebModeDetector.TryGetDirectUrl("://example.com"));
+        Assert.Equal("a+b-c.d://x", WebModeDetector.TryGetDirectUrl("a+b-c.d://x"));
+    }
+}
+
 public sealed class SuggestionAdapterTests
 {
     [Fact]

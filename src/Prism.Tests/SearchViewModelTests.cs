@@ -83,6 +83,45 @@ public sealed class SearchViewModelTests
     }
 
     [Fact]
+    public async Task WebModeSetsIsWebModeAndClearsOnEmptyQuery()
+    {
+        // 小问题 Q2：网页模式进出必须同步 IsWebMode，窗口据此隐藏"当前目录"前缀。
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("g 天气");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        Assert.True(state.IsWebMode);
+        Assert.StartsWith("在 Google 中搜索", state.Results[0].Title);
+
+        vm.OnQueryChanged("");
+        Assert.False(state.IsWebMode);
+    }
+
+    [Fact]
+    public async Task WebModeUrlLikeTermsOpenDirectly()
+    {
+        // 小问题 Q3：网址类查询词直接打开，不套引擎搜索模板。
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("g baidu.com");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+
+        Assert.True(state.IsWebMode);
+        Assert.Equal("打开 baidu.com", state.Results[0].Title);
+        Assert.Equal("https://baidu.com", state.Results[0].Subtitle);
+        Assert.Equal("https://baidu.com", state.Results[0].ExecuteId);
+        Assert.Equal(0, client.SearchCount); // 网页模式不走本地搜索
+    }
+
+    [Fact]
     public async Task GenerationInvalidatesCacheAndLateResponseCannotOverwriteNewQuery()
     {
         var client = new FakeSearchClient();

@@ -92,6 +92,74 @@ public static class WebModeDetector
             return "";
         return urlTemplate.Replace("{q}", SuggestionUrlEncoder.UrlEncode(queryTerms));
     }
+
+    /// <summary>
+    /// 识别"明显的网址"并返回可直接打开的 URL（小问题 Q3）。
+    /// 命中：带 scheme 的（http://…）、域名形态（example.com[:port][/path…]，补 https://）、
+    /// localhost（补 http://）。拒绝：含空白、版本号（3.14 / 1.2.3，末段须为 ≥2 个字母的
+    /// TLD）、Windows 路径（C:\x）、主机名无点（server）——这些继续走引擎搜索。
+    /// </summary>
+    public static string? TryGetDirectUrl(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+        var t = text.Trim();
+        if (t.Length > 2048)
+            return null;
+        foreach (var c in t)
+            if (char.IsWhiteSpace(c) || c == '\0')
+                return null;
+
+        // 带 scheme：格式宽松校验后原样打开，浏览器负责剩下的解析。
+        var schemeEnd = t.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd > 0)
+        {
+            var scheme = t[..schemeEnd];
+            var ok = scheme.Length >= 2
+                && char.IsAsciiLetter(scheme[0])
+                && scheme.All(c => char.IsAsciiLetterOrDigit(c) || c is '+' or '-' or '.');
+            return ok ? t : null;
+        }
+
+        // localhost 是唯一无点也直接打开的主机名（开发者习惯）。
+        if (t.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("localhost:", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("localhost/", StringComparison.OrdinalIgnoreCase))
+            return "http://" + t;
+
+        // 域名形态：host[:port] 后可跟 /path、?query、#fragment。
+        var authorityEnd = t.IndexOfAny(['/', '?', '#']);
+        var authority = authorityEnd < 0 ? t : t[..authorityEnd];
+        var lastColon = authority.LastIndexOf(':');
+        var host = lastColon < 0 ? authority : authority[..lastColon];
+        if (lastColon >= 0)
+        {
+            var port = authority[(lastColon + 1)..];
+            if (port.Length == 0 || !ushort.TryParse(port, out _))
+                return null;
+        }
+
+        var labels = host.Split('.');
+        if (labels.Length < 2)
+            return null;
+        foreach (var label in labels)
+        {
+            if (label.Length is < 1 or > 63)
+                return null;
+            if (!char.IsLetterOrDigit(label[0]) || !char.IsLetterOrDigit(label[^1]))
+                return null;
+            foreach (var c in label)
+                if (!char.IsLetterOrDigit(c) && c != '-')
+                    return null;
+        }
+
+        // 末段必须是 ≥2 个字母的 TLD：挡住 "3.14"、"1.2.3" 这类版本号/数字串。
+        var tld = labels[^1];
+        if (tld.Length < 2 || !tld.All(char.IsLetter))
+            return null;
+
+        return "https://" + t;
+    }
 }
 
 /// <summary>
