@@ -43,10 +43,12 @@ public sealed class ThemeWatcher : IDisposable
         var theme = ReadSystemTheme();
         var app = Application.Current;
         if (app is null) return;
+        // AUDIT-2026-08-18 C-D7: SystemEvents 回调线程持内部锁时同步 Invoke 会与
+        // 系统事件分发互相等待（死锁面）；改 BeginInvoke 异步投递到 UI 线程。
         if (app.Dispatcher.CheckAccess())
             Apply(theme);
         else
-            app.Dispatcher.Invoke(() => Apply(theme));
+            app.Dispatcher.BeginInvoke(() => Apply(theme));
     }
 
     public static AppTheme ReadSystemTheme()
