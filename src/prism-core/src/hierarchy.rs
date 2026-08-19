@@ -579,22 +579,38 @@ impl VolumeIndex {
         Ok(())
     }
 
-    pub fn compact_names_if_needed(&mut self) -> Result<bool, String> {
+    /// S1（FRESH-AUDIT-2026-08-19）: 是否到达压缩阈值——只读谓词，
+    /// 供锁外维护路径在 clone 前判定（压缩本体在 compact_names_if_needed）。
+    pub fn needs_name_compact(&self) -> bool {
         let threshold = (8 * 1024 * 1024usize).max(self.initial_name_bytes / 4);
         // Fast path: use the dead-name counter accumulated by delete/upsert
         // instead of scanning every node on every USN batch.  The counter is
         // serde-skipped (starts at 0 after a cache load), so add a fallback:
         // if the pool has grown far past its initial size the counter may be
         // underreporting, and a full scan is the safe thing to do.
-        let needs_compact = if self.dead_name_bytes > threshold {
-            true
-        } else {
-            self.names.len()
+        self.dead_name_bytes > threshold
+            || self
+                .names
+                .len()
                 > self
                     .initial_name_bytes
                     .saturating_add(threshold.saturating_mul(2))
-        };
-        if !needs_compact {
+    }
+
+    /// S1: 测试探针——强制到达压缩阈值 / 读回死字节计数。
+    /// cfg(test)：仅测试构建存在，避免非测试构建的 dead_code 告警。
+    #[cfg(test)]
+    pub(crate) fn force_name_compact_threshold_for_test(&mut self) {
+        self.dead_name_bytes = usize::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dead_name_bytes_for_test(&self) -> usize {
+        self.dead_name_bytes
+    }
+
+    pub fn compact_names_if_needed(&mut self) -> Result<bool, String> {
+        if !self.needs_name_compact() {
             return Ok(false);
         }
         let mut live_bytes: usize = 0;

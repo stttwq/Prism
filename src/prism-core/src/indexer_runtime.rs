@@ -170,6 +170,9 @@ pub struct ServiceState {
     /// AUDIT-2026-08-18 R-A3: 活跃连接数。每个连接一个 tokio 任务 + 1MB 行缓冲，
     /// 无上限时任凭本地进程堆积连接即可耗尽 2 worker 的 runtime。
     connections: AtomicUsize,
+    /// S1（FRESH-AUDIT-2026-08-19）: 某卷到达名字池压缩阈值。watcher 在写锁内
+    /// O(1) 立标志，maintenance tick 在锁外 clone→压缩→短锁换入。
+    needs_name_compact: AtomicBool,
 }
 
 impl ServiceState {
@@ -207,6 +210,7 @@ impl ServiceState {
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
             connections: AtomicUsize::new(0),
+            needs_name_compact: AtomicBool::new(false),
         })
     }
 
@@ -943,6 +947,29 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                     );
                     last_memory_trend = Instant::now();
                 }
+                // S1: 名字池压缩在锁外做（clone→压缩→短锁换入，next_usn 校验）。
+                if state.needs_name_compact.swap(false, Ordering::AcqRel) {
+                    let compact_task = tokio::task::spawn_blocking({
+                        let state = state.clone();
+                        move || compact_volumes_off_lock(&state)
+                    });
+                    tokio::pin!(compact_task);
+                    let result = tokio::select! {
+                        result = &mut compact_task => result,
+                        _ = stop.cancelled() => break,
+                    };
+                    match result {
+                        Ok(Ok(())) => {}
+                        // 压缩失败只是内存回收延迟（计数器仍在，下轮重触发），
+                        // 搜索不受影响：记日志不降级。
+                        Ok(Err(error)) => {
+                            logging::event_detail("error", "maintenance_compact_failed", &error, None, None);
+                        }
+                        Err(error) => {
+                            logging::event_detail("error", "maintenance_compact_task", &error.to_string(), None, None);
+                        }
+                    }
+                }
                 if state.pinyin_needs_rebuild.swap(false, Ordering::AcqRel)
                     && state.pinyin_status() != PinyinStatus::Disabled
                 {
@@ -1471,13 +1498,12 @@ fn watch_volume(
             let events_before = index.events_since_checkpoint;
             index.events_since_checkpoint = index.events_since_checkpoint.saturating_add(changed);
             if changed > 0 && events_before / 10_000 != index.events_since_checkpoint / 10_000 {
-                // H2b: only compact the volume that received USN events — each
-                // watcher is per-volume, so only its own deletes/upserts produce
-                // dead name bytes.  Compacting all volumes here held the write
-                // lock for O(total nodes) instead of O(one volume's nodes).
-                if volume.compact_names_if_needed()? {
-                    log(format!("compacted name pool for {}", volume.mount_path));
-                }
+                // S1（FRESH-AUDIT-2026-08-19）: 压缩挪出写锁——O(N) 的池重建曾把
+                // 写锁占住数百毫秒（3M 记录卷 ~100MB memcpy），删除风暴期间搜索
+                // 读锁与兄弟卷 watcher 全部停摆。这里只 O(1) 立标志；maintenance
+                // tick 在锁外 clone→压缩→短锁 next_usn 校验后整卷换入。
+                // 计数器仍在（dead_name_bytes 不清零），漏拍不漏压缩。
+                service.needs_name_compact.store(true, Ordering::Release);
             }
             if changed > 0 {
                 index.generation = index.generation.saturating_add(1);
@@ -1535,6 +1561,81 @@ async fn checkpoint_async(state: Arc<ServiceState>, data_dir: PathBuf) -> Result
     tokio::task::spawn_blocking(move || checkpoint(&state, &data_dir))
         .await
         .map_err(|error| format!("checkpoint task: {error}"))?
+}
+
+/// S1（FRESH-AUDIT-2026-08-19）: 锁外压缩全部到达阈值的卷。
+/// 每卷独立处理，单卷失败不拖累其他卷。
+fn compact_volumes_off_lock(state: &ServiceState) -> Result<(), String> {
+    let targets: Vec<crate::hierarchy::VolumeId> = {
+        let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
+        guard
+            .as_ref()
+            .map(|index| {
+                index
+                    .volumes
+                    .iter()
+                    .filter(|volume| volume.needs_name_compact())
+                    .map(|volume| volume.volume_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for volume_id in targets {
+        compact_one_volume_off_lock(state, &volume_id)?;
+    }
+    Ok(())
+}
+
+/// S1: 单卷的「读锁 clone → 锁外压缩 → 短写锁换入」。
+/// clone 与换入之间 USN 到达（该卷 next_usn 前移）则丢弃重试（≤3 次）——
+/// 换入陈旧卷会丢事件，宁可放弃本轮等下一个 tick（计数器不清零，必然重触发）。
+fn compact_one_volume_off_lock(
+    state: &ServiceState,
+    volume_id: &crate::hierarchy::VolumeId,
+) -> Result<bool, String> {
+    const RETRIES: usize = 3;
+    for _ in 0..RETRIES {
+        let snapshot = {
+            let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
+            let index = guard.as_ref().ok_or("index is not ready")?;
+            let Some(volume) = index
+                .volumes
+                .iter()
+                .find(|volume| volume.volume_id == *volume_id)
+            else {
+                return Ok(false); // 卷已被单卷重建替换掉——无事可做
+            };
+            if !volume.needs_name_compact() {
+                return Ok(false); // 已被其他路径压缩过
+            }
+            volume.clone()
+        };
+        let snapshot_usn = snapshot.next_usn;
+        let mut compacted = snapshot;
+        if !compacted.compact_names_if_needed()? {
+            return Ok(false);
+        }
+        let mut guard = state
+            .index
+            .write()
+            .map_err(|_| "index lock is poisoned")?;
+        let index = guard.as_mut().ok_or("index is not ready")?;
+        let Some(slot) = index
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.volume_id == *volume_id)
+        else {
+            return Ok(false);
+        };
+        if slot.next_usn != snapshot_usn {
+            continue; // USN 在 clone 期间到达：丢弃这次压缩，重试
+        }
+        let mount = slot.mount_path.clone();
+        *slot = compacted;
+        log(format!("compacted name pool for {mount} (off-lock)"));
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Number of concurrently armed pipe listeners.
@@ -1882,6 +1983,111 @@ mod tests {
         let detail = state.memory_trend_detail();
         assert!(detail.contains("volumes=1"), "{detail}");
         assert!(!detail.contains("memory_bytes=0"), "{detail}");
+    }
+
+    // --- S1（FRESH-AUDIT-2026-08-19）: 名字池压缩挪出写锁 -----------------------
+
+    /// 构造带死名字字节的卷并发布到 state，然后强制到达压缩阈值。
+    fn compactable_state() -> (std::sync::Arc<ServiceState>, crate::hierarchy::VolumeId) {
+        let state = ServiceState::new();
+        let mut volume = test_volume("v1", "C:\\", "keep.txt");
+        for record in 11..50u32 {
+            volume
+                .upsert(frn2(record, 1), frn2(10, 1), &format!("dead-{record}.bin"), false)
+                .unwrap();
+            volume.delete(frn2(record, 1)).unwrap();
+        }
+        state.merge_and_publish(volume);
+        {
+            let mut guard = state.index.write().unwrap();
+            let live = guard.as_mut().unwrap().volumes.last_mut().unwrap();
+            live.force_name_compact_threshold_for_test(); // 强制触发阈值
+        }
+        let volume_id = {
+            let guard = state.index.read().unwrap();
+            guard.as_ref().unwrap().volumes[0].volume_id.clone()
+        };
+        (state, volume_id)
+    }
+
+    fn frn2(record: u32, sequence: u16) -> u64 {
+        (u64::from(sequence) << 48) | u64::from(record)
+    }
+
+    /// USN 静止时：锁外压缩换入成功，live 卷名字池收缩、搜索不受影响。
+    #[test]
+    fn s1_off_lock_compact_swaps_in_when_usn_is_stable() {
+        let (state, _vid) = compactable_state();
+        let names_before = {
+            let guard = state.index.read().unwrap();
+            guard.as_ref().unwrap().volumes[0].names.len()
+        };
+
+        compact_volumes_off_lock(&state).unwrap();
+
+        let (names_after, dead) = {
+            let guard = state.index.read().unwrap();
+            let live = &guard.as_ref().unwrap().volumes[0];
+            (live.names.len(), live.dead_name_bytes_for_test())
+        };
+        assert!(names_after < names_before, "压缩必须收缩名字池");
+        assert_eq!(dead, 0, "换入后死字节计数归零");
+        assert!(state
+            .search("keep", 8, None, None)
+            .is_ok_and(|r| matches!(r, IndexerResponse::Results { ref items, .. } if !items.is_empty())));
+    }
+
+    /// clone 窗口内 USN 到达（next_usn 前移）：换入必须被拒——live 卷的游标
+    /// 绝不能被陈旧快照回退，压缩重试或放弃都不影响数据新鲜度。
+    #[test]
+    fn s1_off_lock_compact_never_regresses_the_usn_cursor() {
+        let (state, vid) = compactable_state();
+        let stop_bumping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // bumper 最后一次写入的游标值；MIN 表示尚未写过（release 下线程启动可能
+        // 慢于主线程的压缩循环，必须等第一次真实写入后再开始压缩）。
+        let latest_written = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+        let bumper_state = state.clone();
+        let stop = stop_bumping.clone();
+        let latest = latest_written.clone();
+        let bumper = std::thread::spawn(move || {
+            let mut usn: i64 = 10;
+            while !stop.load(Ordering::Acquire) {
+                usn += 1;
+                let mut guard = bumper_state.index.write().unwrap();
+                if let Some(live) = guard.as_mut().unwrap().volumes.first_mut() {
+                    live.next_usn = usn;
+                }
+                drop(guard);
+                latest.store(usn, Ordering::Release);
+            }
+        });
+
+        // 等 bumper 完成至少一次写入，避免"压缩先跑完、断言语义空转"的假阳性。
+        while latest_written.load(Ordering::Acquire) == i64::MIN {
+            std::thread::yield_now();
+        }
+
+        // 压缩循环与游标推进并发：无论换入成败，断言只看最终一致性。
+        for _ in 0..50 {
+            let _ = compact_one_volume_off_lock(&state, &vid);
+        }
+
+        stop_bumping.store(true, Ordering::Release);
+        bumper.join().unwrap();
+
+        let live_usn = {
+            let guard = state.index.read().unwrap();
+            guard.as_ref().unwrap().volumes[0].next_usn
+        };
+        assert_eq!(
+            live_usn,
+            latest_written.load(Ordering::Acquire),
+            "压缩换入绝不能把 USN 游标回退到旧快照"
+        );
+        // 无论是否成功换入，搜索必须始终可用。
+        assert!(state
+            .search("keep", 8, None, None)
+            .is_ok_and(|r| matches!(r, IndexerResponse::Results { ref items, .. } if !items.is_empty())));
     }
 
     #[test]
