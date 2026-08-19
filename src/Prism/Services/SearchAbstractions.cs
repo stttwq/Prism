@@ -95,3 +95,30 @@ public sealed class SearchScheduler : ISearchScheduler
 {
     public Task Delay(TimeSpan delay, CancellationToken ct = default) => Task.Delay(delay, ct);
 }
+
+/// <summary>
+/// P4-RESEARCH P4a: 目标文件夹选择器。此前 SearchViewModel 直接弹 WinForms
+/// FolderBrowserDialog，copy_to/move_to 分支零测试覆盖——抽出接口后该分支可测。
+/// 调用方在 UI/STA 线程，保持同步签名。
+/// </summary>
+public interface IFolderPicker
+{
+    /// <summary>返回所选目录；取消返回 null。</summary>
+    string? PickFolder(string? description);
+}
+
+/// <summary>默认实现：包住 WinForms FolderBrowserDialog，行为与抽取前逐字段一致。</summary>
+public sealed class WinFormsFolderPicker : IFolderPicker
+{
+    public string? PickFolder(string? description)
+    {
+        using var dialog = new System.Windows.Forms.FolderBrowserDialog
+        {
+            Description = description ?? "",
+            ShowNewFolderButton = true,
+        };
+        return dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK
+            ? dialog.SelectedPath
+            : null;
+    }
+}

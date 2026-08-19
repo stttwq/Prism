@@ -924,6 +924,107 @@ public sealed class SearchViewModelTests
         Assert.Equal("索引尚未刷新，结果可能不完整", state.StatusMessage);
     }
 
+    // ------------------------------------------------------------------
+    // P4a: IFolderPicker 注入——copy_to/move_to 分支此前零测试覆盖
+    // ------------------------------------------------------------------
+
+    private static SearchResult FileTarget(string path) =>
+        new("file", System.IO.Path.GetFileName(path), path, path, []);
+
+    private static ActionItem Action(string id) => new(id, id, "", false, false);
+
+    private sealed class FakeFolderPicker : IFolderPicker
+    {
+        public Queue<string?> Results { get; } = new();
+        public List<string?> Descriptions { get; } = [];
+        public string? PickFolder(string? description)
+        {
+            Descriptions.Add(description);
+            return Results.Dequeue();
+        }
+    }
+
+    /// <summary>用户取消选目录：不得发 RunActionAsync、不报错、不刷新。</summary>
+    [Fact]
+    public async Task CopyToWithCancelledPickerDoesNothing()
+    {
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var picker = new FakeFolderPicker();
+        picker.Results.Enqueue(null);
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler(), folderPicker: picker);
+
+        await vm.RunActionOnAsync(FileTarget(@"C:\src\a.txt"), Action("copy_to"));
+
+        Assert.Null(client.LastTarget);
+        Assert.Null(client.LastActionArgs);
+        Assert.Equal("", state.StatusMessage);
+    }
+
+    /// <summary>选了目录：Destination 原样传给后端；generation 信号到来后刷新，不走超时文案。</summary>
+    [Fact]
+    public async Task CopyToSendsPickedDestinationAndRefreshes()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("a", false, 1, Result("alpha"))); // 首搜
+        client.Enqueue(Response("a", false, 2, Result("alpha"))); // RefreshAsync 的补搜
+        var timers = new ManualTimerFactory();
+        var scheduler = new ManualSearchScheduler();
+        var state = new AppState();
+        var picker = new FakeFolderPicker();
+        picker.Results.Enqueue(@"D:\dest");
+        var vm = new SearchViewModel(state, client, timers, scheduler, folderPicker: picker);
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        var runAction = vm.RunActionOnAsync(FileTarget(@"C:\src\a.txt"), Action("copy_to"));
+        await Eventually(() => scheduler.PendingCount == 1); // RefreshAsync 已挂起等信号/超时
+        vm.OnIndexGenerationChanged(); // generation 到来 → 信号路径
+        await runAction.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(client.LastActionArgs);
+        Assert.Equal(@"D:\dest", client.LastActionArgs!.Destination);
+        Assert.DoesNotContain("索引尚未刷新", state.StatusMessage);
+        Assert.True(client.SearchCount >= 2, "动作成功后必须刷新结果");
+    }
+
+    /// <summary>第二次选择不同的目录：传的是本次选择，不是上次的缓存。</summary>
+    [Fact]
+    public async Task MoveToUsesTheLatestPickedFolder()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("a", false, 1, Result("alpha"))); // 首搜
+        client.Enqueue(Response("a", false, 2, Result("alpha"))); // 第一次刷新补搜
+        client.Enqueue(Response("a", false, 3, Result("alpha"))); // 第二次刷新补搜
+        var timers = new ManualTimerFactory();
+        var scheduler = new ManualSearchScheduler();
+        var state = new AppState();
+        var picker = new FakeFolderPicker();
+        picker.Results.Enqueue(@"D:\one");
+        picker.Results.Enqueue(@"E:\two");
+        var vm = new SearchViewModel(state, client, timers, scheduler, folderPicker: picker);
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        var firstRun = vm.RunActionOnAsync(FileTarget(@"C:\src\a.txt"), Action("move_to"));
+        // 每轮 RefreshAsync 各排一个超时任务；信号路径胜出后旧任务留在队列里（永不触发）。
+        await Eventually(() => scheduler.PendingCount >= 1);
+        vm.OnIndexGenerationChanged();
+        await firstRun.WaitAsync(TimeSpan.FromSeconds(5));
+        var first = client.LastActionArgs!.Destination;
+
+        var secondRun = vm.RunActionOnAsync(FileTarget(@"C:\src\b.txt"), Action("move_to"));
+        await Eventually(() => scheduler.PendingCount >= 2);
+        vm.OnIndexGenerationChanged();
+        await secondRun.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(@"D:\one", first);
+        Assert.Equal(@"E:\two", client.LastActionArgs!.Destination);
+    }
+
     private static SearchResult Result(string title) =>
         new("file", title, $"C:\\{title}", $"C:\\{title}", []);
 

@@ -24,6 +24,9 @@ public sealed class SearchViewModel
     private readonly IWindowActivator? _activator;
     /// <summary>在线联想服务（G8）。为空表示未装配，网页模式不发送联想请求。</summary>
     private readonly ISuggestionService? _suggestions;
+
+    /// <summary>P4a: 目标文件夹选择器（copy_to/move_to），可注入假实现测该分支。</summary>
+    private readonly IFolderPicker _folderPicker;
     /// <summary>当前引擎列表（G8 网页模式检测用），由设置更新时刷新。</summary>
     private IReadOnlyList<WebEngine> _webEngines = Settings.DefaultEngines();
     /// <summary>在线联想开关（G8），默认关闭。</summary>
@@ -72,12 +75,15 @@ public sealed class SearchViewModel
         IDebounceTimerFactory? timerFactory = null,
         ISearchScheduler? scheduler = null,
         IWindowActivator? activator = null,
-        ISuggestionService? suggestions = null)
+        ISuggestionService? suggestions = null,
+        IFolderPicker? folderPicker = null)
     {
         _state = state;
         _pipe = pipe;
         _activator = activator;
         _suggestions = suggestions;
+        // P4a: 缺省保持 WinForms 对话框（照抄 ISuggestionService 的可选注入先例）。
+        _folderPicker = folderPicker ?? new WinFormsFolderPicker();
         timerFactory ??= new DispatcherDebounceTimerFactory();
         _scheduler = scheduler ?? new SearchScheduler();
         _debounce = timerFactory.Create(
@@ -617,18 +623,8 @@ public sealed class SearchViewModel
         }
     }
 
-    /// <summary>弹出文件夹选择对话框，返回选中的目录路径或 null（用户取消）。</summary>
-    private string? PickDestinationFolder()
-    {
-        using var dialog = new System.Windows.Forms.FolderBrowserDialog
-        {
-            Description = "选择目标文件夹",
-            ShowNewFolderButton = true,
-        };
-        return dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK
-            ? dialog.SelectedPath
-            : null;
-    }
+    /// <summary>弹出文件夹选择对话框，返回选中的目录路径或 null（用户取消）。P4a: 转发给注入的 IFolderPicker。</summary>
+    private string? PickDestinationFolder() => _folderPicker.PickFolder("选择目标文件夹");
 
     /// <summary>用当前查询重新搜索，用于 mutation 动作成功后刷新结果。</summary>
     public async Task RefreshAsync()
