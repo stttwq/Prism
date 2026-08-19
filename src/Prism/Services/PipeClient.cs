@@ -586,6 +586,16 @@ public sealed class PipeClient : ISearchClient, IDisposable
         _query.SendAsync(request, ct, readTimeout);
 
     /// <summary>
+    /// AUDIT-2026-08-18 R-A6: 动作通道退化到搜索通道后的宽松读超时。
+    /// 此前退化路径是无限期读且豁免 watchdog wedge 判定——broker 对该 run_action
+    /// 永不应答时，后续搜索全堆在 _ioLock 后，UI 永远"搜索中"且无自愈。
+    /// 60 秒覆盖属性页/复制确认等系统对话框的合理上限；超时走既有读超时路径
+    /// （销毁流走重连，绝不重发——约束见 SendAsync 注释）。带读超时即意味着
+    /// 该请求按查询计数，不再豁免 wedge 判定。internal set 供测试缩短。
+    /// </summary>
+    internal static TimeSpan FallbackActionReadTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
     /// 交互式动作类请求（execute / reveal / run_action，审计 C1）：走独立的动作通道，
     /// 无读超时——属性页/复制确认等系统对话框可以合法占住这条连接任意久，
     /// 期间搜索通道不受影响，每击键搜索照常。
@@ -603,7 +613,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
         catch (PipeNotConnectedException)
         {
-            return await _query.SendAsync(request, ct, readTimeout: null).ConfigureAwait(false);
+            return await _query.SendAsync(request, ct, FallbackActionReadTimeout).ConfigureAwait(false);
         }
     }
 

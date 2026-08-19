@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
+using Prism.Models;
 using Prism.Services;
 using Xunit;
 
@@ -183,6 +184,57 @@ public sealed class PipeClientHandshakeTests
 
         await connectTask; // 不应抛
         Assert.True(client.IsConnected);
+    }
+
+    // ------------------------------------------------------------------
+    // R-A6: 动作退化到搜索通道后的读超时
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// AUDIT-2026-08-18 R-A6: 动作通道连不上退化到搜索通道后，broker 对请求
+    /// 永不应答时必须在宽松超时（测试中缩短到 1s）后销毁连接，而不是无限期
+    /// 挂死并豁免 wedge 判定——否则后续搜索全堆在通道锁后，UI 永远"搜索中"。
+    ///
+    /// 布景：管道 server 只有 1 个实例（动作通道连不上 → PipeNotConnectedException
+    /// → 退化到查询通道）；server 完成查询握手后读走 execute 请求但永不应答。
+    /// </summary>
+    [Fact]
+    public async Task Fallback_Action_Read_Times_Out_And_Destroys_Connection()
+    {
+        var original = PipeClient.FallbackActionReadTimeout;
+        PipeClient.FallbackActionReadTimeout = TimeSpan.FromSeconds(1);
+        try
+        {
+            var name = TempPipeName();
+            using var server = CreateServer(name);
+            var accepted = server.WaitForConnectionAsync();
+
+            using var client = new PipeClient(name);
+            // 先建查询通道并握手——占掉 server 唯一实例，动作通道随后必然连不上。
+            var connectTask = client.ConnectInnerAsync(TimeSpan.FromSeconds(2), CancellationToken.None);
+            await accepted;
+            var utf8 = new UTF8Encoding(false);
+            using var reader = new StreamReader(server, utf8);
+            using var writer = new StreamWriter(server, utf8) { AutoFlush = true, NewLine = "\n" };
+            await reader.ReadLineAsync(); // hello
+            await writer.WriteLineAsync("{\"type\":\"hello\",\"protocol\":1}");
+            await connectTask;
+
+            var sendTask = Task.Run(() => client.ExecuteAsync(
+                new ActionTarget("file", @"C:\nonexistent\a.txt"), "", CancellationToken.None));
+
+            // 退化路径的 execute 请求到达查询通道但永不应答
+            var request = await reader.ReadLineAsync();
+            Assert.NotNull(request);
+            Assert.Contains("execute", request);
+
+            await Assert.ThrowsAnyAsync<Exception>(() => sendTask);
+            Assert.False(client.IsConnected, "超时后查询通道必须被销毁（走重连自愈）");
+        }
+        finally
+        {
+            PipeClient.FallbackActionReadTimeout = original;
+        }
     }
 
     // ------------------------------------------------------------------
