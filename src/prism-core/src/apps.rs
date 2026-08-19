@@ -101,7 +101,7 @@ pub fn app_scan_retry_delay(attempt: u32) -> std::time::Duration {
     if attempt <= 5 {
         return std::time::Duration::from_secs(BASE);
     }
-    let shift = (attempt - 5).min(16) as u32; // u64 秒内防溢出即可
+    let shift = (attempt - 5).min(16); // u64 秒内防溢出即可
     std::time::Duration::from_secs((BASE << shift).min(CAP))
 }
 
