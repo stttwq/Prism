@@ -161,12 +161,13 @@ public partial class SearchWindow : Window
             // 清空查询丢弃了结果引用，但窗口仍可见不会走 ReleaseIdleMemory。
             // 在 ApplicationIdle 上做一次轻量回收（保留扩展名图标缓存），
             // 不在 hot path 上阻塞。Trim 延迟到隐藏后统一执行。
-            // AUDIT-2026-08-18 C-D4: Optimized 常被 CLR 跳过、非阻塞不压缩——
-            // 改 Forced + blocking:true 确保真正压缩堆。
+            // G3（FRESH-AUDIT-2）：可见期只收 Gen0/1——Gen2 强制压缩会阻塞 UI 线程
+            // 数十至数百毫秒；全量压缩留给隐藏后的 _idleTrimTimer 路径。
             Dispatcher.BeginInvoke(new Action(() =>
             {
                 _icons?.ClearPathKeys();
-                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                GC.Collect(0, GCCollectionMode.Forced, blocking: true, compacting: true);
+                GC.Collect(1, GCCollectionMode.Forced, blocking: true, compacting: true);
             }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         };
         vm.State.PropertyChanged += OnStateChanged;
@@ -637,6 +638,9 @@ public partial class SearchWindow : Window
                 e.Handled = true;
                 break;
             case Key.Enter:
+                // G3（FRESH-AUDIT-2）：先置 Handled 再 await——await 让出后按键路由已经
+                // 冒泡完毕，事后置位无效，Enter 可能被其他元素二次消费。
+                e.Handled = true;
                 if (mode == PanelMode.Actions)
                 {
                     await _vm.ExecuteActionAsync();
@@ -651,7 +655,6 @@ public partial class SearchWindow : Window
                     // 普通 Enter 始终走 broker 打开，绝不自动导航宿主或确认对话框。
                     await _vm.ExecuteSelectedAsync();
                 }
-                e.Handled = true;
                 break;
             case Key.Escape:
                 HandleEscape();
@@ -664,8 +667,9 @@ public partial class SearchWindow : Window
                     && Keyboard.Modifiers == ModifierKeys.None
                     && IsActionableSelection(_vm.State.SelectedResult))
                 {
-                    await EnterActionsUiAsync();
+                    // 同 Enter：先置 Handled 再 await（见 Key.Enter 注释）。
                     e.Handled = true;
+                    await EnterActionsUiAsync();
                 }
                 break;
             case Key.Left:
@@ -776,8 +780,9 @@ public partial class SearchWindow : Window
     {
         if (_vm is null || !Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) return;
         if (_vm.State.Mode == PanelMode.Actions) return;
-        await _vm.ExecuteIndexAsync(n);
+        // 同 Enter：先置 Handled 再 await（见 Key.Enter 注释）。
         e.Handled = true;
+        await _vm.ExecuteIndexAsync(n);
     }
 
     private void OnResultsSelected(int index)

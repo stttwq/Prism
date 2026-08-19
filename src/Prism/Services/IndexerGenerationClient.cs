@@ -98,9 +98,12 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
             AutoFlush = false,
             NewLine = "\n",
         };
+        // G3（FRESH-AUDIT-2）：有界逐行读——此前裸 ReadLineAsync 无上限，
+        // 任何能写这条管道的进程都可灌超长行撑爆前端内存（对齐 R-A4 的 broker 方向）。
+        var lineReader = new PipeClient.BoundedLineReader(reader);
 
         var hello = await ExchangeAsync(
-            writer, reader, new { type = "hello", protocol = ProtocolVersion }, ct).ConfigureAwait(false);
+            writer, lineReader, new { type = "hello", protocol = ProtocolVersion }, ct).ConfigureAwait(false);
         EnsureResponseType(hello, "hello");
         if (!hello.TryGetProperty("protocol", out var protocol)
             || !protocol.TryGetInt32(out var version)
@@ -110,7 +113,7 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         }
 
         var status = await ExchangeAsync(
-            writer, reader, new { type = "status" }, ct).ConfigureAwait(false);
+            writer, lineReader, new { type = "status" }, ct).ConfigureAwait(false);
         EnsureResponseType(status, "status");
         var generation = ReadGeneration(status);
         // A change can land after the visible search but before this dedicated
@@ -123,7 +126,7 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         {
             var response = await ExchangeAsync(
                 writer,
-                reader,
+                lineReader,
                 new { type = "wait_generation", after = generation, timeout_ms = 30_000 },
                 ct).ConfigureAwait(false);
             EnsureResponseType(response, "generation");
@@ -138,14 +141,14 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
 
     private static async Task<JsonElement> ExchangeAsync(
         StreamWriter writer,
-        StreamReader reader,
+        PipeClient.BoundedLineReader lineReader,
         object request,
         CancellationToken ct)
     {
         var json = JsonSerializer.Serialize(request);
         await writer.WriteLineAsync(json.AsMemory(), ct).ConfigureAwait(false);
         await writer.FlushAsync(ct).ConfigureAwait(false);
-        var line = await reader.ReadLineAsync(ct).ConfigureAwait(false)
+        var line = await lineReader.ReadLineAsync(ct).ConfigureAwait(false)
             ?? throw new IOException("Indexer closed the pipe before responding");
 
         using var document = JsonDocument.Parse(line);

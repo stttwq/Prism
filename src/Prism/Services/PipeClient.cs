@@ -285,12 +285,19 @@ public sealed class PipeClient : ISearchClient, IDisposable
         private readonly char[] _pending = new char[4096];
         private int _pendingStart, _pendingCount;
 
+        // G3（FRESH-AUDIT-2）：读块缓冲与行构造器提为字段——每击键一行响应，
+        // 此前每次 ReadLineAsync 都新分配 4KB char[] + StringBuilder。
+        // 实例挂在 PipeChannel 上、随流销毁重建，调用由 _ioLock 串行化，无重入。
+        private readonly char[] _read = new char[4096];
+        private readonly System.Text.StringBuilder _line = new();
+
         public BoundedLineReader(StreamReader reader) => _reader = reader;
 
         public async Task<string?> ReadLineAsync(CancellationToken ct)
         {
-            var line = new System.Text.StringBuilder();
-            var buffer = new char[4096];
+            _line.Clear();
+            var line = _line;
+            var buffer = _read;
             while (true)
             {
                 // 先用掉上次读完换行后剩下的尾巴。
@@ -664,6 +671,17 @@ public sealed class PipeClient : ISearchClient, IDisposable
     internal static TimeSpan FallbackActionReadTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
     /// <summary>
+    /// FRESH-AUDIT-2 F6: 动作通道自身的宽松读超时（5 分钟级）。
+    /// 此前动作通道无超时且豁免 wedge 判定——broker 无对话框状态下死锁时，
+    /// execute 永久挂起，后续动作在通道 _ioLock 上无限排队，无自愈。
+    /// 5 分钟覆盖属性页/复制确认/大目录 zip 等合法长等待的合理上限；超时销毁
+    /// 动作连接走重连（查询通道不受影响），绝不重发（删除/复制不得执行两次）。
+    /// 超时≠未执行——mutation 类的文案由 ViewModel 按"结果未知"处理（F7）。
+    /// internal set 供测试缩短。
+    /// </summary>
+    internal static TimeSpan ActionReadTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
     /// 交互式动作类请求（execute / reveal / run_action，审计 C1）：走独立的动作通道，
     /// 无读超时——属性页/复制确认等系统对话框可以合法占住这条连接任意久，
     /// 期间搜索通道不受影响，每击键搜索照常。
@@ -677,7 +695,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
     {
         try
         {
-            return await _action.SendAsync(request, ct, readTimeout: null).ConfigureAwait(false);
+            // F6: 动作通道也带宽松超时（5 分钟）——无对话框死锁可自愈；
+            // 对话框等合法长等待超过 5 分钟时按超时处理，文案由 F7 明示"结果未知"。
+            return await _action.SendAsync(request, ct, ActionReadTimeout).ConfigureAwait(false);
         }
         catch (PipeNotConnectedException)
         {
@@ -826,8 +846,19 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
     public void Dispose()
     {
-        // C-D9: 先立墓碑再拆 timer——tick 入口与 EnsureBackendRunning 都会检查它。
+        // G3（FRESH-AUDIT-2）：退出 Dispose 移后台线程——排干 watchdog（最多 12s）与
+        // Kill 整树最坏会阻塞 UI。墓碑同步先立，后续清理交给后台；Prism 若在清理
+        // 完成前就退出，Job Object 关闭时 OS 仍会回收 broker，不留孤儿。
+        if (_disposed)
+            return;
         _disposed = true;
+        ThreadPool.QueueUserWorkItem(_ => DisposeCore());
+    }
+
+    private void DisposeCore()
+    {
+        // C-D9: 先立墓碑再拆 timer——tick 入口与 EnsureBackendRunning 都会检查它。
+        // （墓碑已在 Dispose 里同步立好。）
 
         // C-D9: Timer.Dispose() 不等在途回调；用带等待句柄的 Dispose 排干在途 tick
         // （tick 内部重连有 10s 上限，等待 12s 封顶），保证此后 Kill 的 broker
@@ -1227,7 +1258,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
         public void Dispose()
         {
             DisposeStreamOnly();
-            _ioLock.Dispose();
+            // G3: 退出路径上可能仍有排队等锁的发送者，Dispose 竞态会向它们抛
+            // ObjectDisposedException——吞掉（进程即将退出，句柄由 OS 回收）。
+            try { _ioLock.Dispose(); } catch (ObjectDisposedException) { }
         }
     }
 }

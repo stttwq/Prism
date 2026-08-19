@@ -190,6 +190,12 @@ public partial class ResultList : UserControl
         var rows = Math.Min(_items.Count, MaxVisibleRows);
         var h = rows * SnappedRowHeight();
 
+        // F8（FRESH-AUDIT-2）：面板高度必须计入可见状态行——此前只算结果行，
+        // 有状态文案时要么被固定 Height 裁掉底部，要么空结果态 MinHeight=0 把
+        // "无匹配结果/正在建立索引…"整体挤没了。状态行按单行 36px 计
+        //（与 StatusText 的 Margin 8+12 + 13px 字号布局一致）。
+        var statusH = StatusText.Visibility == Visibility.Visible ? StatusRowHeight : 0;
+
         // 行数没超过可视上限时必须彻底禁掉滚动，不能只依赖"高度刚好装得下"。
         ScrollViewer.SetVerticalScrollBarVisibility(
             List,
@@ -197,18 +203,25 @@ public partial class ResultList : UserControl
                 ? ScrollBarVisibility.Auto
                 : ScrollBarVisibility.Disabled);
 
-        if (h <= 0)
+        if (h <= 0 && statusH <= 0)
         {
-            // No result rows: let the StackPanel auto-size to StatusText (if any).
+            // 无结果行也无状态行：完全收起。
             Height = double.NaN;
             List.Height = double.NaN;
             MinHeight = 0;
         }
+        else if (h <= 0)
+        {
+            // 只有状态行（空结果/索引中）：面板恰为状态行高度。
+            Height = statusH;
+            List.Height = double.NaN;
+            MinHeight = statusH;
+        }
         else
         {
-            Height = h;
+            Height = h + statusH;
             List.Height = h;
-            MinHeight = h;
+            MinHeight = h + statusH;
         }
     }
 

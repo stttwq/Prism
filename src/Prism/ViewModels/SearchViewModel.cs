@@ -612,7 +612,7 @@ public sealed class SearchViewModel
             }
             catch (Exception ex)
             {
-                _state.StatusMessage = "动作失败：" + ShortMsg(ex);
+                _state.StatusMessage = ActionErrorMessage(ex, action.Id);
             }
             await RefreshAsync();
             return;
@@ -635,8 +635,22 @@ public sealed class SearchViewModel
         }
         catch (Exception ex)
         {
-            _state.StatusMessage = "动作失败：" + ShortMsg(ex);
+            _state.StatusMessage = ActionErrorMessage(ex, action.Id);
         }
+    }
+
+    /// <summary>
+    /// FRESH-AUDIT-2 F7: 动作超时 ≠ 未执行——broker 可能已完成删除/移动而响应丢失，
+    /// 用户照旧文案重试会重复执行。mutation 类超时改报"结果未知"，
+    /// 非 mutation（open/locate 等）超时仍按普通失败处理（重试无副作用）。
+    /// </summary>
+    private static string ActionErrorMessage(Exception ex, string actionId)
+    {
+        const string timeoutMarker = "响应超时";
+        var isMutation = !HideAfterSuccessActions.Contains(actionId) && actionId != "rename";
+        if (isMutation && ex is IOException && ex.Message.Contains(timeoutMarker))
+            return $"动作超时，结果未知：{actionId} 可能已执行，请核实文件状态后再决定是否重试";
+        return "动作失败：" + ShortMsg(ex);
     }
 
     /// <summary>弹出文件夹选择对话框，返回选中的目录路径或 null（用户取消）。P4a: 转发给注入的 IFolderPicker。</summary>
@@ -1074,8 +1088,10 @@ public sealed class SearchViewModel
 
     private void CancelSearch()
     {
+        // G3: 只 Cancel 不 Dispose——在途请求的配对读仍持有该 token
+        // （SendAsync 完成读后要 ThrowIfCancellationRequested），Dispose 会让它
+        // 撞上 ObjectDisposedException。CTS 无内部定时器，交给 GC 即可。
         try { _searchCts?.Cancel(); } catch { /* ignore */ }
-        _searchCts?.Dispose();
         _searchCts = null;
     }
 

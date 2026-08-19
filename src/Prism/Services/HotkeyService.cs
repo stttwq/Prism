@@ -149,24 +149,32 @@ public sealed class HotkeyService : IDisposable
         });
     }
 
-    /// <summary>钩子专用泵线程：只跑 Dispatcher 循环，回调不与 WPF UI 抢同一个消息泵。</summary>
+    /// <summary>钩子专用泵线程：只跑 Dispatcher 循环，回调不与 WPF UI 抢同一个消息泵。
+    /// G3（FRESH-AUDIT-2）：加锁双检——定时器回调与 UI RefreshHook 并发进入时，
+    /// 无锁双检会建出两条泵线程，其中一条成为再无人摘的孤儿 Dispatcher。</summary>
+    private readonly object _hookThreadGate = new();
+
     private void EnsureHookThread()
     {
         if (_hookDispatcher is not null) return;
-        using var ready = new System.Threading.ManualResetEventSlim(false);
-        _hookThread = new System.Threading.Thread(() =>
+        lock (_hookThreadGate)
         {
-            _hookDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
-            ready.Set();
-            System.Windows.Threading.Dispatcher.Run();
-        })
-        {
-            IsBackground = true,
-            Name = "PrismHotkeyHook",
-        };
-        _hookThread.SetApartmentState(System.Threading.ApartmentState.STA);
-        _hookThread.Start();
-        ready.Wait();
+            if (_hookDispatcher is not null) return;
+            using var ready = new System.Threading.ManualResetEventSlim(false);
+            _hookThread = new System.Threading.Thread(() =>
+            {
+                _hookDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+                ready.Set();
+                System.Windows.Threading.Dispatcher.Run();
+            })
+            {
+                IsBackground = true,
+                Name = "PrismHotkeyHook",
+            };
+            _hookThread.SetApartmentState(System.Threading.ApartmentState.STA);
+            _hookThread.Start();
+            ready.Wait();
+        }
     }
 
     private IntPtr HookCallback(int code, IntPtr w, IntPtr l)
