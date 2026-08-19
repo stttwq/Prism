@@ -381,6 +381,8 @@ impl PinyinSidecar {
         let mut matched_count = 0u64;
         let mut path_constructions = 0u64;
         let has_path_filter = filters.has_path_filter();
+        // N1: 字面去重查询在循环外降幂一次。
+        let query_lower = query.to_lowercase();
         for record in &self.disk.records {
             if self.delta.contains_key(&record.key) {
                 continue;
@@ -397,7 +399,7 @@ impl PinyinSidecar {
                 continue;
             };
             if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
-                if key_is_literal(index, record.key, query) {
+                if key_is_literal(index, record.key, &query_lower) {
                     continue;
                 }
                 if !key_passes_filters(
@@ -424,7 +426,7 @@ impl PinyinSidecar {
                 continue;
             }
             if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
-                if key_is_literal(index, *key, query) {
+                if key_is_literal(index, *key, &query_lower) {
                     continue;
                 }
                 if !key_passes_filters(
@@ -455,7 +457,8 @@ impl PinyinSidecar {
     }
 }
 
-fn key_is_literal(index: &IndexState, key: RecordKey, query: &str) -> bool {
+/// query_lower 必须已降幂（N1：调用方在扫描循环外降幂一次，不再逐候选分配）。
+fn key_is_literal(index: &IndexState, key: RecordKey, query_lower: &str) -> bool {
     index
         .volumes
         .get(key.volume as usize)
@@ -466,7 +469,9 @@ fn key_is_literal(index: &IndexState, key: RecordKey, query: &str) -> bool {
                 .map(|slot| (volume, slot))
         })
         .and_then(|(volume, slot)| volume.name_at(slot.name_off).ok())
-        .is_some_and(|name| crate::hierarchy::is_literal_match(name, query))
+        .is_some_and(|name| {
+            crate::hierarchy::find_case_insensitive(name, query_lower).is_some()
+        })
 }
 
 #[derive(Debug, Eq)]

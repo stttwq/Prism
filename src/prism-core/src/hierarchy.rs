@@ -804,20 +804,20 @@ fn is_excluded_name(name: &str) -> bool {
 
 fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
     let byte_position = find_case_insensitive(name, query_lower)?;
-    let name_lower = if name.is_ascii() {
-        None
-    } else {
-        Some(name.to_lowercase())
-    };
-    let normalized = name_lower.as_deref().unwrap_or(name);
-    let class = if normalized.len() == query_lower.len() {
+    // N1（FRESH-AUDIT-2026-08-19）: 此前非 ASCII 名字每次比较都 to_lowercase()
+    // 分配一个完整副本——中文库每次击键百万次堆分配。现在：
+    // - class-0（全名精确）只在字节数相同时才做忽略大小写比较（name_eq_ignore_case
+    //   内含零分配快路径），扫描成本 O(1) 比较而非 O(n) 分配；
+    // - position 直接在原串上数 UTF-16 单元——UI 高亮按原名字符偏移对齐，长度会
+    //   变化的大小写折叠（İ→i̇ 等）下比旧的 lowered 串偏移更准。
+    let class = if name.len() == query_lower.len() && name_eq_ignore_case(name, query_lower) {
         0
     } else if byte_position == 0 {
         1
     } else {
         2
     };
-    let position = normalized[..byte_position].encode_utf16().count() as u32;
+    let position = name[..byte_position].encode_utf16().count() as u32;
     Some(MatchMetadata {
         kind: MatchKind::Literal,
         class,
@@ -827,13 +827,23 @@ fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
     })
 }
 
-fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
+/// 大小写不敏感子串查找，返回**原名字节偏移**（字符边界安全）。
+/// N1（FRESH-AUDIT-2026-08-19）三条路径全部避免对名字做 to_lowercase() 分配：
+/// 1. 纯 ASCII 查询：字节级 windows 扫描。对任意（含非 ASCII）名字都安全——
+///    UTF-8 自同步：多字节序列的每个字节都 >= 0x80，ASCII 查询窗口（比较前
+///    to_ascii_lowercase 只影响 a-z）既不会落进序列中间也不会跨序列匹配，
+///    命中位置必为 ASCII 字符边界。
+/// 2. 查询含非 ASCII 且名字无大写字符（典型中文名）：小写化是恒等变换，
+///    直接 find 零分配。
+/// 3. 名字含大写字符且查询非 ASCII：回落 to_lowercase()（与旧行为一致），
+///    并把 lowered 偏移映射回原串（长度变化的折叠如 İ→i̇ 才会走映射分支）。
+pub(crate) fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
     if query_lower.is_empty() {
         // G7: an empty name query matches every candidate (used when ext:/path:
         // filters are the only criteria). Position 0 means "match at start".
         return Some(0);
     }
-    if name.is_ascii() && query_lower.is_ascii() {
+    if query_lower.is_ascii() {
         name.as_bytes()
             .windows(query_lower.len())
             .position(|window| {
@@ -842,19 +852,42 @@ fn find_case_insensitive(name: &str, query_lower: &str) -> Option<usize> {
                     .zip(query_lower.as_bytes())
                     .all(|(left, right)| left.to_ascii_lowercase() == *right)
             })
+    } else if !name.chars().any(char::is_uppercase) {
+        name.find(query_lower)
     } else {
-        name.to_lowercase().find(query_lower)
+        let lowered = name.to_lowercase();
+        let hit = lowered.find(query_lower)?;
+        if lowered.len() == name.len() {
+            Some(hit)
+        } else {
+            Some(map_lowered_offset(name, hit))
+        }
     }
 }
 
-pub(crate) fn is_literal_match(name: &str, query: &str) -> bool {
-    find_case_insensitive(name, &query.to_lowercase()).is_some()
+/// 把 to_lowercase() 结果串里的字节偏移映射回原串字节偏移。
+/// 只有长度会变化的大小写折叠（İ、ẞ 等罕见字符）才会走到这里——常规大写字母
+/// 长度不变，调用方已用 `lowered.len() == name.len()` 短路掉恒等情形。
+fn map_lowered_offset(name: &str, lowered_offset: usize) -> usize {
+    let mut lowered_pos = 0usize;
+    for (idx, ch) in name.char_indices() {
+        if lowered_pos >= lowered_offset {
+            return idx;
+        }
+        lowered_pos += ch.to_lowercase().map(|c| c.len_utf8()).sum::<usize>();
+    }
+    name.len()
 }
 
 /// Case-insensitive whole-name comparison that also works for non-ASCII names.
 pub(crate) fn name_eq_ignore_case(left: &str, right: &str) -> bool {
     if left.is_ascii() && right.is_ascii() {
         left.eq_ignore_ascii_case(right)
+    } else if !left.chars().any(char::is_uppercase)
+        && !right.chars().any(char::is_uppercase)
+    {
+        // N1: 双方都无大写字符（典型中文/纯数字名）——小写化是恒等变换，直接比较。
+        left == right
     } else {
         left.to_lowercase() == right.to_lowercase()
     }
@@ -874,6 +907,12 @@ pub struct QueryFilters {
 
 impl QueryFilters {
     pub fn new(exts: Vec<String>, paths: Vec<String>) -> Self {
+        // N1: path needle 在构造时降幂一次（每请求一次），热路径比较不再
+        // 对每个候选路径反复 to_lowercase()。
+        let paths = paths
+            .into_iter()
+            .map(|needle| needle.to_lowercase())
+            .collect();
         Self { exts, paths }
     }
 
@@ -908,14 +947,20 @@ impl QueryFilters {
     }
 
     /// High-cost path check: requires a constructed full path. All path substrings must
-    /// match (AND), case-insensitive.
+    /// match (AND), case-insensitive. N1: needle 已在构造时降幂；路径比较走
+    /// find_case_insensitive 的零分配路径，只有"非 ASCII needle + 路径含大写"的
+    /// 罕见组合才对路径整体降幂。
     pub(crate) fn path_matches(&self, path: &str) -> bool {
         if self.paths.is_empty() {
             return true;
         }
-        self.paths
-            .iter()
-            .all(|needle| path.to_lowercase().contains(&needle.to_lowercase()))
+        self.paths.iter().all(|needle| {
+            if needle.is_ascii() || !path.chars().any(char::is_uppercase) {
+                find_case_insensitive(path, needle).is_some()
+            } else {
+                path.to_lowercase().contains(needle.as_str())
+            }
+        })
     }
 }
 
@@ -1130,6 +1175,77 @@ impl NormalizedExclusion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- N1（FRESH-AUDIT-2026-08-19）: 大小写折叠零分配路径的语义锚定 ----------
+
+    /// 纯 ASCII 查询必须能命中任意（含中文）名字，位置是原名字节偏移。
+    /// 注意契约：query 参数必须已降幂（"ABC" 是调用方错误，此处只验降幂后的 "abc"）。
+    #[test]
+    fn n1_ascii_query_matches_non_ascii_name_at_original_offset() {
+        let name = "微信ABC文档.txt";
+        assert_eq!(find_case_insensitive(name, "abc"), Some("微信".len()));
+        assert_eq!(find_case_insensitive(name, "txt"), Some("微信ABC文档.".len()));
+        assert_eq!(find_case_insensitive(name, "zzz"), None);
+    }
+
+    /// 非 ASCII 查询 + 无大写字符的名字（典型中文）：直接命中，零分配路径。
+    #[test]
+    fn n1_non_ascii_query_matches_plain_name() {
+        assert_eq!(find_case_insensitive("微信文档", "文档"), Some("微信".len()));
+        assert_eq!(find_case_insensitive("微信文档", "工作"), None);
+    }
+
+    /// 非 ASCII 查询 + 含大写拉丁的名字：回落降幂路径，位置映射回原串。
+    #[test]
+    fn n1_non_ascii_query_with_uppercase_name_maps_offset_back() {
+        let name = "下载X目录"; // 大写拉丁 X + 中文混合
+        assert_eq!(find_case_insensitive(name, "目录"), Some("下载X".len()));
+    }
+
+    /// 长度会变化的大小写折叠（İ → i̇，2 字节变 3 字节）：lowered 偏移必须
+    /// 正确映射回原串偏移，且切片不 panic（字符边界安全）。
+    #[test]
+    fn n1_length_changing_fold_maps_offset_back_to_original() {
+        let name = "aİb文字";
+        // lowered = "ai\u{307}b文字"（İ 展开为 i + 组合上点）
+        let hit = find_case_insensitive(name, "文字").expect("中文子串必须命中");
+        let sliced = &name[hit..];
+        assert_eq!(sliced, "文字");
+    }
+
+    /// class-0/精确匹配与位置语义在混合大小写下保持：match_metadata 的
+    /// position 是原名的 UTF-16 单元偏移（UI 高亮对齐）。
+    #[test]
+    fn n1_match_metadata_positions_are_original_name_offsets() {
+        let meta = match_metadata("微信ABC文档", "abc").expect("必须命中");
+        assert_eq!(meta.class, 2); // 非前缀也非全名
+        assert_eq!(meta.position, 2); // "微信" = 2 个 UTF-16 单位
+        let exact = match_metadata("微信", "微信").expect("全名必须命中");
+        assert_eq!(exact.class, 0);
+        let prefix = match_metadata("微信ABC", "wx").or(match_metadata("微信ABC", "微"));
+        assert!(prefix.is_some());
+        assert_eq!(prefix.unwrap().class, 1);
+    }
+
+    /// path 过滤：needle 预降幂后对含大写/纯中文路径的匹配语义不变。
+    #[test]
+    fn n1_path_filter_matches_with_pre_lowered_needles() {
+        let program = QueryFilters::new(vec![], vec!["Program".into()]);
+        assert!(program.path_matches("C:\\Program Files\\App"));
+        assert!(program.path_matches("c:\\program files\\app"));
+        assert!(!program.path_matches("D:\\Docs\\App"));
+
+        // 非 ASCII needle：纯小写路径走零分配 find，含大写路径回落降幂。
+        let data = QueryFilters::new(vec![], vec!["数据".into()]);
+        assert!(data.path_matches("D:\\数据集\\app"));
+        assert!(data.path_matches("D:\\数据集\\App"));
+        assert!(!data.path_matches("D:\\docs"));
+
+        // 多 needle 是 AND 语义。
+        let both = QueryFilters::new(vec![], vec!["program".into(), "数据".into()]);
+        assert!(both.path_matches("C:\\Program Files\\数据"));
+        assert!(!both.path_matches("C:\\Program Files\\docs"));
+    }
 
     fn volume() -> VolumeIndex {
         VolumeIndex::new(
