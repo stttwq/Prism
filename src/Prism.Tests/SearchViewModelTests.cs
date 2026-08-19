@@ -862,6 +862,68 @@ public sealed class SearchViewModelTests
         Assert.False(state.IsIndexing);
     }
 
+    /// <summary>
+    /// AUDIT-2026-08-18 C-D10 + P4b: 两次 RefreshAsync 重叠时，先结束的那次
+    /// （这里走超时路径）绝不能清掉后一次刚装上的世代信号——否则第二次 mutation
+    /// 的 generation 变化丢失，后一次刷新被迫等满 3 秒超时。
+    /// 超时全走 ManualSearchScheduler（永不自动到点），r2 只可能经信号路径完成：
+    /// 修复前 r2 永远挂起，修复后秒级完成。
+    /// </summary>
+    [Fact]
+    public async Task OverlappingRefreshesDoNotClobberTheNewerGenerationSignal()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("a", false, 1, Result("alpha"))); // 首搜
+        client.Enqueue(Response("a", false, 1, Result("alpha"))); // r1 超时路径的补搜
+        client.Enqueue(Response("a", false, 2, Result("beta")));  // r2 信号路径的补搜
+        var timers = new ManualTimerFactory();
+        var scheduler = new ManualSearchScheduler();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, scheduler);
+
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        Assert.Equal(PanelMode.Results, state.Mode);
+
+        var r1 = vm.RefreshAsync(); // 信号1 装上，等待 generation 或超时（delay 排队 #1）
+        var r2 = vm.RefreshAsync(); // 信号2 覆盖装入（delay 排队 #2）
+
+        scheduler.FireNext(); // 只完成 r1 的超时 → r1 续体执行清字段动作（旧代码清掉信号2）
+        await Eventually(() => client.SearchCount == 2); // r1 已进入补搜 ⇒ 清字段动作已发生
+
+        vm.OnIndexGenerationChanged(); // 修复前信号已丢；修复后完成信号2
+
+        // r2 的超时（#2）永不 FireNext——r2 完成即证明走了信号路径。
+        Assert.True(
+            await Task.WhenAny(r2, Task.Delay(TimeSpan.FromSeconds(5))) == r2,
+            "第二次刷新必须在世代信号（而非超时）路径完成");
+        await r1.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    /// <summary>P4b: RefreshAsync 的 3 秒超时改走 ISearchScheduler 缝——测试可用 FireNext 快进，不再真睡。</summary>
+    [Fact]
+    public async Task RefreshAsyncTimeoutIsDrivenByTheSchedulerSeam()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("a", false, 1, Result("alpha"))); // 首搜
+        client.Enqueue(Response("a", false, 1, Result("alpha"))); // 超时路径的补搜
+        var timers = new ManualTimerFactory();
+        var scheduler = new ManualSearchScheduler();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, scheduler);
+
+        vm.OnQueryChanged("a");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        var refresh = vm.RefreshAsync();
+        scheduler.FireNext(); // 快进 3 秒超时
+        await refresh.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal("索引尚未刷新，结果可能不完整", state.StatusMessage);
+    }
+
     private static SearchResult Result(string title) =>
         new("file", title, $"C:\\{title}", $"C:\\{title}", []);
 

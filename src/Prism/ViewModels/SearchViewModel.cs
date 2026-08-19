@@ -102,8 +102,10 @@ public sealed class SearchViewModel
             return;
 
         _completeCache = null;
+        // C-D10: 只发信号不清字段——清空归属权在等待它的 RefreshAsync（CAS 只清自己
+        // 那份）。这里置 null 会把并发的下一次 RefreshAsync 刚装上的新信号一并清掉，
+        // 逼它走 3 秒超时路径（结果刷新变慢）。
         _mutationGenerationSignal?.TrySetResult();
-        _mutationGenerationSignal = null;
         _generationDebounce.Restart();
     }
 
@@ -645,11 +647,15 @@ public sealed class SearchViewModel
 
             // 等 indexer 的 USN watcher 消化文件变更：generation 变化或 3 秒超时。
             // 超时只提示索引尚未刷新，不标为失败。
-            _mutationGenerationSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var generationTask = _mutationGenerationSignal.Task;
-            var timeoutTask = Task.Delay(3000);
+            // C-D10+P4b: 信号局部持有、归还只清自己那份（CAS）——第二次 RefreshAsync
+            // 已换上新信号时，第一次的续体不得把它清掉，否则第二次只能等满超时。
+            // 超时走 _scheduler.Delay 缝（P4b）：测试可快进/暂停，不再真睡 3 秒。
+            var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _mutationGenerationSignal = signal;
+            var generationTask = signal.Task;
+            var timeoutTask = _scheduler.Delay(TimeSpan.FromMilliseconds(3000));
             var completed = await Task.WhenAny(generationTask, timeoutTask).ConfigureAwait(true);
-            _mutationGenerationSignal = null;
+            Interlocked.CompareExchange(ref _mutationGenerationSignal, null, signal);
 
             if (completed == timeoutTask)
             {
