@@ -625,6 +625,23 @@ impl VolumeIndex {
         replacement.shrink_to_fit();
         self.names = replacement;
         self.dead_name_bytes = 0;
+        // AUDIT-2026-08-18 R-C3: 槽表此前只增不减（上限 16M × 12B = 192MB/卷）。
+        // 记录号是外部键、不能重映射（P4），只能在压缩时回收尾部连续的
+        // tombstone/从未使用槽。尾部界必须覆盖所有在位节点自身的记录号与其
+        // parent_record——缓存校验器把"父记录越界"当硬错误（见 validate），
+        // 被引用的父槽即使是 tombstone 也得留在表内。
+        let mut live_bound = 0usize;
+        for (index, slot) in self.nodes.iter().enumerate() {
+            if slot.flags & FLAG_PRESENT != 0 {
+                live_bound = live_bound
+                    .max(index + 1)
+                    .max(slot.parent_record as usize + 1);
+            }
+        }
+        if live_bound < self.nodes.len() {
+            self.nodes.truncate(live_bound);
+            self.nodes.shrink_to_fit();
+        }
         // Refresh initial_name_bytes so the fallback threshold tracks the
         // compacted baseline rather than the original build size.
         self.initial_name_bytes = live_bytes;
@@ -1155,6 +1172,38 @@ mod tests {
         assert!(volume
             .prepare_initial_capacity(16_777_216, 16_777_216)
             .is_err());
+    }
+
+    /// AUDIT-2026-08-18 R-C3: 高记录号节点删除后，names 压缩必须同步回收
+    /// 尾部 tombstone 槽（nodes.len 回落、容量收缩）；被在位节点引用为父的
+    /// 槽即使在高位也必须保留。
+    #[test]
+    fn compact_names_reclaims_trailing_node_slots() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
+        // 高位父目录 + 更高位的子文件。
+        volume
+            .upsert(frn(900, 1), frn(10, 1), "high", true)
+            .unwrap();
+        volume
+            .upsert(frn(1000, 1), frn(900, 1), "tail.txt", false)
+            .unwrap();
+        assert!(volume.nodes.len() >= 1001);
+
+        // 删掉最高位子文件 → 尾部界应回落到 901（高位父目录被在位子…父在位自身即界）。
+        volume.delete(frn(1000, 1)).unwrap();
+        volume.dead_name_bytes = usize::MAX; // 强制触发压缩
+        assert!(volume.compact_names_if_needed().unwrap());
+        assert_eq!(volume.nodes.len(), 901, "尾部 tombstone 槽必须被回收");
+
+        // 再删高位父目录 → 回落到低位的 dir。
+        volume.delete(frn(900, 1)).unwrap();
+        volume.dead_name_bytes = usize::MAX;
+        assert!(volume.compact_names_if_needed().unwrap());
+        assert_eq!(volume.nodes.len(), 11);
+
+        // 回收后路径构造仍正常。
+        assert_eq!(volume.path_for(10).unwrap(), r"C:\dir");
     }
 
     #[test]
