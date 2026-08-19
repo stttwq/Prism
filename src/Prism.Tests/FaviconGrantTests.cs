@@ -79,7 +79,8 @@ public sealed class FaviconGrantTests : IDisposable
             var cache = CacheWithPlantedFavicon();
             var provider = new WebIconProvider(cache, _ => true);
 
-            var first = provider.GetIcon(Url);
+            // C-D6 后磁盘加载是后台探测：装饰先拿通用图标，探测完成后换上 favicon。
+            var first = AwaitResolved(provider, Url);
             var second = provider.GetIcon(Url);
             var generic = provider.GetIcon("https://unknown.invalid/x");
 
@@ -109,15 +110,34 @@ public sealed class FaviconGrantTests : IDisposable
             var cache = CacheWithPlantedFavicon();
             var provider = new WebIconProvider(cache, _ => true);
 
-            var first = provider.GetIcon(Url);
+            var first = AwaitResolved(provider, Url);
             provider.Invalidate();
-            var reloaded = provider.GetIcon(Url);
+            var reloaded = AwaitResolved(provider, Url);
             var generic = provider.GetIcon("https://unknown.invalid/x");
 
             // 重新从磁盘解析：仍是 favicon（非通用图标）但是新实例。
             Assert.NotSame(first, reloaded);
             Assert.NotSame(generic, reloaded);
         });
+    }
+
+    /// <summary>
+    /// C-D6：磁盘探测在后台线程完成，无 Dispatcher 的测试环境就地写缓存。
+    /// 轮询直到 GetIcon 返回非通用图标（= 后台探测已收敛），失败则给最后一个结果。
+    /// </summary>
+    private static System.Windows.Media.ImageSource AwaitResolved(
+        WebIconProvider provider, string url)
+    {
+        System.Windows.Media.ImageSource? last = null;
+        for (var i = 0; i < 200; i++)
+        {
+            last = provider.GetIcon(url);
+            var generic = provider.GetIcon("https://unknown.invalid/x");
+            if (!ReferenceEquals(last, generic))
+                return last;
+            Thread.Sleep(5);
+        }
+        return last!;
     }
 
     [Fact]
