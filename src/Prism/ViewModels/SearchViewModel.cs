@@ -161,6 +161,7 @@ public sealed class SearchViewModel
             _state.SelectedIndex = -1;
             _state.Mode = PanelMode.Idle;
             _state.IsIndexing = false;
+            _state.IsWebMode = false;
             _state.StatusMessage = "";
         }
     }
@@ -265,6 +266,7 @@ public sealed class SearchViewModel
         _state.RenameNewName = null;
         _state.Mode = PanelMode.Idle;
         _state.IsIndexing = false;
+        _state.IsWebMode = false;
         _state.StatusMessage = _state.IsBackendConnected ? "" : "正在连接后端…";
     }
 
@@ -330,10 +332,14 @@ public sealed class SearchViewModel
             _state.SelectedIndex = -1;
             _state.Mode = PanelMode.Idle;
             _state.IsIndexing = false;
+            _state.IsWebMode = false;
             _state.StatusMessage = "";
             return;
         }
 
+        // 小问题 Q2：进入网页模式即置位（不等防抖搜索），离开（删掉关键词）即复位，
+        // 窗口据此隐藏"当前目录"前缀。
+        _state.IsWebMode = WebModeDetector.TryDetect(text, _webEngines) is not null;
         _state.Mode = PanelMode.Results;
         SetSearchingStatus();
 
@@ -770,6 +776,7 @@ public sealed class SearchViewModel
         // web results in AllMode, but the dedicated web mode isolates them: only 1 direct
         // result + up to 5 suggestions, no file/app/window mixing.
         var webMode = WebModeDetector.TryDetect(query, _webEngines);
+        _state.IsWebMode = webMode is not null;
         if (webMode is not null)
         {
             await RunWebSearchAsync(query, webMode).ConfigureAwait(true);
@@ -1085,11 +1092,14 @@ public sealed class SearchViewModel
         CancelSuggestions();
         _completeCache = null;
 
-        // 构造直接提交结果：首行显示提交原查询。
-        var directUrl = WebModeDetector.BuildUrl(webMode.UrlTemplate, webMode.QueryTerms);
-        var directTitle = string.IsNullOrEmpty(webMode.QueryTerms)
-            ? $"在 {webMode.EngineName} 中搜索"
-            : $"在 {webMode.EngineName} 中搜索：{webMode.QueryTerms}";
+        // 构造直接提交结果：首行显示提交原查询。网址类查询词直接打开（小问题 Q3）。
+        var directOpenUrl = WebModeDetector.TryGetDirectUrl(webMode.QueryTerms);
+        var directUrl = directOpenUrl ?? WebModeDetector.BuildUrl(webMode.UrlTemplate, webMode.QueryTerms);
+        var directTitle = directOpenUrl is not null
+            ? $"打开 {webMode.QueryTerms.Trim()}"
+            : string.IsNullOrEmpty(webMode.QueryTerms)
+                ? $"在 {webMode.EngineName} 中搜索"
+                : $"在 {webMode.EngineName} 中搜索：{webMode.QueryTerms}";
         var directResult = new SearchResult(
             Kind: "web",
             Title: directTitle,
@@ -1118,7 +1128,10 @@ public sealed class SearchViewModel
                 ? $"按 Enter 在 {webMode.EngineName} 中搜索"
                 : "");
 
-        // 只有内置引擎 + 联想开关开启 + 有查询词时才发请求。
+        // 只有内置引擎 + 联想开关开启 + 有查询词 + 非网址直开时才发请求
+        // （网址本身没有搜索联想的意义）。
+        if (directOpenUrl is not null)
+            return;
         if (!_suggestionsEnabled || !webMode.IsBuiltIn || string.IsNullOrWhiteSpace(webMode.QueryTerms))
             return;
         if (_suggestions is null)

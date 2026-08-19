@@ -34,6 +34,7 @@ public sealed class AppState : INotifyPropertyChanged
     private bool _isPinned;
     private bool _isIndexing;
     private bool _isBackendConnected;
+    private bool _isWebMode;
     private string _statusMessage = "";
     private AppTheme _theme = AppTheme.Light;
     private SearchResult? _renameTarget;
@@ -100,6 +101,14 @@ public sealed class AppState : INotifyPropertyChanged
     {
         get => _isBackendConnected;
         set => Set(ref _isBackendConnected, value);
+    }
+
+    /// <summary>网页搜索模式（小问题 Q2）：true 时窗口隐藏"当前目录"范围标签——
+    /// 网页搜索与目录范围无关，前缀只添噪音。仅表现层，底层范围不动。</summary>
+    public bool IsWebMode
+    {
+        get => _isWebMode;
+        set => Set(ref _isWebMode, value);
     }
 
     /// <summary>列表区单行提示（索引中 / 重连中 / 错误）。空串表示无提示。</summary>

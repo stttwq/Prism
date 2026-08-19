@@ -589,7 +589,10 @@ public partial class SearchWindow : Window
 
     private void ApplyScopeUi()
     {
-        Header.SetScope(_scope.IsScopeLabelVisible, _scope.ScopeLabel, _scope.ScopeTooltip);
+        // 小问题 Q2：网页搜索与目录范围无关，模式下隐藏范围标签（仅表现层）。
+        var scopeVisible = _scope.IsScopeLabelVisible
+            && !(_vm is { State.IsWebMode: true });
+        Header.SetScope(scopeVisible, _scope.ScopeLabel, _scope.ScopeTooltip);
         ScopeNotice.Text = _scope.Notice;
         ScopeNotice.Visibility = string.IsNullOrEmpty(_scope.Notice)
             ? Visibility.Collapsed
@@ -800,6 +803,10 @@ public partial class SearchWindow : Window
 
         if (e.PropertyName == nameof(AppState.Query))
             SyncGenerationPolling();
+
+        // 小问题 Q2：网页模式进出时刷新范围标签可见性（ApplyScopeUi 读取 IsWebMode）。
+        if (e.PropertyName == nameof(AppState.IsWebMode))
+            ApplyScopeUi();
 
         ApplyState(_vm?.State, animatePanel: true);
     }
