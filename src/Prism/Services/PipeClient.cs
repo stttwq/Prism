@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Prism.Models;
@@ -55,6 +56,12 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>AUDIT-2026-08-18 R-A5: 测试用——首连失败后 watchdog 是否已 arm。</summary>
     internal bool IsWatchdogArmed => _watchdog is not null;
 
+    /// <summary>AUDIT-2026-08-18 R-A8: 测试用——查询通道当前服务端 PID；未连接为 null。</summary>
+    internal int? QueryServerProcessId => _query.ServerProcessId;
+
+    /// <summary>AUDIT-2026-08-18 R-A8: 测试用——是否已接管某个后端进程对象。</summary>
+    internal bool HasBackendProcess => _backend is not null;
+
     public PipeClient() : this(PipeName)
     {
     }
@@ -92,7 +99,50 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// 连通但不应答的半死连接（IsConnected 仍为 true）必须强制重建。
     /// </summary>
     private Task ConnectOrReconnectAsync(CancellationToken ct, bool forceReconnect = false) =>
-        _query.ConnectOrReconnectAsync(ct, forceReconnect, EnsureBackendRunning);
+        _query.ConnectOrReconnectAsync(ct, forceReconnect, EnsureBackendRunning, AdoptExistingServer);
+
+    /// <summary>broker 进程名（与 <see cref="LocateBackend"/> 搜索的 exe 名一致）。</summary>
+    private const string BrokerProcessName = "prism-core";
+
+    /// <summary>
+    /// AUDIT-2026-08-18 R-A8: 连上已有管道后收编服务端进程。此前孤儿 broker 被复用时
+    /// 不在新 Prism 的 Job Object 里——新 Prism 崩溃不带走它，孤儿逐代积累占管道。
+    /// 规则：自己的 broker 直接认；确认是 prism-core 的孤儿尝试收编，收编失败杀旧拉新
+    /// （返回 false 让通道丢弃连接走拉新路径）；名字不符（开发/测试的 mock server）或
+    /// 探测异常时保守复用（与修复前行为一致），绝不动未知进程。internal 供测试锚定。
+    /// </summary>
+    internal bool AdoptExistingServer(int pid)
+    {
+        Process? proc = null;
+        try
+        {
+            if (_backend is { HasExited: false } own && own.Id == pid)
+                return true; // 本进程拉起的 broker，EnsureBackendRunning 已收编
+
+            proc = Process.GetProcessById(pid);
+            if (!proc.ProcessName.Equals(BrokerProcessName, StringComparison.OrdinalIgnoreCase))
+                return true; // 不是 broker 的管道服务端（mock/测试）——照常复用
+
+            _jobGuard ??= new JobObjectGuard();
+            if (_jobGuard.TryAdopt(pid))
+            {
+                try { _backend?.Dispose(); } catch { /* 已退出 */ }
+                _backend = proc; // 收编成功：接管生命周期，Dispose 时随 Job 一起回收
+                return true;
+            }
+
+            // 收编失败（权限/已死/已在别的 Job 且被拒）：孤儿占着管道名，新 Prism 死后
+            // 它仍会残留——杀掉它让通道走拉新路径（新进程必进本 Job）。
+            proc.Kill(entireProcessTree: true);
+            return false;
+        }
+        catch
+        {
+            // GetProcessById/OpenProcess/Kill 任一失败：保守复用，搜索可用性优先。
+            proc?.Dispose();
+            return true;
+        }
+    }
 
     /// <summary>
     /// 启动后台 watchdog：首次 3 秒后检查，之后每 15 秒一次。
@@ -814,14 +864,43 @@ public sealed class PipeClient : ISearchClient, IDisposable
         public bool HasPendingSlowRead => Volatile.Read(ref _pendingSlowActionReads) != 0;
 
         /// <summary>
+        /// AUDIT-2026-08-18 R-A8: 当前连接的管道服务端进程 ID（握手成功后捕获，
+        /// 断开清空）。用于识别"连上的是谁的 broker"——孤儿还是本进程拉起的。
+        /// </summary>
+        public int? ServerProcessId { get; private set; }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeServerProcessId(
+            Microsoft.Win32.SafeHandles.SafePipeHandle handle, out uint serverProcessId);
+
+        private static int? TryGetServerProcessId(NamedPipeClientStream stream)
+        {
+            try
+            {
+                return GetNamedPipeServerProcessId(stream.SafePipeHandle, out var pid) && pid != 0
+                    ? (int)pid
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
         /// 连接入口：先试已有管道，连不上再走 <paramref name="ensureBackend"/>（可为 null：
         /// 动作通道从不拉进程）后重连。_ioLock 串行化了所有调用者——第一个连上后，
         /// 后续拿到锁会看到已连接直接返回，不需要额外的重入标志。
+        ///
+        /// AUDIT-2026-08-18 R-A8: <paramref name="adoptExisting"/> 在连上已有管道后、
+        /// 返回调用方前被调用（参数=服务端 PID）；返回 false 表示调用方拒绝这次复用
+        /// （孤儿 broker 收编失败已清理），本方法丢弃连接走拉新路径。
         /// </summary>
         public async Task ConnectOrReconnectAsync(
             CancellationToken ct,
             bool forceReconnect,
-            Action? ensureBackend)
+            Action? ensureBackend,
+            Func<int, bool>? adoptExisting = null)
         {
             await _ioLock.WaitAsync(ct).ConfigureAwait(false);
             try
@@ -834,7 +913,14 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
                 // 第一优先：连已有管道。孤儿 broker 只要还活着，就复用它。
                 if (await TryConnectPipeOnlyAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false))
-                    return;
+                {
+                    var serverPid = ServerProcessId;
+                    if (serverPid is null || adoptExisting is null || adoptExisting(serverPid.Value))
+                        return;
+
+                    // 复用被拒（调用方已清理孤儿进程）：丢弃这条连接，走拉新路径。
+                    DisposeStreamOnly();
+                }
 
                 if (ensureBackend is null)
                     throw new PipeNotConnectedException($"{_label}未连接");
@@ -901,6 +987,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
             try
             {
                 await HandshakeAsync().ConfigureAwait(false);
+                // R-A8: 握手成功即记录服务端 PID，供上层判定"连的是谁的 broker"。
+                ServerProcessId = TryGetServerProcessId(stream);
             }
             catch
             {
@@ -1084,6 +1172,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             _reader = null;
             _lineReader = null;
             _writer = null;
+            ServerProcessId = null;
             // 先关闭 stream（CancelIoEx），再关闭 reader/writer——顺序在 ThreadPool
             // 上执行不受调用线程影响。stream 先关让 reader 的 pending read 先被取消。
             ThreadPool.QueueUserWorkItem(_ =>

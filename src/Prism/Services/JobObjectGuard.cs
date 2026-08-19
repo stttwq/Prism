@@ -63,6 +63,29 @@ internal sealed class JobObjectGuard : IDisposable
         return AssignProcessToJobObject(_jobHandle, processHandle);
     }
 
+    /// <summary>
+    /// AUDIT-2026-08-18 R-A8: 把一个**外部已存在**的进程（上次 Prism 留下的孤儿 broker）
+    /// 收编进本 Job。OpenProcess 只申请收编所需的最小权限
+    /// （AssignProcessToJobObject 要求 PROCESS_SET_QUOTA | PROCESS_TERMINATE），
+    /// 不碰句柄所有权，用完即还。失败返回 false，由调用方决定杀旧拉新还是维持复用。
+    /// </summary>
+    public bool TryAdopt(int pid)
+    {
+        if (_disposed || _jobHandle == IntPtr.Zero || pid <= 0)
+            return false;
+        var hProcess = OpenProcess(ProcessSetQuota | ProcessTerminate, false, (uint)pid);
+        if (hProcess == IntPtr.Zero)
+            return false;
+        try
+        {
+            return AssignProcessToJobObject(_jobHandle, hProcess);
+        }
+        finally
+        {
+            CloseHandle(hProcess);
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -80,6 +103,12 @@ internal sealed class JobObjectGuard : IDisposable
 
     private const int JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
     private const int JobObjectExtendedLimitInformation = 9;
+
+    private const uint ProcessSetQuota = 0x0100;
+    private const uint ProcessTerminate = 0x0001;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
