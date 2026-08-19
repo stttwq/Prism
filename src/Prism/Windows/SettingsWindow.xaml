@@ -61,6 +61,42 @@
             <Setter Property="MinWidth" Value="80"/>
         </Style>
 
+        <!-- 引擎管理大按钮：标题 + 说明两行，占满分配宽度（小问题 Q1） -->
+        <Style x:Key="SettingsEngineCardButton" TargetType="Button">
+            <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderSettingsInput}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="Height" Value="52"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource TextMatch}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.55"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- 带边框输入框：替代默认白色系统 TextBox，深浅色都成立 -->
         <Style x:Key="SettingsTextBoxStyle" TargetType="TextBox">
             <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
@@ -349,6 +385,7 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <StackPanel Grid.Row="0" Margin="0,0,0,12">
@@ -385,18 +422,35 @@
                     </DataGrid.Columns>
                 </DataGrid>
 
-                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,8">
-                    <Button Content="添加" Command="{Binding AddEngineCommand}"
-                            Style="{StaticResource SettingsActionButton}" Margin="0,0,8,0"/>
-                    <Button Content="删除选中" Command="{Binding RemoveEngineCommand}"
-                            Style="{StaticResource SettingsActionButton}" Margin="0,0,8,0"/>
-                    <Button Content="恢复预设" Command="{Binding ResetEnginesCommand}"
-                            Style="{StaticResource SettingsActionButton}"/>
-                </StackPanel>
+                <UniformGrid Grid.Row="2" Columns="3" Margin="0,12,0,12">
+                    <Button Command="{Binding AddEngineCommand}"
+                            Style="{StaticResource SettingsEngineCardButton}" Margin="0,0,8,0">
+                        <StackPanel>
+                            <TextBlock Text="添加引擎" FontSize="13" FontWeight="SemiBold"/>
+                            <TextBlock Text="新增一行空白引擎" FontSize="11"
+                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Button>
+                    <Button Command="{Binding RemoveEngineCommand}"
+                            Style="{StaticResource SettingsEngineCardButton}" Margin="0,0,8,0">
+                        <StackPanel>
+                            <TextBlock Text="删除选中" FontSize="13" FontWeight="SemiBold"/>
+                            <TextBlock Text="移除列表中选中的引擎" FontSize="11"
+                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Button>
+                    <Button Command="{Binding ResetEnginesCommand}"
+                            Style="{StaticResource SettingsEngineCardButton}">
+                        <StackPanel>
+                            <TextBlock Text="恢复预设" FontSize="13" FontWeight="SemiBold"/>
+                            <TextBlock Text="还原全部内置引擎" FontSize="11"
+                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Button>
+                </UniformGrid>
 
-                <Border Grid.Row="2" Height="1" Background="{DynamicResource Divider}" Margin="0,0,0,8" VerticalAlignment="Bottom"/>
-
-                <StackPanel Grid.Row="2" VerticalAlignment="Bottom" Margin="0,28,0,0">
+                <StackPanel Grid.Row="3">
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,0,0,12"/>
                     <TextBlock Text="在线联想" FontSize="13" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
                     <CheckBox Content="启用在线联想（仅内置 Bing / 百度 / Google，默认关闭）"
