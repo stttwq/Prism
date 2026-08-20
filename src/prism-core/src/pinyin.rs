@@ -1,8 +1,7 @@
 //! Versioned pinyin encoding and matching shared by broker and indexer.
 
-use ::pinyin::ToPinyin;
-
-pub const PINYIN_DICTIONARY_VERSION: &str = "pinyin-0.10.0/pinyin-data-0.13.0+prism-phrases-v2";
+pub const PINYIN_DICTIONARY_VERSION: &str =
+    "pinyin-0.10.0/pinyin-data-0.13.0+prism-phrases-v2+heteronym";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinyinMatchKind {
@@ -19,12 +18,38 @@ pub struct PinyinMatch {
     pub spans: Vec<i32>,
 }
 
+/// P1-2（搜索报告2，2026-08-21）：token 携带**全部**读音（多音字经
+/// pinyin crate 的 heteronym 表；PHRASES 命中的字仍锁定词表读音——词表
+/// 是人工核对过的，比机器多读音更可信）。匹配路径对多读音 token 逐读
+/// 音分支尝试。`readings` 去重且上限 4（异体生僻读音过多只会撑爆 DP 分支）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Token {
-    reading: String,
+    readings: Vec<String>,
     utf16_start: u16,
     utf16_len: u16,
 }
+
+impl Token {
+    fn first_reading(&self) -> &str {
+        self.readings
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+}
+
+fn tokens_initials(tokens: &[Token], out: &mut Vec<u8>) {
+    out.clear();
+    for token in tokens {
+        let first = token.first_reading();
+        if let Some(byte) = first.as_bytes().first() {
+            out.push(*byte);
+        }
+    }
+}
+
+/// P1-2：单 token 最多收录的读音数。
+const MAX_READINGS_PER_TOKEN: usize = 4;
 
 // Longest-match phrase rules. Changing this table requires a dictionary-version bump.
 //
@@ -249,33 +274,145 @@ pub fn match_name(name: &str, query: &str) -> Option<PinyinMatch> {
         .or_else(|| match_tokens_mixed(&tokens, query.as_bytes()))
 }
 
+/// P1-2+P2（搜索报告2，2026-08-21）：紧凑编码 v2。
+/// 记录布局：`chain_len u16le | chain 首字母字节 | kind u8 | body`。
+/// kind=0（汉字名）：token 流，token = `total_len u8 | utf16_start u16le |
+/// utf16_len u16le | rcount u8 | (r_len u8, r)*`（P1-2 多读音）；
+/// kind=1（纯 ASCII 名 + 非空链）：名字小写 ASCII 字节（1B/字符）——此类
+/// 记录只服务链匹配（名字本身字面搜索已覆盖，全 token 化只会让
+/// node_modules 类目录撑爆 sidecar）。
+/// chain = 祖先目录名的首字母串（root→parent，仅目录）。
+/// sidecar 的 SCHEMA_VERSION 与文件名随本格式一并 bump（v1 文件按 Missing 重建）。
 pub(crate) fn encode_compact(name: &str) -> Option<Vec<u8>> {
+    encode_compact_with_chain(name, &[])
+}
+
+pub(crate) fn encode_compact_with_chain(name: &str, chain: &[u8]) -> Option<Vec<u8>> {
     let (tokens, has_han) = encode_tokens(name);
-    if !has_han {
+    if !has_han && chain.is_empty() {
+        // 纯 ASCII 名 + 无中文祖先：拼音通道无关（字面搜索覆盖）。
         return None;
     }
     let mut bytes = Vec::new();
+    let chain_len = u16::try_from(chain.len()).ok()?;
+    bytes.extend_from_slice(&chain_len.to_le_bytes());
+    bytes.extend_from_slice(chain);
+    if !has_han {
+        // kind=1：纯 ASCII 名（链非空）——只存名字 ASCII 字节。
+        bytes.push(1);
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                bytes.push(ch.to_ascii_lowercase() as u8);
+            }
+        }
+        return Some(bytes);
+    }
+    bytes.push(0);
     for token in tokens {
-        let len = u8::try_from(token.reading.len()).ok()?;
-        bytes.push(len);
+        // total_len = utf16 字段(4) + rcount(1) + Σ(1+r_len)
+        let total = 4
+            + 1
+            + token
+                .readings
+                .iter()
+                .map(|reading| 1 + reading.len())
+                .sum::<usize>();
+        let total = u8::try_from(total).ok()?;
+        bytes.push(total);
         bytes.extend_from_slice(&token.utf16_start.to_le_bytes());
         bytes.extend_from_slice(&token.utf16_len.to_le_bytes());
-        bytes.extend_from_slice(token.reading.as_bytes());
+        let count = u8::try_from(token.readings.len()).ok()?;
+        bytes.push(count);
+        for reading in &token.readings {
+            let len = u8::try_from(reading.len()).ok()?;
+            bytes.push(len);
+            bytes.extend_from_slice(reading.as_bytes());
+        }
     }
     Some(bytes)
+}
+
+/// P2：记录体（chain 之后的部分）。
+enum CompactBody<'a> {
+    /// 汉字名：token 流。
+    Tokens(&'a [u8]),
+    /// 纯 ASCII 名：名字 ASCII 字节（链匹配专用，名字策略跳过）。
+    AsciiName(&'a [u8]),
+}
+
+impl CompactBody<'_> {
+    fn tokens(&self) -> Option<&[u8]> {
+        match self {
+            CompactBody::Tokens(bytes) => Some(bytes),
+            CompactBody::AsciiName(_) => None,
+        }
+    }
+}
+
+/// P2：v2 记录头拆分（链 + 记录体）。
+fn compact_split_record(bytes: &[u8]) -> Option<(&[u8], CompactBody<'_>)> {
+    let chain_len = usize::from(u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]));
+    let chain = bytes.get(2..2 + chain_len)?;
+    let body = bytes.get(2 + chain_len..)?;
+    match body.first() {
+        Some(0) => Some((chain, CompactBody::Tokens(body.get(1..)?))),
+        Some(1) => Some((chain, CompactBody::AsciiName(body.get(1..)?))),
+        _ => None,
+    }
+}
+
+/// P2：名字首字母串（汉字名取每 token 第一读音首字节；ASCII 记录体即名字字节）。
+/// pub(crate) 供 sidecar 构建目录链时逐目录名复用。
+pub(crate) fn name_initials(name: &str, out: &mut Vec<u8>) {
+    let (tokens, _) = encode_tokens(name);
+    tokens_initials(&tokens, out);
+}
+
+/// P1-2：名字是否含汉字（delta 阈值计数用——纯 ASCII 名 + 中文链不计数，
+/// 与 M3「英文风暴不触发重建」的语义一致）。
+pub(crate) fn name_has_han(name: &str) -> bool {
+    name.chars()
+        .any(|ch| ('\u{3400}'..='\u{9FFF}').contains(&ch) || ('\u{F900}'..='\u{FAFF}').contains(&ch))
+}
+
+fn token_initials(body: &CompactBody<'_>, scratch: &mut Vec<u8>) -> Option<()> {
+    scratch.clear();
+    match body {
+        CompactBody::AsciiName(name) => {
+            scratch.extend_from_slice(name);
+        }
+        CompactBody::Tokens(tokens_bytes) => {
+            let mut cursor = 0usize;
+            while cursor < tokens_bytes.len() {
+                let token = compact_token(tokens_bytes, cursor)?;
+                scratch.push(*compact_readings(&token).next()?.first()?);
+                cursor = token.next;
+            }
+        }
+    }
+    Some(())
 }
 
 #[cfg(test)]
 pub(crate) fn match_compact(bytes: &[u8], query: &str) -> Option<PinyinMatch> {
     let query = normalize_query(query)?;
-    match_compact_normalized(bytes, query.as_bytes())
+    let mut scratch = Vec::new();
+    match_compact_normalized(bytes, query.as_bytes(), &mut scratch)
 }
 
-pub(crate) fn match_compact_normalized(bytes: &[u8], query: &[u8]) -> Option<PinyinMatch> {
+/// `scratch` 是名字首字母 scratch（链匹配用），调用方在扫描循环外持有复用。
+pub(crate) fn match_compact_normalized(
+    bytes: &[u8],
+    query: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Option<PinyinMatch> {
     match_compact_kind(bytes, query, PinyinMatchKind::Full)
         .or_else(|| match_compact_kind(bytes, query, PinyinMatchKind::Initials))
         // S3（PRISM-IMPL-PLAN-4-2026-08-20）：前两条纯策略都失败才试混用。
         .or_else(|| match_compact_mixed(bytes, query))
+        // P2（搜索报告2，2026-08-21）：名字三策略未中再试目录链首字母
+        //（纯首字母连续段，起点在链内，可止于链内或延伸进名字前缀）。
+        .or_else(|| match_compact_chain(bytes, query, scratch))
 }
 
 /// S3（PRISM-IMPL-PLAN-4-2026-08-20）：全拼与首字母逐字混用匹配（位掩码 DP）。
@@ -293,37 +430,45 @@ fn match_compact_mixed(bytes: &[u8], query: &[u8]) -> Option<PinyinMatch> {
     if query.is_empty() || query.len() > 63 {
         return None;
     }
+    // P2：ASCII 名记录体（kind=1）只服务链匹配，名字策略跳过。
+    let (_, body) = compact_split_record(bytes)?;
+    let tokens_bytes = body.tokens()?;
     let done_bit = 1u64 << query.len();
     let mut start_cursor = 0usize;
     let mut start_index = 0u32;
-    while start_cursor < bytes.len() {
+    while start_cursor < tokens_bytes.len() {
         let mut mask = 1u64;
         let mut cursor = start_cursor;
-        while cursor < bytes.len() && mask != 0 {
-            let token = compact_token(bytes, cursor)?;
+        while cursor < tokens_bytes.len() && mask != 0 {
+            let token = compact_token(tokens_bytes, cursor)?;
             let mut next = 0u64;
             let mut bits = mask;
             while bits != 0 {
                 let p = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                // 终态：reading 以剩余查询为前缀（尾部部分匹配，允许名字尾部未覆盖）。
-                if token.reading.starts_with(&query[p..]) {
-                    next |= done_bit;
-                }
-                if token.reading[0] == query[p] {
-                    next |= 1u64 << (p + 1);
-                }
-                if query[p..].starts_with(token.reading) {
-                    next |= 1u64 << (p + token.reading.len());
+                // P1-2：多读音 token 对每个读音各试一次转移。
+                for reading in compact_readings(&token) {
+                    // 终态：reading 以剩余查询为前缀（尾部部分匹配，允许名字尾部未覆盖）。
+                    if reading.starts_with(&query[p..]) {
+                        next |= done_bit;
+                    }
+                    if reading[0] == query[p] {
+                        next |= 1u64 << (p + 1);
+                    }
+                    if query[p..].starts_with(reading) {
+                        next |= 1u64 << (p + reading.len());
+                    }
                 }
             }
             if next & done_bit != 0 {
                 let end_cursor = token.next;
                 // class 0 只在「起点为 0 + 覆盖到名字末尾 + 最后消费是全拼」时给，
                 // 与两条纯路径的 at_end 语义对齐（前一条状态含对应全拼位）。
-                let full_at_end = end_cursor == bytes.len()
-                    && query.len() >= token.reading.len()
-                    && mask & (1u64 << (query.len() - token.reading.len())) != 0;
+                let full_at_end = compact_readings(&token).any(|reading| {
+                    end_cursor == tokens_bytes.len()
+                        && query.len() >= reading.len()
+                        && mask & (1u64 << (query.len() - reading.len())) != 0
+                });
                 return Some(PinyinMatch {
                     kind: PinyinMatchKind::Initials,
                     class: if start_cursor == 0 && full_at_end {
@@ -334,21 +479,105 @@ fn match_compact_mixed(bytes: &[u8], query: &[u8]) -> Option<PinyinMatch> {
                         2
                     },
                     position: start_index,
-                    score: compact_token_count(bytes)?,
-                    spans: compact_spans(bytes, start_cursor, end_cursor)?,
+                    score: compact_token_count(tokens_bytes)?,
+                    spans: compact_spans(tokens_bytes, start_cursor, end_cursor)?,
                 });
             }
             mask = next;
             cursor = token.next;
         }
-        let token = compact_token(bytes, start_cursor)?;
+        let token = compact_token(tokens_bytes, start_cursor)?;
         start_cursor = token.next;
         start_index = start_index.saturating_add(1);
     }
     None
 }
 
+/// P2（搜索报告2，2026-08-21）：目录链首字母匹配——纯首字母串
+/// `chain + 名字首字母` 中，起点落在链内的连续段命中（可止于链内
+///——「按目录名搜到该目录下文件」，或延伸覆盖名字前缀）。
+/// class 恒 2（链辅助命中低于名字本身命中），kind 借 Initials 档。
+/// 命中时 spans 覆盖名字侧被消费的前缀 token（全在链内则为空 spans）。
+/// `name_initials` 是调用方复用的 scratch（热路径零分配）。
+fn match_compact_chain(
+    bytes: &[u8],
+    query: &[u8],
+    name_initials_scratch: &mut Vec<u8>,
+) -> Option<PinyinMatch> {
+    let (chain, body) = compact_split_record(bytes)?;
+    if chain.is_empty() {
+        return None;
+    }
+    token_initials(&body, name_initials_scratch)?;
+    let tokens_bytes = body.tokens();
+    let name_initials = name_initials_scratch.as_slice();
+    let full_len = chain.len() + name_initials.len();
+    if query.len() > full_len {
+        return None;
+    }
+    for start in 0..chain.len() {
+        // 先在链内连续消费。
+        let mut qi = 0usize;
+        while start + qi < chain.len() && qi < query.len() && chain[start + qi] == query[qi] {
+            qi += 1;
+        }
+        if qi == query.len() {
+            return Some(PinyinMatch {
+                kind: PinyinMatchKind::Initials,
+                class: 2,
+                position: 0,
+                score: tokens_bytes
+                    .and_then(compact_token_count)
+                    .unwrap_or(name_initials.len() as u32),
+                spans: Vec::new(),
+            });
+        }
+        // 只允许消费到链尾后**连续**延伸进名字首字母前缀。
+        if start + qi != chain.len() {
+            continue;
+        }
+        match &body {
+            CompactBody::AsciiName(ascii_name) => {
+                // 纯 ASCII 名：延伸段就是名字字节前缀（spans 从简为空）。
+                if ascii_name.starts_with(&query[qi..]) {
+                    return Some(PinyinMatch {
+                        kind: PinyinMatchKind::Initials,
+                        class: 2,
+                        position: 0,
+                        score: ascii_name.len() as u32,
+                        spans: Vec::new(),
+                    });
+                }
+            }
+            CompactBody::Tokens(tokens_bytes) => {
+                let mut qi = qi;
+                let mut cursor = 0usize;
+                while cursor < tokens_bytes.len() && qi < query.len() {
+                let token = compact_token(tokens_bytes, cursor)?;
+                let initial = *compact_readings(&token).next()?.first()?;
+                if initial != query[qi] {
+                        break;
+                    }
+                    qi += 1;
+                    cursor = token.next;
+                }
+                if qi == query.len() {
+                    return Some(PinyinMatch {
+                        kind: PinyinMatchKind::Initials,
+                        class: 2,
+                        position: 0,
+                        score: compact_token_count(tokens_bytes)?,
+                        spans: compact_spans(tokens_bytes, 0, cursor)?,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 fn encode_tokens(name: &str) -> (Vec<Token>, bool) {
+    use ::pinyin::ToPinyinMulti;
     let chars: Vec<(usize, char)> = name.char_indices().collect();
     let mut tokens = Vec::with_capacity(chars.len());
     let mut index = 0usize;
@@ -365,8 +594,9 @@ fn encode_tokens(name: &str) -> (Vec<Token>, bool) {
             for (offset, reading) in readings.iter().enumerate() {
                 let ch = chars[index + offset].1;
                 let len = ch.len_utf16() as u16;
+                // 词表读音是人工核对的单一读音（比机器多音表更可信）。
                 tokens.push(Token {
-                    reading: (*reading).to_owned(),
+                    readings: vec![(*reading).to_owned()],
                     utf16_start,
                     utf16_len: len,
                 });
@@ -378,16 +608,31 @@ fn encode_tokens(name: &str) -> (Vec<Token>, bool) {
 
         let ch = chars[index].1;
         let len = ch.len_utf16() as u16;
-        if let Some(reading) = ch.to_pinyin() {
+        if let Some(multi) = ch.to_pinyin_multi() {
             has_han = true;
-            tokens.push(Token {
-                reading: normalize_reading(reading.plain()),
-                utf16_start,
-                utf16_len: len,
-            });
+            // P1-2：收录全部读音（去重、去空、封顶）。first 与 to_pinyin() 同源，
+            // 单读音行为完全不变；多音字新增分支只在单读不命中时兜底。
+            let mut readings: Vec<String> = Vec::with_capacity(1);
+            for pinyin in multi.into_iter() {
+                let reading = normalize_reading(pinyin.plain());
+                if reading.is_empty()
+                    || readings.len() >= MAX_READINGS_PER_TOKEN
+                    || readings.contains(&reading)
+                {
+                    continue;
+                }
+                readings.push(reading);
+            }
+            if !readings.is_empty() {
+                tokens.push(Token {
+                    readings,
+                    utf16_start,
+                    utf16_len: len,
+                });
+            }
         } else if ch.is_ascii_alphanumeric() {
             tokens.push(Token {
-                reading: ch.to_ascii_lowercase().to_string(),
+                readings: vec![ch.to_ascii_lowercase().to_string()],
                 utf16_start,
                 utf16_len: len,
             });
@@ -410,70 +655,157 @@ fn normalize_reading(reading: &str) -> String {
 
 #[derive(Clone, Copy)]
 struct CompactToken<'a> {
-    reading: &'a [u8],
+    bytes: &'a [u8],
+    readings_cursor: usize,
+    reading_count: usize,
     utf16_start: u16,
     utf16_len: u16,
     next: usize,
 }
 
+/// P1-2：本 token 的全部读音切片（无分配——按 r_len 逐个切）。
+fn compact_readings<'a>(token: &CompactToken<'a>) -> CompactReadings<'a> {
+    CompactReadings {
+        bytes: token.bytes,
+        cursor: token.readings_cursor,
+        remaining: token.reading_count,
+    }
+}
+
+struct CompactReadings<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    remaining: usize,
+}
+
+impl<'a> Iterator for CompactReadings<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let len = *self.bytes.get(self.cursor)? as usize;
+        let start = self.cursor + 1;
+        let end = start.checked_add(len)?;
+        let reading = self.bytes.get(start..end)?;
+        self.cursor = end;
+        self.remaining -= 1;
+        Some(reading)
+    }
+}
+
 fn compact_token(bytes: &[u8], cursor: usize) -> Option<CompactToken<'_>> {
-    let len = *bytes.get(cursor)? as usize;
-    if len == 0 {
+    // P1-2 v2 布局：total_len u8 | utf16_start u16 | utf16_len u16 | rcount u8 | (r_len u8, r)*
+    let total = *bytes.get(cursor)? as usize;
+    if total < 5 {
         return None;
     }
     let utf16_start = u16::from_le_bytes([*bytes.get(cursor + 1)?, *bytes.get(cursor + 2)?]);
     let utf16_len = u16::from_le_bytes([*bytes.get(cursor + 3)?, *bytes.get(cursor + 4)?]);
-    let reading_start = cursor + 5;
-    let next = reading_start.checked_add(len)?;
-    let reading = bytes.get(reading_start..next)?;
-    (reading.is_ascii() && utf16_len > 0).then_some(CompactToken {
-        reading,
+    let rcount = *bytes.get(cursor + 5)? as usize;
+    let readings_cursor = cursor + 6;
+    let next = readings_cursor.checked_add(total - 5)?;
+    let readings_region = bytes.get(readings_cursor..next)?;
+    if rcount == 0 || readings_region.is_empty() {
+        return None;
+    }
+    // 逐读音校验长度链一致 + 首读音非空且 ASCII（坏数据宁可不命中，绝不
+    // panic——release 是 abort）。
+    let mut walk = 0usize;
+    for _ in 0..rcount {
+        let len = *readings_region.get(walk)? as usize;
+        walk = walk.checked_add(1 + len)?;
+    }
+    if walk != readings_region.len() {
+        return None;
+    }
+    (utf16_len > 0).then_some(CompactToken {
+        bytes,
+        readings_cursor,
+        reading_count: rcount,
         utf16_start,
         utf16_len,
         next,
     })
 }
 
+/// P1-2（搜索报告2，2026-08-21）：纯策略（全拼/首字母）多读音版。
+/// 每 token 对每个读陚分支推进——可达状态集合 = 已消费 query 字节数
+///（≤ query.len+1 个，位置集很小，`Vec<usize>` 即可）。
+/// 语义对齐单读音版：按起点升序，命中发生在最早的 token，返回时优先
+/// at_end=true 的命中（class 更优）。
 fn match_compact_kind(bytes: &[u8], query: &[u8], kind: PinyinMatchKind) -> Option<PinyinMatch> {
+    // P2：ASCII 名记录体（kind=1）只服务链匹配，名字策略跳过。
+    let (_, body) = compact_split_record(bytes)?;
+    let tokens_bytes = body.tokens()?;
     let mut start_cursor = 0usize;
     let mut start_index = 0u32;
-    while start_cursor < bytes.len() {
+    let mut positions: Vec<usize> = Vec::with_capacity(8);
+    let mut next_positions: Vec<usize> = Vec::with_capacity(8);
+    while start_cursor < tokens_bytes.len() {
+        positions.clear();
+        positions.push(0usize);
         let mut cursor = start_cursor;
-        let mut query_at = 0usize;
-        while cursor < bytes.len() {
-            let token = compact_token(bytes, cursor)?;
-            let reading = match kind {
-                PinyinMatchKind::Full => token.reading,
-                PinyinMatchKind::Initials => &token.reading[..1],
-            };
-            let remaining = &query[query_at..];
-            let compared = remaining.len().min(reading.len());
-            if remaining[..compared] != reading[..compared] {
+        let mut hit: Option<(usize, bool)> = None; // (end_cursor, at_end)
+        while cursor < tokens_bytes.len() {
+            let token = compact_token(tokens_bytes, cursor)?;
+            next_positions.clear();
+            let mut at_end_any = false;
+            for &query_at in &positions {
+                for reading in compact_readings(&token) {
+                    let reading = match kind {
+                        PinyinMatchKind::Full => reading,
+                        PinyinMatchKind::Initials => &reading[..1],
+                    };
+                    let remaining = &query[query_at..];
+                    let compared = remaining.len().min(reading.len());
+                    if remaining[..compared] != reading[..compared] {
+                        continue;
+                    }
+                    let advanced = query_at + compared;
+                    if advanced == query.len() {
+                        let at_end = token.next == tokens_bytes.len() && compared == reading.len();
+                        if at_end {
+                            at_end_any = true;
+                        }
+                        if hit.is_none() || (at_end && !hit.is_some_and(|(_, end)| end)) {
+                            hit = Some((token.next, at_end));
+                        }
+                        continue;
+                    }
+                    if compared != reading.len() {
+                        continue;
+                    }
+                    if !next_positions.contains(&advanced) {
+                        next_positions.push(advanced);
+                    }
+                }
+            }
+            if hit.is_some() {
                 break;
             }
-            query_at += compared;
+            if at_end_any || next_positions.is_empty() {
+                break;
+            }
+            std::mem::swap(&mut positions, &mut next_positions);
             cursor = token.next;
-            if query_at == query.len() {
-                let at_end = cursor == bytes.len() && compared == reading.len();
-                return Some(PinyinMatch {
-                    kind,
-                    class: if start_cursor == 0 && at_end {
-                        0
-                    } else if start_cursor == 0 {
-                        1
-                    } else {
-                        2
-                    },
-                    position: start_index,
-                    score: compact_token_count(bytes)?,
-                    spans: compact_spans(bytes, start_cursor, cursor)?,
-                });
-            }
-            if compared != reading.len() {
-                break;
-            }
         }
-        let token = compact_token(bytes, start_cursor)?;
+        if let Some((end, at_end)) = hit {
+            return Some(PinyinMatch {
+                kind,
+                class: if start_cursor == 0 && at_end {
+                    0
+                } else if start_cursor == 0 {
+                    1
+                } else {
+                    2
+                },
+                position: start_index,
+                score: compact_token_count(tokens_bytes)?,
+                spans: compact_spans(tokens_bytes, start_cursor, end)?,
+            });
+        }
+        let token = compact_token(tokens_bytes, start_cursor)?;
         start_cursor = token.next;
         start_index = start_index.saturating_add(1);
     }
@@ -512,41 +844,61 @@ fn compact_spans(bytes: &[u8], start: usize, end: usize) -> Option<Vec<i32>> {
     (cursor == end).then_some(spans)
 }
 
+/// P1-2：即时路径的纯策略（全拼/首字母）多读音版——位置集分支，
+/// 语义与 compact 侧逐字节对齐（apps.rs 等价锚保两条路径判定一致）。
 fn match_tokens(tokens: &[Token], query: &[u8], kind: PinyinMatchKind) -> Option<PinyinMatch> {
     for start in 0..tokens.len() {
-        let mut query_at = 0usize;
-        let mut end = start;
-        for token in &tokens[start..] {
-            let reading = match kind {
-                PinyinMatchKind::Full => token.reading.as_bytes(),
-                PinyinMatchKind::Initials => &token.reading.as_bytes()[..1],
-            };
-            let remaining = &query[query_at..];
-            let compared = remaining.len().min(reading.len());
-            if remaining[..compared] != reading[..compared] {
+        let mut positions: Vec<usize> = vec![0];
+        let mut hit: Option<(usize, bool)> = None; // (end exclusive, at_end)
+        for (offset, token) in tokens[start..].iter().enumerate() {
+            let mut next_positions: Vec<usize> = Vec::with_capacity(positions.len());
+            for &query_at in &positions {
+                for reading in &token.readings {
+                    let reading: &[u8] = match kind {
+                        PinyinMatchKind::Full => reading.as_bytes(),
+                        PinyinMatchKind::Initials => &reading.as_bytes()[..1],
+                    };
+                    let remaining = &query[query_at..];
+                    let compared = remaining.len().min(reading.len());
+                    if remaining[..compared] != reading[..compared] {
+                        continue;
+                    }
+                    let advanced = query_at + compared;
+                    if advanced == query.len() {
+                        let end = start + offset + 1;
+                        let at_end = end == tokens.len() && compared == reading.len();
+                        if hit.is_none() || (at_end && !hit.is_some_and(|(_, end)| end)) {
+                            hit = Some((end, at_end));
+                        }
+                        continue;
+                    }
+                    if compared != reading.len() {
+                        continue;
+                    }
+                    if !next_positions.contains(&advanced) {
+                        next_positions.push(advanced);
+                    }
+                }
+            }
+            if hit.is_some() || next_positions.is_empty() {
                 break;
             }
-            query_at += compared;
-            end += 1;
-            if query_at == query.len() {
-                let at_end = end == tokens.len() && compared == reading.len();
-                return Some(PinyinMatch {
-                    kind,
-                    class: if start == 0 && at_end {
-                        0
-                    } else if start == 0 {
-                        1
-                    } else {
-                        2
-                    },
-                    position: start as u32,
-                    score: tokens.len() as u32,
-                    spans: spans_for(&tokens[start..end]),
-                });
-            }
-            if compared != reading.len() {
-                break;
-            }
+            positions = next_positions;
+        }
+        if let Some((end, at_end)) = hit {
+            return Some(PinyinMatch {
+                kind,
+                class: if start == 0 && at_end {
+                    0
+                } else if start == 0 {
+                    1
+                } else {
+                    2
+                },
+                position: start as u32,
+                score: tokens.len() as u32,
+                spans: spans_for(&tokens[start..end]),
+            });
         }
     }
     None
@@ -581,27 +933,32 @@ fn match_tokens_mixed(tokens: &[Token], query: &[u8]) -> Option<PinyinMatch> {
     for start in 0..tokens.len() {
         let mut mask = 1u64;
         for (offset, token) in tokens[start..].iter().enumerate() {
-            let reading = token.reading.as_bytes();
             let mut next = 0u64;
             let mut bits = mask;
             while bits != 0 {
                 let p = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                if reading.starts_with(&query[p..]) {
-                    next |= done_bit;
-                }
-                if reading[0] == query[p] {
-                    next |= 1u64 << (p + 1);
-                }
-                if query[p..].starts_with(reading) {
-                    next |= 1u64 << (p + reading.len());
+                // P1-2：多读音 token 对每个读音各试一次转移。
+                for reading_bytes in token.readings.iter().map(String::as_bytes) {
+                    if reading_bytes.starts_with(&query[p..]) {
+                        next |= done_bit;
+                    }
+                    if reading_bytes[0] == query[p] {
+                        next |= 1u64 << (p + 1);
+                    }
+                    if query[p..].starts_with(reading_bytes) {
+                        next |= 1u64 << (p + reading_bytes.len());
+                    }
                 }
             }
             if next & done_bit != 0 {
                 let end = start + offset + 1;
-                let full_at_end = end == tokens.len()
-                    && query.len() >= reading.len()
-                    && mask & (1u64 << (query.len() - reading.len())) != 0;
+                let full_at_end = token.readings.iter().any(|reading| {
+                    let reading = reading.as_bytes();
+                    end == tokens.len()
+                        && query.len() >= reading.len()
+                        && mask & (1u64 << (query.len() - reading.len())) != 0
+                });
                 return Some(PinyinMatch {
                     kind: PinyinMatchKind::Initials,
                     class: if start == 0 && full_at_end {
@@ -780,16 +1137,57 @@ mod tests {
             assert!(match_name(name, query).is_some(), "{name} / {query}");
         }
 
-        // 负例：词表不得把默认读音改错——「重要」仍是 zhong 不是 chong，
-        // 「行为」仍是 xingwei（hang 只在行市/称谓词里），「模型」仍是 mo。
-        assert!(match_name("重要", "chongyao").is_none());
-        assert!(match_name("行为", "hangwei").is_none());
-        assert!(
-            match_name("模型", "muxing").is_none(),
-            "模型=mo xing，模样/模板=mu"
-        );
+        // P1-2（搜索报告2）：多读音语义——词表外的多音字按**任一有效读音**
+        // 组合均可命中（对齐 pinyin-match/IbEverythingExt 的 heteronym 语义）。
+        // 重要=zhongyao，但 重 另有 chong 读音；行为 xingwei/hangwei 同理。
+        // 「按目录名搜文件」的精确语义项交给 PHRASES 词表（银行=hang 等）。
         assert!(match_name("重要", "zhongyao").is_some());
+        assert!(match_name("重要", "chongyao").is_some(), "多读音分支：重 chong 有效");
         assert!(match_name("行为", "xingwei").is_some());
+        assert!(match_name("行为", "hangwei").is_some(), "多读音分支：行 hang 有效");
         assert!(match_name("模型", "moxing").is_some());
+        assert!(match_name("模型", "muxing").is_some(), "多读音分支：模 mu 有效（模样/模板）");
+        // 负例：不是该字任何读音的音节绝不命中（防召回无界放宽）。
+        assert!(match_name("重庆", "hongqing").is_none());
+        assert!(match_name("银行", "yinkuan").is_none());
+    }
+
+    /// P1-2（搜索报告2，2026-08-21）：heteronym 多读音端到端——
+    /// 露 在词表外，第一读 lù(lu) 之外另有 lòu(lou)；「露脸」的 loulian
+    /// 在单读音时代不命中，现在必须命中，且默认读 lulian 不回归。
+    #[test]
+    fn p1_2_heteronym_readings_match() {
+        let lou = match_name("露脸", "loulian");
+        assert!(lou.is_some(), "露=lòu 读法必须经多读音分支命中");
+        let lu = match_name("露脸", "lulian");
+        assert!(lu.is_some(), "第一读 lù 不回归");
+    }
+
+    /// P2（搜索报告2，2026-08-21）：目录链首字母匹配。
+    /// `下载\资料` 链 = "xz"+"zl"；查询可止于链内（按目录名搜到文件），
+    /// 也可连续延伸覆盖名字首字母前缀。class 恒 2、kind 借 Initials 档。
+    #[test]
+    fn p2_directory_chain_initials_match() {
+        // 下载(xz) → 资料(zl) → 资料.pdf（名字首字母 zl + pdf）
+        let encoded = encode_compact_with_chain("资料.pdf", b"xzzl").unwrap();
+        let mut scratch = Vec::new();
+        // 止于链内：xz 命中该文件（空 spans——名字侧无消费）。
+        let chain_only = match_compact_normalized(&encoded, b"xz", &mut scratch).unwrap();
+        assert_eq!(chain_only.class, 2);
+        assert!(chain_only.spans.is_empty());
+        // 链尾延伸进名字前缀：xzzlz（链 xzzl + 名字首字「资」z）覆盖名字 [0,1)。
+        let spill = match_compact_normalized(&encoded, b"xzzlz", &mut scratch).unwrap();
+        assert_eq!(spill.class, 2);
+        assert_eq!(spill.spans, [0, 1], "资 是 BMP 字符，UTF-16 [0,1)");
+        // 纯 ASCII 名 + 链：kind=1 记录体（report.pdf 只存名字 ASCII 字节）。
+        let ascii = encode_compact_with_chain("report.pdf", b"xz").unwrap();
+        let ascii_hit = match_compact_normalized(&ascii, b"xzre", &mut scratch).unwrap();
+        assert_eq!(ascii_hit.class, 2);
+        // 链不连续/不匹配：qq 与链与名字首字母都对不上。
+        assert!(match_compact_normalized(&encoded, b"qq", &mut scratch).is_none());
+        // 起点必须在链内：zl（纯名字首字母）对 kind=0 走名字策略（首字母），
+        // 但对 ASCII 记录体（kind=1）名字策略不存在，链也不含 → 不命中。
+        let ascii_none = encode_compact_with_chain("report.pdf", b"xz").unwrap();
+        assert!(match_compact_normalized(&ascii_none, b"port", &mut scratch).is_none());
     }
 }

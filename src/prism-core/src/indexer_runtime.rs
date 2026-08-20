@@ -595,12 +595,50 @@ impl ServiceState {
             self.pinyin_needs_rebuild.store(true, Ordering::Release);
             return;
         }
+        // P2（搜索报告2，2026-08-21）：目录 RENAME 使全部**既有**后代的链失效
+        //（旧首字母残留会产错命中）。目录 CREATE 无既有后代、DELETE 伴随子节点
+        // 各自 DELETE 掩蔽——都走 delta 即可；唯独 RENAME 宁少勿错：整表卸载
+        // 排队全量重建（M3 的 60s 退避限频，folder 改名风暴不会连环重建）。
+        let directory_renamed = records.iter().any(|record| {
+            record.is_directory
+                && record.reason & ntfs::USN_REASON_FILE_DELETE == 0
+                && record.reason & ntfs::USN_REASON_RENAME_NEW_NAME != 0
+        });
+        if directory_renamed {
+            self.begin_pinyin_rebuild();
+            self.pinyin_needs_rebuild.store(true, Ordering::Release);
+            return;
+        }
+        // P2：delta 编码需要每条记录的目录链（按批从活索引算，批内同父共享缓存）。
+        let delta_records: Vec<u32> = records
+            .iter()
+            .filter_map(|record| VolumeIndex::split_frn(record.frn).ok().map(|(r, _)| r))
+            .collect();
+        let chains = {
+            let Ok(guard) = self.index.read() else {
+                self.pinyin_needs_rebuild.store(true, Ordering::Release);
+                return;
+            };
+            let Some(index) = guard.as_ref() else {
+                self.pinyin_needs_rebuild.store(true, Ordering::Release);
+                return;
+            };
+            index
+                .volumes
+                .get(volume)
+                .map(|live| crate::pinyin_sidecar::chains_for_delta(live, &delta_records))
+        };
+        let Some(chains) = chains else {
+            self.begin_pinyin_rebuild();
+            self.pinyin_needs_rebuild.store(true, Ordering::Release);
+            return;
+        };
         let mut delta = self
             .pinyin_delta
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut invalidate = false;
-        for record in records {
+        for (record, chain) in records.iter().zip(chains.iter()) {
             let Ok((record_number, _)) = VolumeIndex::split_frn(record.frn) else {
                 invalidate = true;
                 break;
@@ -615,7 +653,7 @@ impl ServiceState {
             } else {
                 continue;
             };
-            match delta.apply(volume, record_number, name) {
+            match delta.apply(volume, record_number, name, chain) {
                 Ok(true) | Err(_) => {
                     invalidate = true;
                     break;
@@ -3106,7 +3144,7 @@ mod tests {
         assert_eq!(missing.pinyin_status(), PinyinStatus::Missing);
         assert!(missing.pinyin_needs_rebuild.load(Ordering::Acquire));
 
-        std::fs::write(dir.join("pinyin-v1.bin"), b"not-a-sidecar").unwrap();
+        std::fs::write(dir.join("pinyin-v2.bin"), b"not-a-sidecar").unwrap();
         let corrupt = ServiceState::new();
         corrupt.set_pinyin_data_dir(&dir);
         publish_cached_index(

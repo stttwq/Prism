@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -15,13 +16,15 @@ use crate::hierarchy::{
     RootFilter, FLAG_DIRECTORY, FLAG_PRESENT,
 };
 use crate::pinyin::{
-    encode_compact, match_compact_normalized, normalize_query, PinyinMatch, PinyinMatchKind,
-    PINYIN_DICTIONARY_VERSION,
+    encode_compact, encode_compact_with_chain, match_compact_normalized, normalize_query,
+    name_has_han, name_initials, PinyinMatch, PinyinMatchKind, PINYIN_DICTIONARY_VERSION,
 };
 
 const MAGIC: [u8; 8] = *b"PRPYG2\0\0";
-const SCHEMA_VERSION: u32 = 1;
-const FILE_NAME: &str = "pinyin-v1.bin";
+/// P1-2+P2（搜索报告2，2026-08-21）：schema v2——token 多读音 + 目录链首字母。
+/// 文件名同步 bump：旧 `pinyin-v1.bin` 不再被读取（Missing → 全量重建一次）。
+const SCHEMA_VERSION: u32 = 2;
+const FILE_NAME: &str = "pinyin-v2.bin";
 const MAX_DELTA_RECORDS: usize = 4096;
 /// M3（FRESH-AUDIT-3-2026-08-20）：delta 总条数硬上限。纯英文条目不触发重建
 ///（不占重建阈值），但它们仍要留在 delta 里掩蔽陈旧编码，总量必须封顶兜底内存
@@ -90,18 +93,22 @@ impl PinyinDelta {
             .sum()
     }
 
-    /// 记录一次名字变更（`name=None` 表示删除）。返回 true 表示到达重建阈值，
+    /// 记录一次名字变更（`name=None` 表示删除）。`chain` 是该记录的目录链
+    ///（P2，调用方从活索引按批算好）。返回 true 表示到达重建阈值，
     /// 调用方应卸载主表并排队全量重建。
     pub fn apply(
         &mut self,
         volume: usize,
         record: u32,
         name: Option<&str>,
+        chain: &[u8],
     ) -> Result<bool, String> {
         let volume = u16::try_from(volume).map_err(|_| "pinyin volume exceeds u16")?;
         let key = RecordKey { volume, record };
-        let value = name.and_then(encode_compact);
-        let counts_chinese = value.is_some();
+        let value = name.and_then(|name| encode_compact_with_chain(name, chain));
+        // P1-2：重建阈值只看**名字含汉字**的条目——纯 ASCII 名（即使带中文链）
+        // 与 M3「英文风暴不触发重建」同口径。
+        let counts_chinese = name.is_some_and(name_has_han);
         if let Some(existing) = self.entries.get(&key) {
             // 覆盖既有条目：按旧新取值增减汉字计数（中文→英文 rename 释放容量）。
             let counted_before = existing.is_some();
@@ -238,6 +245,7 @@ pub fn prototype_names(names: &[String], iterations: usize) -> Result<PrototypeR
 
 fn prototype_p95(disk: &SidecarDisk, query: &[u8], iterations: usize) -> f64 {
     let mut samples = Vec::with_capacity(iterations);
+    let mut initials_scratch: Vec<u8> = Vec::with_capacity(64);
     for _ in 0..iterations {
         let started = Instant::now();
         let mut matches = 0usize;
@@ -247,7 +255,7 @@ fn prototype_p95(disk: &SidecarDisk, query: &[u8], iterations: usize) -> f64 {
             if disk
                 .payload
                 .get(start..end)
-                .and_then(|bytes| match_compact_normalized(bytes, query))
+                .and_then(|bytes| match_compact_normalized(bytes, query, &mut initials_scratch))
                 .is_some()
             {
                 matches = matches.saturating_add(1);
@@ -260,6 +268,85 @@ fn prototype_p95(disk: &SidecarDisk, query: &[u8], iterations: usize) -> f64 {
     samples[((samples.len() * 95).saturating_sub(1)) / 100]
 }
 
+/// P2（搜索报告2，2026-08-21）：目录链相关辅助。
+const MAX_CHAIN_BYTES: usize = 255;
+
+type DirChainCache = std::collections::HashMap<u32, Arc<[u8]>>;
+
+/// 「含目录自身名字首字母在内的全链」（root→本目录）。文件/目录 r 的链 =
+/// 父目录的该条目。超长（>255B）从根侧截断（近祖优先）；父链损坏（环/越界）
+/// 归为空链——宁少结果不错结果。`visiting` 防环（损坏索引的合法防护）。
+fn dir_chain_with_own(
+    volume: &crate::hierarchy::VolumeIndex,
+    record: u32,
+    cache: &mut DirChainCache,
+    visiting: &mut std::collections::HashSet<u32>,
+) -> Arc<[u8]> {
+    if let Some(cached) = cache.get(&record) {
+        return cached.clone();
+    }
+    let empty_chain = || -> Arc<[u8]> { Arc::from(Vec::new().into_boxed_slice()) };
+    if record == volume.root_record
+        || (record as usize) >= volume.nodes.len()
+        || !visiting.insert(record)
+    {
+        let empty = empty_chain();
+        cache.insert(record, empty.clone());
+        return empty;
+    }
+    let parent = volume.nodes[record as usize].parent_record;
+    let parent_chain = dir_chain_with_own(volume, parent, cache, visiting);
+    let slot = &volume.nodes[record as usize];
+    let mut initials = Vec::new();
+    if let Ok(name) = volume.name_at(slot.name_off) {
+        name_initials(name, &mut initials);
+    }
+    let mut combined = Vec::with_capacity(parent_chain.len() + initials.len());
+    combined.extend_from_slice(&parent_chain);
+    combined.extend_from_slice(&initials);
+    if combined.len() > MAX_CHAIN_BYTES {
+        let excess = combined.len() - MAX_CHAIN_BYTES;
+        combined.drain(..excess);
+    }
+    let chain: Arc<[u8]> = Arc::from(combined.into_boxed_slice());
+    cache.insert(record, chain.clone());
+    visiting.remove(&record);
+    chain
+}
+
+/// P2：任意记录（文件/目录）的链 = 父目录的「含自身全链」。
+fn record_chain(
+    volume: &crate::hierarchy::VolumeIndex,
+    record: u32,
+    cache: &mut DirChainCache,
+    visiting: &mut std::collections::HashSet<u32>,
+) -> Arc<[u8]> {
+    let parent = volume
+        .nodes
+        .get(record as usize)
+        .map(|slot| slot.parent_record)
+        .unwrap_or(volume.root_record);
+    dir_chain_with_own(volume, parent, cache, visiting)
+}
+
+/// P2：为一批 USN 记录计算各自的新链（delta 编码用）。一次性缓存，
+/// 批内同父目录共享。
+pub fn chains_for_delta(
+    volume: &crate::hierarchy::VolumeIndex,
+    records: &[u32],
+) -> Vec<Vec<u8>> {
+    let mut cache: DirChainCache = std::collections::HashMap::new();
+    let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    records
+        .iter()
+        .map(|record| {
+            record_chain(volume, *record, &mut cache, &mut visiting)
+                .as_ref()
+                .to_vec()
+        })
+        .collect()
+}
+
 impl PinyinSidecar {
     pub fn build(index: &IndexState) -> Result<Self, String> {
         let volume_count = u16::try_from(index.volumes.len())
@@ -269,6 +356,11 @@ impl PinyinSidecar {
         for (volume_number, volume) in index.volumes.iter().enumerate() {
             let volume_number =
                 u16::try_from(volume_number).map_err(|_| "pinyin volume number exceeds u16")?;
+            // P2（搜索报告2，2026-08-21）：目录链缓存——record → 「含自身名字
+            // 首字母的全链」。文件/目录的链 = 父目录的缓存条目；纯 ASCII 名 +
+            // 非空链的记录也入 sidecar（kind=1 记录体，只存名字 ASCII 字节）。
+            let mut dir_cache: DirChainCache = std::collections::HashMap::new();
+            let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (record, slot) in volume.nodes.iter().enumerate() {
                 if slot.flags & FLAG_PRESENT == 0 {
                     continue;
@@ -276,7 +368,8 @@ impl PinyinSidecar {
                 let Ok(name) = volume.name_at(slot.name_off) else {
                     continue;
                 };
-                let Some(encoded) = encode_compact(name) else {
+                let chain = record_chain(volume, record as u32, &mut dir_cache, &mut visiting);
+                let Some(encoded) = encode_compact_with_chain(name, &chain) else {
                     continue;
                 };
                 let offset =
@@ -440,6 +533,8 @@ impl PinyinSidecar {
         let has_path_filter = filters.has_path_filter();
         // N1 + S4：字面去重查询在循环外分词一次（口径与字面路径一致）。
         let terms = NameTerms::parse(query);
+        // P2：名字首字母 scratch 循环外持有（链匹配热路径零分配）。
+        let mut initials_scratch: Vec<u8> = Vec::with_capacity(64);
         for record in &self.disk.records {
             if delta.entries.contains_key(&record.key) {
                 continue;
@@ -455,7 +550,9 @@ impl PinyinSidecar {
             let Some(bytes) = self.disk.payload.get(start..end) else {
                 continue;
             };
-            if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
+            if let Some(matched) =
+                match_compact_normalized(bytes, normalized.as_bytes(), &mut initials_scratch)
+            {
                 // matched_count 修正（FRESH-AUDIT-3-2026-08-20）：FLAG_PRESENT 检查
                 // 前移——sidecar 陈旧条目（索引侧已删、delta 未覆盖的重启窗口）
                 // 不得计入 matched_count，is_truncated 不再虚高。
@@ -488,7 +585,9 @@ impl PinyinSidecar {
             if !key_is_in_root(index, *key, root_filter.as_mut()) {
                 continue;
             }
-            if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
+            if let Some(matched) =
+                match_compact_normalized(bytes, normalized.as_bytes(), &mut initials_scratch)
+            {
                 if !key_is_live_present(index, *key) {
                     continue;
                 }
@@ -942,7 +1041,7 @@ mod tests {
         let index = state();
         let sidecar = Arc::new(PinyinSidecar::build(&index).unwrap());
         let mut delta = PinyinDelta::new();
-        delta.apply(0, 10, Some("支付宝")).unwrap();
+        delta.apply(0, 10, Some("支付宝"), &[]).unwrap();
         // 同一不可变主表快照 + delta → 掩蔽生效（wx 不再命中已改名的记录）。
         assert!(sidecar.search(&delta, &index, "wx", 8).items.is_empty());
         assert_eq!(sidecar.search(&delta, &index, "zfb", 8).items.len(), 1);
@@ -1024,8 +1123,8 @@ mod tests {
 
         // The delta path applies the same rule: a rename inside the root stays visible and
         // a rename outside it does not leak in.
-        delta.apply(0, 11, Some("支付宝")).unwrap();
-        delta.apply(0, 12, Some("支付宝")).unwrap();
+        delta.apply(0, 11, Some("支付宝"), &[]).unwrap();
+        delta.apply(0, 12, Some("支付宝"), &[]).unwrap();
         let delta_scoped =
             sidecar.search_in_root(&delta, &index, "zfb", 8, &[], root, &QueryFilters::none());
         assert_eq!(delta_scoped.items.len(), 1, "{:?}", delta_scoped.items);
@@ -1038,8 +1137,8 @@ mod tests {
         let index = state();
         let sidecar = PinyinSidecar::build(&index).unwrap();
         let mut delta = PinyinDelta::new();
-        delta.apply(0, 10, Some("支付宝")).unwrap();
-        delta.apply(0, 11, None).unwrap();
+        delta.apply(0, 10, Some("支付宝"), &[]).unwrap();
+        delta.apply(0, 11, None, &[]).unwrap();
         assert!(sidecar.search(&delta, &index, "wx", 8).items.is_empty());
         assert_eq!(sidecar.search(&delta, &index, "zfb", 8).items.len(), 1);
         assert!(sidecar.search(&delta, &index, "cq", 8).items.is_empty());
@@ -1101,26 +1200,110 @@ mod tests {
         assert_eq!(outcome.matched_count, 1);
     }
 
+    /// P2（搜索报告2，2026-08-21）：目录链语义**翻转**——「按目录名搜到该目录
+    /// 下的文件」现在是刻意能力（此前该测试断言 notes.txt 不被命中）。
+    /// 目录本体经名字策略命中（class 更优），子文件经链命中（class 2）排在后面。
     #[test]
-    fn pinyin_does_not_match_a_child_through_its_parent_path() {
+    fn p2_child_matches_through_parent_chain_but_ranks_lower() {
         let mut index = state();
         index.volumes[0].upsert(20, 5, "微信目录", true).unwrap();
         index.volumes[0].upsert(21, 20, "notes.txt", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
         let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx", 8);
-        assert!(outcome.items.iter().any(|item| item.name == "微信目录"));
-        assert!(outcome.items.iter().all(|item| item.name != "notes.txt"));
+        assert!(
+            outcome.items.iter().any(|item| item.name == "微信目录"),
+            "{:?}",
+            outcome.items
+        );
+        assert!(
+            outcome.items.iter().any(|item| item.name == "notes.txt"),
+            "链命中：微信目录(wxml) 下的 notes.txt 应可按 wx 搜到：{:?}",
+            outcome.items
+        );
+        // 排序：目录（名字命中）在文件（链命中）之前。
+        let dir_pos = outcome
+            .items
+            .iter()
+            .position(|item| item.name == "微信目录")
+            .unwrap();
+        let file_pos = outcome
+            .items
+            .iter()
+            .position(|item| item.name == "notes.txt")
+            .unwrap();
+        assert!(dir_pos < file_pos);
+    }
+
+    /// P2：中文目录树端到端——`下载\资料` 链 xzzl；查询可止于链内也可
+    /// 延伸到名字首字母前缀；纯 ASCII 名（report.pdf）只入 kind=1 记录体。
+    #[test]
+    fn p2_directory_tree_chain_end_to_end() {
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "volume".into(),
+                serial: 7,
+            },
+            "C:\\".into(),
+            10,
+            20,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "下载", true).unwrap();
+        volume.upsert(11, 10, "资料", true).unwrap();
+        volume.upsert(12, 11, "资料.pdf", false).unwrap();
+        volume.upsert(13, 10, "report.pdf", false).unwrap();
+        let index = IndexState {
+            volumes: vec![volume],
+            generation: 9,
+            events_since_checkpoint: 0,
+        };
+        let sidecar = PinyinSidecar::build(&index).unwrap();
+        let delta = PinyinDelta::new();
+
+        // xz：下载 目录本体（名字）+ 其下全部文件（链）。
+        let xz = sidecar.search(&delta, &index, "xz", 8);
+        let names: Vec<&str> = xz.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"下载"), "{names:?}");
+        assert!(names.contains(&"资料"), "{names:?}");
+        assert!(names.contains(&"资料.pdf"), "{names:?}");
+        assert!(names.contains(&"report.pdf"), "{names:?}");
+        // 排序：目录「下载」名字命中最优，链命中的文件殿后。
+        assert_eq!(xz.items[0].name, "下载");
+
+        // xzzlz：链（下载+资料）延伸进「资料.pdf」名字首字「资」——spans [0,1)。
+        let xzzl = sidecar.search(&delta, &index, "xzzlz", 8);
+        let hit = xzzl
+            .items
+            .iter()
+            .find(|item| item.name == "资料.pdf")
+            .expect("xzzlz 应命中 资料.pdf");
+        assert_eq!(hit.match_spans, [0, 1]);
+        // report.pdf（kind=1）对纯名字查询不可命中（名字策略跳过），
+        // 但链延伸进 ASCII 名前缀可以：xzre。
+        let xzre = sidecar.search(&delta, &index, "xzre", 8);
+        assert!(
+            xzre.items.iter().any(|item| item.name == "report.pdf"),
+            "{:?}",
+            xzre.items
+        );
+        let port = sidecar.search(&delta, &index, "port", 8);
+        assert!(
+            port.items.iter().all(|item| item.name != "report.pdf"),
+            "kind=1 记录体不走名字策略：{:?}",
+            port.items
+        );
     }
 
     #[test]
     fn delta_never_grows_past_the_rebuild_threshold() {
         let mut delta = PinyinDelta::new();
         for record in 0..MAX_DELTA_RECORDS as u32 {
-            let rebuild = delta.apply(0, record, Some("微信")).unwrap();
+            let rebuild = delta.apply(0, record, Some("微信"), &[]).unwrap();
             assert_eq!(rebuild, record as usize + 1 >= MAX_DELTA_RECORDS);
         }
         assert_eq!(delta.entries.len(), MAX_DELTA_RECORDS);
-        assert!(delta.apply(0, MAX_DELTA_RECORDS as u32, Some("微信")).unwrap());
+        assert!(delta.apply(0, MAX_DELTA_RECORDS as u32, Some("微信"), &[]).unwrap());
         assert_eq!(delta.entries.len(), MAX_DELTA_RECORDS);
     }
 
@@ -1130,7 +1313,7 @@ mod tests {
     fn m3_english_name_storm_does_not_trigger_rebuild() {
         let mut delta = PinyinDelta::new();
         for record in 0..(MAX_DELTA_RECORDS as u32 * 2) {
-            let rebuild = delta.apply(0, record, Some("body-styles.css")).unwrap();
+            let rebuild = delta.apply(0, record, Some("body-styles.css"), &[]).unwrap();
             assert!(!rebuild, "纯英文名变更不得触发全量重建");
         }
         assert_eq!(delta.chinese_count, 0);
@@ -1140,12 +1323,12 @@ mod tests {
     #[test]
     fn m3_chinese_to_english_rename_releases_quota() {
         let mut delta = PinyinDelta::new();
-        delta.apply(0, 10, Some("微信")).unwrap();
+        delta.apply(0, 10, Some("微信"), &[]).unwrap();
         assert_eq!(delta.chinese_count, 1);
-        delta.apply(0, 10, Some("english-name")).unwrap();
+        delta.apply(0, 10, Some("english-name"), &[]).unwrap();
         assert_eq!(delta.chinese_count, 0, "中文→英文 rename 计数回落");
         // 释放后不再触发（0 < 阈值），即使 delta 条目本身还在。
-        assert!(!delta.apply(0, 11, Some("支付宝")).unwrap());
+        assert!(!delta.apply(0, 11, Some("支付宝"), &[]).unwrap());
     }
 
     /// M3：delta 总条数硬上限兜底内存——纯英文条目也要留下掩蔽陈旧编码，
@@ -1155,13 +1338,13 @@ mod tests {
         let mut delta = PinyinDelta::new();
         let mut crossed = false;
         for record in 0..MAX_DELTA_TOTAL_RECORDS as u32 {
-            if delta.apply(0, record, Some("english")).unwrap() {
+            if delta.apply(0, record, Some("english"), &[]).unwrap() {
                 crossed = true;
             }
         }
         assert!(crossed, "总条数到达硬上限必须触发重建");
         assert!(delta
-            .apply(0, MAX_DELTA_TOTAL_RECORDS as u32 + 7, Some("more"))
+            .apply(0, MAX_DELTA_TOTAL_RECORDS as u32 + 7, Some("more"), &[])
             .unwrap());
     }
 

@@ -448,8 +448,9 @@ mod tests {
         let wechat = apps.iter().find(|app| app.name == "微信").unwrap();
         let encoded = wechat.pinyin.as_deref().expect("含汉字应有预编码拼音");
         let normalized = crate::pinyin::normalize_query("wx").unwrap();
+        let mut scratch = Vec::new();
         assert_eq!(
-            crate::pinyin::match_compact_normalized(encoded, normalized.as_bytes()),
+            crate::pinyin::match_compact_normalized(encoded, normalized.as_bytes(), &mut scratch),
             crate::pinyin::match_name("微信", "wx")
         );
         // 纯拉丁名不编码，拼音通道对它永远沉默。

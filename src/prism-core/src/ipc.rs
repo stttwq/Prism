@@ -1411,6 +1411,8 @@ fn collect_app_results(
     if pinyin_enabled {
         // 查询归一化一次；清单侧的编码在扫描时就做好了。
         if let Some(normalized) = crate::pinyin::normalize_query(name_query) {
+            // P2：链匹配 scratch 循环外持有（即时路径无链，仅复用同一入口）。
+            let mut initials_scratch: Vec<u8> = Vec::with_capacity(64);
             for app in apps_guard.iter() {
                 if literal_targets.contains(&app.launch_path) {
                     continue;
@@ -1418,9 +1420,11 @@ fn collect_app_results(
                 let Some(encoded) = app.pinyin.as_deref() else {
                     continue;
                 };
-                let Some(matched) =
-                    crate::pinyin::match_compact_normalized(encoded, normalized.as_bytes())
-                else {
+                let Some(matched) = crate::pinyin::match_compact_normalized(
+                    encoded,
+                    normalized.as_bytes(),
+                    &mut initials_scratch,
+                ) else {
                     continue;
                 };
                 let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());

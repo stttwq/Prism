@@ -25,7 +25,9 @@ walkdir = "2"
 # 索引磁盘缓存：紧凑二进制序列化，no_std 友好、体积小
 # use-std 启用 to_io：checkpoint 直接流式写入文件，不再生成整份序列化 Vec（内存峰值 3x→2x）
 postcard = { version = "1", features = ["alloc", "use-std"] }
-pinyin = { version = "0.10.0", default-features = false, features = ["plain"] }
+# P1-2（搜索报告2）：heteronym 启用多音字多读音（ToPinyinMulti），
+# 编码与匹配对多读音 token 逐读音分支尝试。
+pinyin = { version = "0.10.0", default-features = false, features = ["plain", "heteronym"] }
 windows-service = "0.8"
 
 # MFT/USN 加速仅在 Windows 用到；非 Windows（如 CI Linux）自动省略，走目录遍历。
