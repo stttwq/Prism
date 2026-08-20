@@ -136,8 +136,9 @@ impl ShellExecutor {
                 .sender
                 .send(WorkerMessage::ScanApps(result))
                 .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker is closed"))?;
+            // M4：清单扫描解析数百个 .lnk 可合法耗时，给满慢预算防挂死。
             receiver
-                .recv()
+                .recv_timeout(std::time::Duration::from_secs(300))
                 .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker did not reply"))
         })
         .await
@@ -172,6 +173,12 @@ impl ShellExecutor {
                 }
             }
         }
+        // M4（FRESH-AUDIT-3-2026-08-20）：裸 recv() 无限等待——properties 模态页 /
+        // 死网络路径 / IFileOperation 对话框挂住唯一 STA worker 时，后续动作在
+        // 容量 32 的 channel 排队，每个占一个 spawn_blocking 线程无限等。按动作
+        // 类别给等待预算：超时即放弃该请求（worker 完成后 send 到已弃接收端自然
+        // 失败），worker 仍可服务后续动作。预算在 move 前取好。
+        let budget = sta_wait_budget(&operation);
         let (result, receiver) = mpsc::channel();
         self.sender
             .send(WorkerMessage::Execute(WorkItem {
@@ -181,8 +188,31 @@ impl ShellExecutor {
             }))
             .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker is closed"))?;
         receiver
-            .recv()
-            .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker did not reply"))?
+            .recv_timeout(budget)
+            .map_err(|_| {
+                ShellError::new(
+                    ShellErrorKind::System,
+                    format!(
+                        "Shell worker did not reply within {}s (operation may still be in flight)",
+                        budget.as_secs()
+                    ),
+                )
+            })?
+    }
+}
+
+/// M4：按动作类别的 STA 等待预算。模态/进度类（properties 模态页、openas
+/// 对话框、IFileOperation 进度与冲突对话框、长压缩）合法长等待，与前端 F6
+/// 的 5 分钟兜底取齐；open/reveal 通常瞬时，60s 足以越过死网络路径的内核
+/// 超时而不会把队列拖死。
+fn sta_wait_budget(operation: &ShellOperation) -> std::time::Duration {
+    const FAST: std::time::Duration = std::time::Duration::from_secs(60);
+    const SLOW: std::time::Duration = std::time::Duration::from_secs(300);
+    match operation {
+        ShellOperation::Properties(_)
+        | ShellOperation::OpenWith(_)
+        | ShellOperation::RunAction { .. } => SLOW,
+        ShellOperation::Open(_) | ShellOperation::Reveal(_) => FAST,
     }
 }
 
@@ -626,6 +656,27 @@ fn classify_message(message: &str) -> ShellErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4（FRESH-AUDIT-3-2026-08-20）：模态/进度类动作拿 5 分钟慢预算
+    ///（与前端 F6 兜底取齐），open/reveal 拿 60s 快预算。
+    #[test]
+    fn m4_sta_wait_budgets_split_modal_from_fast_verbs() {
+        use std::time::Duration;
+        let target = || ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        assert_eq!(sta_wait_budget(&ShellOperation::Open(target())), Duration::from_secs(60));
+        assert_eq!(sta_wait_budget(&ShellOperation::Reveal(target())), Duration::from_secs(60));
+        assert_eq!(sta_wait_budget(&ShellOperation::Properties(target())), Duration::from_secs(300));
+        assert_eq!(sta_wait_budget(&ShellOperation::OpenWith(target())), Duration::from_secs(300));
+        assert_eq!(
+            sta_wait_budget(&ShellOperation::RunAction {
+                target: target(),
+                action: "copy_to".into(),
+                args: crate::ipc::ActionArgs::default(),
+                zip_program: None,
+            }),
+            Duration::from_secs(300)
+        );
+    }
 
     #[test]
     fn typed_targets_validate_and_unknown_kinds_are_safe() {

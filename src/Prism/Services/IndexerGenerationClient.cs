@@ -25,6 +25,12 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
     /// </summary>
     private const int ProtocolVersion = 2;
 
+    /// <summary>
+    /// M5（审计3 2026-08-20）：单次请求的读超时。wait_generation 服务端最多 30s
+    /// 回包，31s 预算只吞死连接、不误伤正常长轮询。
+    /// </summary>
+    private static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(31);
+
     private readonly object _sync = new();
     private CancellationTokenSource? _loopCts;
     private Task? _loop;
@@ -103,7 +109,7 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         var lineReader = new PipeClient.BoundedLineReader(reader);
 
         var hello = await ExchangeAsync(
-            writer, lineReader, new { type = "hello", protocol = ProtocolVersion }, ct).ConfigureAwait(false);
+            stream, writer, lineReader, new { type = "hello", protocol = ProtocolVersion }, ct).ConfigureAwait(false);
         EnsureResponseType(hello, "hello");
         if (!hello.TryGetProperty("protocol", out var protocol)
             || !protocol.TryGetInt32(out var version)
@@ -113,7 +119,7 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         }
 
         var status = await ExchangeAsync(
-            writer, lineReader, new { type = "status" }, ct).ConfigureAwait(false);
+            stream, writer, lineReader, new { type = "status" }, ct).ConfigureAwait(false);
         EnsureResponseType(status, "status");
         var generation = ReadGeneration(status);
         // A change can land after the visible search but before this dedicated
@@ -125,6 +131,7 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         while (!ct.IsCancellationRequested)
         {
             var response = await ExchangeAsync(
+                stream,
                 writer,
                 lineReader,
                 new { type = "wait_generation", after = generation, timeout_ms = 30_000 },
@@ -140,6 +147,7 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
     }
 
     private static async Task<JsonElement> ExchangeAsync(
+        NamedPipeClientStream stream,
         StreamWriter writer,
         PipeClient.BoundedLineReader lineReader,
         object request,
@@ -148,8 +156,33 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         var json = JsonSerializer.Serialize(request);
         await writer.WriteLineAsync(json.AsMemory(), ct).ConfigureAwait(false);
         await writer.FlushAsync(ct).ConfigureAwait(false);
-        var line = await lineReader.ReadLineAsync(ct).ConfigureAwait(false)
-            ?? throw new IOException("Indexer closed the pipe before responding");
+
+        // M5（审计3 2026-08-20）：读超时用 Task.WhenAny 竞速而非 CancellationToken——
+        // ReadLineAsync(token) 在 NamedPipeClientStream 上不能可靠取消挂起的
+        // overlapped I/O（.NET 已知限制，照抄 PipeChannel.HandshakeAsync 的模式）。
+        // 半死的 indexer（连上但不再响应）此前会让 _loop 永久挂起，
+        // SetActive(true) 见循环未完成直接 return 不换新连接，文件变更后
+        // 结果列表静默陈旧直到重启。超时即 Dispose 底层 stream（CancelIoEx
+        // 让挂起读立即返回），异常交 RunAsync 的 1s 退避重连。
+        var readTask = lineReader.ReadLineAsync(CancellationToken.None);
+        var timeoutTask = Task.Delay(ReadTimeout, ct);
+        string? line;
+        if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
+        {
+            line = await readTask.ConfigureAwait(false);
+        }
+        else
+        {
+            // 先判取消（延迟任务因 ct 完成时走正常的取消路径，由 using 释放流），
+            // 否则按超时处理：销毁底层流让挂起的 ReadLineAsync 立即返回。
+            ct.ThrowIfCancellationRequested();
+            stream.Dispose();
+            throw new IOException(
+                $"Indexer generation connection timed out after {Math.Round(ReadTimeout.TotalSeconds)}s");
+        }
+
+        if (line is null)
+            throw new IOException("Indexer closed the pipe before responding");
 
         using var document = JsonDocument.Parse(line);
         var root = document.RootElement;
