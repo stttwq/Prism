@@ -219,6 +219,30 @@ impl HistoryStore {
         self.enabled.load(Ordering::Acquire)
     }
 
+    /// L 批次（FRESH-AUDIT-3-2026-08-20）：定时冲刷节流窗口内的脏数据。
+    /// G4 的节流依赖「下一次动作或 Drop 到来」才落盘——动作串结束后若无后续
+    /// 动作，窗口内的脏数据要等到进程退出才写；进程被强杀（崩溃/任务管理器）
+    /// 时丢失。本线程把丢失窗口压回 ≤ 2× 节流间隔。持 Weak：最后一个强引用
+    /// Drop 时既有兜底冲刷照常运行，线程随后自行退出；线程创建失败只是回到
+    /// G4 的既有语义（下次动作或 Drop 落盘），不致命。
+    pub fn start_periodic_flush(self: &Arc<Self>) {
+        let weak = std::sync::Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("history-flush".into())
+            .spawn(move || loop {
+                std::thread::sleep(MIN_PERSIST_INTERVAL);
+                let Some(store) = weak.upgrade() else {
+                    return;
+                };
+                // 与 record 路径同一节流判定：到期才真正 clone+persist。
+                if store.should_persist_now() {
+                    if let Ok(state) = store.state.read() {
+                        let _ = persist(&store.path, state.entries.clone());
+                    }
+                }
+            });
+    }
+
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Release);
     }

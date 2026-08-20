@@ -136,6 +136,12 @@ public sealed class PipeClient : ISearchClient, IDisposable
             if (!proc.ProcessName.Equals(BrokerProcessName, StringComparison.OrdinalIgnoreCase))
                 return true; // 不是 broker 的管道服务端（mock/测试）——照常复用
 
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：RDP 双会话时另一会话的 broker
+            // 不是孤儿——跨会话收编必失败，但绝不能 Kill 它（那会打掉别人会话的
+            // 搜索）。保守复用，跨会话连不上时由 watchdog 走拉新路径。
+            if (proc.SessionId != Process.GetCurrentProcess().SessionId)
+                return true;
+
             _jobGuard ??= new JobObjectGuard();
             if (_jobGuard.TryAdopt(pid))
             {
@@ -1086,7 +1092,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
             var readTask = _lineReader!.ReadLineAsync(CancellationToken.None);
             var timeoutTask = Task.Delay(HandshakeReadTimeout);
-
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：延迟任务完成后释放其计时器——
+            // 读先完成时不再等 delay 自然到期。注意 Task.Dispose 对未完成任务
+            // 会抛 InvalidOperationException，所以只在完成态释放。
+            try
+            {
             string? line;
             if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
             {
@@ -1117,6 +1127,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
             // 握手成功即最近一次有效响应（watchdog 判活参考）。
             Interlocked.Exchange(ref _lastResponseTicks, DateTime.UtcNow.Ticks);
+            }
+            finally
+            {
+                if (timeoutTask.IsCompleted) timeoutTask.Dispose();
+            }
         }
 
         /// <summary>

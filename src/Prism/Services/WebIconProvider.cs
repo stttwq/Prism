@@ -37,6 +37,12 @@ public sealed class WebIconProvider
     private readonly HashSet<string> _negative = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>在途探测防抖：同一 origin 的后台磁盘探测同时至多一个。</summary>
     private readonly HashSet<string> _probing = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// L 批次（FRESH-AUDIT-3-2026-08-20）：favicon 探测完成的通知——订阅方
+    ///（ResultList）补一次装饰，图标不必等下一次按键才换上。在 UI 线程触发
+    ///（Finish 本身已投递回 UI 线程）。
+    /// </summary>
+    public event Action? Resolved;
     /// <summary>后台完成回调与 UI 线程之间的互斥（后台路径读写三个表时用）。</summary>
     private readonly object _sync = new();
     /// <summary>测试观测：磁盘探测次数（同一未命中 origin 连续装饰只允许一次）。</summary>
@@ -142,6 +148,8 @@ public sealed class WebIconProvider
                                     _negative.Add(origin);
                                 }
                             }
+                            // L 批次：完成即通知重绘，不等下一次按键的装饰周期。
+                            Resolved?.Invoke();
                         }
                         var dispatcher = Application.Current?.Dispatcher;
                         if (dispatcher is null || dispatcher.CheckAccess())

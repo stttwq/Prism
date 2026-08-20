@@ -153,8 +153,10 @@ public partial class SearchWindow : Window
         Results.SetWebIconProvider(webIcons ?? new WebIconProvider());
         vm.HideRequested += () =>
         {
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：BeginInvoke——后台线程的隐藏
+            // 请求不能阻塞等待 UI 线程（与 RootRejected 同一权衡）。
             if (Dispatcher.CheckAccess()) HideAnimated();
-            else Dispatcher.Invoke(HideAnimated);
+            else Dispatcher.BeginInvoke(HideAnimated);
         };
         vm.IdleMemoryReleaseRequested += () =>
         {
@@ -163,11 +165,13 @@ public partial class SearchWindow : Window
             // 不在 hot path 上阻塞。Trim 延迟到隐藏后统一执行。
             // G3（FRESH-AUDIT-2）：可见期只收 Gen0/1——Gen2 强制压缩会阻塞 UI 线程
             // 数十至数百毫秒；全量压缩留给隐藏后的 _idleTrimTimer 路径。
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：进一步降为 Optimized 非阻塞、
+            // 不压缩——Gen1 强制压缩在 UI 线程仍可感知；真正的回收取舍交给
+            // 隐藏后的全量 Trim 路径。
             Dispatcher.BeginInvoke(new Action(() =>
             {
                 _icons?.ClearPathKeys();
-                GC.Collect(0, GCCollectionMode.Forced, blocking: true, compacting: true);
-                GC.Collect(1, GCCollectionMode.Forced, blocking: true, compacting: true);
+                GC.Collect(0, GCCollectionMode.Optimized, blocking: false, compacting: false);
             }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         };
         vm.State.PropertyChanged += OnStateChanged;
@@ -275,21 +279,45 @@ public partial class SearchWindow : Window
     }
 
     /// <summary>
-    /// 在后台 STA 线程上执行 <paramref name="action"/> 并等待结果。Shell COM 对象
+    /// L 批次（FRESH-AUDIT-3-2026-08-20）：常驻 STA 工作线程——此前每次呼出
+    /// 都新建一次性 STA 线程做宿主识别（线程创建 + COM init 的成本白付），
+    /// 且多个识别并发时线程数随呼出次数增长。Shell COM 对象
     /// （<c>Shell.Application</c> / <c>IShellWindows</c> / <c>IShellBrowser</c>）
-    /// 是 STA-only，线程池 MTA 线程上调用会静默返回空。
+    /// 是 STA-only，线程池 MTA 线程上调用会静默返回空；单一常驻 STA 线程
+    /// 串行服务全部调用（宿主识别是唯一用户，串行即足够）。
     /// </summary>
+    private static readonly System.Collections.Concurrent.BlockingCollection<Action> StaWork =
+        new(new System.Collections.Concurrent.ConcurrentQueue<Action>());
+
+    private static readonly Lazy<System.Threading.Thread> StaWorker = new(() =>
+    {
+        var thread = new System.Threading.Thread(StaWorkerLoop)
+        {
+            IsBackground = true,
+            Name = "prism-sta-host",
+        };
+        thread.SetApartmentState(System.Threading.ApartmentState.STA);
+        thread.Start();
+        return thread;
+    });
+
+    private static void StaWorkerLoop()
+    {
+        foreach (var work in StaWork.GetConsumingEnumerable())
+        {
+            work();
+        }
+    }
+
     private static Task<T> RunOnStaThread<T>(Func<T> action)
     {
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var sta = new Thread(() =>
+        StaWork.Add(() =>
         {
             try { tcs.SetResult(action()); }
             catch (Exception ex) { tcs.SetException(ex); }
-        })
-        { IsBackground = true };
-        sta.SetApartmentState(ApartmentState.STA);
-        sta.Start();
+        });
+        _ = StaWorker.Value; // 惰性启动（首次调用时拉起常驻线程）。
         return tcs.Task;
     }
 
@@ -795,7 +823,9 @@ public partial class SearchWindow : Window
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.Invoke(() => OnStateChanged(sender, e));
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：BeginInvoke——后台线程的属性变更
+            // 不能阻塞等待 UI，否则与 ViewModel 的通知路径互等。
+            Dispatcher.BeginInvoke(() => OnStateChanged(sender, e));
             return;
         }
 
@@ -829,7 +859,9 @@ public partial class SearchWindow : Window
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.Invoke(OnThemeApplied);
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：BeginInvoke——主题应用的回报
+            // 不能阻塞等待 UI 线程。
+            Dispatcher.BeginInvoke(OnThemeApplied);
             return;
         }
         Results.InvalidateThemeBrushes();

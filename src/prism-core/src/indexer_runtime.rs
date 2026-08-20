@@ -1171,16 +1171,26 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
             }
             _ = maintenance.tick() => {
                 // S5: 每小时一行内存趋势——零常驻成本（5s tick 只做一次时间比较）。
+                // L 批次（FRESH-AUDIT-3-2026-08-20）：trend 与 generation 都要
+                // index.read()，挪 spawn_blocking——USN 洪峰期 watcher 持写锁时
+                // 直接在 worker 上读会连管道 accept 一起堵。
                 if last_memory_trend.elapsed() >= Duration::from_secs(3600) {
-                    let detail = state.memory_trend_detail();
-                    logging::event_detail(
-                        "info",
-                        "index_memory_trend",
-                        &detail,
-                        None,
-                        Some(state.generation()),
-                    );
-                    last_memory_trend = Instant::now();
+                    let trend_state = state.clone();
+                    let trend = tokio::task::spawn_blocking(move || {
+                        let detail = trend_state.memory_trend_detail();
+                        (detail, trend_state.generation())
+                    })
+                    .await;
+                    if let Ok((detail, generation)) = trend {
+                        logging::event_detail(
+                            "info",
+                            "index_memory_trend",
+                            &detail,
+                            None,
+                            Some(generation),
+                        );
+                        last_memory_trend = Instant::now();
+                    }
                 }
                 // M1（FRESH-AUDIT-3-2026-08-20）：到点的挂起重试重新入队——
                 // 走 rebuild_rx 的正常准入路径（退避判定在收到端统一做）。
@@ -1247,9 +1257,24 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 // Everything 模式：低频持久化 + USN 前滚兜底。
                 // 6 小时 / 50 万事件覆盖绝大多数会话，落盘开销降为原先的 1/6；
                 // 崩溃恢复由缓存里的 next_usn 继续读日志补齐（日志包装走既有重建路径）。
-                let checkpoint_due = state.index.read().ok().and_then(|guard| {
-                    guard.as_ref().map(|index| index.events_since_checkpoint >= 500_000)
-                }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(6 * 60 * 60);
+                // L 批次：events 计数读取挪 spawn_blocking（同上，读锁不占 worker）。
+                let events_state = state.clone();
+                let events_since_checkpoint = tokio::task::spawn_blocking(move || {
+                    events_state
+                        .index
+                        .read()
+                        .ok()
+                        .and_then(|guard| {
+                            guard
+                                .as_ref()
+                                .map(|index| index.events_since_checkpoint)
+                        })
+                        .unwrap_or(0)
+                })
+                .await
+                .unwrap_or(0);
+                let checkpoint_due = events_since_checkpoint >= 500_000
+                    || last_checkpoint.elapsed() >= Duration::from_secs(6 * 60 * 60);
                 if checkpoint_due {
                     // H1: compete checkpoint against shutdown.
                     // M2：maintenance 节拍照常重建拼音（flush_pinyin=true）。
@@ -1946,6 +1971,11 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path, flush_pinyin: bo
             generation: snapshot.generation,
             events_since_checkpoint: snapshot.events_since_checkpoint,
             volumes: snapshot.volumes.len(),
+            next_usns: snapshot
+                .volumes
+                .iter()
+                .map(|volume| volume.next_usn)
+                .collect(),
         },
         flush_pinyin,
     )
@@ -1966,6 +1996,7 @@ fn checkpoint_streaming(
             generation: index.generation,
             events_since_checkpoint: index.events_since_checkpoint,
             volumes: index.volumes.len(),
+            next_usns: index.volumes.iter().map(|volume| volume.next_usn).collect(),
         }
     };
     checkpoint_streaming_with_head(state, data_dir, head, flush_pinyin)
@@ -1992,14 +2023,16 @@ fn checkpoint_streaming_with_head(
             let index = guard
                 .as_ref()
                 .ok_or_else(|| "index is not ready".to_string())?;
-            // 卷间核对：generation 或卷数变化说明 USN/重建动过索引——本轮流式
-            // 写入作废重试，绝不把混合世代的卷写进同一个 v5 文件。
-            if index.volumes.len() != head.volumes || index.generation != head.generation {
+            // 卷间核对（L 批次放宽）：只有正被序列化的卷自身 next_usn 前移才
+            // 作废本轮——绝不能把混合状态的卷写进同一个 v5 文件。
+            if index.volumes.len() != head.next_usns.len()
+                || index.volumes[position].next_usn != head.next_usns[position]
+            {
                 return Err(format!(
-                    "{}: generation {} -> {}",
+                    "{}: volume {position} next_usn {} -> {}",
                     index_cache::SNAPSHOT_CHANGED,
-                    head.generation,
-                    index.generation
+                    head.next_usns[position],
+                    index.volumes[position].next_usn
                 ));
             }
             postcard::to_io(&index.volumes[position], writer)
@@ -2042,11 +2075,17 @@ fn checkpoint_after_save(
 }
 
 /// M2: 流式序列化用的索引头快照（在首卷写入前一次性捕获）。
-#[derive(Debug, Clone, Copy)]
+/// L 批次（FRESH-AUDIT-3-2026-08-20）：卷间核对从 generation 改为按卷
+/// `next_usn`——USN 洪峰期 generation 每批都前移（任一卷的活动都 bump），
+/// 旧口径使三次竞争重试后仍回落整态 clone 成为常态。逐卷比对后，只有
+/// **正被序列化的卷**自身变化才作废本轮写入；其他卷的活动不影响一致性
+///（v5 按卷存储 next_usn，重放各自独立）。
+#[derive(Debug, Clone)]
 struct SnapshotHead {
     generation: u64,
     events_since_checkpoint: u64,
     volumes: usize,
+    next_usns: Vec<i64>,
 }
 
 async fn checkpoint_async(
@@ -3101,12 +3140,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_clone);
     }
 
-    /// M2: 头快照之后 generation 变化（USN 到达）→ 流式写入必须以
-    /// SNAPSHOT_CHANGED 中止，绝不能把混合世代的卷写进同一个文件。
+    /// M2 + L（FRESH-AUDIT-3-2026-08-20）：流式写入的卷间核对按卷 next_usn——
+    /// 其他卷的 USN 活动（generation 前移而本卷游标不动）不再作废本卷写入；
+    /// 正被写入卷的 next_usn 前移则必须以 SNAPSHOT_CHANGED 中止，绝不把混合
+    /// 状态的卷写进同一个 v5 文件。
     #[test]
-    fn m2_streaming_snapshot_rejects_generation_change() {
+    fn m2_streaming_snapshot_rejects_only_touched_volume() {
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "alpha.txt"));
+        state.merge_and_publish(test_volume("v2", "D:\\", "beta.txt"));
         state.finish_first_build();
 
         let head = {
@@ -3116,14 +3158,36 @@ mod tests {
                 generation: index.generation,
                 events_since_checkpoint: index.events_since_checkpoint,
                 volumes: index.volumes.len(),
+                next_usns: index.volumes.iter().map(|volume| volume.next_usn).collect(),
             }
         };
-        // 模拟 USN 批次到达：generation 前移。
+        // 其他卷活动的等价模拟：generation 前移而各卷 next_usn 不动 → 写入照常完成。
         {
             let mut guard = state.index.write().unwrap();
             guard.as_mut().unwrap().generation += 1;
         }
+        let dir = std::env::temp_dir().join(format!("prism-m2-l-relax-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        checkpoint_streaming_with_head(&state, &dir, head.clone(), true)
+            .expect("generation-only drift must not invalidate the write");
+        let _ = std::fs::remove_dir_all(&dir);
 
+        // 正被写入卷的 next_usn 前移 → SNAPSHOT_CHANGED。
+        let head = {
+            let guard = state.index.read().unwrap();
+            let index = guard.as_ref().unwrap();
+            SnapshotHead {
+                generation: index.generation,
+                events_since_checkpoint: index.events_since_checkpoint,
+                volumes: index.volumes.len(),
+                next_usns: index.volumes.iter().map(|volume| volume.next_usn).collect(),
+            }
+        };
+        {
+            let mut guard = state.index.write().unwrap();
+            let index = guard.as_mut().unwrap();
+            index.volumes[0].next_usn += 1;
+        }
         let dir = std::env::temp_dir().join(format!("prism-m2-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let error = checkpoint_streaming_with_head(&state, &dir, head, true).unwrap_err();

@@ -46,7 +46,14 @@ public partial class ResultList : UserControl
     }
 
     public void SetIconCache(IconCache cache) => _icons = cache;
-    public void SetWebIconProvider(WebIconProvider provider) => _webIcons = provider;
+    public void SetWebIconProvider(WebIconProvider provider)
+    {
+        // L 批次（FRESH-AUDIT-3-2026-08-20）：favicon 探测完成即重绘——
+        // 此前要等下一次按键的装饰周期才换上新图标。防重复挂接（provider 可被换）。
+        provider.Resolved -= DecorateVisibleItems;
+        provider.Resolved += DecorateVisibleItems;
+        _webIcons = provider;
+    }
 
     /// <summary>主题切换后丢弃缓存画刷，下次装饰时重新取。</summary>
     public void InvalidateThemeBrushes()

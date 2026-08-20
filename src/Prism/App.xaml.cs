@@ -350,8 +350,39 @@ public partial class App : Application
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Prism", "logs", "frontend.log");
 
-    /// <summary>写异常到日志文件。10MB 截断。绝不抛出——日志不能反过来杀进程。</summary>
-    private static void LogToFile(string msg)
+    /// <summary>
+    /// L 批次（FRESH-AUDIT-3-2026-08-20）：日志改投递到有界通道、由单一后台
+    /// 任务批量落盘——此前异常处理内同步 AppendAllText 在 UI 线程做 I/O，
+    /// 持续性异常（每帧抛）变成「UI 冻结 + 日志风暴」双重故障。
+    /// 有界 + DropWrite：风暴时丢弃最旧等价物（新行），内存不涨。
+    /// </summary>
+    private static readonly Lazy<System.Threading.Channels.Channel<string>> LogQueue = new(() =>
+    {
+        var channel = System.Threading.Channels.Channel.CreateBounded<string>(
+            new System.Threading.Channels.BoundedChannelOptions(512)
+            {
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropWrite,
+                SingleReader = true,
+            });
+        _ = Task.Run(async () =>
+        {
+            var batch = new System.Text.StringBuilder();
+            while (await channel.Reader.WaitToReadAsync().ConfigureAwait(false))
+            {
+                batch.Clear();
+                while (channel.Reader.TryRead(out var line))
+                {
+                    batch.Append(line).Append("\r\n");
+                    if (batch.Length > 256 * 1024) break; // 单批上限，防一次写盘过大
+                }
+                AppendBatchToDisk(batch.ToString());
+            }
+        });
+        return channel;
+    });
+
+    /// <summary>批量写盘（后台线程）。10MB 截断。绝不抛出。</summary>
+    private static void AppendBatchToDisk(string batch)
     {
         try
         {
@@ -360,9 +391,51 @@ public partial class App : Application
             var info = new FileInfo(path);
             if (info.Exists && info.Length > 10 * 1024 * 1024)
                 info.Delete();
+            File.AppendAllText(path, batch);
+        }
+        catch { /* 日志 I/O 失败不能影响进程 */ }
+    }
+
+    /// <summary>投递一行日志（时间戳在此打）。队满即丢弃。</summary>
+    private static void LogToFile(string msg)
+    {
+        _ = LogQueue.Value.Writer.TryWrite($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}");
+    }
+
+    /// <summary>同步直写（进程即将终结时的遗言，异步通道来不及冲刷）。</summary>
+    private static void LogToFileSync(string msg)
+    {
+        try
+        {
+            var path = LogFilePath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}\r\n");
         }
         catch { /* 日志 I/O 失败不能影响进程 */ }
+    }
+
+    /// <summary>
+    /// L 批次：异常预算——60 秒滚动窗口内 Dispatcher 异常超过 50 次即视为
+    /// 持续性风暴，继续 Handled=true 只会无限冻结 UI，放行默认处理（退出）
+    /// 反而更诚实。
+    /// </summary>
+    private static readonly object ExcessSync = new();
+    private static long _excessWindowStart;
+    private static int _excessCount;
+
+    private static bool ExceedsExceptionBudget()
+    {
+        lock (ExcessSync)
+        {
+            var now = Environment.TickCount64;
+            if (now - _excessWindowStart > 60_000)
+            {
+                _excessWindowStart = now;
+                _excessCount = 0;
+            }
+            _excessCount++;
+            return _excessCount > 50;
+        }
     }
 
     private static void LogException(string source, Exception ex)
@@ -374,7 +447,16 @@ public partial class App : Application
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
-        try { LogException("DispatcherUnhandledException", e.Exception); }
+        try
+        {
+            if (ExceedsExceptionBudget())
+            {
+                LogToFile($"DispatcherUnhandledException: 60s 内超过 50 次，放弃拦截（异常: {e.Exception.GetType().Name}）");
+                e.Handled = false;
+                return;
+            }
+            LogException("DispatcherUnhandledException", e.Exception);
+        }
         catch { /* 吞掉日志异常 */ }
         // 标记已处理：进程不退出，让用户至少有日志可查。
         e.Handled = true;
@@ -390,12 +472,13 @@ public partial class App : Application
     private static void OnDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)
     {
         // AppDomain 级异常无法阻止退出，但至少留一条遗言。
+        // L 批次：isTerminating 时异步通道来不及冲刷——同步直写。
         try
         {
             var msg = e.ExceptionObject is Exception ex
                 ? $"{ex.GetType().Name}: {ex.Message}\r\n{ex.StackTrace}"
                 : e.ExceptionObject?.ToString() ?? "unknown";
-            LogToFile($"AppDomain.UnhandledException (isTerminating={e.IsTerminating}): {msg}");
+            LogToFileSync($"AppDomain.UnhandledException (isTerminating={e.IsTerminating}): {msg}");
         }
         catch { /* 无法记日志就静默 */ }
     }

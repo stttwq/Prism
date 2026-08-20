@@ -386,6 +386,13 @@ pub(crate) struct MutationSnapshot {
     nodes_len: usize,
     names_len: usize,
     slots: Vec<(u32, NodeSlot)>,
+    /// L 批次（FRESH-AUDIT-3-2026-08-20）：回滚时一并还原的派生计数——
+    /// 否则回滚后计数与池/槽表状态失配（fingerprint 漂移致 sidecar 误判、
+    /// dead_name_bytes 虚高提前压缩、present_slots 偏差影响稀疏度防线）。
+    /// 回滚路径随后必被重建覆盖，影响有限，但修正只要多存三个数。
+    names_fingerprint: u64,
+    dead_name_bytes: usize,
+    present_slots: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -777,6 +784,9 @@ impl VolumeIndex {
             nodes_len: self.nodes.len(),
             names_len: self.names.len(),
             slots,
+            names_fingerprint: self.names_fingerprint,
+            dead_name_bytes: self.dead_name_bytes,
+            present_slots: self.present_slots,
         })
     }
 
@@ -786,6 +796,9 @@ impl VolumeIndex {
             self.nodes[record as usize] = slot;
         }
         self.names.truncate(snapshot.names_len);
+        self.names_fingerprint = snapshot.names_fingerprint;
+        self.dead_name_bytes = snapshot.dead_name_bytes;
+        self.present_slots = snapshot.present_slots;
     }
 
     fn ensure_slot(&mut self, record: u32) -> Result<(), VolumeError> {

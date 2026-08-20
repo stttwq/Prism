@@ -15,6 +15,9 @@ async fn main() {
     let apps: apps::SharedApps = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
     let engines = std::sync::Arc::new(std::sync::RwLock::new(cfg.web_engines));
     let history = std::sync::Arc::new(history::HistoryStore::load(&data_dir, cfg.history_enabled));
+    // L 批次（FRESH-AUDIT-3-2026-08-20）：250ms 定时冲刷节流脏数据，
+    // 把强杀场景的丢失窗口压回 ≤ 2× 节流间隔。
+    history.start_periodic_flush();
     let preferences = std::sync::Arc::new(ipc::BrokerPreferences::with_zip_program(
         cfg.pinyin_enabled,
         cfg.zip_program,

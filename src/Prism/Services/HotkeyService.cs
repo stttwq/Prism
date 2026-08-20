@@ -245,8 +245,11 @@ public sealed class HotkeyService : IDisposable
         if (vk == 0)
         {
             // 组合键无法解析（拼写错误/缺主键）——降级到双击 Ctrl，保证仍能呼出。
+            // L 批次（FRESH-AUDIT-3-2026-08-20）：降级分支补 StartHookRefresh——
+            // 钩子被系统摘除后没有 60s 兜底重装，降级路径会静默失效。
             _mode = HotkeyMode.DoubleCtrl;
             InstallLowLevelHook();
+            StartHookRefresh();
             return;
         }
 
@@ -266,6 +269,7 @@ public sealed class HotkeyService : IDisposable
             _msgWindow = null;
             _mode = HotkeyMode.DoubleCtrl;
             InstallLowLevelHook();
+            StartHookRefresh();
         }
     }
 

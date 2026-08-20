@@ -331,6 +331,29 @@ struct BrokerShared {
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
     windows: Arc<crate::window_list::WindowSnapshotStore>,
+    /// L 批次（FRESH-AUDIT-3-2026-08-20）：活跃连接数（照搬 indexer 的
+    /// try_admit_connection）。正常部署只有前端一条全生命期连接 + 少量
+    /// 世代/瞬时客户端，8 已宽裕；无上限时任凭本地进程堆积连接即可耗尽
+    /// 2 worker 的 runtime。
+    connections: AtomicUsize,
+}
+
+impl BrokerShared {
+    /// L 批次：并发连接上限 8。超出者在握手前直接关闭——不产生任务与行缓冲。
+    const MAX_CONNECTIONS: usize = 8;
+
+    fn try_admit_connection(&self) -> bool {
+        let current = self.connections.fetch_add(1, Ordering::AcqRel);
+        if current >= Self::MAX_CONNECTIONS {
+            self.connections.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn release_connection(&self) {
+        self.connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 当前进程用户 SID（字符串，如 S-1-5-21-...）。管道 ACL 需要，只取一次。
@@ -452,6 +475,7 @@ pub async fn serve(
         history,
         preferences,
         windows: Arc::new(crate::window_list::WindowSnapshotStore::new()),
+        connections: AtomicUsize::new(0),
     });
 
     let ownership = Arc::new(PipeOwnership::new());
@@ -533,6 +557,17 @@ async fn accept_loop(
         // 连接任务结束时由其减 1。
         server = rearm_listener(&pipe_name, &ownership).await?;
 
+        // L 批次：连接准入——超限在握手前直接断开，不产生任务。
+        if !shared.try_admit_connection() {
+            log(format!(
+                "broker 连接被拒：超过 {} 个并发连接",
+                BrokerShared::MAX_CONNECTIONS
+            ));
+            drop(connected);
+            ownership.instances.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
+
         let shared = shared.clone();
         let ownership = ownership.clone();
         tokio::spawn(async move {
@@ -543,6 +578,7 @@ async fn accept_loop(
                 history,
                 preferences,
                 windows,
+                ..
             } = &*shared;
             let result = handle_connection(
                 connected,
@@ -554,6 +590,7 @@ async fn accept_loop(
                 windows.clone(),
             )
             .await;
+            shared.release_connection();
             ownership.instances.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 log(format!("连接处理结束：{e}"));

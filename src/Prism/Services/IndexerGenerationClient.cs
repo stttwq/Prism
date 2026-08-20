@@ -166,19 +166,28 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
         // 让挂起读立即返回），异常交 RunAsync 的 1s 退避重连。
         var readTask = lineReader.ReadLineAsync(CancellationToken.None);
         var timeoutTask = Task.Delay(ReadTimeout, ct);
+        // 完成态才 Dispose（未完成任务的 Dispose 会抛异常）；读先完成时
+        // 提前释放计时器。
         string? line;
-        if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
+        try
         {
-            line = await readTask.ConfigureAwait(false);
+            if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
+            {
+                line = await readTask.ConfigureAwait(false);
+            }
+            else
+            {
+                // 先判取消（延迟任务因 ct 完成时走正常的取消路径，由 using 释放流），
+                // 否则按超时处理：销毁底层流让挂起的 ReadLineAsync 立即返回。
+                ct.ThrowIfCancellationRequested();
+                stream.Dispose();
+                throw new IOException(
+                    $"Indexer generation connection timed out after {Math.Round(ReadTimeout.TotalSeconds)}s");
+            }
         }
-        else
+        finally
         {
-            // 先判取消（延迟任务因 ct 完成时走正常的取消路径，由 using 释放流），
-            // 否则按超时处理：销毁底层流让挂起的 ReadLineAsync 立即返回。
-            ct.ThrowIfCancellationRequested();
-            stream.Dispose();
-            throw new IOException(
-                $"Indexer generation connection timed out after {Math.Round(ReadTimeout.TotalSeconds)}s");
+            if (timeoutTask.IsCompleted) timeoutTask.Dispose();
         }
 
         if (line is null)
