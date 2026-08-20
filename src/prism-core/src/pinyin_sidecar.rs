@@ -525,6 +525,9 @@ impl PinyinSidecar {
                 path_constructions: 0,
             };
         };
+        // P3（搜索报告2，2026-08-21）：2~3 个有效分词按 AND 多 term 匹配
+        //（每 term 独立过三策略+链）；否则整串单口径。循环外解析一次。
+        let multi_terms = crate::pinyin::split_query_terms(query);
         let exclusions = ExclusionMatcher::new(exclusion_paths);
         let mut root_filter = root.map(RootFilter::new);
         let mut heap = BinaryHeap::with_capacity(max);
@@ -550,9 +553,15 @@ impl PinyinSidecar {
             let Some(bytes) = self.disk.payload.get(start..end) else {
                 continue;
             };
-            if let Some(matched) =
-                match_compact_normalized(bytes, normalized.as_bytes(), &mut initials_scratch)
-            {
+            let matched = match &multi_terms {
+                Some(terms) => {
+                    crate::pinyin::match_compact_terms(bytes, terms, &mut initials_scratch)
+                }
+                None => {
+                    match_compact_normalized(bytes, normalized.as_bytes(), &mut initials_scratch)
+                }
+            };
+            if let Some(matched) = matched {
                 // matched_count 修正（FRESH-AUDIT-3-2026-08-20）：FLAG_PRESENT 检查
                 // 前移——sidecar 陈旧条目（索引侧已删、delta 未覆盖的重启窗口）
                 // 不得计入 matched_count，is_truncated 不再虚高。
@@ -585,9 +594,15 @@ impl PinyinSidecar {
             if !key_is_in_root(index, *key, root_filter.as_mut()) {
                 continue;
             }
-            if let Some(matched) =
-                match_compact_normalized(bytes, normalized.as_bytes(), &mut initials_scratch)
-            {
+            let matched = match &multi_terms {
+                Some(terms) => {
+                    crate::pinyin::match_compact_terms(bytes, terms, &mut initials_scratch)
+                }
+                None => {
+                    match_compact_normalized(bytes, normalized.as_bytes(), &mut initials_scratch)
+                }
+            };
+            if let Some(matched) = matched {
                 if !key_is_live_present(index, *key) {
                     continue;
                 }

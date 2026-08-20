@@ -264,6 +264,19 @@ pub fn normalize_query(query: &str) -> Option<String> {
 }
 
 pub fn match_name(name: &str, query: &str) -> Option<PinyinMatch> {
+    // P3（搜索报告2，2026-08-21）：2~3 个空白分词各自有效时按 AND 多 term
+    // 匹配（每 term 独立过三策略+链，全部命中才算数）；其余情况整串单口径。
+    if let Some(terms) = split_query_terms(query) {
+        let mut parts = Vec::with_capacity(terms.len());
+        for term in &terms {
+            parts.push(match_name_single(name, term)?);
+        }
+        return Some(combine_term_matches(parts));
+    }
+    match_name_single(name, query)
+}
+
+fn match_name_single(name: &str, query: &str) -> Option<PinyinMatch> {
     let query = normalize_query(query)?;
     let (tokens, has_han) = encode_tokens(name);
     if !has_han {
@@ -272,6 +285,75 @@ pub fn match_name(name: &str, query: &str) -> Option<PinyinMatch> {
     match_tokens(&tokens, query.as_bytes(), PinyinMatchKind::Full)
         .or_else(|| match_tokens(&tokens, query.as_bytes(), PinyinMatchKind::Initials))
         .or_else(|| match_tokens_mixed(&tokens, query.as_bytes()))
+}
+
+/// P3：把原始查询按空白切成 2~3 个**全部有效**（各自通过 normalize_query）
+/// 的拼音 term；返回 None 表示走整串单口径（单 term / 超限 / 含无效 term）。
+pub(crate) fn split_query_terms(query: &str) -> Option<Vec<String>> {
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    if !(2..=3).contains(&terms.len()) {
+        return None;
+    }
+    let mut normalized = Vec::with_capacity(terms.len());
+    for term in terms {
+        normalize_query(term)?;
+        normalized.push(term.to_owned());
+    }
+    Some(normalized)
+}
+
+/// P3：合并各 term 的命中——kind 取最优（Full>Initials）、class/position 取
+/// 最优、score 取最大；spans 拼接后按起点排序、重叠/相邻合并（对齐 S4
+/// 字面侧的 span 口径）。
+pub(crate) fn combine_term_matches(mut parts: Vec<PinyinMatch>) -> PinyinMatch {
+    if parts.len() == 1 {
+        return parts.pop().unwrap_or_else(|| PinyinMatch {
+            kind: PinyinMatchKind::Initials,
+            class: 2,
+            position: 0,
+            score: 0,
+            spans: Vec::new(),
+        });
+    }
+    let kind = parts
+        .iter()
+        .find(|part| part.kind == PinyinMatchKind::Full)
+        .map_or(PinyinMatchKind::Initials, |part| part.kind);
+    let class = parts.iter().map(|part| part.class).min().unwrap_or(2);
+    let position = parts.iter().map(|part| part.position).min().unwrap_or(0);
+    let score = parts.iter().map(|part| part.score).max().unwrap_or(0);
+    let mut ranges: Vec<(i32, i32)> = Vec::new();
+    for part in &parts {
+        let mut index = 0;
+        while index + 1 < part.spans.len() {
+            ranges.push((part.spans[index], part.spans[index + 1]));
+            index += 2;
+        }
+    }
+    ranges.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut spans: Vec<i32> = Vec::with_capacity(ranges.len() * 2);
+    for (start, len) in ranges {
+        if len <= 0 {
+            continue;
+        }
+        if spans.len() >= 2 && spans[spans.len() - 2] + spans[spans.len() - 1] >= start {
+            let last = spans.len() - 1;
+            let last_start = spans[last - 1];
+            let last_end = last_start + spans[last];
+            let end = (start + len).max(last_end);
+            spans[last] = end - last_start;
+        } else {
+            spans.push(start);
+            spans.push(len);
+        }
+    }
+    PinyinMatch {
+        kind,
+        class,
+        position,
+        score,
+        spans,
+    }
 }
 
 /// P1-2+P2（搜索报告2，2026-08-21）：紧凑编码 v2。
@@ -398,6 +480,21 @@ pub(crate) fn match_compact(bytes: &[u8], query: &str) -> Option<PinyinMatch> {
     let query = normalize_query(query)?;
     let mut scratch = Vec::new();
     match_compact_normalized(bytes, query.as_bytes(), &mut scratch)
+}
+
+/// P3：多 term 记录匹配（compact）——每 term 独立过全部策略，全部命中才
+/// 返回合并结果。terms 由 `split_query_terms` 预先校验（各 term 必有效）。
+pub(crate) fn match_compact_terms(
+    bytes: &[u8],
+    terms: &[String],
+    scratch: &mut Vec<u8>,
+) -> Option<PinyinMatch> {
+    let mut parts = Vec::with_capacity(terms.len());
+    for term in terms {
+        let normalized = normalize_query(term)?;
+        parts.push(match_compact_normalized(bytes, normalized.as_bytes(), scratch)?);
+    }
+    Some(combine_term_matches(parts))
 }
 
 /// `scratch` 是名字首字母 scratch（链匹配用），调用方在扫描循环外持有复用。
@@ -1161,6 +1258,30 @@ mod tests {
         assert!(lou.is_some(), "露=lòu 读法必须经多读音分支命中");
         let lu = match_name("露脸", "lulian");
         assert!(lu.is_some(), "第一读 lù 不回归");
+    }
+
+    /// P3（搜索报告2，2026-08-21）：拼音多 term（2~3 个空白分词 AND）。
+    /// 每 term 独立过策略，全部命中才算数；任一 term 落空整条不中。
+    #[test]
+    fn p3_multi_term_pinyin_and_semantics() {
+        // wx + bg：微信报告（w x + bao gao）两段都命中。
+        let hit = match_name("微信报告", "wx bg").unwrap();
+        assert_eq!(hit.spans, [0, 4], "两个 term 的 spans 合并覆盖全部四字");
+        // 任一 term 落空：微信报告没有 zz 段。
+        assert!(match_name("微信报告", "wx zz").is_none());
+        // term 顺序无关（AND 语义）：bg wx 同样命中。
+        assert!(match_name("微信报告", "bg wx").is_some());
+        // 单 term / 超限（4 term）回退整串单口径：4 term 归一后按整串匹配
+        //（"wx bg zz qq" 整串不可能命中微信报告）。
+        assert!(match_name("微信报告", "wx bg zz qq").is_none());
+        // 无效 term（单字母 w）不启用多 term：整串口径下 "w bg" 归一为
+        // "wbg" 不命中。
+        assert!(match_name("微信报告", "w bg").is_none());
+        // 混用策略在 term 内照常工作：xin（全拼）+ bg（首字母）。
+        assert!(match_name("微信报告", "xin bg").is_some());
+        // 三 term AND。
+        assert!(match_name("微信支付宝报告", "wx zfb bg").is_some());
+        assert!(match_name("微信支付宝报告", "wx zfb zz").is_none());
     }
 
     /// P2（搜索报告2，2026-08-21）：目录链首字母匹配。
