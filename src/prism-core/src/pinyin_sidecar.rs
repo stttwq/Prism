@@ -1215,14 +1215,15 @@ mod tests {
         assert_eq!(outcome.matched_count, 1);
     }
 
-    /// P2（搜索报告2，2026-08-21）：目录链语义**翻转**——「按目录名搜到该目录
-    /// 下的文件」现在是刻意能力（此前该测试断言 notes.txt 不被命中）。
-    /// 目录本体经名字策略命中（class 更优），子文件经链命中（class 2）排在后面。
+    /// P2（搜索报告2，2026-08-21）：目录链语义——「按目录名搜到该目录下的
+    /// **汉字名**后代」是刻意能力；纯 ASCII 名（notes.txt）不入拼音通道
+    ///（内存门，见 pinyin.rs kind=1 注释），由字面搜索覆盖。
     #[test]
-    fn p2_child_matches_through_parent_chain_but_ranks_lower() {
+    fn p2_han_child_matches_through_parent_chain_but_ranks_lower() {
         let mut index = state();
         index.volumes[0].upsert(20, 5, "微信目录", true).unwrap();
         index.volumes[0].upsert(21, 20, "notes.txt", false).unwrap();
+        index.volumes[0].upsert(22, 20, "笔记.txt", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
         let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx", 8);
         assert!(
@@ -1231,8 +1232,13 @@ mod tests {
             outcome.items
         );
         assert!(
-            outcome.items.iter().any(|item| item.name == "notes.txt"),
-            "链命中：微信目录(wxml) 下的 notes.txt 应可按 wx 搜到：{:?}",
+            outcome.items.iter().any(|item| item.name == "笔记.txt"),
+            "链命中：微信目录(wxml) 下的汉字名「笔记.txt」应可按 wx 搜到：{:?}",
+            outcome.items
+        );
+        assert!(
+            outcome.items.iter().all(|item| item.name != "notes.txt"),
+            "纯 ASCII 名不入拼音通道：{:?}",
             outcome.items
         );
         // 排序：目录（名字命中）在文件（链命中）之前。
@@ -1244,13 +1250,14 @@ mod tests {
         let file_pos = outcome
             .items
             .iter()
-            .position(|item| item.name == "notes.txt")
+            .position(|item| item.name == "笔记.txt")
             .unwrap();
         assert!(dir_pos < file_pos);
     }
 
     /// P2：中文目录树端到端——`下载\资料` 链 xzzl；查询可止于链内也可
-    /// 延伸到名字首字母前缀；纯 ASCII 名（report.pdf）只入 kind=1 记录体。
+    /// 延伸到名字首字母前缀。纯 ASCII 名（report.pdf）不入拼音通道
+    ///（真机实测内存门，见 pinyin.rs kind=1 注释）。
     #[test]
     fn p2_directory_tree_chain_end_to_end() {
         let mut volume = VolumeIndex::new(
@@ -1276,13 +1283,13 @@ mod tests {
         let sidecar = PinyinSidecar::build(&index).unwrap();
         let delta = PinyinDelta::new();
 
-        // xz：下载 目录本体（名字）+ 其下全部文件（链）。
+        // xz：下载 目录本体（名字）+ 汉字名后代（链）。ASCII 名不在通道。
         let xz = sidecar.search(&delta, &index, "xz", 8);
         let names: Vec<&str> = xz.items.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"下载"), "{names:?}");
         assert!(names.contains(&"资料"), "{names:?}");
         assert!(names.contains(&"资料.pdf"), "{names:?}");
-        assert!(names.contains(&"report.pdf"), "{names:?}");
+        assert!(!names.contains(&"report.pdf"), "纯 ASCII 名不入拼音通道");
         // 排序：目录「下载」名字命中最优，链命中的文件殿后。
         assert_eq!(xz.items[0].name, "下载");
 
@@ -1294,20 +1301,6 @@ mod tests {
             .find(|item| item.name == "资料.pdf")
             .expect("xzzlz 应命中 资料.pdf");
         assert_eq!(hit.match_spans, [0, 1]);
-        // report.pdf（kind=1）对纯名字查询不可命中（名字策略跳过），
-        // 但链延伸进 ASCII 名前缀可以：xzre。
-        let xzre = sidecar.search(&delta, &index, "xzre", 8);
-        assert!(
-            xzre.items.iter().any(|item| item.name == "report.pdf"),
-            "{:?}",
-            xzre.items
-        );
-        let port = sidecar.search(&delta, &index, "port", 8);
-        assert!(
-            port.items.iter().all(|item| item.name != "report.pdf"),
-            "kind=1 记录体不走名字策略：{:?}",
-            port.items
-        );
     }
 
     #[test]

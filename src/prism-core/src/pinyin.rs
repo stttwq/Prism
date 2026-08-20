@@ -1,7 +1,7 @@
 //! Versioned pinyin encoding and matching shared by broker and indexer.
 
 pub const PINYIN_DICTIONARY_VERSION: &str =
-    "pinyin-0.10.0/pinyin-data-0.13.0+prism-phrases-v2+heteronym";
+    "pinyin-0.10.0/pinyin-data-0.13.0+prism-phrases-v2b+heteronym";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinyinMatchKind {
@@ -359,10 +359,10 @@ pub(crate) fn combine_term_matches(mut parts: Vec<PinyinMatch>) -> PinyinMatch {
 /// P1-2+P2（搜索报告2，2026-08-21）：紧凑编码 v2。
 /// 记录布局：`chain_len u16le | chain 首字母字节 | kind u8 | body`。
 /// kind=0（汉字名）：token 流，token = `total_len u8 | utf16_start u16le |
-/// utf16_len u16le | rcount u8 | (r_len u8, r)*`（P1-2 多读音）；
-/// kind=1（纯 ASCII 名 + 非空链）：名字小写 ASCII 字节（1B/字符）——此类
-/// 记录只服务链匹配（名字本身字面搜索已覆盖，全 token 化只会让
-/// node_modules 类目录撑爆 sidecar）。
+/// utf16_len u16le | rcount u8 | (r_len u8, r)*`（P1-2 多读音）。
+/// kind=1 保留值（曾用于「纯 ASCII 名 + 链」记录体——真机实测 2.4M 记录
+/// 把 sidecar 撑到 98MB、索引进程击穿 100MB 内存门，已停用；解析端保留
+/// 分支以稳妥读取历史产物）。纯 ASCII 名回到字面搜索通道。
 /// chain = 祖先目录名的首字母串（root→parent，仅目录）。
 /// sidecar 的 SCHEMA_VERSION 与文件名随本格式一并 bump（v1 文件按 Missing 重建）。
 pub(crate) fn encode_compact(name: &str) -> Option<Vec<u8>> {
@@ -371,24 +371,15 @@ pub(crate) fn encode_compact(name: &str) -> Option<Vec<u8>> {
 
 pub(crate) fn encode_compact_with_chain(name: &str, chain: &[u8]) -> Option<Vec<u8>> {
     let (tokens, has_han) = encode_tokens(name);
-    if !has_han && chain.is_empty() {
-        // 纯 ASCII 名 + 无中文祖先：拼音通道无关（字面搜索覆盖）。
+    if !has_han {
+        // 纯 ASCII 名：字面搜索已覆盖（见上方 kind=1 注释——曾试过带链收录，
+        // 内存代价比场景价值高一个量级）。
         return None;
     }
     let mut bytes = Vec::new();
     let chain_len = u16::try_from(chain.len()).ok()?;
     bytes.extend_from_slice(&chain_len.to_le_bytes());
     bytes.extend_from_slice(chain);
-    if !has_han {
-        // kind=1：纯 ASCII 名（链非空）——只存名字 ASCII 字节。
-        bytes.push(1);
-        for ch in name.chars() {
-            if ch.is_ascii_alphanumeric() {
-                bytes.push(ch.to_ascii_lowercase() as u8);
-            }
-        }
-        return Some(bytes);
-    }
     bytes.push(0);
     for token in tokens {
         // total_len = utf16 字段(4) + rcount(1) + Σ(1+r_len)
@@ -1300,15 +1291,10 @@ mod tests {
         let spill = match_compact_normalized(&encoded, b"xzzlz", &mut scratch).unwrap();
         assert_eq!(spill.class, 2);
         assert_eq!(spill.spans, [0, 1], "资 是 BMP 字符，UTF-16 [0,1)");
-        // 纯 ASCII 名 + 链：kind=1 记录体（report.pdf 只存名字 ASCII 字节）。
-        let ascii = encode_compact_with_chain("report.pdf", b"xz").unwrap();
-        let ascii_hit = match_compact_normalized(&ascii, b"xzre", &mut scratch).unwrap();
-        assert_eq!(ascii_hit.class, 2);
         // 链不连续/不匹配：qq 与链与名字首字母都对不上。
         assert!(match_compact_normalized(&encoded, b"qq", &mut scratch).is_none());
-        // 起点必须在链内：zl（纯名字首字母）对 kind=0 走名字策略（首字母），
-        // 但对 ASCII 记录体（kind=1）名字策略不存在，链也不含 → 不命中。
-        let ascii_none = encode_compact_with_chain("report.pdf", b"xz").unwrap();
-        assert!(match_compact_normalized(&ascii_none, b"port", &mut scratch).is_none());
+        // 纯 ASCII 名不再入拼音通道（真机实测带链收录会把 sidecar 撑爆内存门，
+        // 见 encode_compact_with_chain 注释）——字面搜索覆盖。
+        assert!(encode_compact_with_chain("report.pdf", b"xz").is_none());
     }
 }
