@@ -2232,10 +2232,14 @@ fn sort_search_results(items: &mut Vec<SearchResult>) {
     sort_search_results_with_picks(items, None);
 }
 
-/// `picks` 与 items 对齐：true = 该项被当前（规范化）查询串选中过，在
-/// kind 层级内、class 之前排最前（查询记忆置顶）。标志只活在 broker 排序里，
-/// 不进 MatchMetadata、不进序列化。kind 仍最先比较：拼音命中的 picked 项
-/// 不能越过字面命中的未 picked 项。
+/// `picks` 与 items 对齐：true = 该项被当前（规范化）查询串选中过，排在所有
+/// 匹配质量键之前（查询记忆置顶）。标志只活在 broker 排序里，不进
+/// MatchMetadata、不进序列化。
+/// S1（PRISM-IMPL-PLAN-4-2026-08-20）：原实现 kind 单独提前 + picks 在 kind 内
+/// ——现在 metadata_kind 键删除，picks 直接在 is_none 垫底判定之后、
+/// MatchMetadata::cmp（class→kind→…）之前。pick 权重变强：picked 项跨 class
+/// 跨 kind 置顶（「上次在同样输入下选的就是它」强于任何匹配质量信号），
+/// picked 内部仍按匹配质量排序。
 ///
 /// 审计 P4：重建用 `Option::take` 按序取出，零 String clone、无环特例
 /// （替代旧实现的全量 clone 重建）。
@@ -2247,10 +2251,11 @@ fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&
     indices.sort_by(|&a, &b| {
         // FRESH-AUDIT-2 G1: 无元数据项（注入候选等）不参与 kind 竞争——
         // Option 的 None < Some 会把它们排到最前，反超真实命中，改为垫底。
+        // S1（PRISM-IMPL-PLAN-4-2026-08-20）：删除单独提前的 metadata_kind 比较
+        // 键，kind 交由 MatchMetadata::cmp 在 class 之后裁决（新契约见 hierarchy）。
         metadata_kind(&items[a])
             .is_none()
             .cmp(&metadata_kind(&items[b]).is_none())
-            .then_with(|| metadata_kind(&items[a]).cmp(&metadata_kind(&items[b])))
             .then_with(|| match picks {
                 Some(picks) => picks[b].cmp(&picks[a]),
                 None => std::cmp::Ordering::Equal,
@@ -3267,6 +3272,9 @@ mod protocol_tests {
         let _ = std::fs::remove_dir_all(history_dir);
     }
 
+    /// S1（PRISM-IMPL-PLAN-4-2026-08-20）新契约：class 跨 kind——class 0 的拼音
+    /// 命中先于 class 2 的字面命中；同 class 0 内 kind 锁死（全拼<首字母）、
+    /// 桶内 history 决胜。
     #[test]
     fn cross_type_ranking_preserves_match_tiers_and_same_tier_history() {
         let result = |kind, title: &str, metadata| SearchResult {
@@ -3310,14 +3318,15 @@ mod protocol_tests {
         items.sort_by(compare_search_results);
         assert_eq!(
             items.iter().map(|item| &*item.title).collect::<Vec<_>>(),
-            ["literal", "full-history", "full-no-history", "initials"]
+            ["full-history", "full-no-history", "initials", "literal"]
         );
     }
 
-    /// 查询记忆置顶：picked 项在同 kind 内排最前（越过 class），但不能越过
-    /// kind 层级（字面命中的未 picked 项仍先于拼音命中的 picked 项）。
+    /// 查询记忆置顶（S1 后新契约）：picked 项跨 class/kind 置顶——「上次在同样
+    /// 输入下选的就是它」强于任何匹配质量信号；picked 内部仍按匹配质量
+    ///（class→kind→…）排序。
     #[test]
-    fn query_pick_promotes_within_kind_but_not_across() {
+    fn query_pick_promotes_above_match_quality_but_orders_within() {
         let item = |kind: MatchKind, title: &str, class: u8| SearchResult {
             kind: SearchResultKind::File,
             title: title.into(),
@@ -3356,10 +3365,12 @@ mod protocol_tests {
         ];
         let picks = vec![false, true, true];
         sort_search_results_with_picks(&mut items, Some(&picks));
+        // picked 的两个字面/拼音项（class 2/0）都越过未 picked 的 class 0 精确命中；
+        // picked 内部 class 0 的拼音项先于 class 2 的字面项。
         assert_eq!(
             items.iter().map(|entry| &*entry.title).collect::<Vec<_>>(),
-            ["picked", "plain", "pinyin"],
-            "picked literal ranks first; picked pinyin must not cross the kind tier"
+            ["pinyin", "picked", "plain"],
+            "picked items promote above match quality; within picks, class decides"
         );
     }
 
@@ -3387,9 +3398,11 @@ mod protocol_tests {
             item(MatchKind::Literal, "exact", 0),
         ];
         sort_search_results(&mut items);
+        // S1（PRISM-IMPL-PLAN-4-2026-08-20）：class 先于 kind——class 0 内字面
+        //（exact）先于拼音（pinyin），class 2（substring）垫底。
         assert_eq!(
             items.iter().map(|entry| &*entry.title).collect::<Vec<_>>(),
-            ["exact", "substring", "pinyin"]
+            ["exact", "pinyin", "substring"]
         );
     }
 

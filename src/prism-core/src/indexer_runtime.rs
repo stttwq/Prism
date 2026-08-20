@@ -55,6 +55,10 @@ struct DeferredVolumeRebuild {
 /// 重建后卷已稳定运行，新错误按首次处理。
 const VOLUME_REBUILD_QUIET: Duration = Duration::from_secs(3600);
 
+/// M3（FRESH-AUDIT-3-2026-08-20）：拼音重建退避间隔。重建失败反复置位
+/// needs_rebuild 的风暴期，不再每 5s tick 一轮全量重建。
+const PINYIN_REBUILD_BACKOFF: Duration = Duration::from_secs(60);
+
 /// H1（FRESH-AUDIT-3-2026-08-20）：积压合并——按卷去重保留最新一条。
 /// 全量请求（Full）覆盖一切单卷请求；同卷多条单卷请求保留最后一条
 ///（watcher 死因以最新为准）。输出按各卷首次出现顺序排列。
@@ -862,7 +866,13 @@ impl ServiceState {
         let literal_count = outcome.matched_count;
         let mut matched_count = literal_count;
         let mut path_constructions = outcome.path_constructions;
-        if pinyin_enabled && literal_count < max as u64 {
+        // S2（PRISM-IMPL-PLAN-4-2026-08-20）：拼音门无条件化。旧条件
+        // `literal_count < max` 的语义是「字面结果没填满才补拼音」——短拼音查询
+        //（首字母天然 2-4 字母）字面噪声必远超 max，拼音扫描被整段跳过，
+        // `dy` 永远搜不到「抖音」。配额放开为完整 max，拼音候选以全量参与下方
+        // 合并排序（S1：class 优先），随后 truncate(max) 保证最终条数不变。
+        // 中文/单字母查询成本零变化（normalize_query 在 sidecar 内短路）。
+        if pinyin_enabled {
             // G4（FRESH-AUDIT-2）：clone Arc 快照后立刻放 pinyin 读锁——拼音全表扫
             // 不再占住 pinyin.read()，USN 的 delta 写入不必等一次长扫描。
             let snapshot = self
@@ -875,7 +885,7 @@ impl ServiceState {
                     let pinyin = sidecar.search_in_root(
                         state,
                         query,
-                        max.saturating_sub(items.len()),
+                        max,
                         &exclusions,
                         root_bound,
                         &query_filters,
@@ -1002,6 +1012,8 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     // M1（FRESH-AUDIT-3-2026-08-20）：单卷重建退避 + 失败延迟重试的簿记。
     let mut volume_backoff: Vec<VolumeRebuildBackoff> = Vec::new();
     let mut deferred_rebuilds: Vec<DeferredVolumeRebuild> = Vec::new();
+    // M3（FRESH-AUDIT-3-2026-08-20）：拼音重建退避——None 表示启动后首轮立即可做。
+    let mut last_pinyin_rebuild: Option<Instant> = None;
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     'run: loop {
         tokio::select! {
@@ -1209,9 +1221,16 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                         }
                     }
                 }
-                if state.pinyin_needs_rebuild.swap(false, Ordering::AcqRel)
+                if state.pinyin_needs_rebuild.load(Ordering::Acquire)
                     && state.pinyin_status() != PinyinStatus::Disabled
+                    && last_pinyin_rebuild
+                        .is_none_or(|at| at.elapsed() >= PINYIN_REBUILD_BACKOFF)
                 {
+                    // M3（FRESH-AUDIT-3-2026-08-20）：重建退避——风暴期（重建失败
+                    // 反复置位 needs_rebuild）不再每 5s 一轮全量重建（整索引 clone +
+                    // 全节点编码 + fsync），60s 一拍兜底。窗口内保持标志，到点重试。
+                    state.pinyin_needs_rebuild.store(false, Ordering::Release);
+                    last_pinyin_rebuild = Some(Instant::now());
                     // H1: compete pinyin rebuild against shutdown.
                     let pinyin_task = rebuild_pinyin_from_live(state.clone());
                     tokio::pin!(pinyin_task);
@@ -2598,6 +2617,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2（PRISM-IMPL-PLAN-4-2026-08-20）：字面命中数远超 max 时拼音扫描仍执行，
+    /// 且经 S1 排序后「抖音」（Initials，class 0）排最前——`dy` 场景的索引器侧
+    /// 端到端锚点。旧实现里 `literal_count < max` 为假，拼音 sidecar 一次都不扫。
+    #[test]
+    fn s2_pinyin_scans_and_ranks_past_literal_noise() {
+        let state = ServiceState::new();
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "v".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "抖音", true).unwrap();
+        for record in 11..51u32 {
+            volume
+                .upsert(u64::from(record), 5, &format!("body-{record:03}.css"), false)
+                .unwrap();
+        }
+        state.publish(IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        });
+        let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
+        *state.pinyin.write().unwrap() = Some(Arc::new(PinyinSidecar::build(&snapshot).unwrap()));
+
+        let response = state.search("dy", 8, None, None).unwrap();
+        let IndexerResponse::Results { items, .. } = response else {
+            panic!("expected results");
+        };
+        assert!(items.len() <= 8, "truncate(max) 保证最终条数不变");
+        assert!(
+            items.iter().any(|item| item.name == "抖音"),
+            "拼音命中必须在字面噪声填满配额后仍出现"
+        );
+        assert_eq!(items[0].name, "抖音", "class 0 拼音命中必须排最前");
+        assert!(
+            items.iter().any(|item| item.name.contains("body")),
+            "字面命中仍在结果里"
+        );
+    }
+
+    /// S2 回归锚：`literal_count < max` 的旧行为（字面稀少时拼音补位）不受影响。
+    #[test]
+    fn s2_pinyin_still_fills_sparse_literal_results() {
+        let state = ServiceState::new();
+        state.publish(IndexState {
+            volumes: vec![test_volume("v1", "C:\\", "微信")],
+            generation: 1,
+            events_since_checkpoint: 0,
+        });
+        let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
+        *state.pinyin.write().unwrap() = Some(Arc::new(PinyinSidecar::build(&snapshot).unwrap()));
+
+        let response = state.search("wx", 8, None, None).unwrap();
+        assert!(matches!(&response, IndexerResponse::Results { items, .. } if items.len() == 1));
     }
 
     fn volume_with_id(tag: &str, mount: &str, name: &str, id: VolumeId) -> VolumeIndex {

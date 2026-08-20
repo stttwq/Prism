@@ -23,6 +23,10 @@ const MAGIC: [u8; 8] = *b"PRPYG2\0\0";
 const SCHEMA_VERSION: u32 = 1;
 const FILE_NAME: &str = "pinyin-v1.bin";
 const MAX_DELTA_RECORDS: usize = 4096;
+/// M3（FRESH-AUDIT-3-2026-08-20）：delta 总条数硬上限。纯英文条目不触发重建
+///（不占重建阈值），但它们仍要留在 delta 里掩蔽陈旧编码，总量必须封顶兜底内存
+///（约 32k 条 × BTreeMap 节点 ≈ 数 MB），到达即重建冲刷。
+const MAX_DELTA_TOTAL_RECORDS: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct RecordKey {
@@ -56,6 +60,11 @@ struct SidecarDisk {
 pub struct PinyinSidecar {
     disk: SidecarDisk,
     delta: BTreeMap<RecordKey, Option<Vec<u8>>>,
+    /// M3（FRESH-AUDIT-3-2026-08-20）：含汉字编码的 delta 条数。纯英文名变更
+    /// （npm install / Windows Update 风暴）不计入重建阈值，杜绝"每 4096 条
+    /// 英文变更触发一次全量重建"的周期性整索引 clone + 全节点编码 + fsync。
+    /// 纯内存字段，不参与序列化（SidecarDisk 字节格式不变）。
+    chinese_delta_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +242,7 @@ impl PinyinSidecar {
         Ok(Self {
             disk,
             delta: BTreeMap::new(),
+            chinese_delta_count: 0,
         })
     }
 
@@ -279,6 +289,7 @@ impl PinyinSidecar {
         Ok(Self {
             disk,
             delta: BTreeMap::new(),
+            chinese_delta_count: 0,
         })
     }
 
@@ -329,12 +340,30 @@ impl PinyinSidecar {
     ) -> Result<bool, String> {
         let volume = u16::try_from(volume).map_err(|_| "pinyin volume exceeds u16")?;
         let key = RecordKey { volume, record };
-        if !self.delta.contains_key(&key) && self.delta.len() >= MAX_DELTA_RECORDS {
-            return Ok(true);
-        }
         let value = name.and_then(encode_compact);
+        let counts_chinese = value.is_some();
+        if let Some(existing) = self.delta.get(&key) {
+            // 覆盖既有条目：按旧新取值增减汉字计数（中文→英文 rename 释放容量）。
+            let counted_before = existing.is_some();
+            self.chinese_delta_count = self
+                .chinese_delta_count
+                .saturating_add(usize::from(counts_chinese))
+                .saturating_sub(usize::from(counted_before));
+        } else {
+            // M3（FRESH-AUDIT-3-2026-08-20）：重建阈值只看含汉字编码的条数——
+            // 纯英文名变更（encode_compact=None）不再触发周期性全量重建；
+            // 总条数硬上限兜底内存（纯英文条目也要留下掩蔽陈旧编码）。
+            if counts_chinese && self.chinese_delta_count >= MAX_DELTA_RECORDS {
+                return Ok(true);
+            }
+            if self.delta.len() >= MAX_DELTA_TOTAL_RECORDS {
+                return Ok(true);
+            }
+            self.chinese_delta_count += usize::from(counts_chinese);
+        }
         self.delta.insert(key, value);
-        Ok(self.delta.len() >= MAX_DELTA_RECORDS)
+        Ok(self.chinese_delta_count >= MAX_DELTA_RECORDS
+            || self.delta.len() >= MAX_DELTA_TOTAL_RECORDS)
     }
 
     pub fn search(&self, index: &IndexState, query: &str, max: usize) -> PinyinSearchOutcome {
@@ -401,6 +430,12 @@ impl PinyinSidecar {
                 continue;
             };
             if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
+                // matched_count 修正（FRESH-AUDIT-3-2026-08-20）：FLAG_PRESENT 检查
+                // 前移——sidecar 陈旧条目（索引侧已删、delta 未覆盖的重启窗口）
+                // 不得计入 matched_count，is_truncated 不再虚高。
+                if !key_is_live_present(index, record.key) {
+                    continue;
+                }
                 if key_is_literal(index, record.key, &query_lower) {
                     continue;
                 }
@@ -428,6 +463,9 @@ impl PinyinSidecar {
                 continue;
             }
             if let Some(matched) = match_compact_normalized(bytes, normalized.as_bytes()) {
+                if !key_is_live_present(index, *key) {
+                    continue;
+                }
                 if key_is_literal(index, *key, &query_lower) {
                     continue;
                 }
@@ -474,6 +512,16 @@ fn key_is_literal(index: &IndexState, key: RecordKey, query_lower: &str) -> bool
         .is_some_and(|name| {
             crate::hierarchy::find_case_insensitive(name, query_lower).is_some()
         })
+}
+
+/// matched_count 修正（FRESH-AUDIT-3-2026-08-20）：候选在 live 索引里必须仍然
+/// 存在（FLAG_PRESENT）。与 push_candidate 的拒绝口径对齐，已删记录不再计入。
+fn key_is_live_present(index: &IndexState, key: RecordKey) -> bool {
+    index
+        .volumes
+        .get(key.volume as usize)
+        .and_then(|volume| volume.nodes.get(key.record as usize))
+        .is_some_and(|slot| slot.flags & FLAG_PRESENT != 0)
 }
 
 #[derive(Debug, Eq)]
@@ -1024,5 +1072,62 @@ mod tests {
             .apply_delta(0, MAX_DELTA_RECORDS as u32, Some("微信"))
             .unwrap());
         assert_eq!(sidecar.delta.len(), MAX_DELTA_RECORDS);
+    }
+
+    /// M3（FRESH-AUDIT-3-2026-08-20）：纯英文名风暴（npm install / Windows
+    /// Update 类）不触发重建——重建阈值只看含汉字编码的条数。
+    #[test]
+    fn m3_english_name_storm_does_not_trigger_rebuild() {
+        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
+        for record in 0..(MAX_DELTA_RECORDS as u32 * 2) {
+            let rebuild = sidecar.apply_delta(0, record, Some("body-styles.css")).unwrap();
+            assert!(!rebuild, "纯英文名变更不得触发全量重建");
+        }
+        assert_eq!(sidecar.chinese_delta_count, 0);
+    }
+
+    /// M3：中文→英文 rename 后计数回落，释放的容量可继续容纳新的中文条目。
+    #[test]
+    fn m3_chinese_to_english_rename_releases_quota() {
+        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
+        sidecar.apply_delta(0, 10, Some("微信")).unwrap();
+        assert_eq!(sidecar.chinese_delta_count, 1);
+        sidecar.apply_delta(0, 10, Some("english-name")).unwrap();
+        assert_eq!(sidecar.chinese_delta_count, 0, "中文→英文 rename 计数回落");
+        // 释放后不再触发（0 < 阈值），即使 delta 条目本身还在。
+        assert!(!sidecar.apply_delta(0, 11, Some("支付宝")).unwrap());
+    }
+
+    /// M3：delta 总条数硬上限兜底内存——纯英文条目也要留下掩蔽陈旧编码，
+    /// 但总量到 32k 即触发重建冲刷。
+    #[test]
+    fn m3_delta_total_entries_have_a_hard_cap() {
+        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
+        let mut crossed = false;
+        for record in 0..MAX_DELTA_TOTAL_RECORDS as u32 {
+            if sidecar.apply_delta(0, record, Some("english")).unwrap() {
+                crossed = true;
+            }
+        }
+        assert!(crossed, "总条数到达硬上限必须触发重建");
+        assert!(sidecar
+            .apply_delta(0, MAX_DELTA_TOTAL_RECORDS as u32 + 7, Some("more"))
+            .unwrap());
+    }
+
+    /// matched_count 修正（FRESH-AUDIT-3-2026-08-20）：sidecar 陈旧条目
+    ///（索引侧已删、delta 未覆盖——重启后 delta 为空的窗口）不得计入
+    /// matched_count，is_truncated 不虚高；items 亦不出现（FLAG_PRESENT）。
+    #[test]
+    fn matched_count_skips_stale_deleted_records() {
+        let mut index = state();
+        let sidecar = PinyinSidecar::build(&index).unwrap();
+        index.volumes[0].delete(10).unwrap();
+        let outcome = sidecar.search(&index, "wx", 8);
+        assert!(outcome.items.is_empty());
+        assert_eq!(
+            outcome.matched_count, 0,
+            "已删记录不得计入 matched_count"
+        );
     }
 }

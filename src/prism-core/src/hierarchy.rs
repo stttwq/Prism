@@ -181,9 +181,14 @@ fn usage_tier(score: u32) -> u8 {
 
 impl Ord for MatchMetadata {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.kind
-            .cmp(&other.kind)
-            .then(self.class.cmp(&other.class))
+        // S1（PRISM-IMPL-PLAN-4-2026-08-20）：class 提到 kind 之前——「整名精确/
+        // 前缀」这个更强的匹配信号不再被「碰巧含子串」压制。kind 优先时 `dy`
+        // 的字面噪声（Kennedy.docx，class 2）无条件压过「抖音」（Initials，
+        // class 0），拼音命中再被 Top-8 截断。同 class 内 kind 仍锁死：
+        // 字面 > 全拼 > 首字母。
+        self.class
+            .cmp(&other.class)
+            .then(self.kind.cmp(&other.kind))
             .then(usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
             .then(self.position.cmp(&other.position))
             .then(other.history_score.cmp(&self.history_score))
@@ -2125,7 +2130,10 @@ mod tests {
         let literal_contains = rank(MatchKind::Literal, 2, 9, 0);
         let full_exact_with_history = rank(MatchKind::FullPinyin, 0, 0, u32::MAX);
         let initials_exact_with_history = rank(MatchKind::Initials, 0, 0, u32::MAX);
-        assert!(literal_contains < full_exact_with_history);
+        // S1（PRISM-IMPL-PLAN-4-2026-08-20）新契约：class 跨 kind——整名精确的
+        // 拼音命中（class 0）压过字面子串噪声（class 2）；同 class 内 kind 锁死
+        //（全拼先于首字母）。
+        assert!(full_exact_with_history < literal_contains);
         assert!(full_exact_with_history < initials_exact_with_history);
 
         let prefix_without_history = rank(MatchKind::Literal, 1, 0, 0);
@@ -2135,6 +2143,36 @@ mod tests {
         let same_tier_without_history = rank(MatchKind::FullPinyin, 1, 0, 0);
         let same_tier_with_history = rank(MatchKind::FullPinyin, 1, 0, 20);
         assert!(same_tier_with_history < same_tier_without_history);
+    }
+
+    /// S1（PRISM-IMPL-PLAN-4-2026-08-20）：`dy` 场景的排序层锚点——「抖音」
+    /// （Initials，class 0）必须排在「Kennedy.docx」（Literal，class 2）之前；
+    /// 同 class 决胜回到 kind：dy.txt（Literal，class 0）仍先于抖音。
+    #[test]
+    fn s1_strong_pinyin_class_beats_weak_literal_class() {
+        let douyin = MatchMetadata {
+            kind: MatchKind::Initials,
+            class: 0,
+            position: 0,
+            score: 2,
+            history_score: 0,
+        };
+        let kennedy = MatchMetadata {
+            kind: MatchKind::Literal,
+            class: 2,
+            position: 5,
+            score: 11,
+            history_score: 0,
+        };
+        assert!(douyin < kennedy, "class 0 拼音命中必须压过 class 2 字面噪声");
+        let dy_txt = MatchMetadata {
+            kind: MatchKind::Literal,
+            class: 0,
+            position: 0,
+            score: 6,
+            history_score: 0,
+        };
+        assert!(dy_txt < douyin, "同 class 内 kind 仍锁死：字面先于首字母");
     }
 
     #[test]
@@ -2152,8 +2190,9 @@ mod tests {
         assert!(rank(MatchKind::Literal, 2, 0, 3) < rank(MatchKind::Literal, 2, 5, 3));
         // 桶不越过 class：前缀匹配无历史仍先于子串匹配满桶。
         assert!(rank(MatchKind::Literal, 1, 9, u32::MAX) < rank(MatchKind::Literal, 2, 0, 0));
-        // 桶不越过 kind：字面匹配无历史仍先于拼音匹配满桶。
-        assert!(rank(MatchKind::Literal, 2, 9, u32::MAX) < rank(MatchKind::FullPinyin, 0, 0, 0));
+        // S1：桶不越过 kind 收窄到同 class 内（class 2 的字面无历史仍先于
+        // class 2 的拼音满桶）；跨 class 由 class 决胜（见 s1 测试）。
+        assert!(rank(MatchKind::Literal, 2, 9, u32::MAX) < rank(MatchKind::FullPinyin, 2, 0, 0));
     }
 
     /// C:\project\{sub\deep.txt, near.txt} plus C:\other\deep.txt, and D:\project\deep.txt.
