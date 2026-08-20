@@ -152,6 +152,17 @@ pub enum Request {
         #[serde(default)]
         query: Option<String>,
     },
+    /// 别名系统（2026-08-21 设想）：整体替换目标的词表（空词表 = 解绑）。
+    AliasSet {
+        target: ActionTarget,
+        words: Vec<String>,
+    },
+    /// 解绑目标（幂等）。
+    AliasDelete {
+        target: ActionTarget,
+    },
+    /// 设置页列表。
+    AliasList,
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -241,6 +252,10 @@ pub enum Response {
         title: String,
         is_minimized: bool,
     },
+    /// 别名系统：设置页列表（绑定时间倒序）。
+    AliasItems { items: Vec<AliasItemDto> },
+    /// 别名设置/解绑回执：`Ok` 空串表示成功，否则为用户可读错误。
+    AliasApplied { message: String },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
@@ -316,6 +331,14 @@ pub struct ActionArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_name: Option<String>,
 }
+
+/// 别名系统：设置页列表项。
+#[derive(Debug, Clone, Serialize)]
+pub struct AliasItemDto {
+    pub target: ActionTarget,
+    pub words: Vec<String>,
+    pub bound_at_utc: u64,
+}
 /// 并发 armed 的管道 listener 数（对齐 indexer 侧 `indexer_runtime::PIPE_LISTENERS`）。
 /// 单 listener 在 `connect()` 返回到下一次 `create()` 之间存在不可避免的空窗，
 /// 空窗内到达的客户端拿到 ERROR_PIPE_BUSY；多个 listener 互为备份。前端即将引入
@@ -331,6 +354,8 @@ struct BrokerShared {
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
     windows: Arc<crate::window_list::WindowSnapshotStore>,
+    /// 别名系统（2026-08-21 设想）：broker 拥有（用户数据，同 history）。
+    aliases: Arc<crate::alias::AliasStore>,
     /// L 批次（FRESH-AUDIT-3-2026-08-20）：活跃连接数（照搬 indexer 的
     /// try_admit_connection）。正常部署只有前端一条全生命期连接 + 少量
     /// 世代/瞬时客户端，8 已宽裕；无上限时任凭本地进程堆积连接即可耗尽
@@ -461,6 +486,7 @@ pub async fn serve(
     shell: Arc<ShellExecutor>,
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
+    aliases: Arc<crate::alias::AliasStore>,
 ) -> std::io::Result<()> {
     // 首个实例带 first_pipe_instance(true)：创建失败说明管道名已被另一个 broker
     // 持有（真双实例），唯一正确动作是退出并让 main 上报。
@@ -475,6 +501,7 @@ pub async fn serve(
         history,
         preferences,
         windows: Arc::new(crate::window_list::WindowSnapshotStore::new()),
+        aliases,
         connections: AtomicUsize::new(0),
     });
 
@@ -578,6 +605,7 @@ async fn accept_loop(
                 history,
                 preferences,
                 windows,
+                aliases,
                 ..
             } = &*shared;
             let result = handle_connection(
@@ -588,6 +616,7 @@ async fn accept_loop(
                 history.clone(),
                 preferences.clone(),
                 windows.clone(),
+                aliases.clone(),
             )
             .await;
             shared.release_connection();
@@ -751,6 +780,8 @@ async fn read_handshake_line<R: tokio::io::AsyncRead + Unpin>(
 /// `ordered_writer` 按请求序号严格保序写出**——协议无请求 id、前端按行配对，
 /// 保序是硬前提。EOF 后读循环等 writer 排干在途响应（search 内部自有超时，
 /// 有界），客户端断开时写失败即静默丢弃残余。
+/// 写失败（客户端已断）静默返回，残余丢弃。
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     pipe: NamedPipeServer,
     apps: SharedApps,
@@ -759,6 +790,7 @@ async fn handle_connection(
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
     windows: Arc<crate::window_list::WindowSnapshotStore>,
+    aliases: Arc<crate::alias::AliasStore>,
 ) -> std::io::Result<()> {
     log("前端已连接");
     let (reader, writer) = tokio::io::split(pipe);
@@ -834,6 +866,7 @@ async fn handle_connection(
                 let history = history.clone();
                 let preferences = preferences.clone();
                 let windows = windows.clone();
+                let aliases = aliases.clone();
                 tokio::spawn(async move {
                     let response = search_service(
                         SearchArgs {
@@ -848,6 +881,7 @@ async fn handle_connection(
                         &history,
                         &preferences,
                         &windows,
+                        &aliases,
                     )
                     .await;
                     let _ = tx.send((seq, response));
@@ -856,7 +890,7 @@ async fn handle_connection(
             }
             Ok(req) => {
                 let response =
-                    dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows)
+                    dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows, &aliases)
                         .await;
                 let _ = tx.send((seq, response));
             }
@@ -921,6 +955,8 @@ async fn ordered_writer<W>(
     }
 }
 
+// clippy: 参数表是连接处理器与搜索服务的既有形状，包一层结构体只会加解包噪声。
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_non_search(
     req: Request,
     engines: &SharedEngines,
@@ -928,6 +964,7 @@ async fn dispatch_non_search(
     history: &Arc<HistoryStore>,
     preferences: &Arc<BrokerPreferences>,
     windows: &Arc<crate::window_list::WindowSnapshotStore>,
+    aliases: &Arc<crate::alias::AliasStore>,
 ) -> Response {
     match req {
         Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
@@ -1096,7 +1133,100 @@ async fn dispatch_non_search(
             message: "search must be dispatched asynchronously".into(),
             category: None,
         },
+        Request::AliasSet { target, words } => {
+            // 别名设置是低频 UI 动作：同步落盘放 spawn_blocking（对齐
+            // ClearHistory 的纪律——绝不在 async 线程做文件 I/O）。
+            let aliases_for_blocking = aliases.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                aliases_for_blocking.set(&target, &words, now)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("alias set task: {error}")));
+            Response::AliasApplied {
+                message: result.err().unwrap_or_default(),
+            }
+        }
+        Request::AliasDelete { target } => {
+            let aliases_for_blocking = aliases.clone();
+            let result = tokio::task::spawn_blocking(move || aliases_for_blocking.delete(&target))
+                .await
+                .unwrap_or_else(|error| Err(format!("alias delete task: {error}")));
+            Response::AliasApplied {
+                message: result.err().unwrap_or_default(),
+            }
+        }
+        Request::AliasList => {
+            let items = aliases
+                .list()
+                .into_iter()
+                .map(|entry| AliasItemDto {
+                    target: ActionTarget {
+                        kind: entry.kind,
+                        value: entry.target,
+                    },
+                    words: entry.words,
+                    bound_at_utc: entry.bound_at_utc,
+                })
+                .collect();
+            Response::AliasItems { items }
+        }
     }
+}
+
+/// 别名通道（2026-08-21 设想）：精确查词 + 路径存在性复验 + class 0 行。
+/// history_score 提供 frecency 桶仲裁；score=绑定时间秒——冷启动（无历史）
+/// 时靠它按绑定时间倒序。同词多目标全部出行，排序交给全局
+/// `MatchMetadata::cmp`（web 关键词行由上方 websearch 先出，天然在前）。
+fn alias_search_hits(
+    aliases: &Arc<crate::alias::AliasStore>,
+    word: &str,
+    history: &Arc<HistoryStore>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let mut rows = Vec::new();
+    for entry in aliases.lookup_word(word) {
+        if rows.len() >= limit {
+            break;
+        }
+        // 存在性复验：失效静默跳过（悬空绑定不产出错误行——history stale paths 教训）。
+        let path = std::path::Path::new(&entry.target);
+        if !path.exists() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let kind = match entry.kind.as_str() {
+            "application" => SearchResultKind::App,
+            "directory" => SearchResultKind::Folder,
+            _ => SearchResultKind::File,
+        };
+        let target = ActionTarget {
+            kind: entry.kind.clone(),
+            value: entry.target.clone(),
+        };
+        let metadata = MatchMetadata {
+            kind: MatchKind::Literal,
+            class: 0,
+            position: 0,
+            score: u32::try_from(entry.bound_at_utc.min(u32::MAX as u64)).unwrap_or(0),
+            history_score: history.score(&target),
+        };
+        rows.push(SearchResult {
+            kind,
+            title: Arc::from(file_name),
+            subtitle: Arc::from(entry.target.as_str()),
+            execute_id: Arc::from(entry.target.as_str()),
+            target,
+            match_spans: Vec::new(),
+            match_metadata: Some(metadata),
+        });
+    }
+    rows
 }
 
 /// G5：token → 已复核的句柄。窗口目标永远不进 `ShellExecutor`：激活受 Windows 前台规则
@@ -1552,6 +1682,8 @@ fn process_indexer_reply(
     }
 }
 
+// clippy: 搜索服务的既有参数形状（连接处理器逐 Arc 传入）。
+#[allow(clippy::too_many_arguments)]
 async fn search_service(
     args: SearchArgs<'_>,
     apps: &SharedApps,
@@ -1559,6 +1691,7 @@ async fn search_service(
     history: &Arc<HistoryStore>,
     preferences: &Arc<BrokerPreferences>,
     windows: &Arc<crate::window_list::WindowSnapshotStore>,
+    aliases: &Arc<crate::alias::AliasStore>,
 ) -> Response {
     let SearchArgs {
         query,
@@ -1739,6 +1872,40 @@ async fn search_service(
             pinyin_status: None,
         },
     };
+    // 别名通道（2026-08-21 设想）：查询与词精确相等才触发。窗口模式/过滤态/
+    // 目录范围不出别名行（G7 过滤=只出文件、root=当前目录范围、web 关键词行
+    // 由上方正常逻辑先出）。存在性复验在 spawn_blocking 里（Path::exists 是
+    // 磁盘 I/O——history stale paths 教训）。
+    let alias_rows = if root.is_none() && !has_filters {
+        let aliases_for_blocking = aliases.clone();
+        let history_for_alias = history.clone();
+        let alias_word = name_query.trim().to_lowercase();
+        let alias_limit = result_slots;
+        tokio::task::spawn_blocking(move || {
+            alias_search_hits(&aliases_for_blocking, &alias_word, &history_for_alias, alias_limit)
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !alias_rows.is_empty() {
+        // 去重：目标已在字面/apps/历史/索引结果里就不再重复出行
+        //（既有行的 class/kind 不会更差，保既有行改动最小）。
+        let existing: HashSet<String> = ranked
+            .iter()
+            .map(|item| {
+                crate::history::target_key(&item.target.kind, &item.target.value)
+            })
+            .collect();
+        for row in alias_rows {
+            let key =
+                crate::history::target_key(&row.target.kind, &row.target.value);
+            if !existing.contains(&key) {
+                ranked.push(row);
+            }
+        }
+    }
     // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
     // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
     let pick_key = query_pick_key(query);
@@ -3089,6 +3256,96 @@ mod protocol_tests {
         );
     }
 
+    /// 别名系统（2026-08-21 设想）：精确命中词表的目标以 class 0 行加入合并。
+    /// 存在性复验（悬空绑定静默跳过）与 kind 映射在这里锚定。
+    #[test]
+    fn alias_search_hits_exact_word_with_class_zero() {
+        let dir = std::env::temp_dir().join(format!("prism-alias-hits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("weixin.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let folder = dir.join("资料");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let aliases = std::sync::Arc::new(crate::alias::AliasStore::load(&dir));
+        aliases
+            .set(
+                &ActionTarget {
+                    kind: "application".into(),
+                    value: exe.to_string_lossy().into_owned(),
+                },
+                &["wx".into()],
+                1234,
+            )
+            .unwrap();
+        aliases
+            .set(
+                &ActionTarget {
+                    kind: "directory".into(),
+                    value: folder.to_string_lossy().into_owned(),
+                },
+                &["wx".into()],
+                100,
+            )
+            .unwrap();
+        // 悬空绑定：路径不存在。
+        aliases
+            .set(
+                &ActionTarget {
+                    kind: "file".into(),
+                    value: dir.join("ghost.txt").to_string_lossy().into_owned(),
+                },
+                &["wx".into()],
+                50,
+            )
+            .unwrap();
+
+        let history_dir =
+            std::env::temp_dir().join(format!("prism-alias-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+        let rows = alias_search_hits(&aliases, "WX", &history, 8);
+        assert_eq!(rows.len(), 2, "悬空绑定静默跳过：{:?}", rows.iter().map(|r| r.title.as_ref()).collect::<Vec<_>>());
+        for row in &rows {
+            let metadata = row.match_metadata.unwrap();
+            assert_eq!(metadata.class, 0);
+            assert_eq!(metadata.kind, MatchKind::Literal);
+            assert!(row.match_spans.is_empty());
+        }
+        // kinds 映射：application→App、directory→Folder。
+        assert!(rows.iter().any(|row| row.kind == SearchResultKind::App));
+        assert!(rows.iter().any(|row| row.kind == SearchResultKind::Folder));
+        // 精确触发：前缀词不命中。
+        assert!(alias_search_hits(&aliases, "w", &history, 8).is_empty());
+        assert!(alias_search_hits(&aliases, "wxx", &history, 8).is_empty());
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 别名协议三命令的解码形状。
+    #[test]
+    fn alias_requests_decode() {
+        let set: Request = serde_json::from_str(
+            r#"{"type":"alias_set","target":{"kind":"file","value":"C:\\a.exe"},"words":["wx","微信"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(set, Request::AliasSet { ref target, ref words } if target.kind == "file" && words.len() == 2));
+        let delete: Request = serde_json::from_str(
+            r#"{"type":"alias_delete","target":{"kind":"file","value":"C:\\a.exe"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(delete, Request::AliasDelete { .. }));
+        let list: Request = serde_json::from_str(r#"{"type":"alias_list"}"#).unwrap();
+        assert!(matches!(list, Request::AliasList));
+        // 回执序列化形状。
+        let json = serde_json::to_string(&Response::AliasApplied {
+            message: String::new(),
+        })
+        .unwrap();
+        assert!(json.contains(r#""type":"alias_applied""#), "{json}");
+    }
+
     #[test]
     fn legacy_and_typed_action_requests_both_decode() {
         let legacy: Request =
@@ -3741,6 +3998,7 @@ mod protocol_tests {
             &history,
             &preferences,
             &Arc::new(crate::window_list::WindowSnapshotStore::new()),
+            &Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir())),
         )
         .await;
         assert!(matches!(
@@ -3786,6 +4044,7 @@ mod protocol_tests {
                 &history,
                 &preferences,
                 &windows,
+                &Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir())),
             )
             .await;
             assert!(

@@ -1,6 +1,7 @@
 //! Shared Prism backend library used by the user broker and indexer service.
 
 pub mod actions;
+pub mod alias;
 pub mod apps;
 pub mod config;
 pub mod file_ops;

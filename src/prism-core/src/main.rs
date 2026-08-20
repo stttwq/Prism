@@ -22,6 +22,8 @@ async fn main() {
         cfg.pinyin_enabled,
         cfg.zip_program,
     ));
+    // 别名系统（2026-08-21 设想）：用户数据，同 history 放数据目录。
+    let aliases = std::sync::Arc::new(prism_core::alias::AliasStore::load(&data_dir));
 
     let shell = match shell::ShellExecutor::start() {
         Ok(shell) => shell,
@@ -55,7 +57,9 @@ async fn main() {
     }
 
     log(format!("broker pipe listening at {PIPE_NAME}"));
-    if let Err(error) = ipc::serve(PIPE_NAME, apps, engines, shell, history, preferences).await {
+    if let Err(error) =
+        ipc::serve(PIPE_NAME, apps, engines, shell, history, preferences, aliases).await
+    {
         log(format!("broker pipe failed: {error}"));
         std::process::exit(1);
     }

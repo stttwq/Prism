@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub const HISTORY_SCHEMA_VERSION: u32 = 2;
 pub const FAVICON_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const ALIAS_SCHEMA_VERSION: u32 = 1;
 
 pub trait VersionedData {
     const SCHEMA_VERSION: u32;
@@ -123,6 +124,67 @@ impl VersionedData for HistoryData {
 pub struct FaviconMetadata {
     #[serde(default)]
     pub entries: Vec<serde_json::Value>,
+}
+
+/// 别名系统（2026-08-21 设想）：一个目标（file/directory/application）绑定
+/// 多个词；查询与词**精确相等**时目标以 class 0 行加入合并。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AliasData {
+    #[serde(default)]
+    pub entries: Vec<AliasEntry>,
+}
+
+/// 单条绑定：目标 → 词表（set 整体替换）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AliasEntry {
+    pub kind: String,
+    pub target: String,
+    #[serde(default)]
+    pub words: Vec<String>,
+    #[serde(default)]
+    pub bound_at_utc: u64,
+}
+
+/// 别名词上限：trim 后非空、≤32 字符、不含空白（精确匹配单 token）。
+pub const ALIAS_MAX_WORDS_PER_TARGET: usize = 8;
+pub const ALIAS_MAX_WORD_CHARS: usize = 32;
+pub const ALIAS_MAX_ENTRIES: usize = 2000;
+
+impl VersionedData for AliasData {
+    const SCHEMA_VERSION: u32 = ALIAS_SCHEMA_VERSION;
+
+    fn validate(&self) -> Result<(), String> {
+        if self.entries.len() > ALIAS_MAX_ENTRIES {
+            return Err("alias store contains more than 2000 entries".into());
+        }
+        for entry in &self.entries {
+            if !matches!(
+                entry.kind.as_str(),
+                "file" | "directory" | "application"
+            ) {
+                return Err("alias entry has an unsupported target kind".into());
+            }
+            if entry.target.is_empty()
+                || entry.target.contains('\0')
+                || entry.target.len() > 32 * 1024
+            {
+                return Err("alias entry has an invalid target".into());
+            }
+            if entry.words.is_empty() || entry.words.len() > ALIAS_MAX_WORDS_PER_TARGET {
+                return Err("alias entry must bind 1..=8 words".into());
+            }
+            for word in &entry.words {
+                if word.is_empty()
+                    || word.chars().count() > ALIAS_MAX_WORD_CHARS
+                    || word.contains('\0')
+                    || word.chars().any(char::is_whitespace)
+                {
+                    return Err("alias entry has an invalid word".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VersionedData for FaviconMetadata {
