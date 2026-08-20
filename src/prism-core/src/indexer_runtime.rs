@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc, Notify};
 
-use crate::hierarchy::{ApplyOutcome, IndexState, VolumeIndex};
+use crate::hierarchy::{ApplyOutcome, IndexState, VolumeId, VolumeIndex};
 use crate::index_cache;
 use crate::indexer_ipc::{
     requested_root, validate_search_request, BuildProgress, IndexerItem, IndexerRequest,
@@ -32,6 +32,125 @@ enum RebuildRequest {
     /// 全量重建（卷集合变化等）。当前无发送点，保留为未来扩展。
     #[allow(dead_code)]
     Full(String),
+}
+
+/// M1（FRESH-AUDIT-3-2026-08-20）：单卷重建的退避簿记。
+/// 连续重建按 `apps::app_scan_retry_delay` 指数拉开（30s 起步、封顶 1h、永不放弃），
+/// 卷静默 `VOLUME_REBUILD_QUIET` 后 attempt 归零——偶发失败不背历史包袱。
+struct VolumeRebuildBackoff {
+    id: VolumeId,
+    attempt: u32,
+    next_due: Instant,
+    last_rebuild_at: Option<Instant>,
+}
+
+/// M1：失败（或退避窗口内到达）的单卷重建请求，到 due 时由 maintenance tick 重发。
+struct DeferredVolumeRebuild {
+    descriptor: VolumeDescriptor,
+    reason: String,
+    due: Instant,
+}
+
+/// M1：卷静默多久后重置连续重建计数。1 小时 = 最长退避间隔，超过它说明上一次
+/// 重建后卷已稳定运行，新错误按首次处理。
+const VOLUME_REBUILD_QUIET: Duration = Duration::from_secs(3600);
+
+/// H1（FRESH-AUDIT-3-2026-08-20）：积压合并——按卷去重保留最新一条。
+/// 全量请求（Full）覆盖一切单卷请求；同卷多条单卷请求保留最后一条
+///（watcher 死因以最新为准）。输出按各卷首次出现顺序排列。
+/// 旧的 `while try_recv().is_ok() {}` 是留最旧丢最新：两卷相近时刻出错时
+/// 第二个卷的重建请求被静默丢弃，该卷 watcher 已退出且无 liveness 检查，
+/// 索引从此静默陈旧直到服务重启。
+fn dedupe_rebuild_requests(mut pending: Vec<RebuildRequest>) -> Vec<RebuildRequest> {
+    // 任何 Full 都使单卷请求失去意义（全量重建覆盖全部卷），取最后一条 Full。
+    for position in (0..pending.len()).rev() {
+        if matches!(pending[position], RebuildRequest::Full(_)) {
+            return vec![pending.swap_remove(position)];
+        }
+    }
+    let mut order: Vec<VolumeId> = Vec::new();
+    let mut latest: Vec<RebuildRequest> = Vec::new();
+    for request in pending {
+        let RebuildRequest::SingleVolume { descriptor, .. } = &request else {
+            continue;
+        };
+        match order.iter().position(|id| *id == descriptor.id) {
+            Some(slot) => latest[slot] = request,
+            None => {
+                order.push(descriptor.id.clone());
+                latest.push(request);
+            }
+        }
+    }
+    latest
+}
+
+/// M1：取（或建）某卷的退避条目。新建条目立即到期（首次重建无退避）。
+fn volume_backoff_entry<'a>(
+    entries: &'a mut Vec<VolumeRebuildBackoff>,
+    id: &VolumeId,
+    now: Instant,
+) -> &'a mut VolumeRebuildBackoff {
+    let position = match entries.iter().position(|entry| &entry.id == id) {
+        Some(position) => position,
+        None => {
+            entries.push(VolumeRebuildBackoff {
+                id: id.clone(),
+                attempt: 0,
+                next_due: now,
+                last_rebuild_at: None,
+            });
+            entries.len() - 1
+        }
+    };
+    &mut entries[position]
+}
+
+/// M1：退避准入决策（纯函数，测试注入合成 Instant）。
+/// 到点准入并推进 attempt 与 next_due；窗口内拒绝且不动计数。
+fn admit_volume_rebuild(entry: &mut VolumeRebuildBackoff, now: Instant) -> bool {
+    if entry
+        .last_rebuild_at
+        .is_some_and(|at| now - at >= VOLUME_REBUILD_QUIET)
+    {
+        entry.attempt = 0;
+    }
+    if now < entry.next_due {
+        return false;
+    }
+    entry.attempt = entry.attempt.saturating_add(1);
+    entry.last_rebuild_at = Some(now);
+    entry.next_due = now + crate::apps::app_scan_retry_delay(entry.attempt);
+    true
+}
+
+/// M1：登记/刷新某卷的挂起重试（同卷只保留最新请求）。
+fn defer_volume_rebuild(
+    deferred: &mut Vec<DeferredVolumeRebuild>,
+    descriptor: VolumeDescriptor,
+    reason: String,
+    due: Instant,
+) {
+    match deferred
+        .iter_mut()
+        .find(|pending| pending.descriptor.id == descriptor.id)
+    {
+        Some(pending) => {
+            pending.descriptor = descriptor;
+            pending.reason = reason;
+            pending.due = due;
+        }
+        None => deferred.push(DeferredVolumeRebuild {
+            descriptor,
+            reason,
+            due,
+        }),
+    }
+}
+
+/// M1：该卷重建成功后撤销挂起重试（失败后 watcher 又报错重排的那份）。
+fn remove_deferred_rebuild(deferred: &mut Vec<DeferredVolumeRebuild>, id: &VolumeId) {
+    deferred.retain(|pending| &pending.descriptor.id != id);
 }
 
 pub struct Shutdown {
@@ -880,8 +999,11 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     let mut last_checkpoint = Instant::now();
     // S5: 每小时一行内存趋势入事件日志（趋势观测，见 memory_trend_detail）。
     let mut last_memory_trend = Instant::now();
+    // M1（FRESH-AUDIT-3-2026-08-20）：单卷重建退避 + 失败延迟重试的簿记。
+    let mut volume_backoff: Vec<VolumeRebuildBackoff> = Vec::new();
+    let mut deferred_rebuilds: Vec<DeferredVolumeRebuild> = Vec::new();
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
-    loop {
+    'run: loop {
         tokio::select! {
             _ = stop.cancelled() => break,
             result = &mut pipe_task => {
@@ -894,9 +1016,15 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 return Err(error);
             }
             reason = rebuild_rx.recv() => {
-                let Some(request) = reason else { break };
-                // 清空积压：合并为只处理最新一条。
-                while rebuild_rx.try_recv().is_ok() {}
+                let Some(first) = reason else { break };
+                // H1（FRESH-AUDIT-3-2026-08-20）：积压合并按卷去重保留最新
+                //（Full 优先）后逐条处理。旧的整段丢弃会丢掉相近时刻出错的
+                // 其他卷的请求，该卷索引从此静默陈旧。
+                let mut pending = vec![first];
+                while let Ok(next) = rebuild_rx.try_recv() {
+                    pending.push(next);
+                }
+                for request in dedupe_rebuild_requests(pending) {
                 match request {
                     RebuildRequest::Full(reason) => {
                         logging::event_detail("info", "rebuild_requested", &reason, None, None);
@@ -908,7 +1036,7 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                             result = build_task => result,
                             _ = stop.cancelled() => {
                                 log("rebuild aborted by shutdown");
-                                break;
+                                break 'run;
                             }
                         };
                         let rebuilt = match rebuilt {
@@ -951,6 +1079,26 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                     RebuildRequest::SingleVolume { descriptor, reason } => {
                         logging::event_detail("info", "volume_rebuild_requested", &reason, None, None);
                         log(format!("single-volume rebuild requested: {reason}"));
+                        // M1（FRESH-AUDIT-3-2026-08-20）：退避准入——同卷连续重建按
+                        // app_scan_retry_delay 指数拉开，防"清理工具反复删 journal"类
+                        // 持续错误形成背靠背全盘扫描热循环；窗口内到达的新请求挂起，
+                        // 到点由 maintenance tick 重发。
+                        let now = Instant::now();
+                        let (admitted, next_due) = {
+                            let entry =
+                                volume_backoff_entry(&mut volume_backoff, &descriptor.id, now);
+                            let admitted = admit_volume_rebuild(entry, now);
+                            (admitted, entry.next_due)
+                        };
+                        if !admitted {
+                            defer_volume_rebuild(
+                                &mut deferred_rebuilds,
+                                descriptor,
+                                reason,
+                                next_due,
+                            );
+                            continue;
+                        }
                         let build_descriptor = descriptor.clone();
                         let build_task = tokio::task::spawn_blocking(move || {
                             // 与 build_all 同款单卷重试：首次失败重试一次。
@@ -968,12 +1116,14 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                             result = build_task => result,
                             _ = stop.cancelled() => {
                                 log("single-volume rebuild aborted by shutdown");
-                                break;
+                                break 'run;
                             }
                         };
                         match rebuilt {
                             Ok(Ok(volume)) => {
                                 state.merge_and_publish(volume);
+                                // M1：成功即撤销该卷的挂起重试。
+                                remove_deferred_rebuild(&mut deferred_rebuilds, &descriptor.id);
                                 let watcher_epoch = epoch.load(Ordering::Acquire);
                                 start_watcher(
                                     state.clone(), descriptor,
@@ -984,13 +1134,27 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                             }
                             Ok(Err(error)) => {
                                 logging::event_detail("error", "volume_rebuild_failed", &error, None, None);
-                                state.set_error(error);
+                                state.set_error(error.clone());
+                                // M1：失败不放弃——按退避延迟重试，永不永久失活。
+                                defer_volume_rebuild(
+                                    &mut deferred_rebuilds,
+                                    descriptor,
+                                    format!("deferred retry after: {error}"),
+                                    next_due,
+                                );
                             }
                             Err(error) => {
                                 state.set_error(format!("volume rebuild task: {error}"));
+                                defer_volume_rebuild(
+                                    &mut deferred_rebuilds,
+                                    descriptor,
+                                    reason,
+                                    next_due,
+                                );
                             }
                         }
                     }
+                }
                 }
             }
             _ = maintenance.tick() => {
@@ -1005,6 +1169,22 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                         Some(state.generation()),
                     );
                     last_memory_trend = Instant::now();
+                }
+                // M1（FRESH-AUDIT-3-2026-08-20）：到点的挂起重试重新入队——
+                // 走 rebuild_rx 的正常准入路径（退避判定在收到端统一做）。
+                if !deferred_rebuilds.is_empty() {
+                    let now = Instant::now();
+                    deferred_rebuilds.retain(|pending| {
+                        if now >= pending.due {
+                            let _ = rebuild_tx.send(RebuildRequest::SingleVolume {
+                                descriptor: pending.descriptor.clone(),
+                                reason: pending.reason.clone(),
+                            });
+                            false
+                        } else {
+                            true
+                        }
+                    });
                 }
                 // S1: 名字池压缩在锁外做（clone→压缩→短锁换入，next_usn 校验）。
                 if state.needs_name_compact.swap(false, Ordering::AcqRel) {
@@ -1053,7 +1233,9 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 }).unwrap_or(false) || last_checkpoint.elapsed() >= Duration::from_secs(6 * 60 * 60);
                 if checkpoint_due {
                     // H1: compete checkpoint against shutdown.
-                    let checkpoint_task = checkpoint_async(state.clone(), data_dir.clone());
+                    // M2：maintenance 节拍照常重建拼音（flush_pinyin=true）。
+                    let checkpoint_task =
+                        checkpoint_async(state.clone(), data_dir.clone(), true);
                     tokio::pin!(checkpoint_task);
                     let checkpoint_result = tokio::select! {
                         result = &mut checkpoint_task => result,
@@ -1079,7 +1261,11 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     }
 
     epoch.fetch_add(1, Ordering::AcqRel);
-    if let Err(error) = checkpoint_async(state.clone(), data_dir.clone()).await {
+    // M2（FRESH-AUDIT-3-2026-08-20）：停机只做 v5 落盘，拼音全量重建跳过
+    //（避免撞破 SCM 30s wait_hint 被强杀、sidecar 写一半）。收敛路径见
+    // checkpoint_after_save 的文档注释：identity 失配 → 启动装载失败 →
+    // maintenance tick 重建。
+    if let Err(error) = checkpoint_async(state.clone(), data_dir.clone(), false).await {
         // 用户要求停止就是停止：退出 checkpoint 失败只记一条降级日志，
         // 不变成失败退出码去触发一次毫无意义的 SCM 自动重启。
         logging::event_detail("error", "shutdown_checkpoint_failed", &error, None, None);
@@ -1694,7 +1880,7 @@ fn watch_volume(
     Ok(())
 }
 
-fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), String> {
+fn checkpoint(state: &ServiceState, data_dir: &std::path::Path, flush_pinyin: bool) -> Result<(), String> {
     // R2 gate: a first build in flight means the live index covers only some volumes.
     // Writing it now would produce a file that later looks like a complete cache, so
     // every exit path — including SCM Stop — skips the write and forces a full rebuild.
@@ -1709,7 +1895,7 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
     // （锁竞争）重试 3 次，仍失败回落整态 clone 路径——回落路径就是修复前
     // 的代码，天然安全网。
     for attempt in 1..=3 {
-        match checkpoint_streaming(state, data_dir) {
+        match checkpoint_streaming(state, data_dir, flush_pinyin) {
             Ok(()) => return Ok(()),
             Err(error) if error.contains(index_cache::SNAPSHOT_CHANGED) => {
                 log(format!(
@@ -1742,12 +1928,17 @@ fn checkpoint(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), St
             events_since_checkpoint: snapshot.events_since_checkpoint,
             volumes: snapshot.volumes.len(),
         },
+        flush_pinyin,
     )
 }
 
 /// M2: 流式 checkpoint 的一轮尝试。验证 + 头快照在一个短读锁内完成，
 /// 之后逐卷短读锁写入（卷间核对 generation，回调内完成）。
-fn checkpoint_streaming(state: &ServiceState, data_dir: &std::path::Path) -> Result<(), String> {
+fn checkpoint_streaming(
+    state: &ServiceState,
+    data_dir: &std::path::Path,
+    flush_pinyin: bool,
+) -> Result<(), String> {
     let head = {
         let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
         let index = guard.as_ref().ok_or("index is not ready")?;
@@ -1758,7 +1949,7 @@ fn checkpoint_streaming(state: &ServiceState, data_dir: &std::path::Path) -> Res
             volumes: index.volumes.len(),
         }
     };
-    checkpoint_streaming_with_head(state, data_dir, head)
+    checkpoint_streaming_with_head(state, data_dir, head, flush_pinyin)
 }
 
 /// M2: 以给定头快照逐卷写入（测试可注入陈旧头验证世代核对）。
@@ -1766,6 +1957,7 @@ fn checkpoint_streaming_with_head(
     state: &ServiceState,
     data_dir: &std::path::Path,
     head: SnapshotHead,
+    flush_pinyin: bool,
 ) -> Result<(), String> {
     index_cache::save_streaming(
         data_dir,
@@ -1796,13 +1988,24 @@ fn checkpoint_streaming_with_head(
             Ok(())
         },
     )?;
-    checkpoint_after_save(state, &head)
+    checkpoint_after_save(state, &head, flush_pinyin)
 }
 
 /// checkpoint 成功后的公共收尾：拼音重建 + 事件计数扣减。
 /// 扣减用的 events 计数来自**实际序列化进去的头**（流式=头快照，回落=clone 快照）。
-fn checkpoint_after_save(state: &ServiceState, head: &SnapshotHead) -> Result<(), String> {
-    if state.pinyin_status() != PinyinStatus::Disabled {
+/// M2（FRESH-AUDIT-3-2026-08-20）：`flush_pinyin=false`（停机路径）跳过拼音重建。
+/// 全量重建（整索引 clone + 全节点编码 + fsync + mmap 校验）在大索引 + 慢盘上
+/// 会撞破 SCM 30s wait_hint 被强杀——sidecar 写一半反致下次启动 IndexMismatch
+/// 又触发一轮全量重建。跳过后的收敛由既有机制保证：任何 create/rename 都会
+/// 追加名字池使 identity 失配 → 启动装载失败 → pinyin_needs_rebuild →
+/// maintenance tick 从 live 索引重建；delete-only 失配不触发，但 push_candidate
+/// 的 FLAG_PRESENT 检查会把陈旧记录挡在结果外。
+fn checkpoint_after_save(
+    state: &ServiceState,
+    head: &SnapshotHead,
+    flush_pinyin: bool,
+) -> Result<(), String> {
+    if flush_pinyin && state.pinyin_status() != PinyinStatus::Disabled {
         // Rebuild from the live tree under its read lock. A clone taken for the v5
         // checkpoint can be one USN batch behind by the time the sidecar is installed.
         state.rebuild_pinyin_from_live();
@@ -1827,8 +2030,12 @@ struct SnapshotHead {
     volumes: usize,
 }
 
-async fn checkpoint_async(state: Arc<ServiceState>, data_dir: PathBuf) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || checkpoint(&state, &data_dir))
+async fn checkpoint_async(
+    state: Arc<ServiceState>,
+    data_dir: PathBuf,
+    flush_pinyin: bool,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || checkpoint(&state, &data_dir, flush_pinyin))
         .await
         .map_err(|error| format!("checkpoint task: {error}"))?
 }
@@ -2220,6 +2427,178 @@ mod tests {
     use crate::root_scope::RootRejection;
 
     // --- S2（FRESH-AUDIT-2026-08-19）: 缓存按卷生效 -----------------------------
+
+    /// H1（FRESH-AUDIT-3-2026-08-20）: 两卷相近时刻同时失败的积压必须都活下来
+    /// ——旧的整段丢弃会把第二个卷的请求静默吞掉，该卷从此静默陈旧直到重启。
+    #[test]
+    fn h1_backlog_keeps_both_volumes() {
+        let pending = vec![
+            single_rebuild('C', "c: journal gone"),
+            single_rebuild('D', "d: journal gone"),
+        ];
+        let kept = dedupe_rebuild_requests(pending);
+        assert_eq!(kept.len(), 2, "不同卷的请求一条都不能丢");
+    }
+
+    /// H1: 同卷多条请求保留最后一条（留新弃旧），不重复重建。
+    #[test]
+    fn h1_backlog_keeps_latest_request_per_volume() {
+        let pending = vec![
+            single_rebuild('C', "first"),
+            single_rebuild('D', "d"),
+            single_rebuild('C', "second"),
+        ];
+        let kept = dedupe_rebuild_requests(pending);
+        assert_eq!(kept.len(), 2);
+        match &kept[0] {
+            RebuildRequest::SingleVolume { descriptor, reason } => {
+                assert_eq!(descriptor.mount_path, "C:\\");
+                assert_eq!(reason, "second", "同卷保留最新一条");
+            }
+            _ => panic!("expected SingleVolume"),
+        }
+    }
+
+    /// H1: Full 请求覆盖一切单卷请求（全量重建已包含所有卷）。
+    #[test]
+    fn h1_backlog_full_rebuild_wins_over_single_volume() {
+        let pending = vec![
+            single_rebuild('C', "c"),
+            RebuildRequest::Full("volume set changed".into()),
+            single_rebuild('D', "d"),
+        ];
+        let kept = dedupe_rebuild_requests(pending);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(&kept[0], RebuildRequest::Full(reason) if reason == "volume set changed"));
+    }
+
+    fn single_rebuild(letter: char, reason: &str) -> RebuildRequest {
+        RebuildRequest::SingleVolume {
+            descriptor: descriptor(letter),
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// M1（FRESH-AUDIT-3-2026-08-20）: 首次到达立即准入；退避窗口内拒绝且不动
+    /// 计数；到点再次准入且 attempt 递增。
+    #[test]
+    fn m1_backoff_admits_first_and_defers_within_window() {
+        let start = Instant::now();
+        let mut entry = VolumeRebuildBackoff {
+            id: VolumeId { guid: "v".into(), serial: 1 },
+            attempt: 0,
+            next_due: start,
+            last_rebuild_at: None,
+        };
+        assert!(admit_volume_rebuild(&mut entry, start), "首次重建无退避");
+        assert_eq!(entry.attempt, 1);
+        assert_eq!(entry.next_due, start + Duration::from_secs(30));
+        assert!(
+            !admit_volume_rebuild(&mut entry, start + Duration::from_secs(5)),
+            "退避窗口内必须拒绝"
+        );
+        assert_eq!(entry.attempt, 1, "被拒绝的到达不推进计数");
+        let due = entry.next_due;
+        assert!(admit_volume_rebuild(&mut entry, due), "到点再准入");
+        assert_eq!(entry.attempt, 2);
+    }
+
+    /// M1: 连续失败按 app_scan_retry_delay 指数拉开（第 6 次起 60s、60s、120s…），
+    /// 压平背靠背全盘扫描热循环。
+    #[test]
+    fn m1_backoff_grows_exponentially() {
+        let mut now = Instant::now();
+        let mut entry = VolumeRebuildBackoff {
+            id: VolumeId { guid: "v".into(), serial: 1 },
+            attempt: 0,
+            next_due: now,
+            last_rebuild_at: None,
+        };
+        let mut intervals = Vec::new();
+        for _ in 0..7 {
+            assert!(admit_volume_rebuild(&mut entry, now));
+            intervals.push(entry.next_due - now);
+            now = entry.next_due; // 到点立刻再触发（热循环场景）
+        }
+        assert_eq!(intervals[5], Duration::from_secs(60), "第 6 次起 60s");
+        assert_eq!(intervals[6], Duration::from_secs(120), "之后指数翻倍");
+    }
+
+    /// M1: 卷静默 1 小时后 attempt 归零——正常运行后偶发失败不背历史退避包袱。
+    #[test]
+    fn m1_quiet_volume_resets_attempts() {
+        let start = Instant::now();
+        let mut entry = VolumeRebuildBackoff {
+            id: VolumeId { guid: "v".into(), serial: 1 },
+            attempt: 9,
+            next_due: start,
+            last_rebuild_at: Some(start - VOLUME_REBUILD_QUIET),
+        };
+        assert!(admit_volume_rebuild(&mut entry, start));
+        assert_eq!(entry.attempt, 1, "静默期满后按首次处理");
+        assert_eq!(entry.next_due, start + Duration::from_secs(30));
+    }
+
+    /// M1: 失败登记挂起重试、成功撤销；同卷只保留最新一份。
+    #[test]
+    fn m1_deferred_retry_bookkeeping() {
+        let mut deferred = Vec::new();
+        let now = Instant::now();
+        defer_volume_rebuild(
+            &mut deferred,
+            descriptor('C'),
+            "first".into(),
+            now + Duration::from_secs(30),
+        );
+        defer_volume_rebuild(
+            &mut deferred,
+            descriptor('C'),
+            "second".into(),
+            now + Duration::from_secs(60),
+        );
+        defer_volume_rebuild(
+            &mut deferred,
+            descriptor('D'),
+            "d".into(),
+            now + Duration::from_secs(30),
+        );
+        assert_eq!(deferred.len(), 2, "同卷去重");
+        assert_eq!(deferred[0].reason, "second");
+        remove_deferred_rebuild(&mut deferred, &descriptor('C').id);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].descriptor.mount_path, "D:\\");
+    }
+
+    /// M2（FRESH-AUDIT-3-2026-08-20）: 停机路径只落 v5 不写拼音 sidecar
+    ///（避免拼音全量重建撞破 SCM 30s wait_hint）；maintenance 路径照常重建。
+    #[test]
+    fn m2_shutdown_checkpoint_skips_pinyin_flush_but_maintenance_flushes() {
+        let state = ServiceState::new();
+        state.merge_and_publish(test_volume("v1", "C:\\", "微信"));
+        state.finish_first_build();
+        let dir = std::env::temp_dir().join(format!("prism-m2-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        state.set_pinyin_data_dir(&dir);
+
+        checkpoint(&state, &dir, false).unwrap();
+        assert!(
+            index_cache::cache_path(&dir).exists(),
+            "v5 缓存必须照常落盘"
+        );
+        assert!(
+            !crate::pinyin_sidecar::path(&dir).exists(),
+            "停机路径不得触发拼音全量重建"
+        );
+
+        checkpoint(&state, &dir, true).unwrap();
+        assert!(
+            crate::pinyin_sidecar::path(&dir).exists(),
+            "maintenance 路径照常重建拼音"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn volume_with_id(tag: &str, mount: &str, name: &str, id: VolumeId) -> VolumeIndex {
         let mut volume = test_volume(tag, mount, name);
@@ -2620,7 +2999,7 @@ mod tests {
         // 后取的快照 events 会变 0（那是语义差异，不是字节差异）。
         let snapshot = state.index.read().unwrap().as_ref().unwrap().clone();
         index_cache::save(&snapshot, &dir_clone).unwrap();
-        checkpoint(&state, &dir_streaming).unwrap(); // 内部走流式路径
+        checkpoint(&state, &dir_streaming, true).unwrap(); // 内部走流式路径
 
         let streaming_bytes = std::fs::read(index_cache::cache_path(&dir_streaming)).unwrap();
         let clone_bytes = std::fs::read(index_cache::cache_path(&dir_clone)).unwrap();
@@ -2665,7 +3044,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("prism-m2-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let error = checkpoint_streaming_with_head(&state, &dir, head).unwrap_err();
+        let error = checkpoint_streaming_with_head(&state, &dir, head, true).unwrap_err();
         assert!(
             error.contains(index_cache::SNAPSHOT_CHANGED),
             "错误必须带可识别的重试标记：{error}"
@@ -2683,14 +3062,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Mid-first-build checkpoint: succeeds as a no-op, writes nothing.
-        checkpoint(&state, &dir).unwrap();
+        checkpoint(&state, &dir, true).unwrap();
         assert!(
             !index_cache::cache_path(&dir).exists(),
             "a partial first build must not leave a cache file behind"
         );
 
         state.finish_first_build();
-        checkpoint(&state, &dir).unwrap();
+        checkpoint(&state, &dir, true).unwrap();
         assert!(
             index_cache::cache_path(&dir).exists(),
             "the cache is written once the first build completes"
@@ -2755,7 +3134,7 @@ mod tests {
         persist_first_build_with(&state, |_| Err("cache save failed".into())).unwrap_err();
         assert!(!index_cache::cache_path(&dir).exists());
 
-        checkpoint(&state, &dir).unwrap();
+        checkpoint(&state, &dir, true).unwrap();
         assert!(
             index_cache::cache_path(&dir).exists(),
             "the gate must be open so the checkpoint retries the save"
