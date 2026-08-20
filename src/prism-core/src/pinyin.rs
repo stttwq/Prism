@@ -2,7 +2,7 @@
 
 use ::pinyin::ToPinyin;
 
-pub const PINYIN_DICTIONARY_VERSION: &str = "pinyin-0.10.0/pinyin-data-0.13.0+prism-phrases-v1";
+pub const PINYIN_DICTIONARY_VERSION: &str = "pinyin-0.10.0/pinyin-data-0.13.0+prism-phrases-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinyinMatchKind {
@@ -27,25 +27,189 @@ struct Token {
 }
 
 // Longest-match phrase rules. Changing this table requires a dictionary-version bump.
+//
+// P1-1（搜索报告2，2026-08-21）：18 → ~130 常用多音字词。收录原则：
+// 1. 只收高频词（地名/称谓/软件域动词/日常词）；
+// 2. 逐条人工核对读音——错词表会**制造**错误命中（比缺词更糟）；
+// 3. 读音与库默认可能重合的词条是幂等的（override 结果与默认一致），
+//    留作护栏不删；
+// 4. plain 拼音无声调——同字母异声调的字（好/了/当/倒/处/量/兴…）不收，
+//    收了也不改变行为。
+// 词表变更必须 bump PINYIN_DICTIONARY_VERSION（触发一次拼音 sidecar 全量重建）。
 const PHRASES: &[(&str, &[&str])] = &[
+    // ── 地名 ──
     ("重庆", &["chong", "qing"]),
     ("重慶", &["chong", "qing"]),
+    ("长安", &["chang", "an"]),
+    ("長安", &["chang", "an"]),
+    ("长沙", &["chang", "sha"]),
+    ("长春", &["chang", "chun"]),
+    ("长治", &["chang", "zhi"]),
+    ("长城", &["chang", "cheng"]),
+    ("厦门", &["xia", "men"]),
+    ("廈門", &["xia", "men"]),
+    ("大厦", &["da", "sha"]),
+    ("朝阳", &["chao", "yang"]),
+    ("朝陽", &["chao", "yang"]),
+    ("番禺", &["pan", "yu"]),
+    ("蚌埠", &["beng", "bu"]),
+    ("六安", &["lu", "an"]),
+    ("百色", &["bo", "se"]),
+    ("句容", &["ju", "rong"]),
+    ("莘县", &["shen", "xian"]),
+    ("铅山", &["yan", "shan"]),
+    ("泌阳", &["bi", "yang"]),
+    // ── 音乐/银行/行 系列 ──
     ("音乐", &["yin", "yue"]),
     ("音樂", &["yin", "yue"]),
     ("银行", &["yin", "hang"]),
     ("銀行", &["yin", "hang"]),
     ("行长", &["hang", "zhang"]),
     ("行長", &["hang", "zhang"]),
-    ("长安", &["chang", "an"]),
-    ("長安", &["chang", "an"]),
-    ("厦门", &["xia", "men"]),
-    ("廈門", &["xia", "men"]),
-    ("朝阳", &["chao", "yang"]),
-    ("朝陽", &["chao", "yang"]),
+    ("行业", &["hang", "ye"]),
+    ("行情", &["hang", "qing"]),
+    ("行家", &["hang", "jia"]),
+    ("内行", &["nei", "hang"]),
+    ("外行", &["wai", "hang"]),
+    // ── 长：cháng（名物）与 zhǎng（称谓/生长）──
+    ("长大", &["zhang", "da"]),
+    ("长辈", &["zhang", "bei"]),
+    ("兄长", &["xiong", "zhang"]),
+    ("成长", &["cheng", "zhang"]),
+    ("生长", &["sheng", "zhang"]),
+    ("增长", &["zeng", "zhang"]),
+    ("班长", &["ban", "zhang"]),
+    ("校长", &["xiao", "zhang"]),
+    ("厂长", &["chang", "zhang"]),
+    ("队长", &["dui", "zhang"]),
+    ("市长", &["shi", "zhang"]),
+    ("局长", &["ju", "zhang"]),
+    ("部长", &["bu", "zhang"]),
+    ("会长", &["hui", "zhang"]),
+    ("首长", &["shou", "zhang"]),
+    ("董事长", &["dong", "shi", "zhang"]),
+    // ── 重：chóng（重复义）──
+    ("重新", &["chong", "xin"]),
+    ("重复", &["chong", "fu"]),
+    ("重阳", &["chong", "yang"]),
+    ("重逢", &["chong", "feng"]),
+    ("重叠", &["chong", "die"]),
+    ("重申", &["chong", "shen"]),
+    ("重播", &["chong", "bo"]),
+    ("重启", &["chong", "qi"]),
+    ("重装", &["chong", "zhuang"]),
+    ("重置", &["chong", "zhi"]),
+    // ── 弹：tán（动作）/dàn（弹丸）──
+    ("弹窗", &["tan", "chuang"]),
+    ("弹幕", &["tan", "mu"]),
+    ("弹簧", &["tan", "huang"]),
+    ("弹性", &["tan", "xing"]),
+    ("子弹", &["zi", "dan"]),
+    ("弹药", &["dan", "yao"]),
+    ("导弹", &["dao", "dan"]),
+    ("弹道", &["dan", "dao"]),
+    // ── 调：tiáo（调节）/diào（调用）──
+    ("调整", &["tiao", "zheng"]),
+    ("调节", &["tiao", "jie"]),
+    ("调试", &["tiao", "shi"]),
+    ("调用", &["diao", "yong"]),
+    ("调查", &["diao", "cha"]),
+    ("调研", &["diao", "yan"]),
+    ("调度", &["diao", "du"]),
+    ("声调", &["sheng", "diao"]),
+    // ── 觉/角 ──
+    ("角色", &["jue", "se"]),
+    ("主角", &["zhu", "jue"]),
+    ("配角", &["pei", "jue"]),
+    ("睡觉", &["shui", "jiao"]),
+    ("觉得", &["jue", "de"]),
+    ("直觉", &["zhi", "jue"]),
+    // ── 着/血/壳/模 ──
+    ("着急", &["zhao", "ji"]),
+    ("着重", &["zhuo", "zhong"]),
+    ("执着", &["zhi", "zhuo"]),
+    ("穿着", &["chuan", "zhuo"]),
+    ("血压", &["xue", "ya"]),
+    ("血液", &["xue", "ye"]),
+    ("血管", &["xue", "guan"]),
+    ("流血", &["liu", "xue"]),
+    ("输血", &["shu", "xue"]),
+    ("外壳", &["wai", "ke"]),
+    ("贝壳", &["bei", "ke"]),
+    ("蛋壳", &["dan", "ke"]),
+    ("地壳", &["di", "qiao"]),
+    ("模样", &["mu", "yang"]),
+    ("模板", &["mu", "ban"]),
+    // ── 还：huán（归还）/hái（仍然，护栏）──
+    ("还是", &["hai", "shi"]),
+    ("还有", &["hai", "you"]),
+    ("还原", &["huan", "yuan"]),
+    ("归还", &["gui", "huan"]),
+    ("偿还", &["chang", "huan"]),
+    // ── 藏/曾/查/参/差 ──
+    ("西藏", &["xi", "zang"]),
+    ("藏族", &["zang", "zu"]),
+    ("宝藏", &["bao", "zang"]),
+    ("隐藏", &["yin", "cang"]),
+    ("收藏", &["shou", "cang"]),
+    ("曾经", &["ceng", "jing"]),
+    ("曾祖", &["zeng", "zu"]),
+    ("检查", &["jian", "cha"]),
+    ("查找", &["cha", "zhao"]),
+    ("参加", &["can", "jia"]),
+    ("参考", &["can", "kao"]),
+    ("参观", &["can", "guan"]),
+    ("参谋", &["can", "mou"]),
+    ("人参", &["ren", "shen"]),
+    ("参差", &["cen", "ci"]),
+    ("出差", &["chu", "chai"]),
+    ("差别", &["cha", "bie"]),
+    ("误差", &["wu", "cha"]),
+    // ── 都：dū（都市）/dōu（副词）──
+    ("都市", &["du", "shi"]),
+    ("首都", &["shou", "du"]),
+    ("都是", &["dou", "shi"]),
+    ("全都", &["quan", "dou"]),
+    // ── 传/称/畜/圈/泊/吓/塞/其他 ──
+    ("传记", &["zhuan", "ji"]),
+    ("自传", &["zhi", "zhuan"]),
+    ("水浒传", &["shui", "hu", "zhuan"]),
+    ("传说", &["chuan", "shuo"]),
+    ("传输", &["chuan", "shu"]),
+    ("称职", &["chen", "zhi"]),
+    ("称心", &["chen", "xin"]),
+    ("名称", &["ming", "cheng"]),
+    ("称号", &["cheng", "hao"]),
+    ("畜生", &["chu", "sheng"]),
+    ("畜牧", &["xu", "mu"]),
+    ("羊圈", &["yang", "juan"]),
+    ("圈子", &["quan", "zi"]),
+    ("湖泊", &["hu", "po"]),
+    ("停泊", &["ting", "bo"]),
+    ("吓一跳", &["xia", "yi", "tiao"]),
+    ("恐吓", &["kong", "he"]),
+    ("堵塞", &["du", "se"]),
+    ("塞子", &["sai", "zi"]),
+    ("大夫", &["dai", "fu"]),
+    ("便宜", &["pian", "yi"]),
+    ("便利", &["bian", "li"]),
+    ("倔强", &["jue", "jiang"]),
+    ("提防", &["di", "fang"]),
+    ("揣度", &["chuai", "duo"]),
+    ("伺候", &["ci", "hou"]),
+    ("积攒", &["ji", "zan"]),
+    ("囤积", &["tun", "ji"]),
+    ("剥削", &["bo", "xue"]),
+    ("殷红", &["yan", "hong"]),
+    ("爪牙", &["zhao", "ya"]),
+    ("咬文嚼字", &["yao", "wen", "jiao", "zi"]),
+    ("纤维", &["xian", "wei"]),
+    ("系统", &["xi", "tong"]),
+    ("联系", &["lian", "xi"]),
+    ("朝着", &["chao", "zhe"]),
+    ("折腾", &["zhe", "teng"]),
     ("快乐", &["kuai", "le"]),
     ("快樂", &["kuai", "le"]),
-    ("角色", &["jue", "se"]),
-    ("便宜", &["pian", "yi"]),
 ];
 
 pub fn normalize_query(query: &str) -> Option<String> {
@@ -576,5 +740,56 @@ mod tests {
     fn single_latin_letter_does_not_enable_pinyin() {
         assert!(match_name("微信", "w").is_none());
         assert!(match_name("微信", "2").is_none());
+    }
+
+    /// P1-1（搜索报告2，2026-08-21）：词表扩充后新词条可命中、
+    /// 老词条与默认读音路径不回归、负例不放宽。
+    #[test]
+    fn p1_1_expanded_phrases_match_and_defaults_do_not_regress() {
+        let positive = [
+            // 新增词条（此前走错读音或不命中）
+            ("成长", "chengzhang"),
+            ("睡觉", "shuijiao"),
+            ("主角", "zhujue"),
+            ("倔强", "juejiang"),
+            ("模样", "muyang"),
+            ("模板", "muban"),
+            ("出差", "chuchai"),
+            ("大夫", "daifu"),
+            ("西藏", "xizang"),
+            ("血压", "xueya"),
+            ("外壳", "waike"),
+            ("传记", "zhuanji"),
+            ("曾经", "cengjing"),
+            ("六安", "luan"),
+            ("番禺", "panyu"),
+            ("重启", "chongqi"),
+            ("弹窗", "tanchuang"),
+            ("调整", "tiaozheng"),
+            ("调用", "diao yong"),
+            ("都市", "dushi"),
+            ("都是", "doushi"),
+            ("水流传输", "shuiliuchuanshu"),
+            ("有限公司董事长", "dongshizhang"),
+            // 老词条回归
+            ("重庆", "chongqing"),
+            ("银行", "yinhang"),
+            ("角色", "juese"),
+        ];
+        for (name, query) in positive {
+            assert!(match_name(name, query).is_some(), "{name} / {query}");
+        }
+
+        // 负例：词表不得把默认读音改错——「重要」仍是 zhong 不是 chong，
+        // 「行为」仍是 xingwei（hang 只在行市/称谓词里），「模型」仍是 mo。
+        assert!(match_name("重要", "chongyao").is_none());
+        assert!(match_name("行为", "hangwei").is_none());
+        assert!(
+            match_name("模型", "muxing").is_none(),
+            "模型=mo xing，模样/模板=mu"
+        );
+        assert!(match_name("重要", "zhongyao").is_some());
+        assert!(match_name("行为", "xingwei").is_some());
+        assert!(match_name("模型", "moxing").is_some());
     }
 }
