@@ -1044,6 +1044,10 @@ public sealed class SearchViewModel
 
     private async Task PollUntilReadyAsync(string query, int max, int seq)
     {
+        // B6（AUDIT-4 批次C）：轮询请求带上发起搜索的取消令牌——broker wedge
+        // 时轮询的 SearchAsync 只在等 _ioLock 阶段被取消（写出后仍按配对读
+        // 纪律读完响应再丢弃），不再占住通道锁到 8s 读超时。
+        var pollToken = _searchCts?.Token ?? CancellationToken.None;
         SearchResponse? lastIndexingResponse = null;
         for (var i = 0; i < 30; i++)
         {
@@ -1061,7 +1065,7 @@ public sealed class SearchViewModel
             try
             {
                 var resp = await _pipe.SearchAsync(
-                    StripWindowPrefix(query), max, ContextFor(query)).ConfigureAwait(true);
+                    StripWindowPrefix(query), max, ContextFor(query), pollToken).ConfigureAwait(true);
                 if (seq != _searchSeq) return;
                 if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
                 // Echo carries no `>`; compare against the stripped form.

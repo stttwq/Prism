@@ -16,6 +16,30 @@ struct CacheEnvelope<T> {
     magic: [u8; 8],
     version: u32,
     state: T,
+    /// B3（AUDIT-4 批次C，2026-08-21）：names/nodes 内容校验和（逐卷
+    /// `VolumeIndex::content_hash` 折叠）。v5 此前只有 magic+version+结构
+    /// validate，名字池单字节静默损坏可跨重启存活（sidecar 有 checksum、
+    /// v5 没有）。`serde(default)` 使旧文件（无此字段）解码为 0 并跳过校验；
+    /// 新文件非 0，load 侧重算比对，不匹配按损坏拒绝走全量重建。
+    #[serde(default)]
+    content_checksum: u64,
+}
+
+/// B3: 逐卷 content_hash 折叠成整态校验和。save / save_streaming 两条路径
+/// 共用同一函数，保证字节一致的产物校验和也一致。
+fn state_checksum(state: &IndexState) -> u64 {
+    fn fnv(hash: &mut u64, value: u64) {
+        for byte in value.to_le_bytes() {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    fnv(&mut hash, state.volumes.len() as u64);
+    for volume in &state.volumes {
+        fnv(&mut hash, volume.content_hash());
+    }
+    hash
 }
 
 pub fn machine_data_dir() -> PathBuf {
@@ -31,18 +55,38 @@ pub fn cache_path(data_dir: &Path) -> PathBuf {
 
 pub fn load(data_dir: &Path) -> Result<IndexState, String> {
     let path = cache_path(data_dir);
-    let file =
-        std::fs::File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    // 流式反序列化（分块缓冲）：不再把完整文件字节物化为 Vec，消除字节+结构双驻留。
-    // postcard::from_io 需要 (reader, scratch_buffer)：读取器流式取字节，scratch 仅供
-    // 反序列器暂存非顺序数据，常驻尺寸远小于完整文件。
-    let reader = std::io::BufReader::with_capacity(256 * 1024, file);
-    let mut scratch = [0u8; 4096];
-    let (mut envelope, _leftover): (CacheEnvelope<IndexState>, _) =
-        postcard::from_io((reader, scratch.as_mut_slice()))
-            .map_err(|error| format!("decode v5 cache: {error}"))?;
+    // B3（AUDIT-4 批次C）：新格式尾部多一个校验和 varint。postcard 是顺序
+    // 格式、serde(default) 对缺失的**尾部**字段无能为力——旧文件按
+    // DeserializeUnexpectedEnd 分支重开一次按 legacy 布局（无校验和）解码，
+    // 校验和记 0（跳过校验）。真正截断的新文件两条路径都会失败，语义不变。
+    let mut envelope = match load_envelope(&path) {
+        Ok(envelope) => envelope,
+        Err(LoadEnvelopeError::Legacy) => {
+            let legacy: CacheEnvelopeLegacy<IndexState> = open_and_decode(&path)
+                .map_err(|error| format!("decode v5 legacy cache: {error}"))?;
+            CacheEnvelope {
+                magic: legacy.magic,
+                version: legacy.version,
+                state: legacy.state,
+                content_checksum: 0,
+            }
+        }
+        Err(LoadEnvelopeError::Decode(error)) => {
+            return Err(format!("decode v5 cache: {error}"))
+        }
+    };
     if &envelope.magic != CACHE_MAGIC || envelope.version != CACHE_VERSION {
         return Err("cache is not Prism v5".into());
+    }
+    // B3：非 0 校验和必须匹配。names_fingerprint 是 serde skip 字段（解码后
+    // 为 0），先整算再参与哈希——与 save 侧（活索引的滚入指纹）等值。
+    if envelope.content_checksum != 0 {
+        for volume in &mut envelope.state.volumes {
+            volume.recompute_derived_counters();
+        }
+        if state_checksum(&envelope.state) != envelope.content_checksum {
+            return Err("cache content checksum mismatch".into());
+        }
     }
     validate(&envelope.state)?;
     // F3（FRESH-AUDIT-2）：指纹是 serde skip 字段，载入后整算一次
@@ -51,6 +95,39 @@ pub fn load(data_dir: &Path) -> Result<IndexState, String> {
         volume.recompute_derived_counters();
     }
     Ok(envelope.state)
+}
+
+enum LoadEnvelopeError {
+    /// 按新格式解码在尾部缺数据——大概率是旧格式文件（无校验和字段）。
+    Legacy,
+    Decode(postcard::Error),
+}
+
+fn load_envelope(path: &Path) -> Result<CacheEnvelope<IndexState>, LoadEnvelopeError> {
+    match open_and_decode(path) {
+        Ok(envelope) => Ok(envelope),
+        Err(postcard::Error::DeserializeUnexpectedEnd) => Err(LoadEnvelopeError::Legacy),
+        Err(error) => Err(LoadEnvelopeError::Decode(error)),
+    }
+}
+
+fn open_and_decode<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, postcard::Error> {
+    let file = std::fs::File::open(path).map_err(|_| postcard::Error::DeserializeUnexpectedEnd)?;
+    // 流式反序列化（分块缓冲）：不再把完整文件字节物化为 Vec，消除字节+结构双驻留。
+    // postcard::from_io 需要 (reader, scratch_buffer)：读取器流式取字节，scratch 仅供
+    // 反序列器暂存非顺序数据，常驻尺寸远小于完整文件。
+    let reader = std::io::BufReader::with_capacity(256 * 1024, file);
+    let mut scratch = [0u8; 4096];
+    let (envelope, _leftover): (T, _) = postcard::from_io((reader, scratch.as_mut_slice()))?;
+    Ok(envelope)
+}
+
+/// B3：升级前的 v5 布局（无尾部校验和字段），仅供 load 的 legacy 回退解码。
+#[derive(Serialize, Deserialize)]
+struct CacheEnvelopeLegacy<T> {
+    magic: [u8; 8],
+    version: u32,
+    state: T,
 }
 
 pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
@@ -72,6 +149,7 @@ pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
             magic: *CACHE_MAGIC,
             version: CACHE_VERSION,
             state,
+            content_checksum: state_checksum(state),
         },
         &mut writer,
     )
@@ -92,8 +170,10 @@ pub const SNAPSHOT_CHANGED: &str = "prism-snapshot-changed";
 
 /// M2: 逐卷流式写 v5。字节布局手工复刻 CacheEnvelope<IndexState> 的派生
 /// 序列化（magic 原始 8 字节 + varint 字段；与 save() 逐字节一致，由测试锚定）：
-/// `magic | version | volumes.len | volume* | generation | events_since_checkpoint`。
-/// `write_volume` 由调用方实现锁与世代核对——每卷短读锁、guard 不跨卷存活。
+/// `magic | version | volumes.len | volume* | generation | events_since_checkpoint | content_checksum`。
+/// `write_volume` 由调用方实现锁与世代核对——每卷短读锁、guard 不跨卷存活；
+/// B3（AUDIT-4 批次C）起回调须返回该卷的 `content_hash()`（在同一短读锁内
+/// 计算），流式尾部写出整态校验和，与 save() 派生序列化保持逐字节一致。
 pub fn save_streaming<F>(
     data_dir: &Path,
     volume_count: usize,
@@ -102,7 +182,7 @@ pub fn save_streaming<F>(
     mut write_volume: F,
 ) -> Result<(), String>
 where
-    F: FnMut(usize, &mut std::io::BufWriter<std::fs::File>) -> Result<(), String>,
+    F: FnMut(usize, &mut std::io::BufWriter<std::fs::File>) -> Result<u64, String>,
 {
     std::fs::create_dir_all(data_dir)
         .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
@@ -119,13 +199,24 @@ where
     // Vec 的长度字段：postcard 对 usize 走 varint，与 varint u32 编码一致。
     postcard::to_io(&(volume_count as u32), &mut writer)
         .map_err(|error| format!("encode v5 header: {error}"))?;
+    let mut checksum: u64 = 0xcbf29ce484222325;
+    fn fold(value: u64, checksum: &mut u64) {
+        for byte in value.to_le_bytes() {
+            *checksum ^= u64::from(byte);
+            *checksum = checksum.wrapping_mul(0x100000001b3);
+        }
+    }
+    fold(volume_count as u64, &mut checksum);
     for position in 0..volume_count {
-        write_volume(position, &mut writer)?;
+        let volume_hash = write_volume(position, &mut writer)?;
+        fold(volume_hash, &mut checksum);
     }
     postcard::to_io(&generation, &mut writer)
         .map_err(|error| format!("encode v5 tail: {error}"))?;
     postcard::to_io(&events_since_checkpoint, &mut writer)
         .map_err(|error| format!("encode v5 tail: {error}"))?;
+    postcard::to_io(&checksum, &mut writer)
+        .map_err(|error| format!("encode v5 checksum: {error}"))?;
     writer
         .flush()
         .and_then(|()| writer.get_ref().sync_all())
@@ -215,6 +306,7 @@ mod tests {
             magic: *b"PRISMV4\0",
             version: 4,
             state: state(),
+            content_checksum: 0,
         })
         .unwrap();
         let decoded: CacheEnvelope<IndexState> = postcard::from_bytes(&bytes).unwrap();
@@ -241,5 +333,49 @@ mod tests {
             err.contains("cycle") || err.contains("exceeds depth"),
             "unexpected error: {err}"
         );
+    }
+
+    /// B3（AUDIT-4 批次C）：结构完好但内容被改（names 池单字节静默损坏的
+    /// 等价模拟——同长度名字只差一字节，解码不报错）时校验和必须拒绝。
+    #[test]
+    fn b3_checksum_rejects_silently_altered_content() {
+        let dir = std::env::temp_dir().join(format!("prism-v5-b3a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let clean = state();
+        let mut altered = state();
+        // 同长度、仅一字节之差的名字——结构校验全部通过（父=root_record 5）。
+        altered.volumes[0].upsert(10, 5, "corrupt-name", false).unwrap();
+        // 用干净状态的校验和 + 被改内容组装 envelope。
+        let bytes = postcard::to_allocvec(&CacheEnvelope {
+            magic: *CACHE_MAGIC,
+            version: CACHE_VERSION,
+            state: altered,
+            content_checksum: state_checksum(&clean),
+        })
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(cache_path(&dir), bytes).unwrap();
+        let error = load(&dir).unwrap_err();
+        assert!(error.contains("checksum"), "unexpected: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B3：旧格式文件（无校验和字段）仍可加载——legacy 回退解码 + 跳过校验，
+    /// 升级路径无损。
+    #[test]
+    fn b3_legacy_file_without_checksum_still_loads() {
+        let dir = std::env::temp_dir().join(format!("prism-v5-b3b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = postcard::to_allocvec(&CacheEnvelopeLegacy {
+            magic: *CACHE_MAGIC,
+            version: CACHE_VERSION,
+            state: state(),
+        })
+        .unwrap();
+        std::fs::write(cache_path(&dir), bytes).unwrap();
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.generation, 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

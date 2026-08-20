@@ -136,8 +136,8 @@ public sealed class FaviconCache
             if (!ValidateImageData(buf[..read], out var width, out var height))
                 return null;
 
-            // 原子写：先写临时文件再重命名
-            var tmpPath = Path.Combine(_cacheDir, key.Replace("://", "_").Replace('/', '_') + ".tmp");
+            // 原子写：先写临时文件再重命名（B8：落盘名统一经 KeyToFileName）
+            var tmpPath = Path.Combine(_cacheDir, KeyToFileName(key) + ".tmp");
             await File.WriteAllBytesAsync(tmpPath, buf[..read], ct).ConfigureAwait(false);
 
             var imgPath = GetImagePath(key);
@@ -244,6 +244,15 @@ public sealed class FaviconCache
         }
     }
 
+    /// <summary>
+    /// B8（AUDIT-4 批次C）：origin 到落盘文件名的统一映射。端口 origin
+    ///（如 https://host:8080）此前会把 <c>:</c> 留在文件名里——NTFS 把
+    /// <c>name:stream</c> 解释成 ADS 备用数据流，favicon 静默写丢且脱离
+    /// LRU 淘汰。所有落盘名都经本函数（<c>:</c> 一并替换）。
+    /// </summary>
+    internal static string KeyToFileName(string key) =>
+        key.Replace("://", "_").Replace('/', '_').Replace(':', '_');
+
     private ImageSource? TryLoadImage(string key)
     {
         var path = GetImagePath(key);
@@ -269,10 +278,10 @@ public sealed class FaviconCache
     }
 
     private string GetImagePath(string key) =>
-        Path.Combine(_cacheDir, key.Replace("://", "_").Replace('/', '_') + ".img");
+        Path.Combine(_cacheDir, KeyToFileName(key) + ".img");
 
     private string GetMetadataPath(string key) =>
-        Path.Combine(_cacheDir, key.Replace("://", "_").Replace('/', '_') + ".meta");
+        Path.Combine(_cacheDir, KeyToFileName(key) + ".meta");
 
     private void DeleteEntry(string key)
     {

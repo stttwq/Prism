@@ -308,12 +308,23 @@ pub struct ServiceState {
     /// AUDIT-2026-08-18 R-A3: 活跃连接数。每个连接一个 tokio 任务 + 1MB 行缓冲，
     /// 无上限时任凭本地进程堆积连接即可耗尽 2 worker 的 runtime。
     connections: AtomicUsize,
-    /// F2（FRESH-AUDIT-2）：单槽 RootBound 缓存 (raw root, generation, bound)。
-    /// 带 root 的搜索此前每击键都对节点表全量线性扫描解析 root（CWD 范围搜索
-    /// 是常态路径，3M 记录卷上额外 ~10ms+ 持读锁）。generation 变化即失效——
-    /// 记录号可能因 USN 重放改变，旧 bound 绝不能复用。单槽即可：同一会话里
-    /// 呼出时的 CWD 在下一次呼出前几乎不变。
-    root_bound_cache: RwLock<Option<(String, u64, crate::hierarchy::RootBound)>>,
+    /// B1（AUDIT-4 批次C，2026-08-21）：RootBound 解析缓存（4 槽）。
+    /// 失效粒度从全局 generation 放宽到「被解析卷自身 next_usn」（与流式
+    /// checkpoint 的按卷核对同思路）：USN 洪峰期（浏览器/WU 持续写盘）
+    /// generation 每批次 +1，他卷活动不再作废本卷的解析结果；只有被解析卷
+    /// 自身的 next_usn 前移（节点表已变）才需要重解析。volume_id 防卷表
+    /// 重排/单卷重建后的索引位错配。
+    root_bound_cache: RwLock<Vec<RootBoundCacheEntry>>,
+}
+
+/// B1：RootBound 缓存条目（见 `root_bound_cache` 字段注释）。
+#[derive(Debug, Clone)]
+pub struct RootBoundCacheEntry {
+    pub root: String,
+    pub volume_id: crate::hierarchy::VolumeId,
+    pub volume_index: usize,
+    pub next_usn: i64,
+    pub bound: crate::hierarchy::RootBound,
 }
 
 impl ServiceState {
@@ -351,7 +362,7 @@ impl ServiceState {
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
             connections: AtomicUsize::new(0),
-            root_bound_cache: RwLock::new(None),
+            root_bound_cache: RwLock::new(Vec::new()),
         })
     }
 
@@ -787,33 +798,60 @@ impl ServiceState {
         }
     }
 
-    /// F2（FRESH-AUDIT-2）：带 generation 失效的单槽 RootBound 缓存解析。
-    /// 调用方持有 index 读锁（`state` 借自它）；缓存锁只在此处获取，
-    /// 与 index 锁无反向嵌套，无死序风险。generation 不匹配即重解析并覆盖。
+    /// F2 + B1（AUDIT-4 批次C）：RootBound 缓存解析。调用方持有 index 读锁
+    ///（`state` 借自它）；缓存锁只在此处获取，与 index 锁无反向嵌套，无死序
+    /// 风险。命中条件：同 root + 卷仍在原索引位 + 卷身份一致 + 该卷 next_usn
+    /// 未前移。next_usn 前移或卷表变化即重解析并覆盖。
     fn resolve_root_bound(
         &self,
         state: &IndexState,
         root: &str,
     ) -> RootBoundOutcome {
+        const ROOT_CACHE_SLOTS: usize = 4;
         {
             let cache = self
                 .root_bound_cache
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((key, generation, bound)) = cache.as_ref() {
-                if key == root && *generation == state.generation {
-                    return RootBoundOutcome::Bound(Some(*bound));
+            for entry in cache.iter() {
+                if entry.root != root {
+                    continue;
                 }
+                let valid = state
+                    .volumes
+                    .get(entry.volume_index)
+                    .is_some_and(|volume| {
+                        volume.volume_id == entry.volume_id
+                            && volume.next_usn == entry.next_usn
+                    });
+                if valid {
+                    return RootBoundOutcome::Bound(Some(entry.bound));
+                }
+                break;
             }
         }
         match RootScope::resolve(state, root) {
             Ok(scope) => {
                 let bound = scope.bound();
+                let Some(volume) = state.volumes.get(bound.volume_index) else {
+                    return RootBoundOutcome::Bound(Some(bound));
+                };
+                let entry = RootBoundCacheEntry {
+                    root: root.to_owned(),
+                    volume_id: volume.volume_id.clone(),
+                    volume_index: bound.volume_index,
+                    next_usn: volume.next_usn,
+                    bound,
+                };
                 let mut cache = self
                     .root_bound_cache
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *cache = Some((root.to_owned(), state.generation, bound));
+                cache.retain(|existing| existing.root != root);
+                if cache.len() >= ROOT_CACHE_SLOTS {
+                    cache.remove(0);
+                }
+                cache.push(entry);
                 RootBoundOutcome::Bound(Some(bound))
             }
             Err(rejection) => RootBoundOutcome::Unavailable(IndexerResponse::RootUnavailable {
@@ -2089,7 +2127,9 @@ fn checkpoint_streaming_with_head(
             }
             postcard::to_io(&index.volumes[position], writer)
                 .map_err(|error| format!("encode v5 volume: {error}"))?;
-            Ok(())
+            // B3（AUDIT-4 批次C）：同一短读锁内算出本卷内容哈希，交流式
+            // 尾部折叠成 envelope 校验和。
+            Ok(index.volumes[position].content_hash())
         },
     )?;
     checkpoint_after_save(state, &head, flush_pinyin)
@@ -3617,6 +3657,74 @@ mod tests {
                 })
             ));
         }
+    }
+
+    /// B1（AUDIT-4 批次C）：RootBound 缓存失效粒度=被解析卷自身 next_usn。
+    /// 他卷活动（含 generation 前移）不作废缓存条目；本卷 next_usn 前移后
+    /// 旧 bound 不复用，重解析得到新记录号。
+    #[test]
+    fn b1_root_bound_cache_survives_other_volume_activity_but_not_own_changes() {
+        let state = ServiceState::new();
+        let mut c = VolumeIndex::new(
+            VolumeId { guid: "c".into(), serial: 1 },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        c.upsert(10, 5, "项目", true).unwrap();
+        c.upsert(11, 10, "微信.txt", false).unwrap();
+        let mut d = VolumeIndex::new(
+            VolumeId { guid: "d".into(), serial: 2 },
+            "D:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        d.upsert(10, 5, "other", false).unwrap();
+        state.publish(IndexState {
+            volumes: vec![c, d],
+            generation: 1,
+            events_since_checkpoint: 0,
+        });
+
+        let bound_of = |root: &str| {
+            let guard = state.index.read().unwrap();
+            let live = guard.as_ref().unwrap();
+            match state.resolve_root_bound(live, root) {
+                RootBoundOutcome::Bound(Some(bound)) => Some(bound),
+                _ => None,
+            }
+        };
+        assert_eq!(bound_of(r"C:\项目").map(|b| b.root_record), Some(10));
+
+        // 他卷活动：D 卷 next_usn 前移 + generation 前移——缓存条目保持命中。
+        {
+            let mut guard = state.index.write().unwrap();
+            let live = guard.as_mut().unwrap();
+            live.volumes[1].next_usn += 1;
+            live.generation += 1;
+        }
+        assert_eq!(bound_of(r"C:\项目").map(|b| b.root_record), Some(10));
+        assert_eq!(
+            state.root_bound_cache.read().unwrap().len(),
+            1,
+            "他卷活动不得作废/替换缓存条目"
+        );
+
+        // 本卷变化：C 卷 next_usn 前移 + 同路径目录换记录号——旧 bound 不复用。
+        {
+            let mut guard = state.index.write().unwrap();
+            let live = guard.as_mut().unwrap();
+            let volume = &mut live.volumes[0];
+            volume.delete(10).unwrap();
+            volume.upsert(20, 5, "项目", true).unwrap();
+            volume.next_usn += 1;
+            live.generation += 1;
+        }
+        assert_eq!(bound_of(r"C:\项目").map(|b| b.root_record), Some(20));
     }
 
     #[test]

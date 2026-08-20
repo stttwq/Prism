@@ -194,6 +194,14 @@ fn validate_zip_request(target: &ActionTarget, output_path: &str) -> Result<(), 
             "output path must end with .zip",
         ));
     }
+    // B4（AUDIT-4 批次C）：输出已存在时明确报 Conflict，不再静默覆写——
+    // 此前三级回退都会破坏已存在的 zip（外部路径 -aoa / Shell COM 先写空 zip）。
+    if std::path::Path::new(output_path).exists() {
+        return Err(ShellError::new(
+            ShellErrorKind::Conflict,
+            "output zip already exists",
+        ));
+    }
     Ok(())
 }
 
@@ -310,6 +318,14 @@ fn zip_with_external(
 ///
 /// 这是 Windows 10 1803+ 的内置能力，无需第三方依赖。
 /// 创建空 ZIP 文件，然后用 `Shell.NameSpace(zip_path).CopyHere(source)`。
+///
+/// B4（AUDIT-4 批次C，2026-08-21）：`CopyHere` 是异步提交——立即返回 Success
+/// 意味着 zip 还在后台写、甚至失败也无人知晓。修法：flags 带
+/// FOF_SILENT|FOF_NOCONFIRMATION|FOF_NOERRORUI（broker 无控制台，任何 UI
+/// 挂起都会拖死 STA worker），调用后轮询 zip 目录条目数稳定（连续两个采样
+/// 窗口数量一致）再上报；有界等待（60s）后按完成上报——轮询是启发式，
+/// 宁可乐观上报也不无限占住唯一 STA 队列。输出已存在的冲突在
+/// `validate_zip_request` 拦截。
 #[cfg(windows)]
 fn zip_with_shell_com(source: &str, output: &str) -> Result<ShellOutcome, ShellError> {
     use windows::core::{BSTR, VARIANT};
@@ -340,12 +356,37 @@ fn zip_with_shell_com(source: &str, output: &str) -> Result<ShellOutcome, ShellE
             .NameSpace(&output_var)
             .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
 
-        // CopyHere(source, flags)
-        // source 也需要是 VARIANT(BSTR)
+        // CopyHere(source, flags)：4=FOF_SILENT、16=FOF_NOCONFIRMATION、
+        // 1024=FOF_NOERRORUI——静默 + 免确认 + 免错误 UI，任何交互都会挂死
+        // 无控制台的 broker STA worker。
         let source_var = VARIANT::from(BSTR::from(source));
         folder
-            .CopyHere(&source_var, &VARIANT::default())
+            .CopyHere(&source_var, &VARIANT::from(4i16 | 16 | 1024))
             .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
+
+        // 轮询条目数稳定：CopyHere 异步填充 zip。初始为空/复制完成后数量
+        // 不再变化；连续两个窗口一致且非零即认为完成（有界 60s）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let zip_entry_count = || -> i32 {
+            folder
+                .Items()
+                .ok()
+                .and_then(|items| items.Count().ok())
+                .unwrap_or(-1)
+        };
+        let mut last_count = zip_entry_count();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let count = zip_entry_count();
+            if count > 0 && count == last_count {
+                break;
+            }
+            last_count = count;
+            if std::time::Instant::now() >= deadline {
+                crate::logging::event("warn", "zip_shell_com_wait_timeout", None, None);
+                break;
+            }
+        }
     }
 
     crate::logging::event("info", "zip_shell_com_complete", None, None);
@@ -425,6 +466,29 @@ mod tests {
         let err = zip(&target, r"C:\out.rar", None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains(".zip"));
+    }
+
+    /// B4（AUDIT-4 批次C）：输出 zip 已存在时报 Conflict，不再静默覆写。
+    #[cfg(windows)]
+    #[test]
+    fn zip_rejects_existing_output_as_conflict() {
+        let dir = std::env::temp_dir().join(format!("prism-zip-b4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("out.zip");
+        std::fs::write(&output, b"existing").unwrap();
+
+        let target = ActionTarget::new(TargetKind::File, r"C:\x.txt");
+        let err = zip(&target, output.to_str().unwrap(), None).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Conflict);
+
+        // zip_external 的校验与 zip 一致。
+        let err2 = zip_external(&target, output.to_str().unwrap(), None)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err2.kind, ShellErrorKind::Conflict);
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing", "已存在的 zip 不得被覆写");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

@@ -702,6 +702,30 @@ impl VolumeIndex {
         self.dead_name_bytes = usize::MAX;
     }
 
+    /// B3（AUDIT-4 批次C，2026-08-21）：names/nodes 内容哈希，供 v5 envelope
+    /// 校验和。names 池内容经 `names_fingerprint`（F3，载入侧整算）纳入；
+    /// 节点表逐槽哈希 (record, parent, name_off, sequence, flags)。NodeSlot
+    /// 字段增删时同步 review 本函数——漏字段=校验盲区。
+    pub fn content_hash(&self) -> u64 {
+        fn fnv(hash: &mut u64, value: u64) {
+            for byte in value.to_le_bytes() {
+                *hash ^= u64::from(byte);
+                *hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        let mut hash: u64 = 0xcbf29ce484222325;
+        fnv(&mut hash, self.names_fingerprint);
+        fnv(&mut hash, self.nodes.len() as u64);
+        for (record, slot) in self.nodes.iter().enumerate() {
+            fnv(&mut hash, record as u64);
+            fnv(&mut hash, u64::from(slot.parent_record));
+            fnv(&mut hash, u64::from(slot.name_off));
+            fnv(&mut hash, u64::from(slot.sequence));
+            fnv(&mut hash, u64::from(slot.flags));
+        }
+        hash
+    }
+
     #[cfg(test)]
     pub(crate) fn dead_name_bytes_for_test(&self) -> usize {
         self.dead_name_bytes

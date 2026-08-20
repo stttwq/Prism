@@ -34,45 +34,70 @@ public sealed class IconCache
     private readonly Dictionary<string, LinkedListNode<Entry>> _map = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<Entry> _lru = new(); // 头=最近使用，尾=最久未用
 
-    /// <summary>异步获取系统文件图标；pixelSize 按目标物理像素请求（高 DPI 下取 48/256px 源，避免拉伸发虚）。</summary>
+    /// <summary>异步获取系统文件图标；pixelSize 按目标物理像素请求（高 DPI 下取 48/256px 源，避免拉伸发虚）。
+    /// B9（AUDIT-4 批次C）：无扩展名路径的键判定含 Directory.Exists 探盘，整体挪进
+    /// Task.Run 体——UI 装饰路径零探盘（网络盘/休眠盘不再卡键计算）。</summary>
     public Task<ImageSource?> GetAsync(string path, int pixelSize = 32, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(path))
             return Task.FromResult<ImageSource?>(null);
 
-        var key = SizedKey(path, pixelSize);
-        lock (_lock)
+        var size = Math.Max(1, pixelSize);
+        if (TryKeyWithoutFileSystem(path, out var fastKey))
         {
-            if (_map.TryGetValue(key, out var node))
+            var key = fastKey + "@" + size;
+            lock (_lock)
             {
-                // 命中：提升到链表头，刷新 recency（真 LRU）。
-                _lru.Remove(node);
-                _lru.AddFirst(node);
-                return Task.FromResult(node.Value.Icon);
+                if (_map.TryGetValue(key, out var node))
+                {
+                    // 命中：提升到链表头，刷新 recency（真 LRU）。
+                    _lru.Remove(node);
+                    _lru.AddFirst(node);
+                    return Task.FromResult(node.Value.Icon);
+                }
             }
+            return Task.Run(() => LoadAndStore(key, path, pixelSize, ct), ct);
         }
 
+        // B9：无扩展名路径需要探盘才能定键（dir: 还是 file:）——后台执行。
         return Task.Run(() =>
         {
             ct.ThrowIfCancellationRequested();
-            var icon = LoadIcon(path, pixelSize);
+            var key = CacheKey(path) + "@" + size;
             lock (_lock)
             {
-                // 复查：加载期间可能有别的线程插了同一 key——复用已有条目、丢弃本次结果，
-                // 避免重复条目，同时把它提升为最近使用。
-                if (_map.TryGetValue(key, out var existing))
+                if (_map.TryGetValue(key, out var node))
                 {
-                    _lru.Remove(existing);
-                    _lru.AddFirst(existing);
-                    return existing.Value.Icon;
+                    _lru.Remove(node);
+                    _lru.AddFirst(node);
+                    return node.Value.Icon;
                 }
-                var node = new LinkedListNode<Entry>(new Entry { Key = key, Icon = icon });
-                _lru.AddFirst(node);
-                _map[key] = node;
-                TrimIfNeeded();
             }
-            return icon;
+            return LoadAndStore(key, path, pixelSize, ct);
         }, ct);
+    }
+
+    /// <summary>锁外加载图标并入缓存（加载期间可能有并发插入，复查复用）。</summary>
+    private ImageSource? LoadAndStore(string key, string path, int pixelSize, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var icon = LoadIcon(path, pixelSize);
+        lock (_lock)
+        {
+            // 复查：加载期间可能有别的线程插了同一 key——复用已有条目、丢弃本次结果，
+            // 避免重复条目，同时把它提升为最近使用。
+            if (_map.TryGetValue(key, out var existing))
+            {
+                _lru.Remove(existing);
+                _lru.AddFirst(existing);
+                return existing.Value.Icon;
+            }
+            var node = new LinkedListNode<Entry>(new Entry { Key = key, Icon = icon });
+            _lru.AddFirst(node);
+            _map[key] = node;
+            TrimIfNeeded();
+        }
+        return icon;
     }
 
     /// <summary>清空缓存（搜索窗隐藏后调用，把位图交还 GC）。</summary>
@@ -141,6 +166,53 @@ public sealed class IconCache
     /// </summary>
     internal static string SizedKey(string path, int pixelSize) =>
         CacheKey(path) + "@" + Math.Max(1, pixelSize);
+
+    /// <summary>
+    /// B9（AUDIT-4 批次C）：不触文件系统的键前缀计算。覆盖 CacheKey 的全部
+    /// 无探测分支（URL / 尾分隔符目录 / 可执行类完整路径 / 扩展名键）；
+    /// 返回 false 表示该路径形态（无扩展名）必须 Directory.Exists 探测，
+    /// 调用方负责把探测挪出 UI 线程。
+    /// </summary>
+    internal static bool TryKeyWithoutFileSystem(string path, out string key)
+    {
+        key = "";
+        if (path.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            key = path;
+            return true;
+        }
+        try
+        {
+            if (path.EndsWith('\\') || path.EndsWith('/'))
+            {
+                key = "dir:";
+                return true;
+            }
+            var ext = Path.GetExtension(path);
+            if (ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".msc", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".bat", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".com", StringComparison.OrdinalIgnoreCase))
+            {
+                key = path;
+                return true;
+            }
+            if (!string.IsNullOrEmpty(ext))
+            {
+                key = "ext:" + ext.ToLowerInvariant();
+                return true;
+            }
+            return false;
+        }
+        catch
+        {
+            key = path;
+            return true;
+        }
+    }
 
     internal static string CacheKey(string path)
     {
