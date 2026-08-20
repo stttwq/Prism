@@ -47,13 +47,15 @@ pub fn search_ranked<'a>(
     if query.is_empty() {
         return (Vec::new(), 0);
     }
-    let q = query.to_lowercase();
+    // S4（PRISM-IMPL-PLAN-4-2026-08-20）：空白 AND 分词——「prism 报告」
+    // 匹配同时含两段的应用名。
+    let terms = crate::hierarchy::NameTerms::parse(query);
     let mut matched = 0u64;
     // 有界 top-N：按 (rank, name.len()) 升序保持，满了就与末位比较。
     // 「不优于末位则丢弃」等价于稳定排序后 take(max)——同键的靠后条目本来就排在后面。
     let mut kept: Vec<((u8, usize), &AppEntry)> = Vec::with_capacity(max.min(64));
     for app in apps {
-        let Some(rank) = match_rank(app, &q) else {
+        let Some(rank) = match_rank(app, &terms) else {
             continue;
         };
         matched = matched.saturating_add(1);
@@ -73,17 +75,28 @@ pub fn search_ranked<'a>(
     (kept.into_iter().map(|(_, app)| app).collect(), matched)
 }
 
-/// 命中等级：0 完全匹配、1 前缀、2 包含；未命中 None。`query_lower` 须已小写。
-fn match_rank(app: &AppEntry, query_lower: &str) -> Option<u8> {
-    if app.name_lower == query_lower {
-        Some(0)
-    } else if app.name_lower.starts_with(query_lower) {
-        Some(1)
-    } else if app.name_lower.contains(query_lower) {
-        Some(2)
-    } else {
-        None
+/// 命中等级：0 完全匹配、1 前缀、2 包含；未命中 None。
+/// S4：多 term AND——每个 term 都是降幂名的子串；等级取「整名相等=0 /
+/// 任一 term 在位置 0=1 / 否则 2」，与字面路径的 class 口径一致。
+fn match_rank(app: &AppEntry, terms: &crate::hierarchy::NameTerms) -> Option<u8> {
+    if let Some(single) = terms.single() {
+        if app.name_lower == single {
+            return Some(0);
+        }
+        if app.name_lower.starts_with(single) {
+            return Some(1);
+        }
+        return app.name_lower.contains(single).then_some(2);
     }
+    let mut at_start = false;
+    for term in terms.iter() {
+        match app.name_lower.find(term) {
+            None => return None,
+            Some(0) => at_start = true,
+            Some(_) => {}
+        }
+    }
+    Some(if at_start { 1 } else { 2 })
 }
 
 /// 只要 top-N 的旧签名（测试与外部调用方沿用）。

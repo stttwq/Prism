@@ -1,0 +1,1251 @@
+{
+    "schema_version":  1,
+    "run_id":  "s2gate-20260820",
+    "query_set_version":  "g0-v1",
+    "percentile_method":  "nearest_rank",
+    "raw_sample_count":  722,
+    "warm_sample_count":  720,
+    "aggregates":  [
+                       {
+                           "query_id":  "ascii_contains",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  24.725,
+                           "p95_ms":  28.535,
+                           "max_ms":  73.966,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  10054,
+                                                                   "p95":  10054,
+                                                                   "max":  10054
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  9492,
+                                                                  "p95":  9818,
+                                                                  "max":  9818
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  1000,
+                                                                       "p95":  1000,
+                                                                       "max":  1000
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "ascii_contains",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  15.847,
+                           "p95_ms":  17.888,
+                           "max_ms":  20.356,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  10054,
+                                                                   "p95":  10054,
+                                                                   "max":  10054
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  570,
+                                                                  "p95":  570,
+                                                                  "max":  593
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "ascii_exact",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  22.725,
+                           "p95_ms":  48.451,
+                           "max_ms":  50.269,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  3526,
+                                                                   "p95":  3526,
+                                                                   "max":  3526
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  5770,
+                                                                  "p95":  5883,
+                                                                  "max":  5883
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  1000,
+                                                                       "p95":  1000,
+                                                                       "max":  1000
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "ascii_exact",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  14.451,
+                           "p95_ms":  17.193,
+                           "max_ms":  18.621,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  3526,
+                                                                   "p95":  3526,
+                                                                   "max":  3526
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  572,
+                                                                  "p95":  577,
+                                                                  "max":  577
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "ascii_prefix",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  22.672,
+                           "p95_ms":  66.181,
+                           "max_ms":  73.66,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  4010,
+                                                                   "p95":  4010,
+                                                                   "max":  4010
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  6472,
+                                                                  "p95":  6474,
+                                                                  "max":  6491
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  1000,
+                                                                       "p95":  1000,
+                                                                       "max":  1000
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "ascii_prefix",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  14.487,
+                           "p95_ms":  16.326,
+                           "max_ms":  16.38,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  4010,
+                                                                   "p95":  4010,
+                                                                   "max":  4010
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  512,
+                                                                  "p95":  512,
+                                                                  "max":  512
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "chinese",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  21.765,
+                           "p95_ms":  25.102,
+                           "max_ms":  29.958,
+                           "result_count_min":  29,
+                           "result_count_max":  29,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  29,
+                                                                   "p95":  29,
+                                                                   "max":  29
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  56,
+                                                                  "p95":  56,
+                                                                  "max":  56
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  28,
+                                                                       "p95":  28,
+                                                                       "max":  28
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "chinese",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  21.391,
+                           "p95_ms":  23.272,
+                           "max_ms":  29.154,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  29,
+                                                                   "p95":  29,
+                                                                   "max":  29
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  55,
+                                                                  "p95":  55,
+                                                                  "max":  55
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "cross_volume",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  9.62,
+                           "p95_ms":  10.699,
+                           "max_ms":  10.84,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "cross_volume",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  9.576,
+                           "p95_ms":  9.87,
+                           "max_ms":  11.724,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "no_hit",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  9.445,
+                           "p95_ms":  10.707,
+                           "max_ms":  10.814,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "no_hit",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  9.436,
+                           "p95_ms":  11.019,
+                           "max_ms":  12.086,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "rare_term",
+                           "max":  1000,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  10.445,
+                           "p95_ms":  12.362,
+                           "max_ms":  12.459,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "rare_term",
+                           "max":  8,
+                           "root":  null,
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  10.339,
+                           "p95_ms":  12.347,
+                           "max_ms":  12.427,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_deep_high_candidate",
+                           "max":  1000,
+                           "root":  "E:\\YX",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  32.725,
+                           "p95_ms":  34.478,
+                           "max_ms":  56.497,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  92820,
+                                                                   "p95":  92820,
+                                                                   "max":  92820
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  10556,
+                                                                  "p95":  11545,
+                                                                  "max":  11545
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  1000,
+                                                                       "p95":  1000,
+                                                                       "max":  1000
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_deep_high_candidate",
+                           "max":  8,
+                           "root":  "E:\\YX",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  24.348,
+                           "p95_ms":  25.68,
+                           "max_ms":  25.691,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  92820,
+                                                                   "p95":  92820,
+                                                                   "max":  92820
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  464,
+                                                                  "p95":  488,
+                                                                  "max":  488
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_deep_system32",
+                           "max":  1000,
+                           "root":  "C:\\Windows\\System32",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  25.158,
+                           "p95_ms":  69.215,
+                           "max_ms":  71.931,
+                           "result_count_min":  628,
+                           "result_count_max":  628,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  628,
+                                                                   "p95":  628,
+                                                                   "max":  628
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  1256,
+                                                                  "p95":  1256,
+                                                                  "max":  1256
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  628,
+                                                                       "p95":  628,
+                                                                       "max":  628
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_deep_system32",
+                           "max":  8,
+                           "root":  "C:\\Windows\\System32",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  19.813,
+                           "p95_ms":  22.327,
+                           "max_ms":  22.929,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  628,
+                                                                   "p95":  628,
+                                                                   "max":  628
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  298,
+                                                                  "p95":  298,
+                                                                  "max":  298
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_drive_root",
+                           "max":  1000,
+                           "root":  "E:\\",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  33.88,
+                           "p95_ms":  60.501,
+                           "max_ms":  67.086,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  229640,
+                                                                   "p95":  229640,
+                                                                   "max":  229640
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  18154,
+                                                                  "p95":  18772,
+                                                                  "max":  18772
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  1000,
+                                                                       "p95":  1000,
+                                                                       "max":  1000
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_drive_root",
+                           "max":  8,
+                           "root":  "E:\\",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  24.85,
+                           "p95_ms":  26.401,
+                           "max_ms":  27.678,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  229640,
+                                                                   "p95":  229640,
+                                                                   "max":  229640
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  583,
+                                                                  "p95":  598,
+                                                                  "max":  598
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_no_hit",
+                           "max":  1000,
+                           "root":  "E:\\YX",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  9.726,
+                           "p95_ms":  11.096,
+                           "max_ms":  11.813,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_no_hit",
+                           "max":  8,
+                           "root":  "E:\\YX",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  9.724,
+                           "p95_ms":  11.35,
+                           "max_ms":  13.495,
+                           "result_count_min":  0,
+                           "result_count_max":  0,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  0,
+                                                                   "p95":  0,
+                                                                   "max":  0
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  0,
+                                                                  "p95":  0,
+                                                                  "max":  0
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  0,
+                                                                       "p95":  0,
+                                                                       "max":  0
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_shallow_small",
+                           "max":  1000,
+                           "root":  "E:\\LS\\DM\\listary\\src",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  23.614,
+                           "p95_ms":  26.179,
+                           "max_ms":  28.071,
+                           "result_count_min":  1000,
+                           "result_count_max":  1000,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  1463,
+                                                                   "p95":  1463,
+                                                                   "max":  1463
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  2914,
+                                                                  "p95":  2926,
+                                                                  "max":  2926
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  1000,
+                                                                       "p95":  1000,
+                                                                       "max":  1000
+                                                                   }
+                                        }
+                       },
+                       {
+                           "query_id":  "root_shallow_small",
+                           "max":  8,
+                           "root":  "E:\\LS\\DM\\listary\\src",
+                           "root_rejections":  [
+
+                                               ],
+                           "sample_count":  30,
+                           "p50_ms":  14.393,
+                           "p95_ms":  16.551,
+                           "max_ms":  17.168,
+                           "result_count_min":  8,
+                           "result_count_max":  8,
+                           "workload":  {
+                                            "scanned_nodes":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  3292663,
+                                                                  "p95":  3292663,
+                                                                  "max":  3292663
+                                                              },
+                                            "name_candidates":  {
+                                                                    "status":  "measured",
+                                                                    "sample_count":  30,
+                                                                    "p50":  849913,
+                                                                    "p95":  849913,
+                                                                    "max":  849913
+                                                                },
+                                            "matching_names":  {
+                                                                   "status":  "measured",
+                                                                   "sample_count":  30,
+                                                                   "p50":  1463,
+                                                                   "p95":  1463,
+                                                                   "max":  1463
+                                                               },
+                                            "entered_top_k":  {
+                                                                  "status":  "measured",
+                                                                  "sample_count":  30,
+                                                                  "p50":  212,
+                                                                  "p95":  234,
+                                                                  "max":  234
+                                                              },
+                                            "path_constructions":  {
+                                                                       "status":  "measured",
+                                                                       "sample_count":  30,
+                                                                       "p50":  24,
+                                                                       "p95":  24,
+                                                                       "max":  24
+                                                                   }
+                                        }
+                       }
+                   ],
+    "g1_decision_input_only":  true,
+    "startup":  {
+                    "broker_started_by_runner":  false,
+                    "broker_start_to_pipe_ms":  41.316,
+                    "broker_version":  "0.1.0",
+                    "ready_generation":  907850,
+                    "indexer_volumes":  3,
+                    "indexer_reported_memory_bytes":  84025680
+                },
+    "index_generations":  {
+                              "initial_ready_generation":  907850,
+                              "distinct_count":  1,
+                              "minimum":  907850,
+                              "maximum":  907850,
+                              "changed_during_sampling":  false,
+                              "consistency":  "Each result and generation are captured atomically under the index read lock."
+                          }
+}

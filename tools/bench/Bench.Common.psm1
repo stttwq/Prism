@@ -304,9 +304,13 @@ function Get-IndexerStatus {
 
     $session = New-PipeSession -PipeName $PipeName -ConnectTimeoutMs $ConnectTimeoutMs
     try {
-        $hello = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'hello'; protocol = 1 })
-        if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 1) {
-            throw 'Indexer protocol 1 handshake failed.'
+        # INDEXER_PROTOCOL = 2 (bumped 2026-08-17 audit batch 5; this tool updated from 1).
+        $hello = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'hello'; protocol = 2 })
+        if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 2) {
+            throw 'Indexer protocol 2 handshake failed.'
+        }
+        if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 2) {
+            throw 'Indexer protocol 2 handshake failed.'
         }
         $status = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'status' })
         if ($status.Response.type -ne 'status') { throw "Expected indexer status, got $($status.Response.type)." }

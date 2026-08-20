@@ -11,8 +11,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::hierarchy::{
-    ExclusionMatcher, IndexState, MatchKind, MatchMetadata, QueryFilters, RootBound, RootFilter,
-    FLAG_DIRECTORY, FLAG_PRESENT,
+    ExclusionMatcher, IndexState, MatchKind, MatchMetadata, NameTerms, QueryFilters, RootBound,
+    RootFilter, FLAG_DIRECTORY, FLAG_PRESENT,
 };
 use crate::pinyin::{
     encode_compact, match_compact_normalized, normalize_query, PinyinMatch, PinyinMatchKind,
@@ -412,8 +412,8 @@ impl PinyinSidecar {
         let mut matched_count = 0u64;
         let mut path_constructions = 0u64;
         let has_path_filter = filters.has_path_filter();
-        // N1: 字面去重查询在循环外降幂一次。
-        let query_lower = query.to_lowercase();
+        // N1 + S4：字面去重查询在循环外分词一次（口径与字面路径一致）。
+        let terms = NameTerms::parse(query);
         for record in &self.disk.records {
             if self.delta.contains_key(&record.key) {
                 continue;
@@ -436,7 +436,7 @@ impl PinyinSidecar {
                 if !key_is_live_present(index, record.key) {
                     continue;
                 }
-                if key_is_literal(index, record.key, &query_lower) {
+                if key_is_literal(index, record.key, &terms) {
                     continue;
                 }
                 if !key_passes_filters(
@@ -466,7 +466,7 @@ impl PinyinSidecar {
                 if !key_is_live_present(index, *key) {
                     continue;
                 }
-                if key_is_literal(index, *key, &query_lower) {
+                if key_is_literal(index, *key, &terms) {
                     continue;
                 }
                 if !key_passes_filters(
@@ -497,8 +497,10 @@ impl PinyinSidecar {
     }
 }
 
-/// query_lower 必须已降幂（N1：调用方在扫描循环外降幂一次，不再逐候选分配）。
-fn key_is_literal(index: &IndexState, key: RecordKey, query_lower: &str) -> bool {
+/// S4（PRISM-IMPL-PLAN-4-2026-08-20）：判「已被字面命中」的口径与字面路径一致
+///（NameTerms AND），否则同一条结果会同时以字面项与拼音项双出行或漏行。
+/// terms 已降幂（N1：调用方在扫描循环外分词一次）。
+fn key_is_literal(index: &IndexState, key: RecordKey, terms: &NameTerms) -> bool {
     index
         .volumes
         .get(key.volume as usize)
@@ -510,7 +512,9 @@ fn key_is_literal(index: &IndexState, key: RecordKey, query_lower: &str) -> bool
         })
         .and_then(|(volume, slot)| volume.name_at(slot.name_off).ok())
         .is_some_and(|name| {
-            crate::hierarchy::find_case_insensitive(name, query_lower).is_some()
+            terms
+                .iter()
+                .all(|term| crate::hierarchy::find_case_insensitive(name, term).is_some())
         })
 }
 
@@ -1128,6 +1132,30 @@ mod tests {
         assert_eq!(
             outcome.matched_count, 0,
             "已删记录不得计入 matched_count"
+        );
+    }
+
+    /// S4（PRISM-IMPL-PLAN-4-2026-08-20）：拼音去重口径与字面路径一致——
+    /// 名字含**全部** term 的拼音命中被字面路径吸收（不双出行）；只含部分
+    /// term 的仍作为拼音结果出行。拼音侧查询经 normalize_query 剥空格成
+    /// 单串（「wx zfb」→「wxzfb」首字母整串），去重判定用字面 AND 口径。
+    #[test]
+    fn s4_pinyin_dedup_uses_multi_term_literal_rule() {
+        let mut index = state();
+        // 「微信支付宝」拼音首字母 = wxzfb 命中，但字面不含「wx」/「zfb」→ 出行。
+        index.volumes[0].upsert(20, 5, "微信支付宝", false).unwrap();
+        // 「wxzfb微信」：ASCII 段 wxzfb 全拼命中拼音，同时字面含全部 term → 吸收。
+        index.volumes[0].upsert(21, 5, "wxzfb微信", false).unwrap();
+        let sidecar = PinyinSidecar::build(&index).unwrap();
+        let outcome = sidecar.search(&index, "wx zfb", 8);
+        let names: Vec<&str> = outcome.items.iter().map(|item| item.name.as_str()).collect();
+        assert!(
+            names.contains(&"微信支付宝"),
+            "字面 AND 不命中的拼音命中应出行：{names:?}"
+        );
+        assert!(
+            !names.contains(&"wxzfb微信"),
+            "全部 term 字面命中的条目不得以拼音项双出行：{names:?}"
         );
     }
 }

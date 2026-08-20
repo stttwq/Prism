@@ -922,7 +922,34 @@ fn is_excluded_name(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
+fn match_metadata(name: &str, terms: &NameTerms) -> Option<MatchMetadata> {
+    // S4（PRISM-IMPL-PLAN-4-2026-08-20）：单 term（含空查询）与旧的单一子串
+    // 匹配逐字节等价——这是主要安全网，绝大多数字面命中走这条快路径。
+    if let Some(single) = terms.single() {
+        return match_metadata_single(name, single);
+    }
+    // 多 term AND：每个 term 都是名字的子串才命中。多 term 不产生 class 0
+    //（整名精确对多 term 无定义）；「任一 term 在位置 0」→ class 1，否则 2。
+    // position = 各 term 命中位置（UTF-16 单元）的最小值。
+    let mut position = u32::MAX;
+    let mut at_start = false;
+    for term in terms.iter() {
+        let byte_position = find_case_insensitive(name, term)?;
+        at_start |= byte_position == 0;
+        let utf16_position = name[..byte_position].encode_utf16().count() as u32;
+        position = position.min(utf16_position);
+    }
+    Some(MatchMetadata {
+        kind: MatchKind::Literal,
+        class: if at_start { 1 } else { 2 },
+        position,
+        score: name.encode_utf16().count() as u32,
+        history_score: 0,
+    })
+}
+
+/// S4 之前的旧实现，单 term 语义原样保留（见 match_metadata 注释）。
+fn match_metadata_single(name: &str, query_lower: &str) -> Option<MatchMetadata> {
     let byte_position = find_case_insensitive(name, query_lower)?;
     // N1（FRESH-AUDIT-2026-08-19）: 此前非 ASCII 名字每次比较都 to_lowercase()
     // 分配一个完整副本——中文库每次击键百万次堆分配。现在：
@@ -945,6 +972,42 @@ fn match_metadata(name: &str, query_lower: &str) -> Option<MatchMetadata> {
         score: name.encode_utf16().count() as u32,
         history_score: 0,
     })
+}
+
+/// S4（PRISM-IMPL-PLAN-4-2026-08-20）：名字查询的空白 AND 分词。
+/// 查询按空白切分、丢弃空串、逐个降幂；命中 = 每个 term 都是名字的子串
+///（AND，顺序无关）。空查询映射为单个空 term（与旧的空串行为逐字节一致，
+/// G7 的「仅 ext:/path: 过滤」路径依赖它匹配一切）。所有名字匹配点
+///（索引器字面扫描 / broker 字面回退 / 应用清单 / 拼音去重口径）共用本类型，
+/// 口径不一致会导致同一条结果以字面与拼音双出行或漏行。
+#[derive(Debug, Clone)]
+pub struct NameTerms {
+    terms: Vec<String>,
+}
+
+impl NameTerms {
+    pub fn parse(query: &str) -> Self {
+        let mut terms: Vec<String> = query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        if terms.is_empty() {
+            terms.push(String::new());
+        }
+        Self { terms }
+    }
+
+    /// 单 term（含空 term）时返回它——调用方走与旧行为逐字节等价的快路径。
+    pub fn single(&self) -> Option<&str> {
+        match self.terms.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.terms.iter()
+    }
 }
 
 /// 大小写不敏感子串查找，返回**原名字节偏移**（字符边界安全）。
@@ -1180,7 +1243,7 @@ fn scan_slot_range<'a>(
     volumes: &'a [VolumeIndex],
     volume_index: usize,
     range: std::ops::Range<usize>,
-    query_lower: &str,
+    terms: &NameTerms,
     exclusions: &[NormalizedExclusion],
     root_filter: &mut Option<RootFilter>,
     filters: &QueryFilters,
@@ -1203,7 +1266,7 @@ fn scan_slot_range<'a>(
         let Ok(name) = volume.name_at(slot.name_off) else {
             continue;
         };
-        let Some(metadata) = match_metadata(name, query_lower) else {
+        let Some(metadata) = match_metadata(name, terms) else {
             continue;
         };
         if root_filter
@@ -1283,7 +1346,8 @@ fn search_volumes_impl(
         };
     }
 
-    let query_lower = query.to_lowercase();
+    // S4：空白 AND 分词一次，串行/并行共用；单 term 与旧的单一降幂子串等价。
+    let terms = NameTerms::parse(query);
     let exclusions: Vec<_> = exclusion_paths
         .iter()
         .filter_map(|path| NormalizedExclusion::parse(path))
@@ -1294,7 +1358,7 @@ fn search_volumes_impl(
     let mut acc = if total_slots >= parallel_threshold {
         parallel_scan(
             volumes,
-            &query_lower,
+            &terms,
             &exclusions,
             root,
             filters,
@@ -1310,7 +1374,7 @@ fn search_volumes_impl(
                 volumes,
                 volume_index,
                 0..len,
-                &query_lower,
+                &terms,
                 &exclusions,
                 &mut root_filter,
                 filters,
@@ -1356,7 +1420,7 @@ fn search_volumes_impl(
 /// （RankedCandidate::Ord 是全序，无并列歧义）。
 fn parallel_scan<'a>(
     volumes: &'a [VolumeIndex],
-    query_lower: &str,
+    terms: &NameTerms,
     exclusions: &[NormalizedExclusion],
     root: Option<RootBound>,
     filters: &QueryFilters,
@@ -1388,7 +1452,7 @@ fn parallel_scan<'a>(
                 volumes,
                 volume_index,
                 range,
-                query_lower,
+                terms,
                 exclusions,
                 &mut root_filter,
                 filters,
@@ -1418,7 +1482,7 @@ fn parallel_scan<'a>(
                             volumes,
                             *volume_index,
                             range.clone(),
-                            query_lower,
+                            terms,
                             exclusions,
                             &mut root_filter,
                             filters,
@@ -1560,14 +1624,47 @@ mod tests {
     /// position 是原名的 UTF-16 单元偏移（UI 高亮对齐）。
     #[test]
     fn n1_match_metadata_positions_are_original_name_offsets() {
-        let meta = match_metadata("微信ABC文档", "abc").expect("必须命中");
+        let meta = match_metadata("微信ABC文档", &NameTerms::parse("abc")).expect("必须命中");
         assert_eq!(meta.class, 2); // 非前缀也非全名
-        assert_eq!(meta.position, 2); // "微信" = 2 个 UTF-16 单位
-        let exact = match_metadata("微信", "微信").expect("全名必须命中");
+        assert_eq!(meta.position, 2); // "微信" = 2 个 UTF-16 单元
+        let exact = match_metadata("微信", &NameTerms::parse("微信")).expect("全名必须命中");
         assert_eq!(exact.class, 0);
-        let prefix = match_metadata("微信ABC", "wx").or(match_metadata("微信ABC", "微"));
+        let prefix = match_metadata("微信ABC", &NameTerms::parse("wx"))
+            .or(match_metadata("微信ABC", &NameTerms::parse("微")));
         assert!(prefix.is_some());
         assert_eq!(prefix.unwrap().class, 1);
+    }
+
+    /// S4（PRISM-IMPL-PLAN-4-2026-08-20）：多 term AND 语义——「抖音 视频」
+    /// 命中「抖音-短视频.mp4」（顺序无关），不命中只含其一的名字；多 term
+    /// 不产生 class 0；position 取各命中 UTF-16 偏移最小值；尾随空格的查询
+    /// 与去空格后同结果。
+    #[test]
+    fn s4_multi_term_and_semantics() {
+        let terms = NameTerms::parse("抖音 视频");
+        assert_eq!(terms.single(), None);
+        let hit = match_metadata("抖音-短视频.mp4", &terms).expect("两段都在名字里必须命中");
+        assert_eq!(hit.class, 1, "「抖音」在位置 0 → class 1");
+        assert_eq!(hit.position, 0);
+        // term 顺序无关：命中位置取最小值。
+        let reversed = match_metadata("视频-抖音.mp4", &NameTerms::parse("视频 抖音"))
+            .expect("顺序无关");
+        assert_eq!(reversed.position, 0);
+        // AND 不退化成 OR：只含一个 term 的名字不命中。
+        assert!(match_metadata("抖音-别的.mp4", &terms).is_none());
+        assert!(match_metadata("别的-视频.mp4", &terms).is_none());
+        // 多 term 无 class 0（整名精确对多 term 无定义）。
+        let mid = match_metadata("a抖音x视频y", &terms).expect("两段都在");
+        assert_eq!(mid.class, 2);
+        assert_eq!(mid.position, 1);
+        // 尾随空格：与去空格后逐字节同结果。
+        let trailing = NameTerms::parse("prism ");
+        assert_eq!(trailing.single(), Some("prism"));
+        assert!(match_metadata("prism.exe", &trailing).is_some());
+        // 空查询 → 单个空 term → 匹配一切（G7 仅过滤路径依赖）。
+        let empty = NameTerms::parse("");
+        assert_eq!(empty.single(), Some(""));
+        assert!(match_metadata("任意名字", &empty).is_some());
     }
 
     /// path 过滤：needle 预降幂后对含大写/纯中文路径的匹配语义不变。

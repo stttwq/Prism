@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use crate::apps::SharedApps;
-use crate::hierarchy::{MatchKind, MatchMetadata};
+use crate::hierarchy::{MatchKind, MatchMetadata, NameTerms};
 use crate::history::{HistoryDiagnostic, HistoryStore, HistoryUse, HistoryWeight};
 use crate::indexer_client;
 use crate::indexer_ipc::{
@@ -1272,12 +1272,12 @@ fn collect_app_results(
     };
     let (app_matches, mut app_match_count) =
         crate::apps::search_ranked(&apps_guard, name_query, limit);
-    let query_lower = name_query.to_lowercase();
+    let terms = NameTerms::parse(name_query);
     let mut literal_targets = std::collections::HashSet::new();
     for app in app_matches {
         literal_targets.insert(app.launch_path.clone());
         let target = ActionTarget::new(TargetKind::Application, app.launch_path.clone());
-        let (metadata, spans) = match literal_match_lowered(&app.name, &query_lower) {
+        let (metadata, spans) = match literal_match_lowered(&app.name, &terms) {
             Some((mut metadata, spans)) => {
                 metadata.history_score = history.score(&target);
                 (Some(metadata), spans)
@@ -1365,7 +1365,7 @@ fn process_indexer_reply(
     app_resolved_paths: &HashSet<String>,
     ranked: &mut Vec<SearchResult>,
 ) -> IndexerReplyFields {
-    let query_lower = query.to_lowercase();
+    let terms = NameTerms::parse(query);
     for item in reply.items {
         let kind = if item.is_directory {
             TargetKind::Directory
@@ -1391,7 +1391,7 @@ fn process_indexer_reply(
         // P9：索引器没带 spans/metadata 时的字面回退只降幂一次，两者共用同一次匹配。
         let (fallback_metadata, fallback_spans) =
             if item.match_spans.is_none() || item.match_metadata.is_none() {
-                match literal_match_lowered(&item.name, &query_lower) {
+                match literal_match_lowered(&item.name, &terms) {
                     Some((metadata, spans)) => (Some(metadata), Some(spans)),
                     None => (None, None),
                 }
@@ -1842,8 +1842,8 @@ fn history_file_candidates(
     limit: usize,
 ) -> Vec<SearchResult> {
     let empty_query = query.is_empty();
-    // P9：查询只降幂一次，标题匹配的 metadata 与 spans 同源产出。
-    let query_lower = query.to_lowercase();
+    // P9 + S4：查询只分词一次，标题匹配的 metadata 与 spans 同源产出。
+    let terms = NameTerms::parse(query);
     // P13：root 与排除表都只做一次切片级归一化（去空白/去尾部分隔符），
     // 分隔符统一与大小写折叠在比较时逐字节完成——循环里不再有分配。
     let root_normalized = root.map(trimmed_path);
@@ -1898,7 +1898,7 @@ fn history_file_candidates(
                 },
                 Vec::new(),
             )
-        } else if let Some((mut metadata, spans)) = literal_match_lowered(title, &query_lower) {
+        } else if let Some((mut metadata, spans)) = literal_match_lowered(title, &terms) {
             metadata.history_score = weight.score;
             (metadata, spans)
         } else if pinyin_enabled {
@@ -2035,13 +2035,13 @@ fn rank_window(
         }
     };
 
-    // P9：查询只降幂一次，两个来源共用；metadata 与 spans 同源产出。
-    let query_lower = query.to_lowercase();
-    if let Some((mut metadata, spans)) = literal_match_lowered(&entry.title, &query_lower) {
+    // P9 + S4：查询只分词一次，两个来源共用；metadata 与 spans 同源产出。
+    let terms = NameTerms::parse(query);
+    if let Some((mut metadata, spans)) = literal_match_lowered(&entry.title, &terms) {
         metadata.history_score = history_score;
         consider(metadata, spans);
     }
-    if let Some((mut metadata, _)) = literal_match_lowered(&entry.app_name, &query_lower) {
+    if let Some((mut metadata, _)) = literal_match_lowered(&entry.app_name, &terms) {
         metadata.history_score = history_score;
         // 命中在应用名上，标题不染色。
         consider(metadata, Vec::new());
@@ -2179,34 +2179,77 @@ fn recent_windows(
 }
 
 /// 字面匹配的单次降幂实现（审计 P9）：metadata 与高亮 spans 共用同一个小写串，
-/// 调用方还能把 `query_lower` 提到循环外，一次搜索只降幂一次查询。
+/// 调用方还能把分词提到循环外，一次搜索只分词一次。
 ///
 /// UTF-16 偏移必须在**小写串**上算：大小写转换会改变码元数（如 'İ'），在原串上
 /// 数偏移会与前端的高亮错位。
-fn literal_match_lowered(title: &str, query_lower: &str) -> Option<(MatchMetadata, Vec<i32>)> {
+///
+/// S4（PRISM-IMPL-PLAN-4-2026-08-20）：多 term AND——每个 term 都是标题子串
+/// 才命中；class 0 只在单 term 整名精确时给；position 取各 term 命中 UTF-16
+/// 偏移最小值；spans 每个 term 一段，按起点升序合并重叠段后输出
+///（前端 ResultList 用 cursor 推进消费，要求升序不倒退）。单 term 与旧实现
+/// 逐字节等价。
+fn literal_match_lowered(title: &str, terms: &NameTerms) -> Option<(MatchMetadata, Vec<i32>)> {
     let title_lower = title.to_lowercase();
-    let byte_position = title_lower.find(query_lower)?;
+    if let Some(single) = terms.single() {
+        let byte_position = title_lower.find(single)?;
+        let metadata = MatchMetadata {
+            kind: MatchKind::Literal,
+            class: if title_lower == single {
+                0
+            } else if byte_position == 0 {
+                1
+            } else {
+                2
+            },
+            position: title_lower[..byte_position].encode_utf16().count() as u32,
+            score: title.encode_utf16().count() as u32,
+            history_score: 0,
+        };
+        // 空查询不产生高亮（与旧 match_spans 的空查询短路一致），但仍是一次匹配。
+        let spans = if single.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                metadata.position as i32,
+                single.encode_utf16().count() as i32,
+            ]
+        };
+        return Some((metadata, spans));
+    }
+    let mut raw_spans: Vec<(u32, u32)> = Vec::new();
+    let mut position = u32::MAX;
+    let mut at_start = false;
+    for term in terms.iter() {
+        let byte_position = title_lower.find(term)?;
+        at_start |= byte_position == 0;
+        let start = title_lower[..byte_position].encode_utf16().count() as u32;
+        position = position.min(start);
+        raw_spans.push((start, term.encode_utf16().count() as u32));
+    }
+    raw_spans.sort_unstable();
+    let mut spans: Vec<i32> = Vec::with_capacity(raw_spans.len() * 2);
+    for (start, len) in raw_spans {
+        let (start, len) = (start as i32, len as i32);
+        let last = spans.len().checked_sub(2);
+        if last.is_some_and(|last| spans[last] + spans[last + 1] >= start) {
+            // 与前段重叠或相接：合并（保留更远的终点）。
+            let last = last.expect("checked above");
+            let last_start = spans[last];
+            let last_end = last_start + spans[last + 1];
+            let merged_end = (start + len).max(last_end);
+            spans[last + 1] = merged_end - last_start;
+        } else {
+            spans.push(start);
+            spans.push(len);
+        }
+    }
     let metadata = MatchMetadata {
         kind: MatchKind::Literal,
-        class: if title_lower == query_lower {
-            0
-        } else if byte_position == 0 {
-            1
-        } else {
-            2
-        },
-        position: title_lower[..byte_position].encode_utf16().count() as u32,
+        class: if at_start { 1 } else { 2 },
+        position,
         score: title.encode_utf16().count() as u32,
         history_score: 0,
-    };
-    // 空查询不产生高亮（与旧 match_spans 的空查询短路一致），但仍是一次匹配。
-    let spans = if query_lower.is_empty() {
-        Vec::new()
-    } else {
-        vec![
-            metadata.position as i32,
-            query_lower.encode_utf16().count() as i32,
-        ]
     };
     Some((metadata, spans))
 }
@@ -2214,7 +2257,7 @@ fn literal_match_lowered(title: &str, query_lower: &str) -> Option<(MatchMetadat
 /// 只要 metadata 的旧签名（测试沿用；生产路径一律走 `literal_match_lowered`）。
 #[cfg(test)]
 fn rank_title(title: &str, query: &str) -> Option<MatchMetadata> {
-    literal_match_lowered(title, &query.to_lowercase()).map(|(metadata, _)| metadata)
+    literal_match_lowered(title, &NameTerms::parse(query)).map(|(metadata, _)| metadata)
 }
 
 #[cfg(test)]
@@ -2403,7 +2446,7 @@ fn match_spans(title: &str, query: &str) -> Vec<i32> {
     if query.is_empty() {
         return Vec::new();
     }
-    literal_match_lowered(title, &query.to_lowercase())
+    literal_match_lowered(title, &NameTerms::parse(query))
         .map(|(_, spans)| spans)
         .unwrap_or_default()
 }
@@ -2469,6 +2512,22 @@ mod window_protocol_tests {
     }
 
     // --- old-reader compatibility -------------------------------------------------
+
+    /// S4（PRISM-IMPL-PLAN-4-2026-08-20）：多 term 高亮 spans——每个 term 一段，
+    /// 按起点升序输出（前端 ResultList 用 cursor 推进，要求不倒退），重叠/相接
+    /// 段合并；term 输入乱序时 spans 仍升序。
+    #[test]
+    fn s4_multi_term_spans_ascending_and_merged() {
+        // term 在查询里逆序出现：spans 仍按名字内位置升序（报告@0 两单元、
+        // prism@「报告-」之后三单元处、长五）。
+        let spans = match_spans("报告-prism-v2.docx", "prism 报告");
+        assert_eq!(spans, [0, 2, 3, 5], "两段按名字内位置升序");
+        // 重叠段合并：pr 与 prism 都命中 prism，起点相同 → 单段。
+        let merged = match_spans("prism 报告", "pri prism");
+        assert_eq!(merged, [0, 5], "重叠 term 合并为一段");
+        // 单 term 与旧行为一致。
+        assert_eq!(match_spans("prism 报告", "prism"), [0, 5]);
+    }
 
     #[test]
     fn search_without_mode_still_decodes_and_means_all() {

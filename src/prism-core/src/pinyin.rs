@@ -82,6 +82,7 @@ pub fn match_name(name: &str, query: &str) -> Option<PinyinMatch> {
     }
     match_tokens(&tokens, query.as_bytes(), PinyinMatchKind::Full)
         .or_else(|| match_tokens(&tokens, query.as_bytes(), PinyinMatchKind::Initials))
+        .or_else(|| match_tokens_mixed(&tokens, query.as_bytes()))
 }
 
 pub(crate) fn encode_compact(name: &str) -> Option<Vec<u8>> {
@@ -109,6 +110,78 @@ pub(crate) fn match_compact(bytes: &[u8], query: &str) -> Option<PinyinMatch> {
 pub(crate) fn match_compact_normalized(bytes: &[u8], query: &[u8]) -> Option<PinyinMatch> {
     match_compact_kind(bytes, query, PinyinMatchKind::Full)
         .or_else(|| match_compact_kind(bytes, query, PinyinMatchKind::Initials))
+        // S3（PRISM-IMPL-PLAN-4-2026-08-20）：前两条纯策略都失败才试混用。
+        .or_else(|| match_compact_mixed(bytes, query))
+}
+
+/// S3（PRISM-IMPL-PLAN-4-2026-08-20）：全拼与首字母逐字混用匹配（位掩码 DP）。
+/// 语义：从起点 token 开始的**连续** token 段，每个 token 三选一消费查询——
+/// 首字母（前进 1）/ 全拼（前进 reading.len()）/ 尾部部分（reading 以剩余查询
+/// 为前缀，终态）。查询耗尽即命中。掩码 bit p = 「已消费 p 字节查询」可达；
+/// 掩码归零立即换下一起点（绝大多数不命中条目在首个 token 就归零，成本与
+/// 两条纯路径同量级）。命中上报 `Initials` 档（最弱拼音档）——
+/// `ponytail:` 不新增 MatchKind::MixedPinyin：省掉 serde 线格式新取值 +
+/// INDEXER_PROTOCOL bump + 新旧混装反序列化失败面，代价是 wxin 与 wx 同档
+/// 排序。若实测出现「混用命中被全拼命中不合理压制」的案例，再插入
+/// MixedPinyin 变体（声明序在 FullPinyin 与 Initials 之间）并 bump 协议版本。
+/// 查询 > 63 字节跳过混用（u64 位掩码上限），退回两条纯路径。
+fn match_compact_mixed(bytes: &[u8], query: &[u8]) -> Option<PinyinMatch> {
+    if query.is_empty() || query.len() > 63 {
+        return None;
+    }
+    let done_bit = 1u64 << query.len();
+    let mut start_cursor = 0usize;
+    let mut start_index = 0u32;
+    while start_cursor < bytes.len() {
+        let mut mask = 1u64;
+        let mut cursor = start_cursor;
+        while cursor < bytes.len() && mask != 0 {
+            let token = compact_token(bytes, cursor)?;
+            let mut next = 0u64;
+            let mut bits = mask;
+            while bits != 0 {
+                let p = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                // 终态：reading 以剩余查询为前缀（尾部部分匹配，允许名字尾部未覆盖）。
+                if token.reading.starts_with(&query[p..]) {
+                    next |= done_bit;
+                }
+                if token.reading[0] == query[p] {
+                    next |= 1u64 << (p + 1);
+                }
+                if query[p..].starts_with(token.reading) {
+                    next |= 1u64 << (p + token.reading.len());
+                }
+            }
+            if next & done_bit != 0 {
+                let end_cursor = token.next;
+                // class 0 只在「起点为 0 + 覆盖到名字末尾 + 最后消费是全拼」时给，
+                // 与两条纯路径的 at_end 语义对齐（前一条状态含对应全拼位）。
+                let full_at_end = end_cursor == bytes.len()
+                    && query.len() >= token.reading.len()
+                    && mask & (1u64 << (query.len() - token.reading.len())) != 0;
+                return Some(PinyinMatch {
+                    kind: PinyinMatchKind::Initials,
+                    class: if start_cursor == 0 && full_at_end {
+                        0
+                    } else if start_cursor == 0 {
+                        1
+                    } else {
+                        2
+                    },
+                    position: start_index,
+                    score: compact_token_count(bytes)?,
+                    spans: compact_spans(bytes, start_cursor, end_cursor)?,
+                });
+            }
+            mask = next;
+            cursor = token.next;
+        }
+        let token = compact_token(bytes, start_cursor)?;
+        start_cursor = token.next;
+        start_index = start_index.saturating_add(1);
+    }
+    None
 }
 
 fn encode_tokens(name: &str) -> (Vec<Token>, bool) {
@@ -333,6 +406,61 @@ fn spans_for(tokens: &[Token]) -> Vec<i32> {
     spans
 }
 
+/// S3（PRISM-IMPL-PLAN-4-2026-08-20）：即时匹配路径（apps / 窗口 / 历史候选）
+/// 的混用匹配。与 `match_compact_mixed` 保持判定一致——
+/// apps::precomputed_pinyin_matches_the_on_the_fly_encoder 锚定两条路径等价。
+fn match_tokens_mixed(tokens: &[Token], query: &[u8]) -> Option<PinyinMatch> {
+    if query.is_empty() || query.len() > 63 {
+        return None;
+    }
+    let done_bit = 1u64 << query.len();
+    for start in 0..tokens.len() {
+        let mut mask = 1u64;
+        for (offset, token) in tokens[start..].iter().enumerate() {
+            let reading = token.reading.as_bytes();
+            let mut next = 0u64;
+            let mut bits = mask;
+            while bits != 0 {
+                let p = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if reading.starts_with(&query[p..]) {
+                    next |= done_bit;
+                }
+                if reading[0] == query[p] {
+                    next |= 1u64 << (p + 1);
+                }
+                if query[p..].starts_with(reading) {
+                    next |= 1u64 << (p + reading.len());
+                }
+            }
+            if next & done_bit != 0 {
+                let end = start + offset + 1;
+                let full_at_end = end == tokens.len()
+                    && query.len() >= reading.len()
+                    && mask & (1u64 << (query.len() - reading.len())) != 0;
+                return Some(PinyinMatch {
+                    kind: PinyinMatchKind::Initials,
+                    class: if start == 0 && full_at_end {
+                        0
+                    } else if start == 0 {
+                        1
+                    } else {
+                        2
+                    },
+                    position: start as u32,
+                    score: tokens.len() as u32,
+                    spans: spans_for(&tokens[start..end]),
+                });
+            }
+            mask = next;
+            if mask == 0 {
+                break;
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,7 +473,11 @@ mod tests {
             ("微信", "weix", Some(PinyinMatchKind::Full)),
             ("微信", "xin", Some(PinyinMatchKind::Full)),
             ("微信", "eix", None),
-            ("微信开发", "wxkaifa", None),
+            // S3 前置调查结论（PRISM-IMPL-PLAN-4 §1.4）：「微信开发/wxkaifa」在
+            // 混用语义下是合法输入（wx 首字母 + kaifa 全拼，连续 token 段）——
+            // 从 None 显式翻转为 Some，这就是用户会打出的「混用」定义。
+            // 若要收紧（限制首字母段与全拼段的交替次数），必须重新审视语义。
+            ("微信开发", "wxkaifa", Some(PinyinMatchKind::Initials)),
             ("微信2026", "wx2026", Some(PinyinMatchKind::Initials)),
             ("微信beta", "weixinbeta", Some(PinyinMatchKind::Full)),
             ("重庆", "chongqing", Some(PinyinMatchKind::Full)),
@@ -356,6 +488,17 @@ mod tests {
             ("軟體", "ruanti", Some(PinyinMatchKind::Full)),
             ("绿色", "lvse", Some(PinyinMatchKind::Full)),
             ("绿色", "lüse", Some(PinyinMatchKind::Full)),
+            // S3：全拼与首字母逐字混用（w 首字母 + xin 全拼；wang+yi 全拼 + y+y 首字母）。
+            ("微信", "wxin", Some(PinyinMatchKind::Initials)),
+            ("网易云音乐", "wangyiyy", Some(PinyinMatchKind::Initials)),
+            // S3 负例（防召回过宽）：tenxunhuiyi 缺 g（teng 的尾部部分只允许在
+            // 查询耗尽处发生，teng 之后查询还有内容，不命中是对的）。
+            ("腾讯会议", "tenxunhuiyi", None),
+            // S3 前置调查（PRISM-IMPL-PLAN-4 §1.4）：dysp 对「抖音短视频」需要跳过
+            // 第 3 音节（短/duan 的首字母 d 不在查询里）——那是子序列匹配
+            //（fzf 式），方案 §6.2 明确不做，保持 None。若用户确有「抖音视频」
+            //（dou yin shi pin）命名，dysp 经混用/首字母路径正常命中。
+            ("抖音短视频", "dysp", None),
         ];
         for (name, query, expected) in cases {
             assert_eq!(
@@ -363,6 +506,49 @@ mod tests {
                 expected,
                 "{name} / {query}"
             );
+        }
+    }
+
+    /// S3：混用命中的 class / position / spans 细节——连续 token 段、
+    /// 尾部允许未覆盖、起点决定 class 档位。
+    #[test]
+    fn s3_mixed_match_metadata_and_spans() {
+        // w 首字母 + xin 全拼：起点 0、覆盖到末尾 → class 0（借 Initials 档）。
+        let matched = match_name("微信", "wxin").unwrap();
+        assert_eq!(matched.kind, PinyinMatchKind::Initials);
+        assert_eq!(matched.class, 0);
+        assert_eq!(matched.spans, [0, 2]);
+        // 中段混用：起点 1 → class 2，spans 只覆盖消费段。
+        let matched = match_name("我的网易云音乐", "wangyiyy").unwrap();
+        assert_eq!(matched.class, 2);
+        assert_eq!(matched.position, 2);
+    }
+
+    /// S3：超长查询（> 63 字节）跳过混用、不 panic，退回两条纯路径。
+    #[test]
+    fn s3_overlong_query_skips_mixed_without_panic() {
+        let long = "w".repeat(64);
+        let (tokens, has_han) = encode_tokens("微信");
+        assert!(has_han);
+        assert!(match_tokens_mixed(&tokens, long.as_bytes()).is_none());
+        let encoded = encode_compact("微信").unwrap();
+        assert!(match_compact_mixed(&encoded, long.as_bytes()).is_none());
+        // 63 字节在混用范围内正常工作（不命中也不 panic）。
+        assert!(match_compact_mixed(&encoded, "w".repeat(63).as_bytes()).is_none());
+    }
+
+    /// S3：sidecar 紧凑编码与即时编码两条路径的混用判定等价
+    ///（apps.rs 有同款锚定；这里直接覆盖 compact 侧的混用正例）。
+    #[test]
+    fn s3_compact_mixed_matches_live_path() {
+        for (name, query) in [("微信", "wxin"), ("网易云音乐", "wangyiyy"), ("微信开发", "wxkaifa")] {
+            let encoded = encode_compact(name).unwrap();
+            let compact = match_compact(&encoded, query).unwrap();
+            let live = match_name(name, query).unwrap();
+            assert_eq!(compact.kind, live.kind, "{name}/{query}");
+            assert_eq!(compact.class, live.class, "{name}/{query}");
+            assert_eq!(compact.position, live.position, "{name}/{query}");
+            assert_eq!(compact.spans, live.spans, "{name}/{query}");
         }
     }
 
