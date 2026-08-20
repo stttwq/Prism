@@ -356,6 +356,46 @@
 
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
+                    <!-- 别名系统（2026-08-21 设想）：可见资产——统一看、逐条删。 -->
+                    <TextBlock Text="文件别名" FontSize="13" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
+                    <TextBlock Text="在搜索结果上右键「设置别名…」绑定快捷词；输入词与查询完全一致时对应文件置顶显示。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               TextWrapping="Wrap" Margin="0,0,0,8"/>
+                    <ItemsControl ItemsSource="{Binding AliasEntries}" Margin="0,0,0,4">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding WordsText}"
+                                               FontSize="13" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource TextMatch}"
+                                               Margin="0,0,12,0" VerticalAlignment="Center"/>
+                                    <TextBlock Text="{Binding Target.Value}"
+                                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                               TextTrimming="CharacterEllipsis"
+                                               Grid.Column="1" VerticalAlignment="Center"/>
+                                    <Button Content="删除"
+                                            Command="{Binding DataContext.RemoveAliasCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                            CommandParameter="{Binding}"
+                                            Style="{StaticResource SettingsActionButton}"
+                                            Padding="10,2,10,2"
+                                            Grid.Column="2" Margin="12,0,0,0"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <TextBlock Text="（暂无别名。在搜索结果上右键即可添加。）"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               Visibility="{Binding HasNoAliases, Converter={StaticResource BoolToVis}}"
+                               Margin="0,0,0,16"/>
+
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
+
                     <TextBlock Text="压缩程序" FontSize="13" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
                     <TextBlock Text="压缩为 ZIP 时优先使用此程序（留空则自动探测 7-Zip，再回退 Windows 内置）："

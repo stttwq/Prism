@@ -32,6 +32,7 @@ public partial class SearchWindow : Window
     private IconCache? _icons;
     private ThemeWatcher? _theme;
     private WebIconProvider? _webIcons;
+    private PipeClient? _pipe;
     private bool _suppressQueryEvent;
     private bool _hiding;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
@@ -140,17 +141,20 @@ public partial class SearchWindow : Window
         };
     }
 
-    /// <summary>由 App 在启动时注入 ViewModel、图标缓存与主题监听。</summary>
+    /// <summary>由 App 在启动时注入 ViewModel、图标缓存与主题监听。
+    /// pipe 为可选的别名通道（右键「设置别名…」）；为空时该菜单项不出现。</summary>
     public void Attach(
         SearchViewModel vm,
         IconCache icons,
         ThemeWatcher? theme = null,
-        WebIconProvider? webIcons = null)
+        WebIconProvider? webIcons = null,
+        PipeClient? pipe = null)
     {
         _vm = vm;
         _icons = icons;
         _theme = theme;
         _webIcons = webIcons ?? new WebIconProvider();
+        _pipe = pipe;
         Results.SetIconCache(icons);
         Results.SetWebIconProvider(_webIcons);
         vm.HideRequested += () =>
@@ -500,7 +504,43 @@ public partial class SearchWindow : Window
         };
         menu.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuStyle");
 
-        var separatorPending = false;
+        // 别名系统（2026-08-21 设想）：file/folder/app 行首位放「设置别名…」。
+        if (_pipe is not null && target.Kind is "app" or "file" or "folder"
+            && !string.IsNullOrEmpty(target.ExecuteId))
+        {
+            var aliasItem = new MenuItem { Header = "设置别名…" };
+            aliasItem.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuItemStyle");
+            aliasItem.Icon = new TextBlock
+            {
+                Text = "\uE8AC",
+                FontFamily = (System.Windows.Media.FontFamily)FindResource("IconFontFamily"),
+                FontSize = 14,
+                Foreground = (Brush)FindResource("TextSubtitle"),
+                Width = 18,
+                Height = 18,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                TextAlignment = TextAlignment.Center,
+            };
+            aliasItem.Click += async (_, _) =>
+            {
+                _contextMenuActionPending = true;
+                _ignoreDeactivate = true;
+                try
+                {
+                    await ShowAliasDialogAsync(target).ConfigureAwait(true);
+                }
+                finally
+                {
+                    _contextMenuActionPending = false;
+                    if (!_contextMenuOpen)
+                        ReleaseDeactivateGuardAfterDelay();
+                }
+            };
+            menu.Items.Add(aliasItem);
+        }
+
+        var separatorPending = menu.Items.Count > 0;
         foreach (var action in actions)
         {
             if (action.IsSectionHeader)
@@ -590,6 +630,112 @@ public partial class SearchWindow : Window
                 ReleaseDeactivateGuardAfterDelay();
         };
         menu.IsOpen = true;
+    }
+
+    /// <summary>
+    /// 别名系统（2026-08-21 设想）：右键「设置别名…」的输入对话框。
+    /// 逗号/空白分隔多个词；清空并确定 = 解绑。预填该目标的现有词。
+    /// </summary>
+    private async Task ShowAliasDialogAsync(SearchResult target)
+    {
+        if (_pipe is null || _vm is null) return;
+        var aliasTarget = target.ExecutionTarget;
+
+        // 预填：拉取现有词表（失败静默按空处理）。
+        var existing = Array.Empty<string>();
+        try
+        {
+            if (!_pipe.IsConnected)
+                await _pipe.StartAsync().ConfigureAwait(true);
+            var entries = await _pipe.AliasListAsync().ConfigureAwait(true);
+            existing = entries
+                .FirstOrDefault(entry => entry.Target.Kind == aliasTarget.Kind
+                    && string.Equals(entry.Target.Value, aliasTarget.Value, StringComparison.OrdinalIgnoreCase))
+                ?.Words.ToArray() ?? Array.Empty<string>();
+        }
+        catch
+        {
+            // 后端未就绪时仍允许打开对话框（保存时报错）。
+        }
+
+        var input = new System.Windows.Controls.TextBox
+        {
+            Text = string.Join(", ", existing),
+            FontSize = 14,
+            Padding = new Thickness(8, 6, 8, 6),
+        };
+        var dialog = new Window
+        {
+            Title = "设置别名",
+            Width = 460,
+            SizeToContent = SizeToContent.Height,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            ResizeMode = ResizeMode.NoResize,
+            ShowInTaskbar = false,
+            WindowStyle = WindowStyle.ToolWindow,
+        };
+        var okButton = new System.Windows.Controls.Button { Content = "保存", Padding = new Thickness(16, 6, 16, 6), IsDefault = true };
+        var cancelButton = new System.Windows.Controls.Button { Content = "取消", Padding = new Thickness(16, 6, 16, 6), IsCancel = true };
+        var panel = new StackPanel { Margin = new Thickness(16) };
+        panel.Children.Add(new TextBlock
+        {
+            Text = System.IO.Path.GetFileName(target.ExecuteId),
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 4),
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = "输入一个或多个别名（逗号或空格分隔）；输入词与查询完全一致时置顶显示该文件。清空后保存 = 删除别名。",
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.7,
+            Margin = new Thickness(0, 0, 0, 10),
+        });
+        panel.Children.Add(input);
+        var buttons = new StackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+            Margin = new Thickness(0, 14, 0, 0),
+        };
+        buttons.Children.Add(okButton);
+        buttons.Children.Add(cancelButton);
+        cancelButton.Margin = new Thickness(8, 0, 0, 0);
+        panel.Children.Add(buttons);
+        dialog.Content = panel;
+
+        var confirmed = false;
+        okButton.Click += (_, _) =>
+        {
+            confirmed = true;
+            dialog.Close();
+        };
+        dialog.Loaded += (_, _) => { input.Focus(); input.SelectAll(); };
+        dialog.ShowDialog();
+        if (!confirmed) return;
+
+        var words = input.Text
+            .Split([',', '，', ';', '；'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(word => word.Trim())
+            .Where(word => word.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        try
+        {
+            if (!_pipe.IsConnected)
+                await _pipe.StartAsync().ConfigureAwait(true);
+            await _pipe.AliasSetAsync(aliasTarget, words).ConfigureAwait(true);
+            _vm.State.StatusMessage = words.Count > 0
+                ? $"别名已保存：{string.Join("、", words)}"
+                : "别名已删除";
+        }
+        catch (Exception ex)
+        {
+            _vm.State.StatusMessage = "别名保存失败：" + ex.Message;
+        }
     }
 
     private void ReleaseDeactivateGuardAfterDelay()

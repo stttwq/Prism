@@ -638,6 +638,82 @@ public sealed class PipeClient : ISearchClient, IDisposable
             QueryReadTimeout).ConfigureAwait(false);
     }
 
+    /// <summary>别名系统：整体替换目标的词表（空词表 = 解绑）。</summary>
+    public async Task AliasSetAsync(
+        ActionTarget target,
+        IReadOnlyList<string> words,
+        CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            new { type = "alias_set", target = TargetPayload(target), words },
+            ct,
+            QueryReadTimeout).ConfigureAwait(false);
+        ThrowIfAliasRejected(resp);
+    }
+
+    /// <summary>别名系统：解绑目标（幂等）。</summary>
+    public async Task AliasDeleteAsync(ActionTarget target, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            new { type = "alias_delete", target = TargetPayload(target) },
+            ct,
+            QueryReadTimeout).ConfigureAwait(false);
+        ThrowIfAliasRejected(resp);
+    }
+
+    /// <summary>别名系统：设置页列表（绑定时间倒序）。</summary>
+    public async Task<IReadOnlyList<AliasEntry>> AliasListAsync(CancellationToken ct = default)
+    {
+        var resp = await SendAsync(new { type = "alias_list" }, ct, QueryReadTimeout).ConfigureAwait(false);
+        return ParseAliasList(resp);
+    }
+
+    /// <summary>alias_applied 回执：非空 message 是业务失败（连接仍可用）。</summary>
+    private static void ThrowIfAliasRejected(JsonElement resp)
+    {
+        if (resp.TryGetProperty("message", out var message)
+            && message.ValueKind == JsonValueKind.String
+            && !string.IsNullOrEmpty(message.GetString()))
+        {
+            throw new InvalidOperationException("后端返回错误：" + message.GetString());
+        }
+    }
+
+    internal static IReadOnlyList<AliasEntry> ParseAliasList(JsonElement resp)
+    {
+        var items = new List<AliasEntry>();
+        if (!resp.TryGetProperty("items", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return items;
+        foreach (var el in arr.EnumerateArray())
+        {
+            if (!el.TryGetProperty("target", out var targetValue)
+                || targetValue.ValueKind != JsonValueKind.Object
+                || !targetValue.TryGetProperty("kind", out var kind)
+                || kind.ValueKind != JsonValueKind.String
+                || !targetValue.TryGetProperty("value", out var value)
+                || value.ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+            var words = new List<string>();
+            if (el.TryGetProperty("words", out var wordsValue) && wordsValue.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var word in wordsValue.EnumerateArray())
+                    if (word.ValueKind == JsonValueKind.String)
+                        words.Add(word.GetString() ?? "");
+            }
+            var boundAt = el.TryGetProperty("bound_at_utc", out var bound)
+                && bound.TryGetInt64(out var parsedBound)
+                ? parsedBound
+                : 0L;
+            items.Add(new AliasEntry(
+                new ActionTarget(kind.GetString() ?? "", value.GetString() ?? ""),
+                words,
+                boundAt));
+        }
+        return items;
+    }
+
     internal static WindowHandleInfo ParseWindowHandle(JsonElement resp)
     {
         if (!resp.TryGetProperty("handle", out var handleValue)

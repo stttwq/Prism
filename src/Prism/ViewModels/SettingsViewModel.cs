@@ -26,6 +26,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly Func<string, bool>? _onRequestFaviconGrant;
     /// <summary>G8：授权成功后触发 favicon 下载（App 持有 FaviconCache，完成后刷新图标缓存）。</summary>
     private readonly Action<string>? _onFaviconGranted;
+    /// <summary>别名系统（2026-08-21 设想）：设置页打开时拉取别名列表。</summary>
+    private readonly Func<Task<IReadOnlyList<AliasEntry>>>? _onAliasList;
+    /// <summary>别名系统：删除一条绑定。</summary>
+    private readonly Func<ActionTarget, Task>? _onAliasDelete;
 
     private bool _autoStartEnabled;
     private HotkeyMode _hotkeyMode;
@@ -53,7 +57,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Func<Task>? onClearHistory = null,
         Action<IReadOnlyList<WebEngine>, bool>? onWebSettingsChanged = null,
         Func<string, bool>? onRequestFaviconGrant = null,
-        Action<string>? onFaviconGranted = null)
+        Action<string>? onFaviconGranted = null,
+        Func<Task<IReadOnlyList<AliasEntry>>>? onAliasList = null,
+        Func<ActionTarget, Task>? onAliasDelete = null)
     {
         _store = store;
         _autoStart = autoStart;
@@ -64,6 +70,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onWebSettingsChanged = onWebSettingsChanged;
         _onRequestFaviconGrant = onRequestFaviconGrant;
         _onFaviconGranted = onFaviconGranted;
+        _onAliasList = onAliasList;
+        _onAliasDelete = onAliasDelete;
 
         var settings = store.Load();
         _autoStartEnabled = settings.AutoStart;
@@ -88,6 +96,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         ResetEnginesCommand = new RelayCommand(_ => ResetEngines());
         SaveCommand = new RelayCommand(_ => Save());
         ClearHistoryCommand = new RelayCommand(_ => _ = ClearHistoryAsync());
+        RemoveAliasCommand = new RelayCommand(p => _ = RemoveAliasAsync(p as AliasEntry), _ => AliasEntries.Count > 0);
         SelectTabCommand = new RelayCommand(p =>
         {
             if (p is int i) SelectedTab = i;
@@ -229,6 +238,57 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public ICommand SaveCommand { get; }
     public ICommand SelectTabCommand { get; }
     public ICommand ClearHistoryCommand { get; }
+
+    /// <summary>别名系统：设置页展示的绑定列表（打开时拉取）。</summary>
+    public ObservableCollection<AliasEntry> AliasEntries { get; } = new();
+
+    /// <summary>空列表提示的可见性（有绑定时隐藏）。</summary>
+    public bool HasNoAliases => AliasEntries.Count == 0;
+
+    public ICommand RemoveAliasCommand { get; }
+
+    /// <summary>设置页打开时拉取别名列表（失败静默——后端未连接时列表为空）。</summary>
+    public async Task LoadAliasesAsync()
+    {
+        if (_onAliasList is null)
+        {
+            OnPropertyChanged(nameof(HasNoAliases));
+            return;
+        }
+        try
+        {
+            var entries = await _onAliasList().ConfigureAwait(true);
+            AliasEntries.Clear();
+            foreach (var entry in entries)
+                AliasEntries.Add(entry);
+        }
+        catch
+        {
+            // 后端未连接：列表留空，删除操作会给出错误提示。
+        }
+        OnPropertyChanged(nameof(HasNoAliases));
+    }
+
+    private async Task RemoveAliasAsync(AliasEntry? entry)
+    {
+        if (entry is null) return;
+        if (_onAliasDelete is null)
+        {
+            StatusMessage = "后端未连接，无法删除别名";
+            return;
+        }
+        try
+        {
+            await _onAliasDelete(entry.Target).ConfigureAwait(true);
+            AliasEntries.Remove(entry);
+            OnPropertyChanged(nameof(HasNoAliases));
+            StatusMessage = "别名已删除";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = "删除别名失败：" + ex.Message;
+        }
+    }
 
     public bool HistoryEnabled
     {

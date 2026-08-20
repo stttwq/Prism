@@ -152,7 +152,7 @@ public partial class App : Application
         _webIcons = new WebIconProvider(
             _favicons,
             origin => _hostSettings.FaviconGrants.ContainsKey(origin));
-        _searchWindow.Attach(_vm, _icons, _theme, _webIcons);
+        _searchWindow.Attach(_vm, _icons, _theme, _webIcons, _pipe);
         // 窗口是懒创建的，创建时补上设置里的当前目录搜索总开关。
         _searchWindow.Scope.SetCurrentDirectoryEnabled(_currentDirectorySearchEnabled);
         return _searchWindow;
@@ -191,7 +191,9 @@ public partial class App : Application
             onWebSettingsChanged: (engines, suggestionsEnabled) =>
                 _vm?.UpdateWebSettings(engines, suggestionsEnabled),
             onRequestFaviconGrant: RequestFaviconGrant,
-            onFaviconGranted: DownloadFavicon);
+            onFaviconGranted: DownloadFavicon,
+            onAliasList: ListBackendAliasesAsync,
+            onAliasDelete: DeleteBackendAliasAsync);
         _settingsWindow = new SettingsWindow(vm);
         _settingsWindow.Closed += (_, _) =>
         {
@@ -278,6 +280,20 @@ public partial class App : Application
         if (_pipe is null || !_pipe.IsConnected)
             throw new InvalidOperationException("后端未连接");
         await _pipe.ClearHistoryAsync().ConfigureAwait(true);
+    }
+
+    private async Task<IReadOnlyList<AliasEntry>> ListBackendAliasesAsync()
+    {
+        if (_pipe is null || !_pipe.IsConnected)
+            throw new InvalidOperationException("后端未连接");
+        return await _pipe.AliasListAsync().ConfigureAwait(true);
+    }
+
+    private async Task DeleteBackendAliasAsync(ActionTarget target)
+    {
+        if (_pipe is null || !_pipe.IsConnected)
+            throw new InvalidOperationException("后端未连接");
+        await _pipe.AliasDeleteAsync(target).ConfigureAwait(true);
     }
 
     /// <summary>
