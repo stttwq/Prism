@@ -1136,6 +1136,15 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                                 state.merge_and_publish(volume);
                                 // M1：成功即撤销该卷的挂起重试。
                                 remove_deferred_rebuild(&mut deferred_rebuilds, &descriptor.id);
+                                // AUDIT-4-2026-08-20 修 2：单卷重建后必须失效拼音
+                                // sidecar——记录号被 NTFS 复用后旧编码配上新名字会
+                                // 产出错误命中，重建窗口内新建的中文名则漏检；
+                                // 旧代码不做任何动作，自愈要等下一次全量拼音重建
+                                //（最长 6h）。立即卸载陈旧 sidecar（宁可暂时少结果
+                                // 不错结果），置 needs_rebuild 交 maintenance tick
+                                //（M3 的 60s 退避）从 live 索引重建。
+                                state.begin_pinyin_rebuild();
+                                state.pinyin_needs_rebuild.store(true, Ordering::Release);
                                 let watcher_epoch = epoch.load(Ordering::Acquire);
                                 start_watcher(
                                     state.clone(), descriptor,

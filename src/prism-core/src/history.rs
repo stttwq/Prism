@@ -234,8 +234,8 @@ impl HistoryStore {
                 let Some(store) = weak.upgrade() else {
                     return;
                 };
-                // 与 record 路径同一节流判定：到期才真正 clone+persist。
-                if store.should_persist_now() {
+                // 只读判定：到期且（有真实变更留下的）脏标记才 clone+persist。
+                if store.persist_if_due_and_dirty() {
                     if let Ok(state) = store.state.read() {
                         let _ = persist(&store.path, state.entries.clone());
                     }
@@ -377,7 +377,8 @@ impl HistoryStore {
         persist(&self.path, snapshot)
     }
 
-    /// G4: 到期判定并记账。返回 true = 本次应落盘（调用方随后 clone+persist）。
+    /// G4: 到期判定并记账（record 路径：先改内存再调这里，置脏合理）。
+    /// 返回 true = 本次应落盘（调用方随后 clone+persist）。
     fn should_persist_now(&self) -> bool {
         let Ok(mut gate) = self.persist_gate.lock() else {
             return false;
@@ -391,6 +392,28 @@ impl HistoryStore {
             gate.dirty = false;
         }
         due
+    }
+
+    /// AUDIT-4-2026-08-20 修 1：定时线程专用的**只读**到期判定——到期且脏才
+    /// 落盘并清脏，绝不置脏。此前的定时线程复用 `should_persist_now`
+    /// （无条件 `dirty = true`），导致空闲时也每 250ms 全量 clone+JSON+fsync
+    /// 一次，进程全生命期持续（磁盘写入风暴）。
+    fn persist_if_due_and_dirty(&self) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let Ok(mut gate) = self.persist_gate.lock() else {
+            return false;
+        };
+        let due = gate
+            .last
+            .is_none_or(|at| at.elapsed() >= MIN_PERSIST_INTERVAL);
+        if gate.dirty && due {
+            gate.last = Some(std::time::Instant::now());
+            gate.dirty = false;
+            return true;
+        }
+        false
     }
 
     pub fn score(&self, target: &ActionTarget) -> u32 {
@@ -750,6 +773,43 @@ mod tests {
             )
             .unwrap();
         assert!(store.entries().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// AUDIT-4-2026-08-20 修 1 的回归锚：定时线程的只读判定在**无变更**时
+    /// 不得置脏——空闲等待多个节拍后历史文件必须不存在（修复前每 250ms
+    /// 全量落盘一次，文件立刻出现且持续被重写）。
+    #[test]
+    fn periodic_flush_never_marks_dirty_on_its_own() {
+        let dir = test_dir("idle-flush");
+        let store = HistoryStore::load_at(&dir, true, 1_000_000);
+        // 无任何 record：连续两拍只读判定都为假。
+        assert!(!store.persist_if_due_and_dirty());
+        assert!(!store.persist_if_due_and_dirty());
+        assert!(
+            !store.path.exists(),
+            "空闲判定不得触发落盘"
+        );
+
+        // 第一条 record 立即落盘（G4 首条语义），第二条在 250ms 窗口内置脏
+        // 不落盘，随后定时判定接管冲刷。
+        store
+            .record_at(&target("C:\\audit4"), HistoryUse::Execute, None, 1_000_000)
+            .unwrap();
+        assert!(store.path.exists(), "首条 record 立即落盘");
+        store
+            .record_at(&target("C:\\audit4b"), HistoryUse::Execute, None, 1_000_001)
+            .unwrap();
+        // 窗口未到：不冲刷（脏标记留在门上）。
+        assert!(!store.persist_if_due_and_dirty());
+        std::thread::sleep(MIN_PERSIST_INTERVAL + MIN_PERSIST_INTERVAL / 2);
+        assert!(
+            store.persist_if_due_and_dirty(),
+            "到期且脏必须冲刷"
+        );
+        // 冲刷清脏后，下一拍回到空闲静默。
+        std::thread::sleep(MIN_PERSIST_INTERVAL + MIN_PERSIST_INTERVAL / 2);
+        assert!(!store.persist_if_due_and_dirty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
