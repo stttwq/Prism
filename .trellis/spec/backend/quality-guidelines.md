@@ -30,6 +30,34 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 - Search ranking when query has **no** web-engine keyword: apps, files, and folders
   compete in one global order: exact name, prefix, contains position, centralized
   score, then stable name/path/kind ties. Do not reserve slots by kind.
+- Ranking contract (S1, 2026-08-20): `MatchMetadata::cmp` compares **class before
+  kind** — a whole-name exact pinyin hit (class 0) outranks literal substring noise
+  (class 2); within one class, kind stays locked (Literal > FullPinyin > Initials).
+  Broker-side `sort_search_results_with_picks` must not re-introduce a separate
+  kind key; picks (query memory) promote above match quality entirely, ordering
+  within picks still by `MatchMetadata::cmp`. Test anchors live in
+  `hierarchy.rs` (`match_tiers_and_history_cannot_cross_locked_boundaries`,
+  `s1_strong_pinyin_class_beats_weak_literal_class`) and `ipc.rs`
+  (`query_pick_promotes_above_match_quality_but_orders_within`).
+- Pinyin matching (S3, 2026-08-20): three strategies tried in order — whole-name
+  full pinyin, whole-name initials, then **mixed** per-character (initial or full
+  per token, contiguous token run, tail-partial terminal; bitmask DP, query ≤ 63
+  bytes). Mixed hits report `Initials` kind without a new enum variant (protocol
+  and sidecar byte format unchanged). The compact (sidecar) and on-the-fly
+  encoders must stay decision-equal — anchored by
+  `apps.rs precomputed_pinyin_matches_the_on_the_fly_encoder` and
+  `pinyin.rs s3_compact_mixed_matches_live_path`. Subsequence (skip-a-syllable)
+  queries like `dysp` → 抖音短视频 are intentionally **not** matched.
+- Name query tokenization (S4, 2026-08-20): whitespace splits the name query
+  into AND terms (`hierarchy::NameTerms`) at **every** literal matching point —
+  indexer scan (`match_metadata`), broker fallback (`literal_match_lowered`),
+  app manifest (`apps::match_rank`), and pinyin literal-dedup
+  (`pinyin_sidecar::key_is_literal`). Single-term (including empty query →
+  single empty term) must stay byte-equal with the pre-S4 single-substring
+  behavior. Multi-term yields no class 0, position = min UTF-16 offset, and
+  highlight spans sorted ascending with overlaps merged. The pinyin side keeps
+  the whole normalized string (spaces stripped by `normalize_query`) — no
+  cross-mode term model.
 - When the query matches a web-engine keyword (`bi`/`b`/`g` or custom from `settings.json` `WebEngines`): insert one **`kind=web`** hit **first**, then apps, then files. Longer keywords win (`bi` before `b`).
 - `execute` for `kind=web`: `execute_id` is an `http(s)` URL — open via ShellExecute **without** path validation (absolute-path checks reject URLs). File/app execute still validates paths.
 - `results` JSON must include **`is_indexing`** so the UI can poll until the file index is ready even if apps already returned.
