@@ -54,17 +54,84 @@ struct SidecarDisk {
     checksum: u64,
 }
 
-/// G4（FRESH-AUDIT-2）：Clone 供运行时的 Arc 快照在 USN delta 写入时 COW
-///（`Arc::make_mut`），仅在与拼音扫描并发时发生。
-#[derive(Debug, Clone)]
-pub struct PinyinSidecar {
-    disk: SidecarDisk,
-    delta: BTreeMap<RecordKey, Option<Vec<u8>>>,
+/// A1（AUDIT-4 批次B，2026-08-21）：增量表从 [`PinyinSidecar`] 拆出。
+/// 此前 delta 活在 sidecar 里，USN 批次写入用 `Arc::make_mut` COW 深克隆整份
+/// sidecar（几十 MB）——击键搜索几乎总在飞，浏览器/WU 持续写盘时每批次克隆一次，
+/// 分配 churn + 瞬时 2× 常驻。拆出后主表 `Arc` 快照永不变异，watcher 只写这张
+/// 独立的小表；字节格式不变（delta 本就不序列化）。
+#[derive(Debug, Default)]
+pub struct PinyinDelta {
+    entries: BTreeMap<RecordKey, Option<Vec<u8>>>,
     /// M3（FRESH-AUDIT-3-2026-08-20）：含汉字编码的 delta 条数。纯英文名变更
     /// （npm install / Windows Update 风暴）不计入重建阈值，杜绝"每 4096 条
     /// 英文变更触发一次全量重建"的周期性整索引 clone + 全节点编码 + fsync。
-    /// 纯内存字段，不参与序列化（SidecarDisk 字节格式不变）。
-    chinese_delta_count: usize,
+    chinese_count: usize,
+}
+
+impl PinyinDelta {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.chinese_count = 0;
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .filter_map(Option::as_ref)
+            .map(Vec::capacity)
+            .sum()
+    }
+
+    /// 记录一次名字变更（`name=None` 表示删除）。返回 true 表示到达重建阈值，
+    /// 调用方应卸载主表并排队全量重建。
+    pub fn apply(
+        &mut self,
+        volume: usize,
+        record: u32,
+        name: Option<&str>,
+    ) -> Result<bool, String> {
+        let volume = u16::try_from(volume).map_err(|_| "pinyin volume exceeds u16")?;
+        let key = RecordKey { volume, record };
+        let value = name.and_then(encode_compact);
+        let counts_chinese = value.is_some();
+        if let Some(existing) = self.entries.get(&key) {
+            // 覆盖既有条目：按旧新取值增减汉字计数（中文→英文 rename 释放容量）。
+            let counted_before = existing.is_some();
+            self.chinese_count = self
+                .chinese_count
+                .saturating_add(usize::from(counts_chinese))
+                .saturating_sub(usize::from(counted_before));
+        } else {
+            // M3（FRESH-AUDIT-3-2026-08-20）：重建阈值只看含汉字编码的条数——
+            // 纯英文名变更（encode_compact=None）不再触发周期性全量重建；
+            // 总条数硬上限兜底内存（纯英文条目也要留下掩蔽陈旧编码）。
+            if counts_chinese && self.chinese_count >= MAX_DELTA_RECORDS {
+                return Ok(true);
+            }
+            if self.entries.len() >= MAX_DELTA_TOTAL_RECORDS {
+                return Ok(true);
+            }
+            self.chinese_count += usize::from(counts_chinese);
+        }
+        self.entries.insert(key, value);
+        Ok(self.chinese_count >= MAX_DELTA_RECORDS
+            || self.entries.len() >= MAX_DELTA_TOTAL_RECORDS)
+    }
+}
+
+/// 主表（磁盘字节格式的内存映像）。不可变共享：搜索只拿 `Arc` 快照，
+/// 增量变更全部走 [`PinyinDelta`]（A1，AUDIT-4 批次B）。
+#[derive(Debug, Clone)]
+pub struct PinyinSidecar {
+    disk: SidecarDisk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,11 +306,7 @@ impl PinyinSidecar {
             checksum: 0,
         };
         disk.checksum = content_checksum(&disk);
-        Ok(Self {
-            disk,
-            delta: BTreeMap::new(),
-            chinese_delta_count: 0,
-        })
+        Ok(Self { disk })
     }
 
     pub fn load(data_dir: &Path, index: &IndexState) -> Result<Self, LoadError> {
@@ -286,17 +349,12 @@ impl PinyinSidecar {
         validate_disk_with(&disk, identity, volume_count)?;
         // 反序列化完成后 mapping 立即随本地变量 drop：mmap 与堆拷贝双份常驻
         // 等于白占一份内存（大卷可达百 MB），而这里的字节此后再无读取。
-        Ok(Self {
-            disk,
-            delta: BTreeMap::new(),
-            chinese_delta_count: 0,
-        })
+        Ok(Self { disk })
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        if !self.delta.is_empty() {
-            return Err("pinyin sidecar must be rebuilt before saving".into());
-        }
+        // A1（AUDIT-4 批次B）：delta 已拆出本类型，save 不再校验 delta——
+        // 调用方（rebuild 路径）总是从活索引全新构建，无 delta 可言。
         std::fs::create_dir_all(data_dir)
             .map_err(|error| format!("create pinyin directory: {error}"))?;
         let destination = path(data_dir);
@@ -324,74 +382,42 @@ impl PinyinSidecar {
     pub fn resident_bytes(&self) -> usize {
         self.disk.records.capacity() * std::mem::size_of::<SidecarRecord>()
             + self.disk.payload.capacity()
-            + self
-                .delta
-                .values()
-                .filter_map(Option::as_ref)
-                .map(Vec::capacity)
-                .sum::<usize>()
     }
 
-    pub fn apply_delta(
-        &mut self,
-        volume: usize,
-        record: u32,
-        name: Option<&str>,
-    ) -> Result<bool, String> {
-        let volume = u16::try_from(volume).map_err(|_| "pinyin volume exceeds u16")?;
-        let key = RecordKey { volume, record };
-        let value = name.and_then(encode_compact);
-        let counts_chinese = value.is_some();
-        if let Some(existing) = self.delta.get(&key) {
-            // 覆盖既有条目：按旧新取值增减汉字计数（中文→英文 rename 释放容量）。
-            let counted_before = existing.is_some();
-            self.chinese_delta_count = self
-                .chinese_delta_count
-                .saturating_add(usize::from(counts_chinese))
-                .saturating_sub(usize::from(counted_before));
-        } else {
-            // M3（FRESH-AUDIT-3-2026-08-20）：重建阈值只看含汉字编码的条数——
-            // 纯英文名变更（encode_compact=None）不再触发周期性全量重建；
-            // 总条数硬上限兜底内存（纯英文条目也要留下掩蔽陈旧编码）。
-            if counts_chinese && self.chinese_delta_count >= MAX_DELTA_RECORDS {
-                return Ok(true);
-            }
-            if self.delta.len() >= MAX_DELTA_TOTAL_RECORDS {
-                return Ok(true);
-            }
-            self.chinese_delta_count += usize::from(counts_chinese);
-        }
-        self.delta.insert(key, value);
-        Ok(self.chinese_delta_count >= MAX_DELTA_RECORDS
-            || self.delta.len() >= MAX_DELTA_TOTAL_RECORDS)
-    }
-
-    pub fn search(&self, index: &IndexState, query: &str, max: usize) -> PinyinSearchOutcome {
-        self.search_with_exclusions(index, query, max, &[])
+    pub fn search(
+        &self,
+        delta: &PinyinDelta,
+        index: &IndexState,
+        query: &str,
+        max: usize,
+    ) -> PinyinSearchOutcome {
+        self.search_with_exclusions(delta, index, query, max, &[])
     }
 
     pub fn search_with_exclusions(
         &self,
+        delta: &PinyinDelta,
         index: &IndexState,
         query: &str,
         max: usize,
         exclusion_paths: &[String],
     ) -> PinyinSearchOutcome {
-        self.search_in_root(
-            index,
-            query,
-            max,
-            exclusion_paths,
-            None,
-            &QueryFilters::none(),
-        )
+        self.search_in_root(delta, index, query, max, exclusion_paths, None, &QueryFilters::none())
     }
 
     /// Pinyin candidates are filtered by the same root rule as the literal path, before
     /// the Top-K heap, so a current-directory search never leaks matches from elsewhere.
     /// G7: ext/path filters are applied here too, before the Top-K heap.
+    ///
+    /// A1（AUDIT-4 批次B）：`delta` 是独立于主表的增量表——主表条目被 delta
+    /// 键掩蔽后跳过，delta 条目自己作为候选（`Some`）参与；掩蔽语义与拆分前
+    /// 逐条对齐。
+    // clippy: 8 参数是搜索入口的既有形状（与字面路径 search_in_root_filtered
+    // 同族），再包一层参数结构体只会增加一层解包噪声。
+    #[allow(clippy::too_many_arguments)]
     pub fn search_in_root(
         &self,
+        delta: &PinyinDelta,
         index: &IndexState,
         query: &str,
         max: usize,
@@ -415,7 +441,7 @@ impl PinyinSidecar {
         // N1 + S4：字面去重查询在循环外分词一次（口径与字面路径一致）。
         let terms = NameTerms::parse(query);
         for record in &self.disk.records {
-            if self.delta.contains_key(&record.key) {
+            if delta.entries.contains_key(&record.key) {
                 continue;
             }
             if key_is_excluded(index, record.key, &exclusions) {
@@ -452,7 +478,7 @@ impl PinyinSidecar {
                 push_candidate(&mut heap, index, record.key, matched, max, &exclusions);
             }
         }
-        for (key, encoded) in &self.delta {
+        for (key, encoded) in &delta.entries {
             let Some(bytes) = encoded else {
                 continue;
             };
@@ -901,11 +927,30 @@ mod tests {
     fn compact_sidecar_matches_and_maps_utf16_spans() {
         let sidecar = PinyinSidecar::build(&state()).unwrap();
         assert_eq!(sidecar.disk.records.len(), 2);
-        let outcome = sidecar.search(&state(), "wx2026", 8);
+        let outcome = sidecar.search(&PinyinDelta::new(), &state(), "wx2026", 8);
         assert_eq!(outcome.items.len(), 1);
         assert_eq!(outcome.items[0].path, "C:\\微信2026");
         assert_eq!(outcome.items[0].match_spans, [0, 6]);
         assert_eq!(outcome.items[0].match_metadata.kind, MatchKind::Initials);
+    }
+
+    /// A1（AUDIT-4 批次B）：delta 是独立表——主表 Arc 快照永不变异，
+    /// 掩蔽全部经 delta 发生。这是拆锁后「主表只读共享」的锚。
+    #[test]
+    fn a1_delta_masks_without_mutating_the_shared_snapshot() {
+        use std::sync::Arc;
+        let index = state();
+        let sidecar = Arc::new(PinyinSidecar::build(&index).unwrap());
+        let mut delta = PinyinDelta::new();
+        delta.apply(0, 10, Some("支付宝")).unwrap();
+        // 同一不可变主表快照 + delta → 掩蔽生效（wx 不再命中已改名的记录）。
+        assert!(sidecar.search(&delta, &index, "wx", 8).items.is_empty());
+        assert_eq!(sidecar.search(&delta, &index, "zfb", 8).items.len(), 1);
+        // 同一快照不带 delta：主表内容原样（从未被变异）。
+        assert_eq!(
+            sidecar.search(&PinyinDelta::new(), &index, "wx", 8).items.len(),
+            1
+        );
     }
 
     /// F3（FRESH-AUDIT-2）：identity 指纹的稳定性与敏感性。
@@ -961,14 +1006,15 @@ mod tests {
             generation: 9,
             events_since_checkpoint: 0,
         };
-        let mut sidecar = PinyinSidecar::build(&index).unwrap();
+        let sidecar = PinyinSidecar::build(&index).unwrap();
+        let mut delta = PinyinDelta::new();
         let root = Some(RootBound {
             volume_index: 0,
             root_record: 10,
         });
 
-        assert_eq!(sidecar.search(&index, "wx", 8).items.len(), 3);
-        let scoped = sidecar.search_in_root(&index, "wx", 8, &[], root, &QueryFilters::none());
+        assert_eq!(sidecar.search(&delta, &index, "wx", 8).items.len(), 3);
+        let scoped = sidecar.search_in_root(&delta, &index, "wx", 8, &[], root, &QueryFilters::none());
         assert_eq!(scoped.items.len(), 1, "{:?}", scoped.items);
         assert_eq!(scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(
@@ -978,10 +1024,10 @@ mod tests {
 
         // The delta path applies the same rule: a rename inside the root stays visible and
         // a rename outside it does not leak in.
-        sidecar.apply_delta(0, 11, Some("支付宝")).unwrap();
-        sidecar.apply_delta(0, 12, Some("支付宝")).unwrap();
+        delta.apply(0, 11, Some("支付宝")).unwrap();
+        delta.apply(0, 12, Some("支付宝")).unwrap();
         let delta_scoped =
-            sidecar.search_in_root(&index, "zfb", 8, &[], root, &QueryFilters::none());
+            sidecar.search_in_root(&delta, &index, "zfb", 8, &[], root, &QueryFilters::none());
         assert_eq!(delta_scoped.items.len(), 1, "{:?}", delta_scoped.items);
         assert_eq!(delta_scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(delta_scoped.matched_count, 1);
@@ -990,12 +1036,13 @@ mod tests {
     #[test]
     fn delta_rename_and_tombstone_override_main_records() {
         let index = state();
-        let mut sidecar = PinyinSidecar::build(&index).unwrap();
-        sidecar.apply_delta(0, 10, Some("支付宝")).unwrap();
-        sidecar.apply_delta(0, 11, None).unwrap();
-        assert!(sidecar.search(&index, "wx", 8).items.is_empty());
-        assert_eq!(sidecar.search(&index, "zfb", 8).items.len(), 1);
-        assert!(sidecar.search(&index, "cq", 8).items.is_empty());
+        let sidecar = PinyinSidecar::build(&index).unwrap();
+        let mut delta = PinyinDelta::new();
+        delta.apply(0, 10, Some("支付宝")).unwrap();
+        delta.apply(0, 11, None).unwrap();
+        assert!(sidecar.search(&delta, &index, "wx", 8).items.is_empty());
+        assert_eq!(sidecar.search(&delta, &index, "zfb", 8).items.len(), 1);
+        assert!(sidecar.search(&delta, &index, "cq", 8).items.is_empty());
     }
 
     #[test]
@@ -1045,7 +1092,8 @@ mod tests {
         index.volumes[0].upsert(20, 5, "秘密", true).unwrap();
         index.volumes[0].upsert(21, 20, "微信", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
-        let outcome = sidecar.search_with_exclusions(&index, "wx", 8, &["C:\\秘密".to_owned()]);
+        let outcome =
+            sidecar.search_with_exclusions(&PinyinDelta::new(), &index, "wx", 8, &["C:\\秘密".to_owned()]);
         assert!(outcome
             .items
             .iter()
@@ -1059,63 +1107,61 @@ mod tests {
         index.volumes[0].upsert(20, 5, "微信目录", true).unwrap();
         index.volumes[0].upsert(21, 20, "notes.txt", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
-        let outcome = sidecar.search(&index, "wx", 8);
+        let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx", 8);
         assert!(outcome.items.iter().any(|item| item.name == "微信目录"));
         assert!(outcome.items.iter().all(|item| item.name != "notes.txt"));
     }
 
     #[test]
     fn delta_never_grows_past_the_rebuild_threshold() {
-        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
+        let mut delta = PinyinDelta::new();
         for record in 0..MAX_DELTA_RECORDS as u32 {
-            let rebuild = sidecar.apply_delta(0, record, Some("微信")).unwrap();
+            let rebuild = delta.apply(0, record, Some("微信")).unwrap();
             assert_eq!(rebuild, record as usize + 1 >= MAX_DELTA_RECORDS);
         }
-        assert_eq!(sidecar.delta.len(), MAX_DELTA_RECORDS);
-        assert!(sidecar
-            .apply_delta(0, MAX_DELTA_RECORDS as u32, Some("微信"))
-            .unwrap());
-        assert_eq!(sidecar.delta.len(), MAX_DELTA_RECORDS);
+        assert_eq!(delta.entries.len(), MAX_DELTA_RECORDS);
+        assert!(delta.apply(0, MAX_DELTA_RECORDS as u32, Some("微信")).unwrap());
+        assert_eq!(delta.entries.len(), MAX_DELTA_RECORDS);
     }
 
     /// M3（FRESH-AUDIT-3-2026-08-20）：纯英文名风暴（npm install / Windows
     /// Update 类）不触发重建——重建阈值只看含汉字编码的条数。
     #[test]
     fn m3_english_name_storm_does_not_trigger_rebuild() {
-        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
+        let mut delta = PinyinDelta::new();
         for record in 0..(MAX_DELTA_RECORDS as u32 * 2) {
-            let rebuild = sidecar.apply_delta(0, record, Some("body-styles.css")).unwrap();
+            let rebuild = delta.apply(0, record, Some("body-styles.css")).unwrap();
             assert!(!rebuild, "纯英文名变更不得触发全量重建");
         }
-        assert_eq!(sidecar.chinese_delta_count, 0);
+        assert_eq!(delta.chinese_count, 0);
     }
 
     /// M3：中文→英文 rename 后计数回落，释放的容量可继续容纳新的中文条目。
     #[test]
     fn m3_chinese_to_english_rename_releases_quota() {
-        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
-        sidecar.apply_delta(0, 10, Some("微信")).unwrap();
-        assert_eq!(sidecar.chinese_delta_count, 1);
-        sidecar.apply_delta(0, 10, Some("english-name")).unwrap();
-        assert_eq!(sidecar.chinese_delta_count, 0, "中文→英文 rename 计数回落");
+        let mut delta = PinyinDelta::new();
+        delta.apply(0, 10, Some("微信")).unwrap();
+        assert_eq!(delta.chinese_count, 1);
+        delta.apply(0, 10, Some("english-name")).unwrap();
+        assert_eq!(delta.chinese_count, 0, "中文→英文 rename 计数回落");
         // 释放后不再触发（0 < 阈值），即使 delta 条目本身还在。
-        assert!(!sidecar.apply_delta(0, 11, Some("支付宝")).unwrap());
+        assert!(!delta.apply(0, 11, Some("支付宝")).unwrap());
     }
 
     /// M3：delta 总条数硬上限兜底内存——纯英文条目也要留下掩蔽陈旧编码，
     /// 但总量到 32k 即触发重建冲刷。
     #[test]
     fn m3_delta_total_entries_have_a_hard_cap() {
-        let mut sidecar = PinyinSidecar::build(&state()).unwrap();
+        let mut delta = PinyinDelta::new();
         let mut crossed = false;
         for record in 0..MAX_DELTA_TOTAL_RECORDS as u32 {
-            if sidecar.apply_delta(0, record, Some("english")).unwrap() {
+            if delta.apply(0, record, Some("english")).unwrap() {
                 crossed = true;
             }
         }
         assert!(crossed, "总条数到达硬上限必须触发重建");
-        assert!(sidecar
-            .apply_delta(0, MAX_DELTA_TOTAL_RECORDS as u32 + 7, Some("more"))
+        assert!(delta
+            .apply(0, MAX_DELTA_TOTAL_RECORDS as u32 + 7, Some("more"))
             .unwrap());
     }
 
@@ -1127,7 +1173,7 @@ mod tests {
         let mut index = state();
         let sidecar = PinyinSidecar::build(&index).unwrap();
         index.volumes[0].delete(10).unwrap();
-        let outcome = sidecar.search(&index, "wx", 8);
+        let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx", 8);
         assert!(outcome.items.is_empty());
         assert_eq!(
             outcome.matched_count, 0,
@@ -1147,7 +1193,7 @@ mod tests {
         // 「wxzfb微信」：ASCII 段 wxzfb 全拼命中拼音，同时字面含全部 term → 吸收。
         index.volumes[0].upsert(21, 5, "wxzfb微信", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
-        let outcome = sidecar.search(&index, "wx zfb", 8);
+        let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx zfb", 8);
         let names: Vec<&str> = outcome.items.iter().map(|item| item.name.as_str()).collect();
         assert!(
             names.contains(&"微信支付宝"),

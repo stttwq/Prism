@@ -18,7 +18,7 @@ use crate::indexer_ipc::{
 };
 use crate::logging;
 use crate::ntfs::{self, VolumeDescriptor};
-use crate::pinyin_sidecar::{LoadErrorKind, PinyinSidecar};
+use crate::pinyin_sidecar::{LoadErrorKind, PinyinDelta, PinyinSidecar};
 use crate::root_scope::RootScope;
 use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 
@@ -295,6 +295,12 @@ pub struct ServiceState {
     /// path can write a partial index that would later look like a complete cache.
     first_build_complete: AtomicBool,
     pinyin: RwLock<Option<Arc<PinyinSidecar>>>,
+    /// A1（AUDIT-4 批次B，2026-08-21）：拼音增量表独立于主表。此前 delta 活在
+    /// `PinyinSidecar` 里，USN 批次经 `Arc::make_mut` COW 深克隆整份主表
+    /// （几十 MB）——击键搜索几乎总在飞，浏览器/WU 持续写盘时每批次一次，
+    /// 分配 churn + 瞬时 2× 常驻。拆出后主表 Arc 快照永不变异，watcher 只写
+    /// 这张小表；重建/卸载主表时必须同步 clear（旧 delta 掩蔽新主表会产错命中）。
+    pinyin_delta: RwLock<PinyinDelta>,
     pinyin_status: RwLock<PinyinStatus>,
     pinyin_data_dir: RwLock<Option<PathBuf>>,
     pinyin_needs_rebuild: AtomicBool,
@@ -340,6 +346,7 @@ impl ServiceState {
             progress: BuildProgressCounters::default(),
             first_build_complete: AtomicBool::new(false),
             pinyin: RwLock::new(None),            pinyin_status: RwLock::new(PinyinStatus::Building),
+            pinyin_delta: RwLock::new(PinyinDelta::new()),
             pinyin_data_dir: RwLock::new(None),
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
@@ -378,6 +385,10 @@ impl ServiceState {
         {
             *sidecar = None;
         }
+        self.pinyin_delta
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.set_pinyin_status(PinyinStatus::Disabled);
     }
 
@@ -387,6 +398,12 @@ impl ServiceState {
         {
             *sidecar = None;
         }
+        // A1：主表卸载的同时清 delta——主表缺席期间 delta 无从对齐（重建后的
+        // 新主表已含全部已应用事件，旧掩蔽条目反而会盖掉新编码）。
+        self.pinyin_delta
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.set_pinyin_status(PinyinStatus::Building);
     }
 
@@ -456,6 +473,12 @@ impl ServiceState {
                 {
                     *current = Some(Arc::new(sidecar));
                 }
+                // A1：安装全新主表的同时清 delta（新主表来自重建后的索引快照，
+                // 已含全部已应用事件；旧掩蔽条目盖新编码会产错命中）。
+                self.pinyin_delta
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
                 self.set_pinyin_status(PinyinStatus::Ready);
             }
             Err(error) => {
@@ -489,6 +512,11 @@ impl ServiceState {
                 {
                     *current = Some(Arc::new(sidecar));
                 }
+                // A1：同 load 安装路径——新主表 + 清空 delta 成对出现。
+                self.pinyin_delta
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
                 self.set_pinyin_status(PinyinStatus::Ready);
                 self.pinyin_needs_rebuild.store(false, Ordering::Release);
                 log("pinyin sidecar ready");
@@ -542,21 +570,24 @@ impl ServiceState {
         if !self.pinyin_enabled.load(Ordering::Acquire) {
             return;
         }
-        let Ok(mut sidecar_slot) = self.pinyin.write() else {
+        // A1（AUDIT-4 批次B，2026-08-21）：主表只读共享（Arc 快照），增量写进
+        // 独立的 delta 表——彻底移除 `Arc::make_mut` 的整表 COW 深克隆
+        //（几十 MB/批，USN 洪峰 + 击键搜索并发时每批次一次）。主表缺席
+        //（Building/卸载/重建窗口）时不写 delta：掉线的主表无法与增量对齐，
+        // 置 needs_rebuild 交 maintenance 全量重建（与拆分前语义一致）。
+        let main_table_present = self
+            .pinyin
+            .read()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false);
+        if !main_table_present {
             self.pinyin_needs_rebuild.store(true, Ordering::Release);
             return;
-        };
-        let Some(sidecar_arc) = sidecar_slot.as_mut() else {
-            self.pinyin_needs_rebuild.store(true, Ordering::Release);
-            return;
-        };
-        // G4（FRESH-AUDIT-2）：搜索侧只持 Arc 快照（见 search 的 clone 路径），
-        // 恰有拼音扫描在飞时这里 COW 克隆一次完整 sidecar（几 MB memcpy，罕见且
-        // 只发生在 watcher 线程）；无并发时零拷贝。换来的是 pinyin.write 永不
-        // 等一次长扫描。
-        // ponytail: COW 克隆上限=单卷 sidecar 载荷，若 USN 批次与拼音搜索高频
-        // 交叠成为瓶颈，再拆独立 delta 锁。
-        let sidecar = Arc::make_mut(sidecar_arc);
+        }
+        let mut delta = self
+            .pinyin_delta
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut invalidate = false;
         for record in records {
             let Ok((record_number, _)) = VolumeIndex::split_frn(record.frn) else {
@@ -573,7 +604,7 @@ impl ServiceState {
             } else {
                 continue;
             };
-            match sidecar.apply_delta(volume, record_number, name) {
+            match delta.apply(volume, record_number, name) {
                 Ok(true) | Err(_) => {
                     invalidate = true;
                     break;
@@ -581,10 +612,10 @@ impl ServiceState {
                 Ok(false) => {}
             }
         }
+        drop(delta);
         if invalidate {
-            *sidecar_slot = None;
-            drop(sidecar_slot);
-            self.set_pinyin_status(PinyinStatus::Building);
+            // 到达重建阈值或坏记录：卸载主表（连带清 delta）排队全量重建。
+            self.begin_pinyin_rebuild();
             self.pinyin_needs_rebuild.store(true, Ordering::Release);
         }
     }
@@ -616,6 +647,11 @@ impl ServiceState {
                 .read()
                 .ok()
                 .and_then(|sidecar| sidecar.as_ref().map(|s| s.resident_bytes()))
+                .unwrap_or(0)
+            + self
+                .pinyin_delta
+                .read()
+                .map(|delta| delta.resident_bytes())
                 .unwrap_or(0);
         format!(
             "memory_bytes={} volumes={} events_since_checkpoint={} pinyin={:?}",
@@ -643,6 +679,11 @@ impl ServiceState {
                     .read()
                     .ok()
                     .and_then(|sidecar| sidecar.as_ref().map(|s| s.resident_bytes()))
+                    .unwrap_or(0)
+                + self
+                    .pinyin_delta
+                    .read()
+                    .map(|delta| delta.resident_bytes())
                     .unwrap_or(0),
             message: self.message.read().ok().and_then(|value| value.clone()),
             build_progress: self.progress.snapshot(),
@@ -871,14 +912,22 @@ impl ServiceState {
         if pinyin_enabled {
             // G4（FRESH-AUDIT-2）：clone Arc 快照后立刻放 pinyin 读锁——拼音全表扫
             // 不再占住 pinyin.read()，USN 的 delta 写入不必等一次长扫描。
+            // A1（AUDIT-4 批次B）：delta 拆出为独立表后，扫描期间持有的是
+            // delta 的**读锁**（watcher 的增量写被压到毫秒级扫描窗口内，与字面
+            // 路径持 index.read() 的既有取舍一致）；主表快照自身永不变异。
             let snapshot = self
                 .pinyin
                 .read()
                 .ok()
                 .and_then(|sidecar| sidecar.clone());
             if let Some(sidecar) = snapshot {
+                let delta_guard = self
+                    .pinyin_delta
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 {
                     let pinyin = sidecar.search_in_root(
+                        &delta_guard,
                         state,
                         query,
                         max,
