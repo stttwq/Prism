@@ -54,8 +54,13 @@ public sealed record SearchResult(
     /// </summary>
     public string? RowKey { get; init; }
 
-    /// <summary>容器复用比对用的键。未显式指定 RowKey 时退回按内容比对。</summary>
-    public string ContainerKey => RowKey ?? $"{Kind}\u001f{ExecuteId}\u001f{Title}";
+    /// <summary>容器复用比对用的键。未显式指定 RowKey 时退回按内容比对。
+    /// AUDIT-4 A3（2026-08-21）：惰性缓存——record 不可变，同实例恒同键；
+    /// 此前每次访问都重新拼接分配，展开 1000 行态每击键 SynchronizeDisplayItems
+    /// 要比对 ~2000 次。</summary>
+    public string ContainerKey => _containerKey ??= RowKey ?? $"{Kind}\u001f{ExecuteId}\u001f{Title}";
+
+    private string? _containerKey;
 
     public ActionTarget ExecutionTarget => Target ?? ActionTarget.FromLegacy(Kind, ExecuteId);
 

@@ -302,9 +302,6 @@ pub struct ServiceState {
     /// AUDIT-2026-08-18 R-A3: 活跃连接数。每个连接一个 tokio 任务 + 1MB 行缓冲，
     /// 无上限时任凭本地进程堆积连接即可耗尽 2 worker 的 runtime。
     connections: AtomicUsize,
-    /// S1（FRESH-AUDIT-2026-08-19）: 某卷到达名字池压缩阈值。watcher 在写锁内
-    /// O(1) 立标志，maintenance tick 在锁外 clone→压缩→短锁换入。
-    needs_name_compact: AtomicBool,
     /// F2（FRESH-AUDIT-2）：单槽 RootBound 缓存 (raw root, generation, bound)。
     /// 带 root 的搜索此前每击键都对节点表全量线性扫描解析 root（CWD 范围搜索
     /// 是常态路径，3M 记录卷上额外 ~10ms+ 持读锁）。generation 变化即失效——
@@ -347,7 +344,6 @@ impl ServiceState {
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
             connections: AtomicUsize::new(0),
-            needs_name_compact: AtomicBool::new(false),
             root_bound_cache: RwLock::new(None),
         })
     }
@@ -1217,8 +1213,12 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                         }
                     });
                 }
-                // S1: 名字池压缩在锁外做（clone→压缩→短锁换入，next_usn 校验）。
-                if state.needs_name_compact.swap(false, Ordering::AcqRel) {
+                // S1 + AUDIT-4 B2（2026-08-21）: 名字池压缩——tick 直接驱动
+                // compact_volumes_off_lock（内部谓词选目标卷，锁外 clone→压缩→
+                // 短锁 next_usn 校验换入）。不再用一次性标志：标志先消费后竞争
+                // 失败（clone 窗口内 USN 到达）且卷转安静时，死名字将永不回收。
+                // 每 5s 一拍幂等：无目标时只花一次读锁 + 每卷 O(1) 谓词。
+                {
                     let compact_task = tokio::task::spawn_blocking({
                         let state = state.clone();
                         move || compact_volumes_off_lock(&state)
@@ -1230,7 +1230,7 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                     };
                     match result {
                         Ok(Ok(())) => {}
-                        // 压缩失败只是内存回收延迟（计数器仍在，下轮重触发），
+                        // 压缩失败只是内存回收延迟（计数器仍在，下轮 tick 重触发），
                         // 搜索不受影响：记日志不降级。
                         Ok(Err(error)) => {
                             logging::event_detail("error", "maintenance_compact_failed", &error, None, None);
@@ -1907,16 +1907,10 @@ fn watch_volume(
             let volume = &mut index.volumes[volume_number];
             let rebuild_required =
                 ntfs::apply_records(volume, &records, next_usn)? == ApplyOutcome::RebuildRequired;
-            let events_before = index.events_since_checkpoint;
             index.events_since_checkpoint = index.events_since_checkpoint.saturating_add(changed);
-            if changed > 0 && events_before / 10_000 != index.events_since_checkpoint / 10_000 {
-                // S1（FRESH-AUDIT-2026-08-19）: 压缩挪出写锁——O(N) 的池重建曾把
-                // 写锁占住数百毫秒（3M 记录卷 ~100MB memcpy），删除风暴期间搜索
-                // 读锁与兄弟卷 watcher 全部停摆。这里只 O(1) 立标志；maintenance
-                // tick 在锁外 clone→压缩→短锁 next_usn 校验后整卷换入。
-                // 计数器仍在（dead_name_bytes 不清零），漏拍不漏压缩。
-                service.needs_name_compact.store(true, Ordering::Release);
-            }
+            // AUDIT-4 B2（2026-08-21）: 压缩触发不再立标志——maintenance tick 每 5s
+            // 直接驱动 compact_volumes_off_lock，内部按 dead_name_bytes/池尺寸
+            // 谓词选目标卷，计数器仍在（不清零），漏拍不漏压缩。
             if changed > 0 {
                 index.generation = index.generation.saturating_add(1);
             }

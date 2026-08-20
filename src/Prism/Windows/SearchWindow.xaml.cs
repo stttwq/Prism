@@ -394,6 +394,10 @@ public partial class SearchWindow : Window
             {
                 _idleTrimTimer?.Stop();
                 _idleTrimTimer = null;
+                // AUDIT-4 B7（2026-08-21）：Tick 已入队但窗口再呼出（ShowAndFocus
+                // 停表后再呼出）的竞态下，阻塞式 Gen2 压缩会撞上正在使用的 UI 线程
+                // （违背 A4 承诺）——收集前再核一次窗口状态。
+                if (IsVisible || _hiding) return;
                 GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             };
             _idleTrimTimer.Start();
@@ -606,8 +610,42 @@ public partial class SearchWindow : Window
     /// <summary>当前目录 / 全局 范围状态机，供 App 同步设置里的总开关。</summary>
     public HostScopeController Scope => _scope;
 
-    /// <summary>范围标签点击或 `Ctrl+G`：在当前目录与全局之间切换。</summary>
-    private void ToggleSearchScope() => _scope.ToggleScope();
+    /// <summary>
+    /// 范围标签点击或 `Ctrl+G`：在当前目录与全局之间切换。
+    /// AUDIT-4 A2（2026-08-21）：切回「当前目录」方向的路径复验含磁盘 I/O
+    /// （RootValidation：Exists + 目录枚举探权限），网络盘/休眠盘可达数秒——
+    /// 挪到常驻 STA 线程执行，UI 线程只做快查与结果应用。Global 方向无 I/O，
+    /// 保持同步切换。
+    /// </summary>
+    private void ToggleSearchScope()
+    {
+        if (_scope.Scope == SearchScope.CurrentDirectory)
+        {
+            _scope.ToggleScope();
+            return;
+        }
+
+        var workload = _scope.PrepareToggleToCurrentDirectory(out var capturedWindow);
+        if (workload is null) return;
+        _ = RunToggleValidationAsync(workload, capturedWindow);
+    }
+
+    private async Task RunToggleValidationAsync(
+        Func<HostScopeController.ScopeToggleValidation> workload,
+        IntPtr capturedWindow)
+    {
+        HostScopeController.ScopeToggleValidation result;
+        try
+        {
+            result = await RunOnStaThread(workload).ConfigureAwait(true);
+        }
+        catch
+        {
+            result = new HostScopeController.ScopeToggleValidation(
+                false, HostDetectionStatus.DetectFailed);
+        }
+        _ = Dispatcher.BeginInvoke(() => _scope.ApplyToggleValidation(capturedWindow, result));
+    }
 
     private void OnScopeChanged()
     {

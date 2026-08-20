@@ -134,25 +134,41 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
             proc = Process.GetProcessById(pid);
             if (!proc.ProcessName.Equals(BrokerProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                // AUDIT-4 B10（2026-08-21）：复用返回前释放 Process 句柄——
+                // GetProcessById 每次都新开句柄，不 Dispose 会延迟回收。
+                proc.Dispose();
                 return true; // 不是 broker 的管道服务端（mock/测试）——照常复用
+            }
 
             // L 批次（FRESH-AUDIT-3-2026-08-20）：RDP 双会话时另一会话的 broker
             // 不是孤儿——跨会话收编必失败，但绝不能 Kill 它（那会打掉别人会话的
             // 搜索）。保守复用，跨会话连不上时由 watchdog 走拉新路径。
             if (proc.SessionId != Process.GetCurrentProcess().SessionId)
+            {
+                proc.Dispose(); // AUDIT-4 B10：同上，复用返回前释放句柄。
                 return true;
+            }
 
             _jobGuard ??= new JobObjectGuard();
             if (_jobGuard.TryAdopt(pid))
             {
                 try { _backend?.Dispose(); } catch { /* 已退出 */ }
-                _backend = proc; // 收编成功：接管生命周期，Dispose 时随 Job 一起回收
+                _backend = proc; // 收编成功：接管生命周期（Dispose 时随 Job 一起回收），不得提前 Dispose
                 return true;
             }
 
             // 收编失败（权限/已死/已在别的 Job 且被拒）：孤儿占着管道名，新 Prism 死后
             // 它仍会残留——杀掉它让通道走拉新路径（新进程必进本 Job）。
-            proc.Kill(entireProcessTree: true);
+            try
+            {
+                proc.Kill(entireProcessTree: true);
+            }
+            catch { /* 已退出/无权限：管道侧自然拉新 */ }
+            finally
+            {
+                proc.Dispose(); // AUDIT-4 B10：Kill 后同样释放句柄。
+            }
             return false;
         }
         catch

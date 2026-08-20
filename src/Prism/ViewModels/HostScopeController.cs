@@ -200,7 +200,10 @@ public sealed class HostScopeController
         Changed?.Invoke();
     }
 
-    /// <summary>范围标签点击 / `Ctrl+G`。返回是否发生了切换。</summary>
+    /// <summary>范围标签点击 / `Ctrl+G`。返回是否发生了切换。
+    /// 注意：切回「当前目录」方向含磁盘 I/O（RootValidation 的 Exists + 目录枚举），
+    /// UI 线程请改用 <see cref="PrepareToggleToCurrentDirectory"/> 两段式入口；
+    /// 本方法保留给 Global 方向与单测（无 I/O 或可接受同步等待）。</summary>
     public bool ToggleScope()
     {
         lock (_gate)
@@ -233,6 +236,73 @@ public sealed class HostScopeController
             Changed?.Invoke();
             return true;
         }
+    }
+
+    /// <summary>后台复验结果：Ok=复验通过可切回；否则 Status 为降级原因。</summary>
+    public readonly record struct ScopeToggleValidation(bool Ok, HostDetectionStatus Status);
+
+    /// <summary>
+    /// AUDIT-4 A2（2026-08-21）：Ctrl+G 切回「当前目录」的两段式入口（快查 + 后台复验）。
+    /// 返回 null 表示无需后台复验（快查失败已设置提示并触发 Changed，或已在当前目录）；
+    /// 否则返回可在任意线程执行的复验闭包（内含 RootValidation 的磁盘 I/O——
+    /// 网络盘掉线/机械盘休眠/SMB 超时时可达数秒，绝不能挂 UI 线程），并经
+    /// <paramref name="capturedWindow"/> 输出串台守卫用的窗口句柄。
+    /// 调用方在后台线程执行闭包，把结果交回 <see cref="ApplyToggleValidation"/>。
+    /// </summary>
+    public Func<ScopeToggleValidation>? PrepareToggleToCurrentDirectory(out IntPtr capturedWindow)
+    {
+        lock (_gate)
+        {
+            capturedWindow = IntPtr.Zero;
+            if (Scope == SearchScope.CurrentDirectory)
+                return null;
+            if (!CurrentDirectoryEnabled)
+            {
+                Notice = "当前目录搜索已在设置中关闭";
+                Changed?.Invoke();
+                return null;
+            }
+            if (!Host.HasUsableRoot)
+            {
+                Notice = "没有可用的当前目录，保持全局搜索";
+                Changed?.Invoke();
+                return null;
+            }
+            var host = Host;
+            capturedWindow = host.CapturedWindow;
+            return () =>
+            {
+                if (!_probe.IsAlive(host.CapturedWindow))
+                    return new ScopeToggleValidation(false, HostDetectionStatus.HostGone);
+                var rejection = _validator.Validate(host.Root, out _);
+                if (rejection is not null)
+                    return new ScopeToggleValidation(false, StatusFor(rejection.Value));
+                return new ScopeToggleValidation(true, HostDetectionStatus.Detected);
+            };
+        }
+    }
+
+    /// <summary>
+    /// 应用后台复验结果（UI 线程调用）。期间宿主上下文已变（重新呼出/失效/已手动
+    /// 切换）则整份丢弃——过期复验不得覆盖新状态。成功切换与失败降级都触发 Changed。
+    /// </summary>
+    public void ApplyToggleValidation(IntPtr capturedWindow, ScopeToggleValidation result)
+    {
+        lock (_gate)
+        {
+            if (Scope != SearchScope.Global
+                || !Host.HasUsableRoot
+                || Host.CapturedWindow != capturedWindow)
+                return;
+            if (result.Ok)
+            {
+                Scope = SearchScope.CurrentDirectory;
+                Notice = "";
+                Changed?.Invoke();
+                return;
+            }
+        }
+        Invalidate(result.Status);
     }
 
     /// <summary>

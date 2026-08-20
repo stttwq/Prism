@@ -49,8 +49,11 @@ public partial class ResultList : UserControl
     public void SetWebIconProvider(WebIconProvider provider)
     {
         // L 批次（FRESH-AUDIT-3-2026-08-20）：favicon 探测完成即重绘——
-        // 此前要等下一次按键的装饰周期才换上新图标。防重复挂接（provider 可被换）。
-        provider.Resolved -= DecorateVisibleItems;
+        // 此前要等下一次按键的装饰周期才换上新图标。防重复挂接。
+        // AUDIT-4 B11（2026-08-21）：先摘**旧** provider 的订阅再挂新的——
+        // 此前只对新 provider 做去重，换 provider 时旧实例的 Resolved 仍指向这里。
+        if (ReferenceEquals(_webIcons, provider)) return;
+        if (_webIcons is not null) _webIcons.Resolved -= DecorateVisibleItems;
         provider.Resolved += DecorateVisibleItems;
         _webIcons = provider;
     }

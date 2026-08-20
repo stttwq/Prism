@@ -479,6 +479,95 @@ public sealed class HostScopeControllerTests
         Assert.Equal(other.Notice, controller.Notice);
     }
 
+    [Fact]
+    public void PrepareAndApplyToggleValidatesOffThreadAndSwitchesScope()
+    {
+        var adapter = new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs");
+        var controller = Controller(adapter, out var validator, out _);
+        controller.Capture(Explorer);
+        Assert.True(controller.ToggleScope()); // 切到全局
+        Assert.Equal(SearchScope.Global, controller.Scope);
+
+        var workload = controller.PrepareToggleToCurrentDirectory(out var capturedWindow);
+        Assert.NotNull(workload);
+        Assert.Equal(Explorer, capturedWindow);
+
+        // 闭包在"后台线程"执行：纯计算，不改状态。
+        var result = workload();
+        Assert.True(result.Ok);
+
+        controller.ApplyToggleValidation(capturedWindow, result);
+        Assert.Equal(SearchScope.CurrentDirectory, controller.Scope);
+        Assert.Equal(@"C:\Users\me\Docs", controller.Root);
+        Assert.Equal("", controller.Notice);
+        Assert.Equal(2, validator.Calls); // Capture 一次 + 复验一次
+    }
+
+    [Fact]
+    public void PrepareToggleFailsFastWhenDisabledOrNoRoot()
+    {
+        var adapter = new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs");
+        var controller = Controller(adapter, out _, out _);
+        controller.Capture(Explorer);
+        controller.SetCurrentDirectoryEnabled(false);
+
+        Assert.Null(controller.PrepareToggleToCurrentDirectory(out _));
+        Assert.Equal("当前目录搜索已在设置中关闭", controller.Notice);
+
+        controller.SetCurrentDirectoryEnabled(true);
+        // 开关重新打开但 root 已被清空（FeatureDisabled 清了上下文），快查失败。
+        Assert.Null(controller.PrepareToggleToCurrentDirectory(out _));
+        Assert.Equal("没有可用的当前目录，保持全局搜索", controller.Notice);
+    }
+
+    [Fact]
+    public void ApplyToggleValidationInvalidatesOnBackgroundFailure()
+    {
+        var adapter = new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs");
+        var controller = Controller(adapter, out var validator, out _);
+        controller.Capture(Explorer);
+        Assert.True(controller.ToggleScope());
+
+        var workload = controller.PrepareToggleToCurrentDirectory(out var capturedWindow);
+        Assert.NotNull(workload);
+
+        validator.Rejection = RootRejection.NotFound;
+        var result = workload();
+        Assert.False(result.Ok);
+        Assert.Equal(HostDetectionStatus.RootInvalid, result.Status);
+
+        controller.ApplyToggleValidation(capturedWindow, result);
+        Assert.Equal(SearchScope.Global, controller.Scope);
+        Assert.Null(controller.Root);
+        Assert.Contains("已回到全局搜索", controller.Notice);
+    }
+
+    [Fact]
+    public void ApplyToggleValidationDropsStaleCaptures()
+    {
+        var adapter = new FakeAdapter(HostKind.Explorer, Explorer, @"C:\Users\me\Docs");
+        var controller = Controller(adapter, out _, out _);
+        controller.Capture(Explorer);
+        Assert.True(controller.ToggleScope());
+
+        var workload = controller.PrepareToggleToCurrentDirectory(out var capturedWindow);
+        Assert.NotNull(workload);
+        var result = workload();
+
+        // 复验飞行期间重新呼出：宿主上下文已被新捕获替换（不同窗口），过期结果丢弃。
+        var other = new FakeAdapter(HostKind.Explorer, Other, @"C:\Users\me\Pics");
+        var controller2 = Controller(other, out _, out _);
+        controller2.Capture(Other);
+        Assert.Equal(SearchScope.CurrentDirectory, controller2.Scope);
+
+        // 对 controller：模拟上下文失效（窗口关闭）后再应用旧结果。
+        controller.Invalidate(HostDetectionStatus.HostGone);
+        controller.ApplyToggleValidation(capturedWindow, result);
+        // 丢弃：范围仍由 Invalidate 决定，未被过期 Ok 覆盖。
+        Assert.Equal(SearchScope.Global, controller.Scope);
+        Assert.Null(controller.Root);
+    }
+
     private static HostScopeController Controller(
         FakeAdapter adapter,
         out FakeValidator validator,
