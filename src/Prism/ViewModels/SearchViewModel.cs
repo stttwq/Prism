@@ -786,6 +786,21 @@ public sealed class SearchViewModel
 
     private async Task RunSearchAsync(string query, int max)
     {
+        // Bug 4: 裸网址直开——普通搜索框输入 example.com / https://… / localhost
+        // 即显示一行"打开 …"结果，Enter 经 broker ShellExecuteExW 打开浏览器。
+        // 在网页关键词检测之前、窗口模式之后：>example.com 仍是窗口模式，不走此处。
+        // 不设 IsWebMode（非网页搜索模式，无联想）。
+        if (!IsWindowQuery(query))
+        {
+            var directUrl = WebModeDetector.TryGetDirectUrlForSearchBox(query);
+            if (directUrl is not null)
+            {
+                _state.IsWebMode = false;
+                RunDirectUrlSearch(query, directUrl);
+                return;
+            }
+        }
+
         // G8: web mode — detect web keyword before pipe search. The broker still produces
         // web results in AllMode, but the dedicated web mode isolates them: only 1 direct
         // result + up to 5 suggestions, no file/app/window mixing.
@@ -1167,6 +1182,41 @@ public sealed class SearchViewModel
                 _state.Results = WebSearchCoordinator.BuildWebRows(directResult, suggestions, webMode);
                 _state.StatusMessage = "";
             });
+    }
+
+    /// <summary>
+    /// Bug 4: 搜索框裸网址直开。镜像 <see cref="RunWebSearch"/> 的单行直接结果，
+    /// 但不发联想请求（网址无搜索联想意义），不设 IsWebMode。
+    /// 执行路径复用 ExecuteSelectedAsync → _pipe.ExecuteAsync（kind="web"）→
+    /// broker ShellExecuteExW → 默认浏览器打开。
+    /// </summary>
+    private void RunDirectUrlSearch(string query, string url)
+    {
+        var seq = ++_searchSeq;
+        CancelSearch();
+        CancelSuggestions();
+        _completeCache = null;
+
+        var terms = query.Trim();
+        var directResult = new SearchResult(
+            Kind: "web",
+            Title: $"打开 {terms}",
+            Subtitle: url,
+            ExecuteId: url,
+            MatchSpans: WebSearchCoordinator.BuildWebMatchSpans($"打开 {terms}", terms))
+        {
+            Target = new ActionTarget("web", url),
+            RowKey = "web:direct:url",
+        };
+
+        if (seq != _searchSeq) return;
+        if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
+
+        _state.Results = new List<SearchResult> { directResult };
+        _state.SelectedIndex = 0;
+        _state.Mode = PanelMode.Results;
+        _state.IsIndexing = false;
+        _state.StatusMessage = "";
     }
 
     private static bool QueryMatchesResponse(string requested, string echoed)

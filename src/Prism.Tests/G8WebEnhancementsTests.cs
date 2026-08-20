@@ -168,6 +168,61 @@ public sealed class DirectUrlDetectionTests
     }
 }
 
+/// <summary>搜索框裸网址直开判定（Bug 4）：普通搜索框直接输入网址即打开。</summary>
+public sealed class SearchBoxDirectUrlTests
+{
+    [Theory]
+    [InlineData("example.com", "https://example.com")]           // 白名单 TLD
+    [InlineData("baidu.com", "https://baidu.com")]
+    [InlineData("www.example.com", "https://www.example.com")]    // www. 前缀强信号
+    [InlineData("https://example.com", "https://example.com")]    // 带 scheme
+    [InlineData("http://example.com", "http://example.com")]
+    [InlineData("localhost", "http://localhost")]                 // localhost
+    [InlineData("localhost:3000", "http://localhost:3000")]
+    [InlineData("example.com:8080/x?q=1#f", "https://example.com:8080/x?q=1#f")]
+    [InlineData("sub.example.co.uk", "https://sub.example.co.uk")] // 国家码白名单
+    public void Bare_Url_Opens_Directly(string input, string expected)
+    {
+        Assert.Equal(expected, WebModeDetector.TryGetDirectUrlForSearchBox(input));
+    }
+
+    [Theory]
+    [InlineData("setup.exe")]     // 文件扩展名，非互联网 TLD
+    [InlineData("readme.txt")]
+    [InlineData("data.csv")]
+    [InlineData("report.pdf")]
+    [InlineData("photo.jpg")]
+    [InlineData("archive.zip")]
+    [InlineData("config.ini")]
+    [InlineData("note.docx")]
+    [InlineData("song.mp3")]
+    public void FileName_Not_Treated_As_Url(string input)
+    {
+        // 文件名末段不在 TLD 白名单内 → 返回 null → 走文件搜索。
+        Assert.Null(WebModeDetector.TryGetDirectUrlForSearchBox(input));
+    }
+
+    [Theory]
+    [InlineData("3.14")]          // 版本号
+    [InlineData("1.2.3")]
+    [InlineData("hello world")]   // 含空白
+    [InlineData("C:\\x\\y")]      // Windows 路径
+    [InlineData("server")]         // 无点主机名
+    [InlineData("what is 2+2")]
+    public void Non_Url_Returns_Null(string input)
+    {
+        Assert.Null(WebModeDetector.TryGetDirectUrlForSearchBox(input));
+    }
+
+    [Fact]
+    public void Null_Or_Empty_Returns_Null()
+    {
+        Assert.Null(WebModeDetector.TryGetDirectUrlForSearchBox(null));
+        Assert.Null(WebModeDetector.TryGetDirectUrlForSearchBox(""));
+        Assert.Null(WebModeDetector.TryGetDirectUrlForSearchBox("   "));
+    }
+}
+
 public sealed class SuggestionAdapterTests
 {
     [Fact]

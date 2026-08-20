@@ -121,6 +121,45 @@ public sealed class SearchViewModelTests
         Assert.Equal(0, client.SearchCount); // 网页模式不走本地搜索
     }
 
+    /// <summary>Bug 4：普通搜索框直接输入网址（无 g 关键词）即显示一行"打开 …"结果，
+    /// 不走本地文件搜索。Enter 后 ExecuteAsync 收到 kind="web"。</summary>
+    [Fact]
+    public async Task BareUrlInSearchBoxShowsDirectOpenRow()
+    {
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("example.com");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+
+        Assert.False(state.IsWebMode);                // 非网页搜索模式
+        Assert.Equal("打开 example.com", state.Results[0].Title);
+        Assert.Equal("https://example.com", state.Results[0].Subtitle);
+        Assert.Equal("web", state.Results[0].Target!.Kind);
+        Assert.Equal("https://example.com", state.Results[0].Target!.Value);
+        Assert.Equal(0, client.SearchCount);           // 不走本地文件搜索
+    }
+
+    /// <summary>Bug 4：文件名类输入（setup.exe）不当网址，继续走文件搜索。</summary>
+    [Fact]
+    public async Task FileNameInSearchBoxGoesToFileSearch()
+    {
+        var client = new FakeSearchClient();
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("setup.exe");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        Assert.False(state.IsWebMode);
+        // 未产生 web 行——走的是文件搜索（SearchAsync 被调用）。
+    }
+
     /// <summary>F7（FRESH-AUDIT-2）：动作超时 ≠ 未执行——mutation 类超时文案必须
     /// 报"结果未知"引导核实，普通失败仍走"动作失败"。</summary>
     [Fact]

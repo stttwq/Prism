@@ -275,4 +275,26 @@ public sealed class WebIconNegativeCacheTests
         p.GetIcon(url);
         await Eventually(() => p.DiskProbes >= 2);
     }
+
+    /// <summary>Bug 1：隐藏时 ClearTransientCaches 清空无界增长的瞬态缓存，
+    /// 下次装饰重新从磁盘探测 favicon。</summary>
+    [Fact]
+    public async Task ClearTransientCaches_DropsResolvedAndNegative()
+    {
+        var p = new WebIconProvider(NewCache(), isGranted: _ => true);
+        var url = "https://clear.example/search?q=a";
+
+        // 装饰一个未命中 origin：进 _negative + 一次磁盘探测。
+        p.GetIcon(url);
+        await Eventually(() => p.IsNegativeCached("https://clear.example"));
+        Assert.Equal(1, p.DiskProbes);
+
+        // 清理：负缓存应清空。
+        p.ClearTransientCaches();
+        Assert.False(p.IsNegativeCached("https://clear.example"));
+
+        // 下次装饰：_negative 为空 → 重新探测磁盘（DiskProbes 增长）。
+        p.GetIcon(url);
+        await Eventually(() => p.DiskProbes >= 2);
+    }
 }

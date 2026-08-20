@@ -31,6 +31,7 @@ public partial class SearchWindow : Window
     private SearchViewModel? _vm;
     private IconCache? _icons;
     private ThemeWatcher? _theme;
+    private WebIconProvider? _webIcons;
     private bool _suppressQueryEvent;
     private bool _hiding;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
@@ -149,8 +150,9 @@ public partial class SearchWindow : Window
         _vm = vm;
         _icons = icons;
         _theme = theme;
+        _webIcons = webIcons ?? new WebIconProvider();
         Results.SetIconCache(icons);
-        Results.SetWebIconProvider(webIcons ?? new WebIconProvider());
+        Results.SetWebIconProvider(_webIcons);
         vm.HideRequested += () =>
         {
             // L 批次（FRESH-AUDIT-3-2026-08-20）：BeginInvoke——后台线程的隐藏
@@ -376,6 +378,9 @@ public partial class SearchWindow : Window
             Actions.Items = Array.Empty<ActionItem>();
             // A4：只清路径类图标键，保留 ext:/dir: 扩展名键——下次呼出扩展名图标立即可见。
             _icons?.ClearPathKeys();
+            // Bug 1：清空 WebIconProvider 按 origin 无界增长的瞬态缓存（每个 origin 持一个
+            // frozen ImageSource 强引用，GC 回收不了）。下次网页搜索从磁盘 FaviconCache 重读。
+            _webIcons?.ClearTransientCaches();
             // AUDIT-2026-08-18 C-D4: 删除 EmptyWorkingSet 调用（只逐出工作集不降私有提交，
             // 下次呼出软缺页变慢）。改 GC.Collect Forced + blocking:true + compacting:true
             // 确保真正压缩堆降私有提交。窗口已隐藏不卡交互。

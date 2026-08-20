@@ -69,12 +69,11 @@ public sealed class OrphanBrokerAdoptionTests
     }
 
     /// <summary>
-    /// 真实端到端：TryAdopt 收编一个外部已存在的进程，Job Dispose（关句柄）后
-    /// OS 必须按 KILL_ON_JOB_CLOSE 回收它——这正是"孤儿 broker 收编后随新 Prism
-    /// 退出一起回收"的机制本体。
+    /// Bug 3：移除 KILL_ON_JOB_CLOSE 后，Job Dispose 不再杀关联进程。收编的外部进程
+    /// 在 Job 句柄关闭后仍存活——这验证用户打开的应用不会随 Prism 退出被杀。
     /// </summary>
     [Fact]
-    public void TryAdopt_External_Process_Dies_With_Job_Dispose()
+    public void TryAdopt_External_Process_Survives_Job_Dispose()
     {
         using var victim = Process.Start(new ProcessStartInfo
         {
@@ -88,15 +87,16 @@ public sealed class OrphanBrokerAdoptionTests
         using (var guard = new JobObjectGuard())
         {
             Assert.True(guard.TryAdopt(victim!.Id), "同用户外部进程应收编成功");
-        } // Dispose 关闭 Job 句柄 → OS 杀掉 victim
+        } // Dispose 关闭 Job 句柄——不再设 KILL_ON_JOB_CLOSE，victim 不被杀
 
-        Assert.True(victim.WaitForExit(TimeSpan.FromSeconds(10)), "收编的进程应随 Job Dispose 被 OS 回收");
+        // 给 OS 一个短暂窗口确认它没被杀，然后断言仍存活。
+        Assert.False(victim.WaitForExit(TimeSpan.FromSeconds(2)), "移除 KILL_ON_JOB_CLOSE 后收编进程应存活");
 
         try
         {
             if (!victim.HasExited)
                 victim.Kill(entireProcessTree: true);
         }
-        catch { /* 断言已失败，兜底清理 */ }
+        catch { /* 测试结束兜底清理 */ }
     }
 }

@@ -884,14 +884,18 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
         try
         {
+            // Bug 3: 只杀 broker 本身，不杀进程树——broker 经 ShellExecuteExW 打开的用户应用
+            // 是 broker 的子进程，entireProcessTree:true 会把它们一起杀掉。KILL_ON_JOB_CLOSE
+            // 已移除（JobObjectGuard 不再设该标志），此处也不再杀树，用户应用随 Prism 退出存活。
             if (_backend is { HasExited: false })
-                _backend.Kill(entireProcessTree: true);
+                _backend.Kill();
         }
         catch { /* ignore */ }
         _backend?.Dispose();
 
-        // 释放 Job Object：如果 Prism 正常退出，Kill 已处理子进程；
-        // 如果 Prism 崩溃走到这里，关闭 Job 句柄让 OS 回收 broker。
+        // 释放 Job Object：不再设 KILL_ON_JOB_CLOSE（Bug 3），Job Dispose 不杀任何进程。
+        // Prism 正常退出时上面 Kill 已处理 broker；Prism 崩溃时 broker 作孤儿留存，
+        // 下次启动由 AdoptExistingServer 收编或杀旧拉新。
         _jobGuard?.Dispose();
         _jobGuard = null;
     }

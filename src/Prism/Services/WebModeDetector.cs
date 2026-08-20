@@ -160,6 +160,73 @@ public static class WebModeDetector
 
         return "https://" + t;
     }
+
+    /// <summary>
+    /// 常见互联网 TLD 白名单：搜索框裸域名判断用。文件扩展名（exe/txt/csv/pdf/jpg/zip）
+    /// 不在集合内 → 不当网址，继续走文件搜索。覆盖主流通用 TLD 与常见国家码，
+    /// 不追求穷举——用户仍可用 scheme:// 或 www. 前缀强制打开任意域名。
+    /// </summary>
+    private static readonly HashSet<string> WebTldAllowlist = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // 通用
+        "com", "org", "net", "edu", "gov", "int", "mil", "io", "dev", "ai", "co",
+        "app", "info", "biz", "me", "tv", "cc", "xyz", "top", "online", "site",
+        "tech", "store", "blog", "cloud", "link", "page", "zone", "world", "life",
+        // 常见国家码
+        "uk", "us", "de", "jp", "cn", "fr", "ru", "ca", "au", "br", "in", "it",
+        "es", "nl", "se", "no", "fi", "dk", "ch", "at", "be", "pl", "kr", "tw",
+        "hk", "sg", "my", "th", "id", "ph", "vn", "tr", "gr", "pt", "ie", "nz",
+        "za", "mx", "ar", "cl", "ve", "pe",
+    };
+
+    /// <summary>
+    /// 搜索框裸 URL 检测（Bug 4）：用户在普通搜索框直接输入网址即打开，无需先切网页模式。
+    /// 复用 <see cref="TryGetDirectUrl"/> 的 scheme/localhost 判断（无歧义），
+    /// 但对裸域名加 TLD 白名单校验：setup.exe / readme.txt / data.csv 等文件名末段
+    /// 不在互联网 TLD 白名单内 → 返回 null → 走文件搜索。用户想打开非白名单 TLD 的
+    /// 域名时，可加 scheme:// 或 www. 前缀强制。
+    /// </summary>
+    public static string? TryGetDirectUrlForSearchBox(string? query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return null;
+        var t = query.Trim();
+        if (t.Length > 2048)
+            return null;
+        foreach (var c in t)
+            if (char.IsWhiteSpace(c) || c == '\0')
+                return null;
+
+        // 带 scheme 或 localhost：无歧义，直接交给 TryGetDirectUrl。
+        var schemeEnd = t.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd > 0)
+            return TryGetDirectUrl(query);
+
+        if (t.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("localhost:", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("localhost/", StringComparison.OrdinalIgnoreCase))
+            return TryGetDirectUrl(query);
+
+        // www. 前缀：强 URL 信号，直接打开。
+        if (t.StartsWith("www.", StringComparison.OrdinalIgnoreCase))
+            return TryGetDirectUrl(query);
+
+        // 裸域名：末段 TLD 须在白名单内，否则当文件名处理。
+        var authorityEnd = t.IndexOfAny(['/', '?', '#']);
+        var authority = authorityEnd < 0 ? t : t[..authorityEnd];
+        var lastColon = authority.LastIndexOf(':');
+        var host = lastColon < 0 ? authority : authority[..lastColon];
+        var dot = host.LastIndexOf('.');
+        if (dot < 0 || dot == host.Length - 1)
+            return null;
+        var tld = host[(dot + 1)..];
+        if (tld.Length < 2 || !tld.All(char.IsLetter))
+            return null;
+        if (!WebTldAllowlist.Contains(tld))
+            return null;
+
+        return TryGetDirectUrl(query);
+    }
 }
 
 /// <summary>

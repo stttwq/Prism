@@ -98,6 +98,25 @@ public sealed class WebIconProvider
     }
 
     /// <summary>
+    /// Bug 1：搜索面板隐藏时清空按 origin 无界增长的瞬态缓存（<see cref="_resolved"/>、
+    /// <see cref="_negative"/>、<see cref="_probing"/>）。每个成功解析的 origin 持有一个
+    /// frozen <see cref="ImageSource"/> 强引用，GC 回收不了——不清理则内存随访问的 origin
+    /// 数单调增长。内置引擎图标（<see cref="_builtInIcons"/>）小且每次网页搜索都用，保留。
+    /// 下次网页搜索时 <see cref="_resolved"/> 为空会重新从磁盘 <see cref="FaviconCache"/>
+    /// （磁盘 LRU 64 文件）读取，不发网络请求。与 <see cref="Invalidate"/> 不同：后者在
+    /// favicon 重新下载后调用让新图标立即可见，本方法在隐藏时调用释放内存。
+    /// </summary>
+    public void ClearTransientCaches()
+    {
+        lock (_sync)
+        {
+            _resolved.Clear();
+            _negative.Clear();
+            _probing.Clear();
+        }
+    }
+
+    /// <summary>
     /// 获取引擎图标。优先内置图标，其次（已授权的）favicon 缓存，最后通用图标。
     /// </summary>
     /// <param name="url">引擎 URL（用于提取 origin 查 favicon 缓存，或推断内置引擎）。</param>

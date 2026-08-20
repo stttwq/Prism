@@ -3,8 +3,11 @@ using System.Runtime.InteropServices;
 namespace Prism.Services;
 
 /// <summary>
-/// 把子进程纳入 Job Object，父进程退出时 OS 内核自动回收子进程，
-/// 防止 Prism 崩溃后 prism-core.exe 变成孤儿继续占管道。
+/// 把子进程纳入 Job Object，用于跨 Prism 会话的 broker 所有权跟踪（TryAdopt 收编孤儿）。
+/// **不再设 KILL_ON_JOB_CLOSE**（Bug 3 修复）：broker 经 ShellExecuteExW 打开的用户应用会
+/// 继承 Job 成员身份，KILL 标志会让 Prism 退出时连用户应用一起杀。现在 Prism 正常退出由
+/// DisposeCore 显式 Kill broker 本身；Prism 崩溃后 broker 作为孤儿留存，下次启动由
+/// AdoptExistingServer 收编复用或杀旧拉新。
 /// </summary>
 internal sealed class JobObjectGuard : IDisposable
 {
@@ -12,47 +15,15 @@ internal sealed class JobObjectGuard : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// 创建 Job Object 并设置 KILL_ON_JOB_CLOSE 限制。
-    /// 只要本对象不被 Dispose（即父进程不退出），子进程照常运行；
-    /// 父进程退出 → Job 句柄关闭 → OS 杀掉所有关联子进程。
+    /// 创建 Job Object（不设任何 limit）。Job 仅用于 Assign/TryAdopt 的进程归属跟踪。
     /// </summary>
     public JobObjectGuard()
     {
         _jobHandle = CreateJobObject(IntPtr.Zero, null);
         if (_jobHandle == IntPtr.Zero)
             return;
-
-        var info = new JOBOBJECT_BASIC_LIMIT_INFORMATION
-        {
-            LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        var extended = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-        {
-            BasicLimitInformation = info,
-        };
-
-        var length = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
-        var ptr = Marshal.AllocHGlobal(length);
-        try
-        {
-            Marshal.StructureToPtr(extended, ptr, false);
-            // KILL_ON_JOB_CLOSE 没设置成功 = 孤儿进程保护形同虚设（Prism 崩溃后
-            // broker 会继续占管道）。行为保持"尽力而为"，但失败必须留下痕迹。
-            if (!SetInformationJobObject(
-                    _jobHandle,
-                    JobObjectExtendedLimitInformation,
-                    ptr,
-                    (uint)length))
-            {
-                var error = Marshal.GetLastWin32Error();
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Prism] JobObject 限制设置失败（Win32 {error}），孤儿进程保护未生效");
-            }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(ptr);
-        }
+        // Bug 3: 不再设置 KILL_ON_JOB_CLOSE——它会让 broker 启动的用户应用随 Prism 退出被杀。
+        // 无任何 limit 需要设置，Job 句柄仅用于 AssignProcessToJobObject 归属跟踪。
     }
 
     /// <summary>把进程纳入 Job Object。失败时静默忽略——Job 是保险，不是必要条件。</summary>
@@ -91,7 +62,7 @@ internal sealed class JobObjectGuard : IDisposable
         if (_disposed)
             return;
         _disposed = true;
-        // 关闭 Job 句柄 → OS 内核杀掉所有关联子进程。
+        // 关闭 Job 句柄。不再设 KILL_ON_JOB_CLOSE（Bug 3），故不杀任何关联进程。
         if (_jobHandle != IntPtr.Zero)
         {
             CloseHandle(_jobHandle);
@@ -101,57 +72,14 @@ internal sealed class JobObjectGuard : IDisposable
 
     // --- P/Invoke ---
 
-    private const int JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
-    private const int JobObjectExtendedLimitInformation = 9;
-
     private const uint ProcessSetQuota = 0x0100;
     private const uint ProcessTerminate = 0x0001;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
-    {
-        public long PerProcessUserTimeLimit;
-        public long PerJobUserTimeLimit;
-        public uint LimitFlags;
-        public UIntPtr MinimumWorkingSetSize;
-        public UIntPtr MaximumWorkingSetSize;
-        public uint ActiveProcessLimit;
-        public UIntPtr Affinity;
-        public uint PriorityClass;
-        public uint SchedulingClass;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct IO_COUNTERS
-    {
-        public ulong ReadOperationCount;
-        public ulong WriteOperationCount;
-        public ulong OtherOperationCount;
-        public ulong ReadTransferCount;
-        public ulong WriteTransferCount;
-        public ulong OtherTransferCount;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-    {
-        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
-        public IO_COUNTERS IoInfo;
-        public UIntPtr ProcessMemoryLimit;
-        public UIntPtr JobMemoryLimit;
-        public UIntPtr PeakProcessMemoryUsed;
-        public UIntPtr PeakJobMemoryUsed;
-    }
-
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string? lpName);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetInformationJobObject(
-        IntPtr hJob, int infoClass, IntPtr lpInfo, uint cbInfoLength);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
