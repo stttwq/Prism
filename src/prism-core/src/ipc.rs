@@ -743,6 +743,14 @@ async fn read_handshake_line<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// 单个连接的收发循环：逐行读入 JSON 请求，分发后逐行写回 JSON 响应。
+///
+/// B5（AUDIT-4 批次D，2026-08-21）：`Search` 是查询通道上唯一的无界计算请求
+/// （索引写锁停顿可达数秒）。此前逐请求串行，一次慢搜索冻结同连接后续全部
+/// 请求的读取与计算。现在 Search spawn 并发计算（在途上限 16/连接），其余
+/// 请求（ping/actions/resolve 等本就快）保持内联；**响应经 mpsc 交给连接级
+/// `ordered_writer` 按请求序号严格保序写出**——协议无请求 id、前端按行配对，
+/// 保序是硬前提。EOF 后读循环等 writer 排干在途响应（search 内部自有超时，
+/// 有界），客户端断开时写失败即静默丢弃残余。
 async fn handle_connection(
     pipe: NamedPipeServer,
     apps: SharedApps,
@@ -753,14 +761,16 @@ async fn handle_connection(
     windows: Arc<crate::window_list::WindowSnapshotStore>,
 ) -> std::io::Result<()> {
     log("前端已连接");
-    let (reader, mut writer) = tokio::io::split(pipe);
+    let (reader, writer) = tokio::io::split(pipe);
     let mut lines = BoundedLineReader::new(reader);
-    // 审计 P15：响应序列化缓冲在整条连接生命期内复用，每次响应不再新建 Vec。
-    // 偶发的超大响应（"more" 模式 300 项）不长期占着容量：写完超过 `RESPONSE_BUFFER_KEEP`
-    // 就缩回去。
-    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
-    const RESPONSE_BUFFER_KEEP: usize = 256 * 1024;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Response)>();
+    let writer_task = tokio::spawn(ordered_writer(writer, rx));
+    // B5：在途 search 并发上限。超出（本地进程灌请求）立即回错——仍走保序
+    // 通道，不破配对。Arc<Semaphore> 的 permit 随任务结束释放。
+    let search_permits =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_SEARCHES));
 
+    let mut next_seq: u64 = 0;
     let mut first_line = true;
     loop {
         let read = if std::mem::take(&mut first_line) {
@@ -775,27 +785,30 @@ async fn handle_connection(
             },
             Err(message) => {
                 // 超长/损坏的入站行（或握手超时）：回一条错误说明后断开连接。
-                let response = Response::Error {
-                    message,
-                    category: None,
-                };
-                out.clear();
-                if serde_json::to_writer(&mut out, &response).is_ok() {
-                    out.push(b'\n');
-                    let _ = writer.write_all(&out).await;
-                    let _ = writer.flush().await;
-                }
+                let _ = tx.send((
+                    next_seq,
+                    Response::Error {
+                        message,
+                        category: None,
+                    },
+                ));
                 log("入站请求行异常，断开连接");
+                drop(tx);
+                let _ = writer_task.await;
                 return Ok(());
             }
         };
 
         let line = line.trim();
         if line.is_empty() {
+            // 空行不占序号也不回包（与旧行为一致：continue 不写响应）。
             continue;
         }
 
-        let response = match serde_json::from_str::<Request>(line) {
+        let seq = next_seq;
+        next_seq = next_seq.saturating_add(1);
+
+        match serde_json::from_str::<Request>(line) {
             Ok(Request::Search {
                 query,
                 max,
@@ -803,49 +816,109 @@ async fn handle_connection(
                 root,
                 mode,
             }) => {
-                search_service(
-                    SearchArgs {
-                        query: &query,
-                        max,
-                        filters,
-                        root: root.as_deref(),
-                        mode: mode.unwrap_or_default(),
-                    },
-                    &apps,
-                    &engines,
-                    &history,
-                    &preferences,
-                    &windows,
-                )
-                .await
+                let Ok(permit) = search_permits.clone().try_acquire_owned() else {
+                    let _ = tx.send((
+                        seq,
+                        Response::Error {
+                            message: format!(
+                                "too many concurrent searches (limit {MAX_INFLIGHT_SEARCHES})"
+                            ),
+                            category: None,
+                        },
+                    ));
+                    continue;
+                };
+                let tx = tx.clone();
+                let apps = apps.clone();
+                let engines = engines.clone();
+                let history = history.clone();
+                let preferences = preferences.clone();
+                let windows = windows.clone();
+                tokio::spawn(async move {
+                    let response = search_service(
+                        SearchArgs {
+                            query: &query,
+                            max,
+                            filters,
+                            root: root.as_deref(),
+                            mode: mode.unwrap_or_default(),
+                        },
+                        &apps,
+                        &engines,
+                        &history,
+                        &preferences,
+                        &windows,
+                    )
+                    .await;
+                    let _ = tx.send((seq, response));
+                    drop(permit);
+                });
             }
             Ok(req) => {
-                dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows).await
+                let response =
+                    dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows)
+                        .await;
+                let _ = tx.send((seq, response));
             }
-            Err(e) => Response::Error {
-                message: format!("无法解析请求：{e}"),
-                category: None,
-            },
-        };
-
-        out.clear();
-        if let Err(error) = serde_json::to_writer(&mut out, &response) {
-            // 序列化中途失败：丢掉半截字节，回一条自造的错误行（与旧行为一致）。
-            out.clear();
-            out.extend_from_slice(
-                format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}").as_bytes(),
-            );
-        }
-        out.push(b'\n');
-        writer.write_all(&out).await?;
-        writer.flush().await?;
-        if out.capacity() > RESPONSE_BUFFER_KEEP {
-            out = Vec::with_capacity(8 * 1024);
+            Err(e) => {
+                let _ = tx.send((
+                    seq,
+                    Response::Error {
+                        message: format!("无法解析请求：{e}"),
+                        category: None,
+                    },
+                ));
+            }
         }
     }
 
+    drop(tx);
+    // EOF：等 writer 把在途响应写完/写失败（search 计算自带超时，有界）。
+    let _ = writer_task.await;
     log("前端断开连接");
     Ok(())
+}
+
+/// B5（AUDIT-4 批次D）：单连接在途 search 并发上限。
+const MAX_INFLIGHT_SEARCHES: usize = 16;
+
+/// B5：连接级保序 writer。收 (seq, response)，BTreeMap 缓冲乱序到达者，
+/// 严格按 0,1,2,… 顺序序列化写出。P15 的响应缓冲复用移到这里（唯一消费者）：
+/// 偶发的超大响应（"more" 模式 300 项）不长期占着容量，写完超过
+/// `RESPONSE_BUFFER_KEEP` 就缩回去。写失败（客户端已断）静默返回，残余丢弃。
+async fn ordered_writer<W>(
+    mut writer: W,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Response)>,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
+    const RESPONSE_BUFFER_KEEP: usize = 256 * 1024;
+    let mut buffered: std::collections::BTreeMap<u64, Response> =
+        std::collections::BTreeMap::new();
+    let mut next_seq: u64 = 0;
+    while let Some((seq, response)) = rx.recv().await {
+        buffered.insert(seq, response);
+        while let Some(response) = buffered.remove(&next_seq) {
+            out.clear();
+            if let Err(error) = serde_json::to_writer(&mut out, &response) {
+                // 序列化中途失败：丢掉半截字节，回一条自造的错误行（与旧行为一致）。
+                out.clear();
+                out.extend_from_slice(
+                    format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}")
+                        .as_bytes(),
+                );
+            }
+            out.push(b'\n');
+            if writer.write_all(&out).await.is_err() || writer.flush().await.is_err() {
+                return;
+            }
+            if out.capacity() > RESPONSE_BUFFER_KEEP {
+                out = Vec::with_capacity(8 * 1024);
+            }
+            next_seq = next_seq.saturating_add(1);
+        }
+    }
 }
 
 async fn dispatch_non_search(
@@ -4067,5 +4140,38 @@ mod pipe_lifecycle_tests {
         let mut lines = BoundedLineReader::new(server);
         let result = read_handshake_line(&mut lines, Duration::from_secs(10)).await;
         assert_eq!(result, Ok(None));
+    }
+
+    /// B5（AUDIT-4 批次D）：writer 必须按请求序号严格保序——乱序到达的响应
+    /// 缓冲到 BTreeMap，顺序 0,1,2 写出；通道关闭后排干残余再退出。
+    #[tokio::test]
+    async fn b5_ordered_writer_writes_responses_in_request_order() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = tokio::spawn(super::ordered_writer(server, rx));
+
+        // 乱序投递：2 先到、0 后到，1 最晚。
+        tx.send((2, Response::Error { message: "two".into(), category: None })).unwrap();
+        tx.send((0, Response::Error { message: "zero".into(), category: None })).unwrap();
+        tx.send((1, Response::Error { message: "one".into(), category: None })).unwrap();
+        drop(tx);
+
+        // 给 writer 一点时间写完（三条消息都很小）。
+        for _ in 0..100 {
+            if writer.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(writer.await.is_ok(), "通道关闭后 writer 必须排干退出");
+
+        client.shutdown().await.unwrap();
+        let mut received = String::new();
+        client.read_to_string(&mut received).await.unwrap();
+        let lines: Vec<&str> = received.lines().collect();
+        assert_eq!(lines.len(), 3, "三条响应全部写出：{received:?}");
+        assert!(lines[0].contains("zero"), "序号 0 必须最先写出");
+        assert!(lines[1].contains("one"), "序号 1 第二");
+        assert!(lines[2].contains("two"), "序号 2 最后");
     }
 }
