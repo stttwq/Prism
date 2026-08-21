@@ -60,6 +60,7 @@ public sealed class SettingsStore
                 WebEngines = settings.WebEngines ?? [],
                 ExcludedPaths = settings.ExcludedPaths ?? [],
                 ZipProgram = string.IsNullOrWhiteSpace(settings.ZipProgram) ? null : settings.ZipProgram,
+                ActionHotkeys = NormalizeActionHotkeys(settings.ActionHotkeys),
             };
         }
         catch
@@ -94,6 +95,33 @@ public sealed class SettingsStore
                 throw new InvalidDataException("ExcludedPaths must contain bounded absolute paths.");
             }
         }
+        if (settings.ActionHotkeys.Count > ActionHotkeyCatalog.Entries.Count)
+            throw new InvalidDataException(
+                $"ActionHotkeys may contain at most {ActionHotkeyCatalog.Entries.Count} entries.");
+        var hotkeyError = ActionHotkeyTable.ValidateBindings(settings.ActionHotkeys);
+        if (hotkeyError is not null)
+            throw new InvalidDataException("ActionHotkeys: " + hotkeyError);
+    }
+
+    /// <summary>
+    /// 2026-08-21 动作快捷键：加载时清理手改文件——未知动作 id、无法解析的组合键、
+    /// 保留键占用静默丢弃，其余规范化为固定顺序（Ctrl+Alt+Shift+Win+主键）。
+    /// </summary>
+    private static Dictionary<string, string> NormalizeActionHotkeys(Dictionary<string, string>? raw)
+    {
+        if (raw is null || raw.Count == 0)
+            return [];
+        var clean = new Dictionary<string, string>(raw.Count, StringComparer.Ordinal);
+        foreach (var (id, combo) in raw)
+        {
+            if (ActionHotkeyCatalog.Find(id) is null)
+                continue;
+            var parsed = ActionHotkeyTable.Parse(combo);
+            if (parsed is null || ActionHotkeyTable.IsReserved(parsed.Value.Key, parsed.Value.Mods))
+                continue;
+            clean[id] = ActionHotkeyTable.Canonicalize(combo)!;
+        }
+        return clean;
     }
 
     /// <summary>

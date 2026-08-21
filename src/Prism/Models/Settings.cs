@@ -85,6 +85,12 @@ public sealed record Settings
     /// </summary>
     public Dictionary<string, FaviconGrant> FaviconGrants { get; init; } = [];
 
+    /// <summary>
+    /// 动作快捷键（2026-08-21 设想）：动作 id（broker 面板枚举）→ 窗口级组合键串
+    /// （如 "Ctrl+Shift+C"）。空值/缺失 = 未绑定。旧设置文件缺字段时为空表。
+    /// </summary>
+    public Dictionary<string, string> ActionHotkeys { get; init; } = [];
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
@@ -102,6 +108,7 @@ public sealed record Settings
         ZipProgram = null,
         SuggestionsEnabled = false,
         FaviconGrants = [],
+        ActionHotkeys = [],
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>
