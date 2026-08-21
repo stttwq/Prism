@@ -268,11 +268,14 @@
                 <Button Content="常规"
                         Command="{Binding SelectTabCommand}" CommandParameter="0"
                         Style="{StaticResource SettingsNavButton}"/>
-                <Button Content="网页搜索"
+                <Button Content="快速访问"
                         Command="{Binding SelectTabCommand}" CommandParameter="1"
                         Style="{StaticResource SettingsNavButton}"/>
-                <Button Content="关于"
+                <Button Content="网页搜索"
                         Command="{Binding SelectTabCommand}" CommandParameter="2"
+                        Style="{StaticResource SettingsNavButton}"/>
+                <Button Content="关于"
+                        Command="{Binding SelectTabCommand}" CommandParameter="3"
                         Style="{StaticResource SettingsNavButton}"/>
             </StackPanel>
         </Border>
@@ -292,30 +295,6 @@
                 <StackPanel>
                     <TextBlock Text="常规" FontSize="20" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,18"/>
-
-                    <TextBlock Text="呼出快捷键" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
-
-                    <RadioButton Content="双击 Ctrl（默认）"
-                                 IsChecked="{Binding IsDoubleCtrlMode, Mode=TwoWay}"
-                                 GroupName="HotkeyMode"
-                                 Style="{StaticResource SettingsRadioButtonStyle}"
-                                 Margin="0,0,0,8"/>
-                    <RadioButton Content="自定义组合键"
-                                 IsChecked="{Binding IsComboMode, Mode=TwoWay}"
-                                 GroupName="HotkeyMode"
-                                 Style="{StaticResource SettingsRadioButtonStyle}"
-                                 Margin="0,0,0,8"/>
-
-                    <StackPanel Margin="22,0,0,16"
-                                IsEnabled="{Binding IsComboEditorEnabled}">
-                        <TextBlock Text="点击下方框并按下组合键（如 Alt+Space）"
-                                   FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                                   Margin="0,0,0,6"/>
-                        <controls:HotkeyRecorderBox Value="{Binding ComboHotkey, Mode=TwoWay}"/>
-                    </StackPanel>
-
-                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
                     <TextBlock Text="启动" FontSize="13" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
@@ -356,6 +335,103 @@
 
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
+                    <TextBlock Text="压缩程序" FontSize="13" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
+                    <TextBlock Text="压缩为 ZIP 时优先使用此程序（留空则自动探测 7-Zip，再回退 Windows 内置）："
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               TextWrapping="Wrap" Margin="0,0,0,4"/>
+                    <TextBox Text="{Binding ZipProgram, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             Style="{StaticResource SettingsTextBoxStyle}"
+                             Margin="0,0,0,16"/>
+
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
+
+                    <TextBlock Text="数据目录" FontSize="13" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
+                    <TextBlock Text="索引与设置存放位置（安装目录不可写时自动改到用户数据夹）："
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               TextWrapping="Wrap" Margin="0,0,0,4"/>
+                    <TextBlock Text="{Binding DataDir}"
+                               FontSize="13" Foreground="{DynamicResource TextQuery}"
+                               TextWrapping="Wrap"/>
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- 快速访问（2026-08-21 设想）：呼出键（全局）+ 动作快捷键（窗口级）+ 文件别名。 -->
+            <ScrollViewer Grid.Row="0"
+                          VerticalScrollBarVisibility="Auto"
+                          Visibility="{Binding IsQuickAccessTab, Converter={StaticResource BoolToVis}}">
+                <StackPanel>
+                    <TextBlock Text="快速访问" FontSize="20" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,4"/>
+                    <TextBlock Text="呼出键全局生效；动作快捷键与别名只在 Prism 搜索窗口打开时生效，不与其他软件抢键位。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               TextWrapping="Wrap" Margin="0,0,0,18"/>
+
+                    <TextBlock Text="呼出快捷键（全局）" FontSize="13" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
+
+                    <RadioButton Content="双击 Ctrl（默认）"
+                                 IsChecked="{Binding IsDoubleCtrlMode, Mode=TwoWay}"
+                                 GroupName="HotkeyMode"
+                                 Style="{StaticResource SettingsRadioButtonStyle}"
+                                 Margin="0,0,0,8"/>
+                    <RadioButton Content="自定义组合键"
+                                 IsChecked="{Binding IsComboMode, Mode=TwoWay}"
+                                 GroupName="HotkeyMode"
+                                 Style="{StaticResource SettingsRadioButtonStyle}"
+                                 Margin="0,0,0,8"/>
+
+                    <StackPanel Margin="22,0,0,16"
+                                IsEnabled="{Binding IsComboEditorEnabled}">
+                        <TextBlock Text="点击下方框并按下组合键（如 Alt+Space）"
+                                   FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                   Margin="0,0,0,6"/>
+                        <controls:HotkeyRecorderBox Value="{Binding ComboHotkey, Mode=TwoWay}"/>
+                    </StackPanel>
+
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
+
+                    <TextBlock Text="动作快捷键（搜索窗口内生效）" FontSize="13" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
+                    <TextBlock Text="为动作面板里的动作直接绑组合键，搜索窗口打开时按下即对当前选中项执行，无需按 → 进面板。清空即解绑；方向键、Enter、Esc、Ctrl+G、Ctrl+数字保留给导航，不可绑定。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               TextWrapping="Wrap" Margin="0,0,0,10"/>
+                    <ItemsControl ItemsSource="{Binding ActionHotkeys}" Margin="0,0,0,16">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding Label}"
+                                               FontSize="13"
+                                               Foreground="{DynamicResource TextQuery}"
+                                               VerticalAlignment="Center"/>
+                                    <TextBlock Text="{Binding ScopeText}"
+                                               FontSize="11" Foreground="{DynamicResource TextSubtitle}"
+                                               Grid.Column="1" VerticalAlignment="Center"
+                                               Margin="10,1,0,0"/>
+                                    <controls:HotkeyRecorderBox Value="{Binding Value, Mode=TwoWay}"
+                                                                Width="200"
+                                                                Grid.Column="3"/>
+                                    <Button Content="清除"
+                                            Command="{Binding DataContext.ClearActionHotkeyCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                            CommandParameter="{Binding}"
+                                            Style="{StaticResource SettingsActionButton}"
+                                            Padding="10,2,10,2"
+                                            Grid.Column="4" Margin="8,0,0,0"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
+
                     <!-- 别名系统（2026-08-21 设想）：可见资产——统一看、逐条删。 -->
                     <TextBlock Text="文件别名" FontSize="13" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
@@ -393,28 +469,6 @@
                                FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                                Visibility="{Binding HasNoAliases, Converter={StaticResource BoolToVis}}"
                                Margin="0,0,0,16"/>
-
-                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
-
-                    <TextBlock Text="压缩程序" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
-                    <TextBlock Text="压缩为 ZIP 时优先使用此程序（留空则自动探测 7-Zip，再回退 Windows 内置）："
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               TextWrapping="Wrap" Margin="0,0,0,4"/>
-                    <TextBox Text="{Binding ZipProgram, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                             Style="{StaticResource SettingsTextBoxStyle}"
-                             Margin="0,0,0,16"/>
-
-                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
-
-                    <TextBlock Text="数据目录" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
-                    <TextBlock Text="索引与设置存放位置（安装目录不可写时自动改到用户数据夹）："
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               TextWrapping="Wrap" Margin="0,0,0,4"/>
-                    <TextBlock Text="{Binding DataDir}"
-                               FontSize="13" Foreground="{DynamicResource TextQuery}"
-                               TextWrapping="Wrap"/>
                 </StackPanel>
             </ScrollViewer>
 

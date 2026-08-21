@@ -1,6 +1,7 @@
 using System.Windows.Input;
 using Prism.Models;
 using Prism.Services;
+using Prism.ViewModels;
 using Xunit;
 
 namespace Prism.Tests;
@@ -187,5 +188,91 @@ public sealed class ActionHotkeyTableTests
         Assert.False(item.IsSectionHeader);
         Assert.False(item.HasSubmenu);
         Assert.Throws<ArgumentException>(() => ActionHotkeyCatalog.ToActionItem("nope"));
+    }
+}
+
+/// <summary>设置页保存路径的动作快捷键校验（VM 层拦截在 Store 校验之前）。</summary>
+public sealed class SettingsViewModelActionHotkeyTests
+{
+    [Fact]
+    public void SaveBlocksDuplicateAndReservedCombosBeforeTouchingDisk()
+    {
+        var directory = TestDir();
+        try
+        {
+            var store = new SettingsStore(directory);
+            store.Save(Settings.Default);
+            var before = File.ReadAllText(store.SettingsPath);
+
+            var vm = new SettingsViewModel(store, new AutoStartService());
+            Assert.Equal(ActionHotkeyCatalog.Entries.Count, vm.ActionHotkeys.Count);
+
+            // 撞键：两个动作同一个组合键。
+            vm.ActionHotkeys.Single(r => r.Id == "open_folder").Value = "Ctrl+Shift+O";
+            vm.ActionHotkeys.Single(r => r.Id == "copy").Value = "Ctrl+Shift+O";
+            vm.SaveCommand.Execute(null);
+            Assert.Contains("同一个组合键", vm.StatusMessage);
+            Assert.True(vm.IsQuickAccessTab);
+            Assert.Equal(before, File.ReadAllText(store.SettingsPath));
+
+            // 保留键。
+            vm.ActionHotkeys.Single(r => r.Id == "copy").Value = "Ctrl+G";
+            vm.SaveCommand.Execute(null);
+            Assert.Contains("保留给导航", vm.StatusMessage);
+            Assert.Equal(before, File.ReadAllText(store.SettingsPath));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SavePersistsCanonicalCombosAndClearMeansUnbound()
+    {
+        var directory = TestDir();
+        Settings? applied = null;
+        try
+        {
+            var store = new SettingsStore(directory);
+            store.Save(Settings.Default with
+            {
+                ActionHotkeys = new Dictionary<string, string> { ["zip"] = "Ctrl+Shift+Z" },
+            });
+
+            var vm = new SettingsViewModel(store, new AutoStartService(), onApplied: s => applied = s);
+            // 旧绑定预填进行；改写 + 新增一个，其余留空。
+            Assert.Equal("Ctrl+Shift+Z", vm.ActionHotkeys.Single(r => r.Id == "zip").Value);
+            vm.ActionHotkeys.Single(r => r.Id == "open_folder").Value = "Ctrl+Shift+O";
+            vm.ActionHotkeys.Single(r => r.Id == "run_as_admin").Value = "Ctrl+Alt+Shift+A";
+            vm.SaveCommand.Execute(null);
+
+            Assert.Equal("已保存", vm.StatusMessage);
+            var loaded = store.Load();
+            Assert.Equal(3, loaded.ActionHotkeys.Count);
+            Assert.Equal("Ctrl+Shift+O", loaded.ActionHotkeys["open_folder"]);
+            Assert.Equal("Ctrl+Shift+Z", loaded.ActionHotkeys["zip"]);
+            Assert.Equal("Ctrl+Alt+Shift+A", loaded.ActionHotkeys["run_as_admin"]);
+            Assert.Equal(3, applied!.ActionHotkeys.Count);
+
+            // 清空即解绑：落盘后字典只剩其余两键。
+            vm.ActionHotkeys.Single(r => r.Id == "zip").Value = "";
+            vm.ClearActionHotkeyCommand.Execute(vm.ActionHotkeys.Single(r => r.Id == "zip"));
+            vm.SaveCommand.Execute(null);
+            var reloaded = store.Load();
+            Assert.Equal(2, reloaded.ActionHotkeys.Count);
+            Assert.False(reloaded.ActionHotkeys.ContainsKey("zip"));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static string TestDir()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "prism-actionhotkey-vm-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        return path;
     }
 }

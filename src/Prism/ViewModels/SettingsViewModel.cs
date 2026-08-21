@@ -36,7 +36,15 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private string _comboHotkey;
     private string _statusMessage = "";
     private WebEngineEditItem? _selectedEngine;
-    private int _selectedTab; // 0=常规 1=网页搜索 2=关于
+    private sealed class TabIndex
+    {
+        public const int General = 0;
+        public const int QuickAccess = 1;
+        public const int Web = 2;
+        public const int About = 3;
+    }
+
+    private int _selectedTab; // 0=常规 1=快速访问 2=网页搜索 3=关于
     private readonly List<string> _excludedPaths;
     private bool _historyEnabled;
     private bool _pinyinEnabled;
@@ -91,12 +99,23 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             (settings.WebEngines.Count > 0 ? settings.WebEngines : Settings.DefaultEngines())
             .Select(e => new WebEngineEditItem(e)));
 
+        ActionHotkeys = new ObservableCollection<ActionHotkeyEditItem>(
+            ActionHotkeyCatalog.Entries.Select(e => new ActionHotkeyEditItem(
+                e.Id,
+                e.Label,
+                ScopeText(e.Kinds),
+                settings.ActionHotkeys.GetValueOrDefault(e.Id, ""))));
+
         AddEngineCommand = new RelayCommand(_ => AddEngine());
         RemoveEngineCommand = new RelayCommand(_ => RemoveSelectedEngine(), _ => SelectedEngine is not null);
         ResetEnginesCommand = new RelayCommand(_ => ResetEngines());
         SaveCommand = new RelayCommand(_ => Save());
         ClearHistoryCommand = new RelayCommand(_ => _ = ClearHistoryAsync());
         RemoveAliasCommand = new RelayCommand(p => _ = RemoveAliasAsync(p as AliasEntry), _ => AliasEntries.Count > 0);
+        ClearActionHotkeyCommand = new RelayCommand(p =>
+        {
+            if (p is ActionHotkeyEditItem row) row.Value = "";
+        });
         SelectTabCommand = new RelayCommand(p =>
         {
             if (p is int i) SelectedTab = i;
@@ -120,14 +139,16 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             _selectedTab = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(IsGeneralTab));
+            OnPropertyChanged(nameof(IsQuickAccessTab));
             OnPropertyChanged(nameof(IsWebTab));
             OnPropertyChanged(nameof(IsAboutTab));
         }
     }
 
-    public bool IsGeneralTab => SelectedTab == 0;
-    public bool IsWebTab => SelectedTab == 1;
-    public bool IsAboutTab => SelectedTab == 2;
+    public bool IsGeneralTab => SelectedTab == TabIndex.General;
+    public bool IsQuickAccessTab => SelectedTab == TabIndex.QuickAccess;
+    public bool IsWebTab => SelectedTab == TabIndex.Web;
+    public bool IsAboutTab => SelectedTab == TabIndex.About;
 
     /// <summary>是否使用双击 Ctrl 呼出（与 IsComboMode 互斥）。</summary>
     public bool IsDoubleCtrlMode
@@ -208,6 +229,22 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     }
 
     public ObservableCollection<WebEngineEditItem> Engines { get; }
+
+    /// <summary>动作快捷键行集合（2026-08-21 设想）：目录固定 15 行，值来自设置。</summary>
+    public ObservableCollection<ActionHotkeyEditItem> ActionHotkeys { get; }
+
+    /// <summary>动作快捷键行的清除按钮（清空即解绑）。</summary>
+    public ICommand ClearActionHotkeyCommand { get; }
+
+    /// <summary>目录适用类型的设置页文案。</summary>
+    private static string ScopeText(ActionHotkeyKinds kinds) => kinds switch
+    {
+        ActionHotkeyKinds.All => "文件 / 文件夹 / 应用",
+        ActionHotkeyKinds.FileAndFolder => "文件 / 文件夹",
+        ActionHotkeyKinds.File => "文件",
+        ActionHotkeyKinds.App => "应用",
+        _ => "",
+    };
 
     public WebEngineEditItem? SelectedEngine
     {
@@ -413,7 +450,30 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         if (_hotkeyMode == HotkeyMode.Combo && string.IsNullOrWhiteSpace(ComboHotkey))
         {
             StatusMessage = "请录制一个组合键，或改回双击 Ctrl";
-            SelectedTab = 0;
+            SelectedTab = TabIndex.QuickAccess;
+            return;
+        }
+
+        // 动作快捷键（2026-08-21 设想）：先逐行规范化，再整表校验（保留键/撞键）。
+        var actionHotkeys = new Dictionary<string, string>();
+        foreach (var row in ActionHotkeys)
+        {
+            var raw = row.Value.Trim();
+            if (raw.Length == 0) continue;
+            var canonical = ActionHotkeyTable.Canonicalize(raw);
+            if (canonical is null)
+            {
+                StatusMessage = $"「{row.Label}」的组合键无法识别，请重新录制";
+                SelectedTab = TabIndex.QuickAccess;
+                return;
+            }
+            actionHotkeys[row.Id] = canonical;
+        }
+        var hotkeyError = ActionHotkeyTable.ValidateBindings(actionHotkeys);
+        if (hotkeyError is not null)
+        {
+            StatusMessage = "动作快捷键：" + hotkeyError;
+            SelectedTab = TabIndex.QuickAccess;
             return;
         }
 
@@ -428,35 +488,35 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             if (string.IsNullOrEmpty(eng.Keyword))
             {
                 StatusMessage = "引擎关键词不能为空";
-                SelectedTab = 1;
+                SelectedTab = TabIndex.Web;
                 SelectedEngine = row;
                 return;
             }
             if (eng.Keyword.Any(char.IsWhiteSpace))
             {
                 StatusMessage = $"关键词「{eng.Keyword}」不能含空格";
-                SelectedTab = 1;
+                SelectedTab = TabIndex.Web;
                 SelectedEngine = row;
                 return;
             }
             if (string.IsNullOrEmpty(eng.Name))
             {
                 StatusMessage = "引擎显示名不能为空";
-                SelectedTab = 1;
+                SelectedTab = TabIndex.Web;
                 SelectedEngine = row;
                 return;
             }
             if (string.IsNullOrEmpty(eng.UrlTemplate) || !eng.UrlTemplate.Contains("{q}", StringComparison.Ordinal))
             {
                 StatusMessage = $"引擎「{eng.Name}」的 URL 必须包含 {{q}} 占位符";
-                SelectedTab = 1;
+                SelectedTab = TabIndex.Web;
                 SelectedEngine = row;
                 return;
             }
             if (!seen.Add(eng.Keyword))
             {
                 StatusMessage = $"关键词「{eng.Keyword}」重复";
-                SelectedTab = 1;
+                SelectedTab = TabIndex.Web;
                 SelectedEngine = row;
                 return;
             }
@@ -466,7 +526,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         if (engines.Count == 0)
         {
             StatusMessage = "至少保留一个网页搜索引擎";
-            SelectedTab = 1;
+            SelectedTab = TabIndex.Web;
             return;
         }
 
@@ -486,6 +546,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             ZipProgram = string.IsNullOrWhiteSpace(ZipProgram) ? null : ZipProgram,
             SuggestionsEnabled = _suggestionsEnabled,
             FaviconGrants = prevSettings.FaviconGrants,
+            ActionHotkeys = actionHotkeys,
         };
 
         try
