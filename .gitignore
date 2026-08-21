@@ -70,3 +70,15 @@ artifacts/g4-test-build/Prism.*.json
 
 # Debug symbols never ship with the installer payload.
 dist/*.pdb
+
+# ZCode session plan scratch (local agent state, same class as .claude/)
+.zcode/
+
+# Ad-hoc UI verification screenshots
+artifacts/ui-shot-*.png
+
+# Throwaway deploy/regression helpers
+scripts/tmp-*
+
+# Local debug archives
+*.zip
