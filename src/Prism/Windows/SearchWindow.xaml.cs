@@ -33,6 +33,8 @@ public partial class SearchWindow : Window
     private ThemeWatcher? _theme;
     private WebIconProvider? _webIcons;
     private PipeClient? _pipe;
+    /// <summary>窗口级动作快捷键表（2026-08-21 设想）：未装配时空表，恒不命中。</summary>
+    private ActionHotkeyTable _actionHotkeys = ActionHotkeyTable.Empty;
     private bool _suppressQueryEvent;
     private bool _hiding;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
@@ -771,6 +773,13 @@ public partial class SearchWindow : Window
     public HostScopeController Scope => _scope;
 
     /// <summary>
+    /// 更新窗口级动作快捷键表（设置加载后与每次保存后由 App 调用；UI 线程）。
+    /// 非法条目（未知 id/无修饰键/保留键）在表构建时已被丢弃，这里无需再防。
+    /// </summary>
+    public void SetActionHotkeys(IReadOnlyDictionary<string, string> bindings) =>
+        _actionHotkeys = ActionHotkeyTable.FromSettings(bindings);
+
+    /// <summary>
     /// 范围标签点击或 `Ctrl+G`：在当前目录与全局之间切换。
     /// AUDIT-4 A2（2026-08-21）：切回「当前目录」方向的路径复验含磁盘 I/O
     /// （RootValidation：Exists + 目录枚举探权限），网络盘/休眠盘可达数秒——
@@ -854,6 +863,19 @@ public partial class SearchWindow : Window
     {
         if (_vm is null) return;
 
+        // 动作快捷键（2026-08-21 设想）：先于输入/导航查用户表；保留键（导航/
+        // Ctrl+Enter/Ctrl+G/Ctrl+数字）永远进不去用户表，原有按键行为零改动。
+        // Alt 组合经 Key.System 到达，取 SystemKey 再匹配（与录键框同规则）。
+        var hotkeyKey = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (!ActionHotkeyTable.IsReserved(hotkeyKey, Keyboard.Modifiers)
+            && _actionHotkeys.TryMatch(hotkeyKey, Keyboard.Modifiers, out var actionId))
+        {
+            // 与 Key.Enter 同纪律：先置 Handled 再 await。
+            e.Handled = true;
+            await RunActionShortcutAsync(actionId);
+            return;
+        }
+
         var mode = _vm.State.Mode;
 
         switch (e.Key)
@@ -931,6 +953,48 @@ public partial class SearchWindow : Window
 
     private static bool IsActionableSelection(SearchResult? item) =>
         item is { Kind: "file" or "folder" } && !string.IsNullOrEmpty(item.ExecuteId);
+
+    /// <summary>
+    /// 动作快捷键命中后的执行入口（2026-08-21 设想）。与动作面板 Enter、
+    /// 右键菜单共用 <see cref="SearchViewModel.RunActionOnAsync"/>——成功隐藏、
+    /// mutation 刷新、copy_to/move_to 模态失活守卫、错误文案全部继承。
+    /// 类型不适用（如 app 行按了「重命名」键）按设想忽略，不吞键。
+    /// rename 特殊：内联编辑需要动作面板态，与右键菜单同款序列——先进面板
+    /// 再选中 rename 执行。
+    /// </summary>
+    private async Task RunActionShortcutAsync(string actionId)
+    {
+        if (_vm is null || _vm.State.Mode != PanelMode.Results) return;
+        var target = _vm.State.SelectedResult;
+        if (target is null
+            || !ActionHotkeyCatalog.AppliesTo(actionId, target.Kind)
+            || string.IsNullOrEmpty(target.ExecuteId))
+        {
+            return;
+        }
+
+        if (actionId == "rename")
+        {
+            var idx = IndexOfResult(target);
+            if (idx >= 0) _vm.State.SelectedIndex = idx;
+            await EnterActionsUiAsync().ConfigureAwait(true);
+            if (_vm.State.Mode != PanelMode.Actions) return;
+            var actions = _vm.State.Actions;
+            for (var i = 0; i < actions.Count; i++)
+            {
+                if (actions[i].Id == "rename" && !actions[i].IsSectionHeader)
+                {
+                    _vm.State.SelectedActionIndex = i;
+                    break;
+                }
+            }
+            await _vm.ExecuteActionAsync().ConfigureAwait(true);
+            return;
+        }
+
+        await _vm.RunActionOnAsync(target, ActionHotkeyCatalog.ToActionItem(actionId))
+            .ConfigureAwait(true);
+    }
 
     /// <summary>
     /// Ctrl+Enter：有可用原宿主时交回 <see cref="IHostAdapter.NavigateOrFill"/>；

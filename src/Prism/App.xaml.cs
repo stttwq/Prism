@@ -39,6 +39,8 @@ public partial class App : Application
     private bool _currentDirectorySearchEnabled = true;
     /// <summary>宿主 adapter 读取的设置快照；保存设置后更新，adapter 的 IsEnabled 委托读这里。</summary>
     private Settings _hostSettings = Settings.Default;
+    /// <summary>动作快捷键绑定快照（2026-08-21 设想）：搜索窗懒创建时注入，保存后热更新。</summary>
+    private IReadOnlyDictionary<string, string> _actionHotkeyBindings = new Dictionary<string, string>();
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -68,6 +70,7 @@ public partial class App : Application
         _store = new SettingsStore();
         var settings = _store.Load();
         _hostSettings = settings;
+        _actionHotkeyBindings = settings.ActionHotkeys;
         _favicons = new FaviconCache(_store.DataDir);
 
         _autoStart = new AutoStartService();
@@ -155,6 +158,7 @@ public partial class App : Application
         _searchWindow.Attach(_vm, _icons, _theme, _webIcons, _pipe);
         // 窗口是懒创建的，创建时补上设置里的当前目录搜索总开关。
         _searchWindow.Scope.SetCurrentDirectoryEnabled(_currentDirectorySearchEnabled);
+        _searchWindow.SetActionHotkeys(_actionHotkeyBindings);
         return _searchWindow;
     }
 
@@ -235,6 +239,8 @@ public partial class App : Application
             _hotkey?.Apply(settings);
             ApplySearchExclusions(settings);
             _vm?.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
+            _actionHotkeyBindings = settings.ActionHotkeys;
+            _searchWindow?.SetActionHotkeys(settings.ActionHotkeys);
             Log($"快捷键已应用：{settings.HotkeyMode}" +
                 (settings.HotkeyMode == HotkeyMode.Combo ? $" ({settings.ComboHotkey})" : ""));
         }
