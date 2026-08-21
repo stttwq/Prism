@@ -2511,9 +2511,8 @@ pub(crate) async fn handle_connection(
             return Ok(());
         }
     }
-    // G5（FRESH-AUDIT-2）：SetPinyinEnabled 的每连接速率限制（见
-    // SET_PINYIN_MIN_INTERVAL 常量注释）。
-    let mut last_set_pinyin: Option<std::time::Instant> = None;
+    // G5（FRESH-AUDIT-2）：SetPinyinEnabled 的速率限制是进程级共享的
+    // SET_PINYIN_LAST（原先记在每连接局部，见其注释）。
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
         let response = match serde_json::from_str::<IndexerRequest>(&line) {            // `status()` takes `index.read()` synchronously. Calling it directly
@@ -2556,13 +2555,12 @@ pub(crate) async fn handle_connection(
                 }
             }
             Ok(IndexerRequest::SetPinyinEnabled { enabled }) => {
-                // G5: 速率限制先行——拒绝时不做任何状态变更。
-                if set_pinyin_rate_limited(&mut last_set_pinyin) {
+                // G5: 速率限制先行（进程级窗口）——拒绝时不做任何状态变更。
+                if set_pinyin_rate_limited() {
                     IndexerResponse::Error {
                         message: "set_pinyin_enabled is rate limited to once per second".into(),
                     }
                 } else {
-                    last_set_pinyin = Some(std::time::Instant::now());
                     let state_for_task = state.clone();
                     match tokio::task::spawn_blocking(move || {
                         if enabled {
@@ -2607,7 +2605,15 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 
 /// G5: SetPinyinEnabled 的每连接速率门——窗口内第二次及以后返回 true（拒绝），
 /// 并在放行时推进时间戳。独立成函数以便单测锚定。
-fn set_pinyin_rate_limited(last: &mut Option<std::time::Instant>) -> bool {
+/// 复审 M（2026-08-21 全仓重审）：限速状态进程级共享。原先记在每连接局部，
+/// 本地任意 AU 进程开 N 条连接即得 N 个独立窗口，1 秒一次的限制形同虚设。
+static SET_PINYIN_LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn set_pinyin_rate_limited() -> bool {
+    // 锁毒化（只可能因持锁线程 panic 产生）：保守拒绝，宁可拒绝也不放开风暴面。
+    let Ok(mut last) = SET_PINYIN_LAST.lock() else {
+        return true;
+    };
     if last.is_some_and(|at| at.elapsed() < SET_PINYIN_MIN_INTERVAL) {
         return true;
     }
@@ -3837,15 +3843,15 @@ mod tests {
         assert!(hello.contains("Hello"));
     }
 
-    /// G5（FRESH-AUDIT-2）：SetPinyinEnabled 每连接限速——首条放行，
-    /// 窗口内的第二条拒绝（防任意本地用户触发拼音重建风暴）。
+    /// G5（FRESH-AUDIT-2）+复审 M（2026-08-21）：SetPinyinEnabled 限速——首条
+    /// 放行，窗口内的第二条拒绝。限速状态进程级共享：多连接共享同一窗口，
+    /// 不能各开一条连接绕过（防任意本地用户触发拼音重建风暴）。
     #[test]
     fn g5_set_pinyin_rate_limit_rejects_rapid_second_call() {
-        let mut last = None;
-        assert!(!set_pinyin_rate_limited(&mut last), "first call passes");
+        assert!(!set_pinyin_rate_limited(), "first call passes");
         assert!(
-            set_pinyin_rate_limited(&mut last),
-            "immediate second call is rejected"
+            set_pinyin_rate_limited(),
+            "immediate second call is rejected (process-wide window)"
         );
     }
 

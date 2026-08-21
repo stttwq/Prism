@@ -793,9 +793,8 @@ impl VolumeIndex {
             self.nodes.truncate(live_bound);
             self.nodes.shrink_to_fit();
         }
-        // Refresh initial_name_bytes so the fallback threshold tracks the
-        // compacted baseline rather than the original build size.
-        self.initial_name_bytes = live_bytes;
+        // initial_name_bytes 基线随池重写由 recompute_derived_counters 恢复
+        // （复审 M 2026-08-21：names.len() 即压缩后基线）。
         Ok(true)
     }
 
@@ -865,11 +864,17 @@ impl VolumeIndex {
         Ok(offset)
     }
 
-    /// F3+G4: 重算派生计数（names 指纹 + 在位槽位数）。v5 缓存载入后调用
-    /// （两者都是 serde skip 字段），名字池压缩后调用（池与槽表都被重写）。
-    /// 整算与增量滚入在相同字节序列下等值。
+    /// F3+G4: 重算派生计数（names 指纹 + 在位槽位数 + 名字池基线）。v5 缓存
+    /// 载入后调用（三者都是 serde skip 字段），名字池压缩后调用（池与槽表都被
+    /// 重写）。整算与增量滚入在相同字节序列下等值。
+    /// 复审 M（2026-08-21 全仓重审）：initial_name_bytes 也在此恢复——它是
+    /// serde skip，载入后若保持 0，needs_name_compact 的 fallback 阈值退化为
+    /// 常量 16MB，names 池超 16MB 的卷每次缓存命中启动后的第一个维护 tick 都
+    /// 触发一次无谓的全卷压缩（clone + 全池重写，纯浪费）。载入/压缩后的
+    /// 当前池长就是新基线。
     pub fn recompute_derived_counters(&mut self) {
         self.names_fingerprint = names_pool_fingerprint(&self.names);
+        self.initial_name_bytes = self.names.len();
         self.present_slots = self
             .nodes
             .iter()
@@ -2188,6 +2193,19 @@ mod tests {
         let before = volume.present_slots;
         volume.recompute_derived_counters();
         assert_eq!(volume.present_slots, before);
+    }
+
+    /// 复审 M（2026-08-21 全仓重审）：载入侧基线恢复。initial_name_bytes 是
+    /// serde skip——v5 缓存载入后必须等于当前池长，否则 needs_name_compact
+    /// 的 fallback 阈值退化为常量 16MB，names 池超 16MB 的卷每次缓存命中
+    /// 启动后的首个维护 tick 都触发一次无谓全量压缩。
+    #[test]
+    fn recompute_restores_name_pool_baseline() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "a", true).unwrap();
+        volume.recompute_derived_counters(); // v5 载入路径
+        assert_eq!(volume.initial_name_bytes, volume.names.len());
+        assert!(!volume.needs_name_compact());
     }
 
     #[test]

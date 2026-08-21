@@ -215,6 +215,19 @@ public partial class App : Application
     {
         var cache = _favicons;
         if (cache is null) return;
+        // 复审中危（2026-08-21 全仓重审）：WebIconProvider 的授权门闭包读
+        // _hostSettings 快照，而 VM 侧授权落盘不经过 ApplySettings——快照不
+        // 更新的话已授权图标要等下一次完整保存或重启才显示。此处同步补上
+        // 该 origin（UI 线程调用；引用替换原子，adapter 委托读到旧或新皆合法）。
+        var normalized = FaviconCache.NormalizeOrigin(origin);
+        if (normalized is not null)
+        {
+            var grants = new Dictionary<string, FaviconGrant>(_hostSettings.FaviconGrants)
+            {
+                [normalized] = new FaviconGrant(normalized, DateTimeOffset.UtcNow.ToString("o")),
+            };
+            _hostSettings = _hostSettings with { FaviconGrants = grants };
+        }
         _ = Task.Run(async () =>
         {
             try

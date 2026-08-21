@@ -529,12 +529,16 @@ impl HistoryStore {
             }
         }
         // 慢路径：读锁内重建。
+        // 复审 H2（2026-08-21 全仓重审）：record_at 对已有条目原地更新、新条目
+        // 尾插，entries 的 last_used 降序只在 prune（超容量）与 load 时恢复——
+        // 两次 prune 之间的 entries 无序。weights() 的消费方（空查询 MRU 注入）
+        // 按返回顺序截断，这里必须显式排序，否则刚用过的文件沉底进不了列表。
         let now = now_utc();
         let snapshot: Arc<[HistoryWeight]> = self
             .state
             .read()
             .map(|state| {
-                state
+                let mut list = state
                     .entries
                     .iter()
                     .map(|entry| HistoryWeight {
@@ -545,8 +549,15 @@ impl HistoryStore {
                         score: effective_frecency(entry, now),
                         last_used_utc: entry.last_used_utc,
                     })
-                    .collect::<Vec<_>>()
-                    .into()
+                    .collect::<Vec<_>>();
+                list.sort_by(|left, right| {
+                    right
+                        .last_used_utc
+                        .cmp(&left.last_used_utc)
+                        .then_with(|| left.target.kind.cmp(&right.target.kind))
+                        .then_with(|| left.target.value.cmp(&right.target.value))
+                });
+                list.into()
             })
             .unwrap_or_else(|_| Arc::from([]));
         // 缓存：try_lock 避免在锁竞争时阻塞——miss 时多一次重建是无害的（幂等）。
@@ -822,6 +833,45 @@ mod tests {
             !store.path.exists(),
             "clear 后在飞 persist 必须放弃，不得复活历史文件"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 复审 H2（2026-08-21 全仓重审）：record_at 尾插/原地更新使 entries 无序
+    /// （降序只在 prune/load 时恢复），weights() 必须按 last_used 显式降序——
+    /// 空查询 MRU 注入按 weights 顺序截断，刚用过的文件必须排在最前。
+    /// 序列刻意选尾插序与 MRU 序分歧的纯粹形（second 后用）：去掉 sort_by
+    /// 该断言必挂。
+    #[test]
+    fn weights_returns_true_mru_order_between_prunes() {
+        let dir = test_dir("weights-mru");
+        let store = HistoryStore::load_at(&dir, true, 1_000_000);
+        store
+            .record_at(&target("C:\\first.txt"), HistoryUse::Execute, None, 1_000)
+            .unwrap();
+        store
+            .record_at(&target("C:\\second.txt"), HistoryUse::Execute, None, 2_000)
+            .unwrap();
+        // entries 插入序 = [first, second]；MRU 序 = [second, first]。
+        let weights = store.weights();
+        let values: Vec<&str> = weights
+            .iter()
+            .map(|w| w.target.value.as_str())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["C:\\second.txt", "C:\\first.txt"],
+            "最近使用的条目必须排最前（真 MRU），不能按插入序"
+        );
+        // 复用已有条目上浮：first 更新为最新后必须回到首位（原地更新不动位置）。
+        store
+            .record_at(&target("C:\\first.txt"), HistoryUse::Execute, None, 3_000)
+            .unwrap();
+        let after = store.weights();
+        let values_after: Vec<&str> = after
+            .iter()
+            .map(|w| w.target.value.as_str())
+            .collect();
+        assert_eq!(values_after, vec!["C:\\first.txt", "C:\\second.txt"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

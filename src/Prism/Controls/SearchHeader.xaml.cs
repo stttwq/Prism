@@ -136,7 +136,11 @@ public partial class SearchHeader : UserControl
                 QueryKeyDown?.Invoke(e);
                 break;
             default:
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+                // 任意带修饰键的组合上抛给搜索窗（Ctrl+G/Ctrl+数字/动作快捷键等）；
+                // Alt 组合经 Key.System 到达（真实主键在 SystemKey），也必须转发，
+                // 否则 Alt/Shift 系动作快捷键永远到不了匹配表。未命中的组合
+                // 在搜索窗不被置 Handled，原样落回文本框。
+                if (e.Key == Key.System || Keyboard.Modifiers != ModifierKeys.None)
                     QueryKeyDown?.Invoke(e);
                 break;
         }

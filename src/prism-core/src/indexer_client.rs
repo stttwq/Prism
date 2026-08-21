@@ -42,10 +42,17 @@ use crate::{INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 /// `root_rejection` is only set when the service refused the *root*, never for transport
 /// or protocol problems. Callers use it to fall back to a global search and tell the user
 /// which scope was dropped, instead of showing an opaque error string.
+///
+/// `semantic` marks failures that came back as an `IndexerResponse::Error` — the
+/// service answered; the request itself was refused (query too long, max out of
+/// range, …). Retrying or reconnecting cannot change the answer, so the persistent
+/// path must NOT drop the connection for these (复审 M 2026-08-21：语义错误
+/// 曾被当传输错误处理，>4KB 查询每击键断连重连一次，持久连接机制失效)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchFailure {
     pub message: String,
     pub root_rejection: Option<RootRejection>,
+    semantic: bool,
 }
 
 impl SearchFailure {
@@ -53,6 +60,16 @@ impl SearchFailure {
         Self {
             message,
             root_rejection: Some(reason),
+            semantic: false,
+        }
+    }
+
+    /// The service answered with an Error response: a refusal, not a transport fault.
+    fn semantic(message: String) -> Self {
+        Self {
+            message,
+            root_rejection: None,
+            semantic: true,
         }
     }
 }
@@ -62,6 +79,7 @@ impl From<String> for SearchFailure {
         Self {
             message,
             root_rejection: None,
+            semantic: false,
         }
     }
 }
@@ -245,7 +263,11 @@ async fn search_on_persistent(
         {
             Ok(reply) => Ok(reply),
             // Transport-level failure: drop the connection, reconnect, retry once.
-            Err(failure) if failure.root_rejection.is_none() => {
+            // 语义错误（semantic / root_rejection）不在其列——服务已明确拒绝
+            // 该请求，重连重试只会得到同一答案并白白丢弃健康连接。
+            Err(failure)
+                if failure.root_rejection.is_none() && !failure.semantic =>
+            {
                 *conn = None; // drop the broken connection
                 let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
                 handshake(&mut new_conn).await?;
@@ -255,7 +277,7 @@ async fn search_on_persistent(
                 *conn = Some(new_conn);
                 Ok(reply)
             }
-            // Root rejection is a semantic response, not a transport error — propagate as-is.
+            // Semantic responses (root rejection / Error) propagate as-is.
             Err(failure) => Err(failure),
         }
     };
@@ -274,8 +296,10 @@ async fn search_on_persistent(
 /// AUDIT-2026-08-18 R-A7: 一次性降级连接的并发闸。
 /// 此前锁竞争降级路径无全局上限——每个并发搜索各开一条到 indexer 的短连接，
 /// 突发竞争时可同时打出几十条连接（每条占服务端任务 + 行缓冲）。许可数 2：
-/// 正常情况下该路径本身就是罕见的竞争兜底，排队等待即可，外层 REQUEST_BUDGET
-/// 仍兜底总时限。
+/// 正常情况下该路径本身就是罕见的竞争兜底，排队等待即可。
+/// 复审 M（2026-08-21 全仓重审）：排队等闸计入 REQUEST_BUDGET——acquire 原先
+/// 在 timeout 之外，索引器慢期排队任务的实际等待无界（8s×任务数/2）。
+/// 超时放弃时 RAII 许可随 future 一起 drop，无泄漏。
 static ONE_OFF_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// R-A7 测试观测用：当前持有一次性连接闸的在途请求数。与闸许可数一致，
@@ -296,13 +320,14 @@ async fn search_one_off(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
-    let _permit = ONE_OFF_GATE
-        .acquire()
-        .await
-        .map_err(|_| SearchFailure::from("one-off gate closed".to_string()))?;
-    // 拿到许可后才计在途：排队等闸的请求不计，峰值才等于真实并发连接数。
-    let _inflight = Inflight::track();
+    // 闸排队与实际请求同在 REQUEST_BUDGET 内（见 ONE_OFF_GATE 注释）。
     let attempt = async {
+        let _permit = ONE_OFF_GATE
+            .acquire()
+            .await
+            .map_err(|_| SearchFailure::from("one-off gate closed".to_string()))?;
+        // 拿到许可后才计在途：排队等闸的请求不计，峰值才等于真实并发连接数。
+        let _inflight = Inflight::track();
         let mut conn = PersistentConnection::connect(pipe_name).await?;
         handshake(&mut conn).await?;
         search_on_connection(&mut conn, query, max, filters, pinyin_enabled, root).await
@@ -348,7 +373,7 @@ async fn search_on_connection(
         .map_err(SearchFailure::from)?
     {
         IndexerResponse::Status(status) => status,
-        IndexerResponse::Error { message } => return Err(message.into()),
+        IndexerResponse::Error { message } => return Err(SearchFailure::semantic(message)),
         _ => return Err("indexer service returned an invalid status response".into()),
     };
     let mut status = status;
@@ -406,7 +431,7 @@ async fn search_on_connection(
                 path_constructions,
             })
         }
-        IndexerResponse::Error { message } => Err(message.into()),
+        IndexerResponse::Error { message } => Err(SearchFailure::semantic(message)),
         IndexerResponse::RootUnavailable { reason, message } => {
             // The reason travels as a value, not as prose: the broker turns it back into a
             // structured field so the UI can explain the fallback instead of guessing.
@@ -565,14 +590,14 @@ async fn search_pipe_inner(
     .await?;
     match read_response(&mut lines).await? {
         IndexerResponse::Hello { protocol } if protocol == INDEXER_PROTOCOL => {}
-        IndexerResponse::Error { message } => return Err(message.into()),
+        IndexerResponse::Error { message } => return Err(SearchFailure::semantic(message)),
         _ => return Err("indexer service returned an invalid hello response".into()),
     }
 
     write_request(&mut writer, &IndexerRequest::Status).await?;
     let mut status = match read_response(&mut lines).await? {
         IndexerResponse::Status(status) => status,
-        IndexerResponse::Error { message } => return Err(message.into()),
+        IndexerResponse::Error { message } => return Err(SearchFailure::semantic(message)),
         _ => return Err("indexer service returned an invalid status response".into()),
     };
     // Only a completely unready index short-circuits. `ready && building` — a first build
@@ -630,7 +655,7 @@ async fn search_pipe_inner(
                 path_constructions,
             })
         }
-        IndexerResponse::Error { message } => Err(message.into()),
+        IndexerResponse::Error { message } => Err(SearchFailure::semantic(message)),
         IndexerResponse::RootUnavailable { reason, message } => {
             // The reason travels as a value, not as prose: the broker turns it back into a
             // structured field so the UI can explain the fallback instead of guessing.

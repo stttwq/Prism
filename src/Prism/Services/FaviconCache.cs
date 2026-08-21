@@ -95,7 +95,10 @@ public sealed class FaviconCache
         var host = key[(key.IndexOf("://", StringComparison.Ordinal) + 3)..];
         var sources = new[]
         {
-            $"https://{key}/favicon.ico",
+            // key 本身已含 scheme（如 "https://example.com"），直接拼根路径；
+            // 此前多套一层 "https://" 得到 https://https://… 双 scheme，
+            // 直连下载永远 DNS 失败，静默退化为聚合源。
+            $"{key}/favicon.ico",
             $"https://icons.duckduckgo.com/ip3/{host}.ico",
         };
         foreach (var faviconUrl in sources)

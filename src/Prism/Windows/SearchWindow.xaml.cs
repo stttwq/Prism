@@ -602,19 +602,19 @@ public partial class SearchWindow : Window
                     // 右键菜单场景先进入 Actions 面板再触发 rename。
                     if (action.Id == "rename")
                     {
-                        // 先选中目标结果，再进入动作面板。
+                        // 复审中危（2026-08-21 全仓重审）：菜单打开期间 generation
+                        // 刷新可能已把目标行换掉——IndexOfResult 落空必须中止，
+                        // 否则 rename 会作用于当前选中的另一个文件。
                         var idx = IndexOfResult(target);
-                        if (idx >= 0) _vm.State.SelectedIndex = idx;
+                        if (idx < 0) return;
+                        _vm.State.SelectedIndex = idx;
                         await EnterActionsUiAsync().ConfigureAwait(true);
-                        // 进入面板后手动选中 rename 动作并执行。
-                        var actions = _vm.State.Actions;
-                        for (var i = 0; i < actions.Count; i++)
+                        // 进入面板后选中 rename 动作并执行；列表无 rename（broker
+                        // 按目标状态裁剪）时退回结果，绝不静默执行其他动作。
+                        if (!TrySelectAction("rename"))
                         {
-                            if (actions[i].Id == "rename" && !actions[i].IsSectionHeader)
-                            {
-                                _vm.State.SelectedActionIndex = i;
-                                break;
-                            }
+                            LeaveActionsUi();
+                            return;
                         }
                         await _vm.ExecuteActionAsync().ConfigureAwait(true);
                     }
@@ -866,9 +866,12 @@ public partial class SearchWindow : Window
         // 动作快捷键（2026-08-21 设想）：先于输入/导航查用户表；保留键（导航/
         // Ctrl+Enter/Ctrl+G/Ctrl+数字）永远进不去用户表，原有按键行为零改动。
         // Alt 组合经 Key.System 到达，取 SystemKey 再匹配（与录键框同规则）。
+        // 适用性（模式/类型/ExecuteId）同步预检：不适用则不吞键、不执行，
+        // 按键原样落回原逻辑（与「类型不适用忽略」的设想一致）。
         var hotkeyKey = e.Key == Key.System ? e.SystemKey : e.Key;
         if (!ActionHotkeyTable.IsReserved(hotkeyKey, Keyboard.Modifiers)
-            && _actionHotkeys.TryMatch(hotkeyKey, Keyboard.Modifiers, out var actionId))
+            && _actionHotkeys.TryMatch(hotkeyKey, Keyboard.Modifiers, out var actionId)
+            && ActionShortcutApplies(actionId))
         {
             // 与 Key.Enter 同纪律：先置 Handled 再 await。
             e.Handled = true;
@@ -955,23 +958,31 @@ public partial class SearchWindow : Window
         item is { Kind: "file" or "folder" } && !string.IsNullOrEmpty(item.ExecuteId);
 
     /// <summary>
+    /// 动作快捷键的同步适用性预检：Results 模式 + 选中行类型适用 + 有执行 id。
+    /// 预检通过后才置 Handled 并进入执行；不适用按设想忽略（键不吞、走原逻辑）。
+    /// </summary>
+    private bool ActionShortcutApplies(string actionId)
+    {
+        var target = _vm?.State.SelectedResult;
+        return _vm?.State.Mode == PanelMode.Results
+            && target is not null
+            && !string.IsNullOrEmpty(target.ExecuteId)
+            && ActionHotkeyCatalog.AppliesTo(actionId, target.Kind);
+    }
+
+    /// <summary>
     /// 动作快捷键命中后的执行入口（2026-08-21 设想）。与动作面板 Enter、
     /// 右键菜单共用 <see cref="SearchViewModel.RunActionOnAsync"/>——成功隐藏、
     /// mutation 刷新、copy_to/move_to 模态失活守卫、错误文案全部继承。
-    /// 类型不适用（如 app 行按了「重命名」键）按设想忽略，不吞键。
+    /// 调用前已经过 <see cref="ActionShortcutApplies"/> 预检；这里的守卫是
+    /// await 期间状态可能变化的防御性复核。
     /// rename 特殊：内联编辑需要动作面板态，与右键菜单同款序列——先进面板
     /// 再选中 rename 执行。
     /// </summary>
     private async Task RunActionShortcutAsync(string actionId)
     {
-        if (_vm is null || _vm.State.Mode != PanelMode.Results) return;
-        var target = _vm.State.SelectedResult;
-        if (target is null
-            || !ActionHotkeyCatalog.AppliesTo(actionId, target.Kind)
-            || string.IsNullOrEmpty(target.ExecuteId))
-        {
-            return;
-        }
+        if (!ActionShortcutApplies(actionId)) return;
+        var target = _vm!.State.SelectedResult!;
 
         if (actionId == "rename")
         {
@@ -979,14 +990,11 @@ public partial class SearchWindow : Window
             if (idx >= 0) _vm.State.SelectedIndex = idx;
             await EnterActionsUiAsync().ConfigureAwait(true);
             if (_vm.State.Mode != PanelMode.Actions) return;
-            var actions = _vm.State.Actions;
-            for (var i = 0; i < actions.Count; i++)
+            if (!TrySelectAction("rename"))
             {
-                if (actions[i].Id == "rename" && !actions[i].IsSectionHeader)
-                {
-                    _vm.State.SelectedActionIndex = i;
-                    break;
-                }
+                // broker 对该目标未返回 rename：静默退回结果，绝不执行其他动作。
+                LeaveActionsUi();
+                return;
             }
             await _vm.ExecuteActionAsync().ConfigureAwait(true);
             return;
@@ -994,6 +1002,22 @@ public partial class SearchWindow : Window
 
         await _vm.RunActionOnAsync(target, ActionHotkeyCatalog.ToActionItem(actionId))
             .ConfigureAwait(true);
+    }
+
+    /// <summary>在当前动作面板列表中选中指定 id 的动作；未找到返回 false。</summary>
+    private bool TrySelectAction(string actionId)
+    {
+        if (_vm is null) return false;
+        var actions = _vm.State.Actions;
+        for (var i = 0; i < actions.Count; i++)
+        {
+            if (actions[i].Id == actionId && !actions[i].IsSectionHeader)
+            {
+                _vm.State.SelectedActionIndex = i;
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
