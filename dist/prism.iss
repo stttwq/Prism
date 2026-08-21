@@ -12,10 +12,10 @@
 ;
 ; 编译（路径按实际安装位置调整）：
 ;   "D:\LS\Setup 7\ISCC.exe" prism.iss
-; 产物：dist\PrismSetup-1.0.0.exe
+; 产物：dist\PrismSetup-1.1beta.exe
 
 #define MyAppName "Prism"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1beta"
 #define MyAppPublisher "Prism"
 #define MyAppExeName "Prism.exe"
 #define MyFullSourceDir "."
