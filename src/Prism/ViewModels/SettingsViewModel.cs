@@ -53,6 +53,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private bool _directoryOpusHostIntegrationEnabled;
     private string? _zipProgram;
     private bool _suggestionsEnabled;
+    /// <summary>暂存区（2026-08-22 计划）：容量（字符串编辑，保存时解析报错）。</summary>
+    private string _stagingCapacityText;
+    private string _stagingAddHotkey;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -93,6 +96,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _directoryOpusHostIntegrationEnabled = settings.DirectoryOpusHostIntegrationEnabled;
         _zipProgram = settings.ZipProgram;
         _suggestionsEnabled = settings.SuggestionsEnabled;
+        _stagingCapacityText = settings.StagingCapacity.ToString();
+        _stagingAddHotkey = settings.StagingAddHotkey ?? "";
         DataDir = store.DataDir;
 
         Engines = new ObservableCollection<WebEngineEditItem>(
@@ -412,6 +417,30 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    /// <summary>暂存区容量（1..32，文本编辑；保存时解析，非法则拦在落盘前）。</summary>
+    public string StagingCapacityText
+    {
+        get => _stagingCapacityText;
+        set
+        {
+            if (_stagingCapacityText == value) return;
+            _stagingCapacityText = value ?? "";
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>「加入暂存区」组合键；空 = 禁用。HotkeyRecorderBox 直写。</summary>
+    public string StagingAddHotkey
+    {
+        get => _stagingAddHotkey;
+        set
+        {
+            if (_stagingAddHotkey == value) return;
+            _stagingAddHotkey = value ?? "";
+            OnPropertyChanged();
+        }
+    }
+
     private void AddEngine()
     {
         var item = new WebEngineEditItem
@@ -475,6 +504,28 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             StatusMessage = "动作快捷键：" + hotkeyError;
             SelectedTab = TabIndex.QuickAccess;
             return;
+        }
+
+        // 暂存区（2026-08-22 计划）：容量解析 + 快捷键规范化，非法拦在落盘之前。
+        if (!int.TryParse(StagingCapacityText.Trim(), out var stagingCapacity)
+            || stagingCapacity is < 1 or > 32)
+        {
+            StatusMessage = "暂存区容量需为 1–32 的整数";
+            SelectedTab = TabIndex.QuickAccess;
+            return;
+        }
+        var stagingHotkey = StagingAddHotkey.Trim();
+        if (stagingHotkey.Length > 0)
+        {
+            var canonical = ActionHotkeyTable.Canonicalize(stagingHotkey);
+            if (canonical is null)
+            {
+                StatusMessage = "「加入暂存区」的组合键无法识别，请重新录制";
+                SelectedTab = TabIndex.QuickAccess;
+                return;
+            }
+            // SettingsStore.Validate 侧再做保留键/撞键检查（与动作快捷键双侧校验同纪律）。
+            stagingHotkey = canonical;
         }
 
         // G8: 保存前的旧设置，用于检测自定义引擎 origin 变化。
@@ -547,6 +598,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             SuggestionsEnabled = _suggestionsEnabled,
             FaviconGrants = prevSettings.FaviconGrants,
             ActionHotkeys = actionHotkeys,
+            StagingCapacity = stagingCapacity,
+            StagingAddHotkey = stagingHotkey,
         };
 
         try

@@ -31,6 +31,8 @@
                            Foreground="{DynamicResource TextSubtitle}"
                            TextWrapping="Wrap"
                            Visibility="Collapsed"/>
+                <!-- 暂存区条带（2026-08-22 计划）：空态整体收起；不接 AnimatePanelHeight（PanelHost 专属） -->
+                <controls:StagingStrip x:Name="Staging"/>
                 <Border x:Name="Divider"
                         Height="1"
                         Background="{DynamicResource Divider}"

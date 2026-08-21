@@ -54,13 +54,21 @@ public sealed class SettingsStore
             var settings = JsonSerializer.Deserialize<Settings>(json, JsonOptions);
             if (settings is null || settings.SchemaVersion > Settings.CurrentSchemaVersion)
                 return Settings.Default;
+            var actionHotkeys = NormalizeActionHotkeys(settings.ActionHotkeys);
             return settings with
             {
                 ComboHotkey = settings.ComboHotkey ?? Settings.Default.ComboHotkey,
                 WebEngines = settings.WebEngines ?? [],
                 ExcludedPaths = settings.ExcludedPaths ?? [],
                 ZipProgram = string.IsNullOrWhiteSpace(settings.ZipProgram) ? null : settings.ZipProgram,
-                ActionHotkeys = NormalizeActionHotkeys(settings.ActionHotkeys),
+                ActionHotkeys = actionHotkeys,
+                StagingCapacity = settings.StagingCapacity is < 1 or > 32
+                    ? 5
+                    : settings.StagingCapacity,
+                // 缺字段（旧文件）→ 默认 Ctrl+D；有值但非法（手改）→ 置空禁用。
+                StagingAddHotkey = settings.StagingAddHotkey is null
+                    ? Settings.Default.StagingAddHotkey
+                    : NormalizeStagingAddHotkey(settings.StagingAddHotkey, actionHotkeys),
             };
         }
         catch
@@ -101,6 +109,48 @@ public sealed class SettingsStore
         var hotkeyError = ActionHotkeyTable.ValidateBindings(settings.ActionHotkeys);
         if (hotkeyError is not null)
             throw new InvalidDataException("ActionHotkeys: " + hotkeyError);
+
+        // 暂存区（2026-08-22）：容量界 + 快捷键三查（可解析/非保留/不与动作快捷键撞键）。
+        if (settings.StagingCapacity is < 1 or > 32)
+            throw new InvalidDataException("StagingCapacity must be between 1 and 32.");
+        var stagingHotkeyError = ValidateStagingAddHotkey(settings.StagingAddHotkey, settings.ActionHotkeys);
+        if (stagingHotkeyError is not null)
+            throw new InvalidDataException("StagingAddHotkey: " + stagingHotkeyError);
+    }
+
+    /// <summary>
+    /// 校验「加入暂存区」快捷键：空 = 禁用（合法）；否则须可解析、不落保留集、
+    /// 不与任何动作快捷键同组合。返回错误文案；合法返回 null。
+    /// </summary>
+    private static string? ValidateStagingAddHotkey(string? combo, Dictionary<string, string> actionHotkeys)
+    {
+        if (string.IsNullOrWhiteSpace(combo)) return null;
+        var parsed = ActionHotkeyTable.Parse(combo);
+        if (parsed is null)
+            return "无法解析（需至少一个修饰键 + 主键）。";
+        var (key, mods) = parsed.Value;
+        if (ActionHotkeyTable.IsReserved(key, mods))
+            return $"{ActionHotkeyTable.Canonicalize(combo)} 保留给导航，请换一个。";
+        foreach (var (actionId, actionCombo) in actionHotkeys)
+        {
+            if (string.IsNullOrWhiteSpace(actionCombo)) continue;
+            var other = ActionHotkeyTable.Parse(actionCombo);
+            if (other is not null && other.Value.Key == key && other.Value.Mods == mods)
+                return $"{ActionHotkeyTable.Canonicalize(combo)} 与动作「{actionId}」的快捷键冲突。";
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 加载时清理手改文件：无法解析/落保留集/与动作快捷键撞键的「加入暂存区」
+    /// 绑定静默置空（禁用），与 NormalizeActionHotkeys 同纪律。
+    /// </summary>
+    private static string NormalizeStagingAddHotkey(string? combo, Dictionary<string, string> actionHotkeys)
+    {
+        if (string.IsNullOrWhiteSpace(combo)) return "";
+        return ValidateStagingAddHotkey(combo, actionHotkeys) is null
+            ? ActionHotkeyTable.Canonicalize(combo)!
+            : "";
     }
 
     /// <summary>

@@ -189,6 +189,108 @@ public sealed class SettingsStoreTests
         }
     }
 
+    // ── 暂存区设置（2026-08-22 计划）──────────────────────────────────
+
+    [Fact]
+    public void StagingDefaultsRoundTripAndLegacyFilesUpgrade()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            var store = new SettingsStore(directory);
+            store.Save(Settings.Default);
+            var loaded = store.Load();
+            Assert.Equal(5, loaded.StagingCapacity);
+            Assert.Equal("Ctrl+D", loaded.StagingAddHotkey);
+
+            // 旧 settings.json 缺两个字段：容量回落 5、快捷键取默认（非禁用）。
+            File.WriteAllText(
+                Path.Combine(directory, "settings.json"),
+                """{"SchemaVersion":1}""");
+            var legacy = store.Load();
+            Assert.Equal(5, legacy.StagingCapacity);
+            Assert.Equal("Ctrl+D", legacy.StagingAddHotkey);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SaveRejectsStagingCapacityOutOfBounds()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            var store = new SettingsStore(directory);
+            Assert.Throws<InvalidDataException>(() =>
+                store.Save(Settings.Default with { StagingCapacity = 0 }));
+            Assert.Throws<InvalidDataException>(() =>
+                store.Save(Settings.Default with { StagingCapacity = 33 }));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SaveRejectsBadStagingAddHotkeyButAllowsEmpty()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            var store = new SettingsStore(directory);
+            // 空串 = 禁用，合法。
+            store.Save(Settings.Default with { StagingAddHotkey = "" });
+            // 无法解析。
+            Assert.Throws<InvalidDataException>(() =>
+                store.Save(Settings.Default with { StagingAddHotkey = "D" }));
+            // 保留键（Ctrl+G 导航）。
+            Assert.Throws<InvalidDataException>(() =>
+                store.Save(Settings.Default with { StagingAddHotkey = "Ctrl+G" }));
+            // 与动作快捷键撞键。
+            Assert.Throws<InvalidDataException>(() =>
+                store.Save(Settings.Default with
+                {
+                    ActionHotkeys = new Dictionary<string, string> { ["copy"] = "Ctrl+D" },
+                }));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void LoadCleansHandEditedStagingHotkeyAndClampsCapacity()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            var store = new SettingsStore(directory);
+            // 手改：保留键 / 无修饰键 / 与动作快捷键撞键 → 静默禁用；容量越界回落 5。
+            File.WriteAllText(
+                Path.Combine(directory, "settings.json"),
+                """{"SchemaVersion":1,"StagingCapacity":99,"StagingAddHotkey":"Ctrl+G","ActionHotkeys":{"copy":"Ctrl+Shift+O"}}""");
+            var cleaned = store.Load();
+            Assert.Equal(5, cleaned.StagingCapacity);
+            Assert.Equal("", cleaned.StagingAddHotkey);
+
+            File.WriteAllText(
+                Path.Combine(directory, "settings.json"),
+                """{"SchemaVersion":1,"StagingCapacity":8,"StagingAddHotkey":"ALT+ctrl+D"}""");
+            var normalized = store.Load();
+            Assert.Equal(8, normalized.StagingCapacity);
+            Assert.Equal("Ctrl+Alt+D", normalized.StagingAddHotkey);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static string TestDirectory()
     {
         var path = Path.Combine(Path.GetTempPath(), "prism-settings-tests", Guid.NewGuid().ToString("N"));

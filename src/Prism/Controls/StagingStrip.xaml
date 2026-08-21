@@ -1,0 +1,44 @@
+<UserControl x:Class="Prism.Controls.StagingStrip"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- 暂存区条带（2026-08-22 暂存区计划）：搜索框下方、结果列表上方。
+         空态整体收起；chips 由 code-behind 重建（≤32 项，非热路径）。 -->
+    <Border x:Name="Root"
+            Background="{DynamicResource BgItemSelected}"
+            MinHeight="44"
+            Padding="20,0"
+            Visibility="Collapsed">
+        <Grid VerticalAlignment="Center">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="CountText"
+                       FontSize="12"
+                       FontFamily="{DynamicResource AppFontFamily}"
+                       Foreground="{DynamicResource TextSubtitle}"
+                       VerticalAlignment="Center"
+                       Margin="0,0,10,0"
+                       ToolTip="暂存区文件数"/>
+            <ScrollViewer Grid.Column="1"
+                          VerticalScrollBarVisibility="Disabled"
+                          HorizontalScrollBarVisibility="Auto">
+                <StackPanel x:Name="ChipPanel" Orientation="Horizontal"/>
+            </ScrollViewer>
+            <Button x:Name="ClearButton"
+                    Grid.Column="2"
+                    Content="清"
+                    FontSize="12"
+                    FontFamily="{DynamicResource AppFontFamily}"
+                    Foreground="{DynamicResource TextSubtitle}"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Padding="8,4"
+                    VerticalAlignment="Center"
+                    Margin="10,0,0,0"
+                    Cursor="Hand"
+                    ToolTip="清空未标记文件（工作集文件保留）"/>
+        </Grid>
+    </Border>
+</UserControl>

@@ -432,6 +432,40 @@
 
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
+                    <!-- 暂存区（2026-08-22 计划）：容量 + 加入快捷键。 -->
+                    <TextBlock Text="暂存区" FontSize="13" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
+                    <TextBlock Text="搜索窗口内按下方快捷键把选中文件扔进暂存区（搜索框下方的文件架），随时拖出到任意应用。满了自动挤掉最早加入的未标记文件。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               TextWrapping="Wrap" Margin="0,0,0,10"/>
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="加入暂存区"
+                                   FontSize="13" Foreground="{DynamicResource TextQuery}"
+                                   VerticalAlignment="Center" Margin="0,0,12,0"/>
+                        <controls:HotkeyRecorderBox Value="{Binding StagingAddHotkey, Mode=TwoWay}"
+                                                    Width="200"
+                                                    Grid.Column="1"/>
+                        <StackPanel Grid.Column="2" Orientation="Horizontal"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <TextBlock Text="容量（1–32）"
+                                       FontSize="13" Foreground="{DynamicResource TextQuery}"
+                                       VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Text="{Binding StagingCapacityText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource SettingsTextBoxStyle}"
+                                     Width="64" Padding="8,4,8,4"/>
+                        </StackPanel>
+                    </Grid>
+                    <TextBlock Text="清空录键框 = 禁用该快捷键。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                               Margin="0,0,0,16"/>
+
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
+
                     <!-- 别名系统（2026-08-21 设想）：可见资产——统一看、逐条删。 -->
                     <TextBlock Text="文件别名" FontSize="13" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>

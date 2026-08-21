@@ -41,6 +41,11 @@ public partial class App : Application
     private Settings _hostSettings = Settings.Default;
     /// <summary>动作快捷键绑定快照（2026-08-21 设想）：搜索窗懒创建时注入，保存后热更新。</summary>
     private IReadOnlyDictionary<string, string> _actionHotkeyBindings = new Dictionary<string, string>();
+    /// <summary>暂存区（2026-08-22 计划）：独立 staging.json 持久化（不进 settings.json，
+    /// 防设置页全量保存覆盖搜索窗侧写入）。</summary>
+    private StagingStore? _stagingStore;
+    private StagingArea? _staging;
+    private string _stagingAddHotkey = Settings.Default.StagingAddHotkey;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -72,6 +77,12 @@ public partial class App : Application
         _hostSettings = settings;
         _actionHotkeyBindings = settings.ActionHotkeys;
         _favicons = new FaviconCache(_store.DataDir);
+        _stagingStore = new StagingStore(_store.DataDir);
+        _staging = new StagingArea { Capacity = settings.StagingCapacity };
+        _staging.Restore(_stagingStore.Load().Items);
+        _staging.Changed += () => _stagingStore!.Save(
+            _staging!.Items, Array.Empty<WorksetEntry>(), null);
+        _stagingAddHotkey = settings.StagingAddHotkey;
 
         _autoStart = new AutoStartService();
         try
@@ -155,10 +166,11 @@ public partial class App : Application
         _webIcons = new WebIconProvider(
             _favicons,
             origin => _hostSettings.FaviconGrants.ContainsKey(origin));
-        _searchWindow.Attach(_vm, _icons, _theme, _webIcons, _pipe);
+        _searchWindow.Attach(_vm, _icons, _theme, _webIcons, _pipe, _staging);
         // 窗口是懒创建的，创建时补上设置里的当前目录搜索总开关。
         _searchWindow.Scope.SetCurrentDirectoryEnabled(_currentDirectorySearchEnabled);
         _searchWindow.SetActionHotkeys(_actionHotkeyBindings);
+        _searchWindow.SetStagingAddHotkey(_stagingAddHotkey);
         return _searchWindow;
     }
 
@@ -254,6 +266,11 @@ public partial class App : Application
             _vm?.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
             _actionHotkeyBindings = settings.ActionHotkeys;
             _searchWindow?.SetActionHotkeys(settings.ActionHotkeys);
+            // 暂存区容量/快捷键热更新（2026-08-22 计划）。
+            if (_staging is not null)
+                _staging.Capacity = settings.StagingCapacity;
+            _stagingAddHotkey = settings.StagingAddHotkey;
+            _searchWindow?.SetStagingAddHotkey(_stagingAddHotkey);
             Log($"快捷键已应用：{settings.HotkeyMode}" +
                 (settings.HotkeyMode == HotkeyMode.Combo ? $" ({settings.ComboHotkey})" : ""));
         }

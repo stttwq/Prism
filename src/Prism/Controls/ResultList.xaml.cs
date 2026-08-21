@@ -205,34 +205,33 @@ public partial class ResultList : UserControl
     // 位移阈值区分"点击"与"拖动"：按住左键移动超过系统最小拖拽距离才算拖。
     // 与单击选中/双击打开共存：Down 只记录不置 Handled，Up 清记录。
 
-    private Point _dragStartPoint;
-    private int _dragStartIndex = -1;
+    private DragOutStart _dragStart;
 
     private void OnPreviewMouseLeftButtonDownDrag(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
-        _dragStartIndex = -1;
+        _dragStart.End();
         var source = e.OriginalSource as DependencyObject;
         if (source is null) return;
         if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;
         // 同 _displayItems 惯例：容器可能持有旧实例，索引在起拖时经 ItemAt 重解析。
-        _dragStartIndex = List.ItemContainerGenerator.IndexFromContainer(container);
-        _dragStartPoint = e.GetPosition(List);
+        _dragIndex = List.ItemContainerGenerator.IndexFromContainer(container);
+        _dragStart.Begin(e.GetPosition(List));
         // 不置 e.Handled：单击选中归 ListBox 自身处理。
     }
+
+    private int _dragIndex = -1;
 
     private void OnMouseMoveDrag(object sender, System.Windows.Input.MouseEventArgs e)
     {
         if (e.LeftButton != System.Windows.Input.MouseButtonState.Pressed) return;
-        if (_dragStartIndex < 0) return;
-        var pos = e.GetPosition(List);
-        if (Math.Abs(pos.X - _dragStartPoint.X) < SystemParameters.MinimumHorizontalDragDistance
-            && Math.Abs(pos.Y - _dragStartPoint.Y) < SystemParameters.MinimumVerticalDragDistance)
-            return;
+        if (_dragIndex < 0) return;
+        if (!_dragStart.Exceeded(e.GetPosition(List))) return;
 
-        var index = _dragStartIndex;
-        _dragStartIndex = -1; // 本次按下只判定一次，不可拖的行不反复探测
-        if (!IsDraggableItem(ItemAt(index))) return;
-        DragOutAsync(ItemAt(index)!);
+        var index = _dragIndex;
+        _dragIndex = -1; // 本次按下只判定一次，不可拖的行不反复探测
+        _dragStart.End();
+        if (ItemAt(index) is { } item && IsDraggableItem(item))
+            FileDragOut.Start(List, [item.ExecuteId], DragOutStarted, DragOutFinished);
     }
 
     /// <summary>
@@ -243,34 +242,6 @@ public partial class ResultList : UserControl
         item is { Kind: "file" or "folder" or "app" }
         && !string.IsNullOrEmpty(item.ExecuteId)
         && (System.IO.File.Exists(item.ExecuteId) || System.IO.Directory.Exists(item.ExecuteId));
-
-    /// <summary>
-    /// 快照路径后进入 OLE 拖拽。DoDragDrop 是阻塞式嵌套消息循环：期间 debounce
-    /// 定时器、generation 变更、pipe 响应照常派发，Results.Items 可能整个被换掉——
-    /// 所以必须在调用前取好路径。目标程序异常时 OLE 抛 COMException，吞掉不外冒；
-    /// _isDragging 闸必须 finally 复位，否则窗口从此永不失焦隐藏。
-    /// </summary>
-    private void DragOutAsync(SearchResult item)
-    {
-        var path = item.ExecuteId;
-        var files = new System.Collections.Specialized.StringCollection { path };
-        var data = new System.Windows.DataObject();
-        data.SetFileDropList(files);
-        // 只声明 Copy：搜索结果不是文件所有者，不允许目标程序搬走原文件。
-        DragOutStarted?.Invoke();
-        try
-        {
-            System.Windows.DragDrop.DoDragDrop(List, data, System.Windows.DragDropEffects.Copy);
-        }
-        catch (System.Runtime.InteropServices.COMException)
-        {
-            // 目标程序行为异常属预期内，不上报到应用级未处理异常。
-        }
-        finally
-        {
-            DragOutFinished?.Invoke();
-        }
-    }
 
     private void UpdateListHeight()
     {
@@ -352,7 +323,8 @@ public partial class ResultList : UserControl
 
     private void OnPreviewMouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
-        _dragStartIndex = -1; // 未超阈值的按下以点击收场，拖拽记录作废
+        _dragIndex = -1; // 未超阈值的按下以点击收场，拖拽记录作废
+        _dragStart.End();
         var source = e.OriginalSource as DependencyObject;
         if (source is null) return;
         if (ItemsControl.ContainerFromElement(List, source) is not ListBoxItem container) return;

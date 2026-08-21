@@ -35,6 +35,9 @@ public partial class SearchWindow : Window
     private PipeClient? _pipe;
     /// <summary>窗口级动作快捷键表（2026-08-21 设想）：未装配时空表，恒不命中。</summary>
     private ActionHotkeyTable _actionHotkeys = ActionHotkeyTable.Empty;
+    /// <summary>暂存区（2026-08-22 计划）：未装配时快捷键恒不命中、条带不显示。</summary>
+    private StagingArea? _staging;
+    private (System.Windows.Input.Key Key, System.Windows.Input.ModifierKeys Mods)? _stagingAddHotkey;
     private bool _suppressQueryEvent;
     private bool _hiding;
     /// <summary>OLE 拖出进行中（2026-08-22 拖拽计划）：失焦隐藏闸的第六守卫。
@@ -116,21 +119,7 @@ public partial class SearchWindow : Window
         Results.SelectedIndexChanged += OnResultsSelected;
         Results.ContextMenuRequested += OnContextMenuRequested;
         Results.DragOutStarted += () => _isDragging = true;
-        Results.DragOutFinished += () =>
-        {
-            _isDragging = false;
-            // 嵌套消息循环期间的激活变更被 isDragging 挡下且松手后不会重发——
-            // 不补判的话，拖到外部程序上松手后 Prism 会残留可见（违反验收 1.6-5）。
-            // 拖回本窗口取消/落点在自身时仍持有激活，不隐藏。
-            if (!IsActive && SearchWindowFocusPolicy.ShouldHide(
-                    _ignoreDeactivate,
-                    _contextMenuOpen,
-                    _contextMenuActionPending,
-                    IsPinned,
-                    _hiding,
-                    _isDragging))
-                HideAnimated();
-        };
+        Results.DragOutFinished += OnDragOutFinished;
         Results.ItemInvoked += async r =>
         {
             if (_vm is null) return;
@@ -163,22 +152,51 @@ public partial class SearchWindow : Window
         };
     }
 
+    /// <summary>
+    /// OLE 拖出结束（结果列表行 / 暂存区 chip 共用）：嵌套消息循环期间的激活变更
+    /// 被 isDragging 挡下且松手后不会重发——不补判的话，拖到外部程序上松手后
+    /// Prism 会残留可见（违反验收 1.6-5）。拖回本窗口取消/落点在自身时仍持有
+    /// 激活，不隐藏。
+    /// </summary>
+    private void OnDragOutFinished()
+    {
+        _isDragging = false;
+        if (!IsActive && SearchWindowFocusPolicy.ShouldHide(
+                _ignoreDeactivate,
+                _contextMenuOpen,
+                _contextMenuActionPending,
+                IsPinned,
+                _hiding,
+                _isDragging))
+            HideAnimated();
+    }
+
     /// <summary>由 App 在启动时注入 ViewModel、图标缓存与主题监听。
-    /// pipe 为可选的别名通道（右键「设置别名…」）；为空时该菜单项不出现。</summary>
+    /// pipe 为可选的别名通道（右键「设置别名…」）；为空时该菜单项不出现。
+    /// staging 为可选的暂存区（2026-08-22 计划）；为空时条带不装配。</summary>
     public void Attach(
         SearchViewModel vm,
         IconCache icons,
         ThemeWatcher? theme = null,
         WebIconProvider? webIcons = null,
-        PipeClient? pipe = null)
+        PipeClient? pipe = null,
+        StagingArea? staging = null)
     {
         _vm = vm;
         _icons = icons;
         _theme = theme;
         _webIcons = webIcons ?? new WebIconProvider();
         _pipe = pipe;
+        _staging = staging;
         Results.SetIconCache(icons);
         Results.SetWebIconProvider(_webIcons);
+        if (staging is not null)
+        {
+            Staging.Attach(staging);
+            Staging.DragOutStarted += () => _isDragging = true;
+            Staging.DragOutFinished += OnDragOutFinished;
+            Staging.OpenRequested += OpenStagedFile;
+        }
         vm.HideRequested += () =>
         {
             // L 批次（FRESH-AUDIT-3-2026-08-20）：BeginInvoke——后台线程的隐藏
@@ -802,6 +820,50 @@ public partial class SearchWindow : Window
         _actionHotkeys = ActionHotkeyTable.FromSettings(bindings);
 
     /// <summary>
+    /// 更新「加入暂存区」组合键（空 = 禁用）。设置加载后与每次保存后由 App 调用。
+    /// 值已经过 store 侧归一化（可解析/非保留/不撞键），此处解析失败仅防御性禁用。
+    /// </summary>
+    public void SetStagingAddHotkey(string? combo) =>
+        _stagingAddHotkey = ActionHotkeyTable.Parse(combo ?? "");
+
+    /// <summary>点击暂存区 chip：Shell 打开（不经 broker、不记历史——暂存区取用
+    /// 不是搜索挑选）。窗口保持可见（暂存区是拿取口，开完通常还要继续拿）。</summary>
+    private void OpenStagedFile(string path)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path)
+            {
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            if (_vm is not null)
+                _vm.State.StatusMessage = "暂存区打开失败：" + ex.Message;
+        }
+    }
+
+    /// <summary>把当前选中结果加入暂存区（快捷键入口）。</summary>
+    private void AddSelectedToStaging()
+    {
+        if (_vm is null || _staging is null) return;
+        var target = _vm.State.SelectedResult;
+        if (target is null
+            || target.Kind is not ("file" or "folder" or "app")
+            || string.IsNullOrEmpty(target.ExecuteId))
+            return;
+
+        var result = _staging.Add(target.ExecuteId);
+        _vm.State.StatusMessage = result switch
+        {
+            StagingAddResult.Added => $"已加入暂存区（{_staging.Count}）",
+            StagingAddResult.Duplicate => "已在暂存区",
+            _ => "暂存区已满：工作集文件不会被挤掉",
+        };
+    }
+
+    /// <summary>
     /// 范围标签点击或 `Ctrl+G`：在当前目录与全局之间切换。
     /// AUDIT-4 A2（2026-08-21）：切回「当前目录」方向的路径复验含磁盘 I/O
     /// （RootValidation：Exists + 目录枚举探权限），网络盘/休眠盘可达数秒——
@@ -898,6 +960,21 @@ public partial class SearchWindow : Window
             // 与 Key.Enter 同纪律：先置 Handled 再 await。
             e.Handled = true;
             await RunActionShortcutAsync(actionId);
+            return;
+        }
+
+        // 「加入暂存区」（2026-08-22 计划）：动作快捷键之后、导航键之前查这唯一
+        // 绑定（保存校验已防撞键/保留键，运行期动作表先试因此恒无冲突）。
+        // 适用性预检与动作快捷键同纪律：不适用不吞键、按键落回原逻辑。
+        if (_stagingAddHotkey is { } stagingKey
+            && hotkeyKey == stagingKey.Key
+            && Keyboard.Modifiers == stagingKey.Mods
+            && _vm.State.Mode == PanelMode.Results
+            && _vm.State.SelectedResult is { Kind: "file" or "folder" or "app" }
+            && !string.IsNullOrEmpty(_vm.State.SelectedResult.ExecuteId))
+        {
+            e.Handled = true;
+            AddSelectedToStaging();
             return;
         }
 

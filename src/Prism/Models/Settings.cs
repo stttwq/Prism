@@ -91,6 +91,19 @@ public sealed record Settings
     /// </summary>
     public Dictionary<string, string> ActionHotkeys { get; init; } = [];
 
+    /// <summary>
+    /// 暂存区容量上限（2026-08-22 暂存区计划）：默认 5，界 1..32。
+    /// 满了挤掉最早加入的未标记项；工作集标记项不可挤。
+    /// </summary>
+    public int StagingCapacity { get; init; } = 5;
+
+    /// <summary>
+    /// 「加入暂存区」窗口级组合键（默认 "Ctrl+D"，空串 = 禁用）。
+    /// 不塞进 ActionHotkeys：那是 broker 动作面板的前端静态镜像（有防漂移锚测试），
+    /// 加入暂存区是纯前端动作。校验规则与动作快捷键同源（可解析/非保留/不撞键）。
+    /// </summary>
+    public string StagingAddHotkey { get; init; } = "Ctrl+D";
+
     /// <summary>全新用户的默认设置：双击 Ctrl + 预设 bi/b/g 三个引擎（必应优先）。</summary>
     public static Settings Default => new()
     {
@@ -109,6 +122,8 @@ public sealed record Settings
         SuggestionsEnabled = false,
         FaviconGrants = [],
         ActionHotkeys = [],
+        StagingCapacity = 5,
+        StagingAddHotkey = "Ctrl+D",
     };
 
     /// <summary>预设引擎：必应优先，其次百度、Google（关键词 bi / b / g）。</summary>
