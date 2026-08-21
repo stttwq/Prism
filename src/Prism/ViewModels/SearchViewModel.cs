@@ -130,6 +130,12 @@ public sealed class SearchViewModel
         if (_searchContext.IsEquivalentTo(context)) return;
         _searchContext = context;
         _completeCache = null;
+        // 复审 L4（2026-08-21）：上下文维度变了（root/filters/mode），在飞的
+        // 旧上下文搜索响应会通过全部既有 staleness 守卫（seq/查询文本/回显都
+        // 没变）被误应用——约一个防抖+搜索时延内新标签下显示旧范围结果。
+        // 与空查询分支同一纪律：bump seq + 取消在飞请求。
+        _searchSeq++;
+        CancelSearch();
         if (_state.Mode == PanelMode.Actions)
             return;
 

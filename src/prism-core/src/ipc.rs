@@ -1134,6 +1134,13 @@ async fn dispatch_non_search(
             category: None,
         },
         Request::AliasSet { target, words } => {
+            // M1（复审 2026-08-21）：绑定性校验（绝对路径 + 支持的 kind）在
+            // 进入存储之前——alias.rs 的 set 内也有同款防线，双保险。
+            if !crate::alias::target_path_is_bindable(&target) {
+                return Response::AliasApplied {
+                    message: "别名目标必须是 file/directory/application 的绝对路径".into(),
+                };
+            }
             // 别名设置是低频 UI 动作：同步落盘放 spawn_blocking（对齐
             // ClearHistory 的纪律——绝不在 async 线程做文件 I/O）。
             let aliases_for_blocking = aliases.clone();
@@ -4194,6 +4201,10 @@ mod query_parser_tests {
         let (name, filters) = parse_query("report ext:pdf");
         assert_eq!(name, "report");
         assert_eq!(filters, vec![ext("pdf")]);
+        // 复审 L4（2026-08-21）：直连索引器管道的带点 ext 值也要归一——
+        //「broker 已剥点」的假设对任意本地客户端不成立。
+        let dotted = crate::indexer_ipc::ext_filters(Some(&[ext(".PDF")]));
+        assert_eq!(dotted, vec!["pdf".to_owned()]);
     }
 
     #[test]

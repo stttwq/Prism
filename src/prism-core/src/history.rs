@@ -236,8 +236,17 @@ impl HistoryStore {
                 };
                 // 只读判定：到期且（有真实变更留下的）脏标记才 clone+persist。
                 if store.persist_if_due_and_dirty() {
-                    if let Ok(state) = store.state.read() {
-                        let _ = persist(&store.path, state.entries.clone());
+                    // M2（复审 2026-08-21）：clone 在读锁内（纯 memcpy），锁释放
+                    // 后再 persist——编码+写盘+fsync+ReplaceFileW 曾整段持读锁，
+                    // record 写者与 async 线程上的 score() 会被一次慢盘 fsync
+                    // 拖住（与 record_at 的锁外 persist 同一纪律）。
+                    let snapshot = store
+                        .state
+                        .read()
+                        .ok()
+                        .map(|state| state.entries.clone());
+                    if let Some(entries) = snapshot {
+                        let _ = persist(&store.path, entries);
                     }
                 }
             });

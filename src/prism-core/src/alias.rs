@@ -56,8 +56,18 @@ impl AliasStore {
 
     /// 整体替换目标的词表。空词表 = 解绑（删除条目）。同步落盘（调用方在
     /// spawn_blocking 里）——别名变更是低频 UI 动作，不值得节流。
+    /// M1（复审 2026-08-21）：目标值校验**前置**——persist 的
+    /// VersionedEnvelope::new 会整表 validate，一个坏条目曾能把内存态
+    /// 改成功但落盘失败，此后所有 set/delete 都卡在同一条坏数据上直到重启。
     pub fn set(&self, target: &ActionTarget, words: &[String], now_utc: u64) -> AliasMutationResult {
         let kind = target_kind(target)?;
+        if target.value.is_empty()
+            || target.value.contains('\0')
+            || target.value.len() > 32 * 1024
+            || !Path::new(&target.value).is_absolute()
+        {
+            return Err("别名目标必须是绝对路径（≤32KB、无空字节）".into());
+        }
         let normalized = normalized_words(words);
         if words.is_empty() {
             // 显式清空 = 解绑。

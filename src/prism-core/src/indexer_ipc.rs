@@ -155,6 +155,11 @@ const FIELD_EXCLUDE_PATH: &str = "exclude_path";
 const FIELD_EXT: &str = "ext";
 const FIELD_PATH: &str = "path";
 
+/// H1（复审 2026-08-21）：查询长度上限。索引器管道对 Authenticated Users
+/// 开放，无界查询即使经 NameTerms 去重/封顶，归一化与分词本身也是每击键
+/// 的线性成本——4KB 覆盖真实输入（文件名搜索的最长意图），超出直接拒绝。
+pub const MAX_QUERY_BYTES: usize = 4 * 1024;
+
 pub fn validate_search_request(max: usize, filters: Option<&[SearchFilter]>) -> Result<(), String> {
     if max == 0 || max > MAX_SEARCH_RESULTS {
         return Err(format!("max must be between 1 and {MAX_SEARCH_RESULTS}"));
@@ -242,7 +247,12 @@ pub fn ext_filters(filters: Option<&[SearchFilter]>) -> Vec<String> {
         .unwrap_or_default()
         .iter()
         .filter(|filter| filter.field == FIELD_EXT)
-        .map(|filter| filter.value.trim().to_owned())
+        // L4（复审 2026-08-21）：剥一个前导点并降幂——「已由 broker 归一化」的
+        // 假设对直连索引器管道的客户端不成立，ext:.pdf 此前静默匹配不到任何东西。
+        .map(|filter| {
+            let trimmed = filter.value.trim().to_lowercase();
+            trimmed.strip_prefix('.').unwrap_or(&trimmed).to_owned()
+        })
         .collect()
 }
 

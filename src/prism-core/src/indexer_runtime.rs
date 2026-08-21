@@ -907,6 +907,14 @@ impl ServiceState {
         root: Option<&str>,
     ) -> Result<IndexerResponse, String> {
         validate_search_request(max, filters)?;
+        // H1（复审 2026-08-21）：查询长度上限——索引器管道对 AU 开放，
+        // 无界查询是 CPU 耗尽面（NameTerms 去重/封顶之外再挡一层）。
+        if query.len() > crate::indexer_ipc::MAX_QUERY_BYTES {
+            return Err(format!(
+                "query exceeds {} bytes",
+                crate::indexer_ipc::MAX_QUERY_BYTES
+            ));
+        }
         let root = match requested_root(root) {
             Ok(root) => root,
             Err(rejection) => {

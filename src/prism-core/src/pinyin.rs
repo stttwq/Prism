@@ -797,11 +797,16 @@ fn compact_token(bytes: &[u8], cursor: usize) -> Option<CompactToken<'_>> {
     if rcount == 0 || readings_region.is_empty() {
         return None;
     }
-    // 逐读音校验长度链一致 + 首读音非空且 ASCII（坏数据宁可不命中，绝不
-    // panic——release 是 abort）。
+    // 逐读音校验长度链一致 + 非空（坏数据宁可不命中，绝不 panic——release
+    // 是 abort）。M4（复审 2026-08-21）：此前只校验长度链总和，r_len==0 的
+    // 空读音能通过——Initials 分支的 `&reading[..1]` 与混用 DP 的
+    // `reading[0]` 都是越界 panic。
     let mut walk = 0usize;
     for _ in 0..rcount {
         let len = *readings_region.get(walk)? as usize;
+        if len == 0 {
+            return None;
+        }
         walk = walk.checked_add(1 + len)?;
     }
     if walk != readings_region.len() {
@@ -1238,6 +1243,22 @@ mod tests {
         // 负例：不是该字任何读音的音节绝不命中（防召回无界放宽）。
         assert!(match_name("重庆", "hongqing").is_none());
         assert!(match_name("银行", "yinkuan").is_none());
+    }
+
+    /// 复审 M4（2026-08-21）：r_len==0 的空读音记录必须被 compact_token 拒绝
+    ///——Initials 分支的 `&reading[..1]` 与混用 DP 的 `reading[0]` 都是越界
+    /// panic（release 是 abort，一条坏记录杀整个索引服务）。
+    #[test]
+    fn m4_zero_length_reading_is_rejected_without_panic() {
+        // 手工构造：chain_len=0 | kind=0 | token(total=5+2, utf16, rcount=1, r_len=0)
+        let mut bytes = vec![0, 0, 0];
+        bytes.push(5 + 2); // total
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // utf16_start
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // utf16_len
+        bytes.push(1); // rcount
+        bytes.push(0); // r_len = 0 —— 毒丸
+        let mut scratch = Vec::new();
+        assert!(match_compact_normalized(&bytes, b"wx", &mut scratch).is_none());
     }
 
     /// P1-2（搜索报告2，2026-08-21）：heteronym 多读音端到端——

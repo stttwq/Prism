@@ -144,7 +144,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
             // L 批次（FRESH-AUDIT-3-2026-08-20）：RDP 双会话时另一会话的 broker
             // 不是孤儿——跨会话收编必失败，但绝不能 Kill 它（那会打掉别人会话的
             // 搜索）。保守复用，跨会话连不上时由 watchdog 走拉新路径。
-            if (proc.SessionId != Process.GetCurrentProcess().SessionId)
+            // 跨会话检查不杀（同前）；本进程会话号只读一次缓存。
+            using var current = Process.GetCurrentProcess();
+            if (proc.SessionId != current.SessionId)
             {
                 proc.Dispose(); // AUDIT-4 B10：同上，复用返回前释放句柄。
                 return true;
@@ -153,6 +155,14 @@ public sealed class PipeClient : ISearchClient, IDisposable
             _jobGuard ??= new JobObjectGuard();
             if (_jobGuard.TryAdopt(pid))
             {
+                // 复审 M1（2026-08-21）：收编成功后，若此前还认着一只**自己的**
+                /// 活 broker（连接打到了孤儿实例的窗口期），旧实例已无用途——
+                // 不杀会变成第二只无主孤儿占着 listener（KILL_ON_JOB_CLOSE 已移除，
+                // 没有任何机制会带走它）。只杀本体不杀树（Bug 3：用户应用是子进程）。
+                if (_backend is { HasExited: false } previous && previous.Id != pid)
+                {
+                    try { previous.Kill(); } catch { /* 已退出 */ }
+                }
                 try { _backend?.Dispose(); } catch { /* 已退出 */ }
                 _backend = proc; // 收编成功：接管生命周期（Dispose 时随 Job 一起回收），不得提前 Dispose
                 return true;
@@ -160,9 +170,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
             // 收编失败（权限/已死/已在别的 Job 且被拒）：孤儿占着管道名，新 Prism 死后
             // 它仍会残留——杀掉它让通道走拉新路径（新进程必进本 Job）。
+            // 复审 M1（2026-08-21）：只杀本体不杀树——孤儿 broker 的子进程是
+            // 经它打开的用户应用（Bug 3 同款语义），杀树会带走用户的程序。
             try
             {
-                proc.Kill(entireProcessTree: true);
+                proc.Kill();
             }
             catch { /* 已退出/无权限：管道侧自然拉新 */ }
             finally

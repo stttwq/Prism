@@ -1024,10 +1024,22 @@ pub struct NameTerms {
 
 impl NameTerms {
     pub fn parse(query: &str) -> Self {
-        let mut terms: Vec<String> = query
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect();
+        // H1（复审 2026-08-21）：多 term AND 的匹配成本 = 每 term 一次子串扫描，
+        // 索引器管道对 Authenticated Users 开放——不去重不封顶时，
+        //「a a a …」×1MB 查询可达 10^12 级字节比较（CPU 耗尽 LocalSystem 服务）。
+        // 去重不改变 AND 语义（a AND a = a）；封顶 16 term 是诚实降级：
+        // 超长分词列表的搜索意图本就模糊，匹配前 16 个已覆盖真实输入。
+        const MAX_TERMS: usize = 16;
+        let mut terms: Vec<String> = Vec::new();
+        for term in query.split_whitespace() {
+            let lowered = term.to_lowercase();
+            if !terms.contains(&lowered) {
+                terms.push(lowered);
+                if terms.len() >= MAX_TERMS {
+                    break;
+                }
+            }
+        }
         if terms.is_empty() {
             terms.push(String::new());
         }
@@ -1676,6 +1688,22 @@ mod tests {
     /// 命中「抖音-短视频.mp4」（顺序无关），不命中只含其一的名字；多 term
     /// 不产生 class 0；position 取各命中 UTF-16 偏移最小值；尾随空格的查询
     /// 与去空格后同结果。
+    /// 复审 H1（2026-08-21）：多 term 去重 + 封顶 16——索引器管道对 AU 开放，
+    /// 「a a a …」×1MB 的查询曾是每名字 50 万次子串扫描的 CPU 耗尽面。
+    #[test]
+    fn h1_name_terms_dedup_and_cap() {
+        // 去重：AND 语义不变（a AND a = a）。
+        let terms = NameTerms::parse("a A b  a");
+        assert_eq!(terms.iter().count(), 2);
+        // 封顶 16：超出的 term 诚实降级（不参与 AND）。
+        let long = (0..24).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" ");
+        let capped = NameTerms::parse(&long);
+        assert_eq!(capped.iter().count(), 16);
+        assert!(capped.iter().all(|term| term.starts_with('t')));
+        // 空白查询仍是单空 term（G7 依赖）。
+        assert_eq!(NameTerms::parse("   ").single(), Some(""));
+    }
+
     #[test]
     fn s4_multi_term_and_semantics() {
         let terms = NameTerms::parse("抖音 视频");

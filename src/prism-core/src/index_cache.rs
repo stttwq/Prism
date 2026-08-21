@@ -55,26 +55,9 @@ pub fn cache_path(data_dir: &Path) -> PathBuf {
 
 pub fn load(data_dir: &Path) -> Result<IndexState, String> {
     let path = cache_path(data_dir);
-    // B3（AUDIT-4 批次C）：新格式尾部多一个校验和 varint。postcard 是顺序
-    // 格式、serde(default) 对缺失的**尾部**字段无能为力——旧文件按
-    // DeserializeUnexpectedEnd 分支重开一次按 legacy 布局（无校验和）解码，
-    // 校验和记 0（跳过校验）。真正截断的新文件两条路径都会失败，语义不变。
-    let mut envelope = match load_envelope(&path) {
-        Ok(envelope) => envelope,
-        Err(LoadEnvelopeError::Legacy) => {
-            let legacy: CacheEnvelopeLegacy<IndexState> = open_and_decode(&path)
-                .map_err(|error| format!("decode v5 legacy cache: {error}"))?;
-            CacheEnvelope {
-                magic: legacy.magic,
-                version: legacy.version,
-                state: legacy.state,
-                content_checksum: 0,
-            }
-        }
-        Err(LoadEnvelopeError::Decode(error)) => {
-            return Err(format!("decode v5 cache: {error}"))
-        }
-    };
+    // B3（AUDIT-4 批次C）+ M3（复审 2026-08-21）：envelope 解析（含 legacy
+    // 回退与 IO 重试）整体收敛在 load_envelope_with_retry。
+    let mut envelope = load_envelope_with_retry(&path)?;
     if &envelope.magic != CACHE_MAGIC || envelope.version != CACHE_VERSION {
         return Err("cache is not Prism v5".into());
     }
@@ -100,25 +83,82 @@ pub fn load(data_dir: &Path) -> Result<IndexState, String> {
 enum LoadEnvelopeError {
     /// 按新格式解码在尾部缺数据——大概率是旧格式文件（无校验和字段）。
     Legacy,
+    /// 打开失败（AV 扫描共享冲突/瞬时 ACL）——与格式损坏分流（M3）。
+    IoOpen,
     Decode(postcard::Error),
+}
+
+/// M3（复审 2026-08-21）：打开错误≠损坏。此前 File::open 的任何错误都被折进
+/// DeserializeUnexpectedEnd，触发 legacy 回退→再失败→按损坏丢缓存→多卷 MFT
+/// 全量重建——一次杀软扫描窗口就能白丢几分钟的磁盘工作。现在打开失败先
+/// 退避 250ms 重试一次；仍失败才按不可用上抛（调用方走重建，但那已是
+/// 真正持续的占用而非瞬态窗口）。
+fn load_envelope_with_retry(path: &Path) -> Result<CacheEnvelope<IndexState>, String> {
+    for attempt in 0..2 {
+        match load_envelope(path) {
+            Ok(envelope) => return Ok(envelope),
+            Err(LoadEnvelopeError::IoOpen) if attempt == 0 => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(LoadEnvelopeError::IoOpen) => {
+                return Err("open v5 cache failed after retry".into())
+            }
+            Err(LoadEnvelopeError::Legacy) => {
+                let legacy: CacheEnvelopeLegacy<IndexState> = match open_and_decode(path) {
+                    Ok(legacy) => legacy,
+                    Err(CacheReadError::Io) if attempt == 0 => {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        continue;
+                    }
+                    Err(CacheReadError::Io) => {
+                        return Err("open v5 legacy cache failed after retry".into())
+                    }
+                    Err(CacheReadError::Postcard(error)) => {
+                        return Err(format!("decode v5 legacy cache: {error}"))
+                    }
+                };
+                return Ok(CacheEnvelope {
+                    magic: legacy.magic,
+                    version: legacy.version,
+                    state: legacy.state,
+                    content_checksum: 0,
+                });
+            }
+            Err(LoadEnvelopeError::Decode(error)) => {
+                return Err(format!("decode v5 cache: {error}"))
+            }
+        }
+    }
+    unreachable!("retry loop returns from every branch")
 }
 
 fn load_envelope(path: &Path) -> Result<CacheEnvelope<IndexState>, LoadEnvelopeError> {
     match open_and_decode(path) {
         Ok(envelope) => Ok(envelope),
-        Err(postcard::Error::DeserializeUnexpectedEnd) => Err(LoadEnvelopeError::Legacy),
-        Err(error) => Err(LoadEnvelopeError::Decode(error)),
+        Err(CacheReadError::Postcard(postcard::Error::DeserializeUnexpectedEnd)) => {
+            Err(LoadEnvelopeError::Legacy)
+        }
+        Err(CacheReadError::Postcard(error)) => Err(LoadEnvelopeError::Decode(error)),
+        Err(CacheReadError::Io) => Err(LoadEnvelopeError::IoOpen),
     }
 }
 
-fn open_and_decode<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, postcard::Error> {
-    let file = std::fs::File::open(path).map_err(|_| postcard::Error::DeserializeUnexpectedEnd)?;
+/// B3/M3：读缓存的两类失败——打开（IO）与解码（postcard）必须分流。
+/// Io 不携带错误详情：调用方只按「打不开」分支处理（重试/放弃加载）。
+enum CacheReadError {
+    Io,
+    Postcard(postcard::Error),
+}
+
+fn open_and_decode<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, CacheReadError> {
+    let file = std::fs::File::open(path).map_err(|_| CacheReadError::Io)?;
     // 流式反序列化（分块缓冲）：不再把完整文件字节物化为 Vec，消除字节+结构双驻留。
     // postcard::from_io 需要 (reader, scratch_buffer)：读取器流式取字节，scratch 仅供
     // 反序列器暂存非顺序数据，常驻尺寸远小于完整文件。
     let reader = std::io::BufReader::with_capacity(256 * 1024, file);
     let mut scratch = [0u8; 4096];
-    let (envelope, _leftover): (T, _) = postcard::from_io((reader, scratch.as_mut_slice()))?;
+    let (envelope, _leftover): (T, _) =
+        postcard::from_io((reader, scratch.as_mut_slice())).map_err(CacheReadError::Postcard)?;
     Ok(envelope)
 }
 
