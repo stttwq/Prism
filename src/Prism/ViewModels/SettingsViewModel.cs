@@ -104,12 +104,13 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             (settings.WebEngines.Count > 0 ? settings.WebEngines : Settings.DefaultEngines())
             .Select(e => new WebEngineEditItem(e)));
 
+        // 第一轮 bug 修复：默认没有任何行——用户点「添加动作」逐个加、自选动作
+        // 与组合键；不再预列全部 15 个动作。已有绑定（旧设置）按行恢复。
         ActionHotkeys = new ObservableCollection<ActionHotkeyEditItem>(
-            ActionHotkeyCatalog.Entries.Select(e => new ActionHotkeyEditItem(
-                e.Id,
-                e.Label,
-                ScopeText(e.Kinds),
-                settings.ActionHotkeys.GetValueOrDefault(e.Id, ""))));
+            ActionHotkeyCatalog.Entries
+                .Where(e => !string.IsNullOrWhiteSpace(settings.ActionHotkeys.GetValueOrDefault(e.Id)))
+                .Select(e => new ActionHotkeyEditItem(e.Id, settings.ActionHotkeys[e.Id])));
+        RefreshActionChoices();
 
         AddEngineCommand = new RelayCommand(_ => AddEngine());
         RemoveEngineCommand = new RelayCommand(_ => RemoveSelectedEngine(), _ => SelectedEngine is not null);
@@ -117,10 +118,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         SaveCommand = new RelayCommand(_ => Save());
         ClearHistoryCommand = new RelayCommand(_ => _ = ClearHistoryAsync());
         RemoveAliasCommand = new RelayCommand(p => _ = RemoveAliasAsync(p as AliasEntry), _ => AliasEntries.Count > 0);
-        ClearActionHotkeyCommand = new RelayCommand(p =>
-        {
-            if (p is ActionHotkeyEditItem row) row.Value = "";
-        });
+        AddActionHotkeyCommand = new RelayCommand(_ => AddActionHotkey());
+        RemoveActionHotkeyCommand = new RelayCommand(
+            p => RemoveActionHotkey(p as ActionHotkeyEditItem),
+            _ => ActionHotkeys.Count > 0);
         SelectTabCommand = new RelayCommand(p =>
         {
             if (p is int i) SelectedTab = i;
@@ -235,21 +236,49 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public ObservableCollection<WebEngineEditItem> Engines { get; }
 
-    /// <summary>动作快捷键行集合（2026-08-21 设想）：目录固定 15 行，值来自设置。</summary>
+    /// <summary>动作快捷键行集合：默认空，用户逐个添加（第一轮 bug 修复）。</summary>
     public ObservableCollection<ActionHotkeyEditItem> ActionHotkeys { get; }
 
-    /// <summary>动作快捷键行的清除按钮（清空即解绑）。</summary>
-    public ICommand ClearActionHotkeyCommand { get; }
+    /// <summary>「添加动作」：追加一行并选中第一个未被占用的动作。</summary>
+    public ICommand AddActionHotkeyCommand { get; }
 
-    /// <summary>目录适用类型的设置页文案。</summary>
-    private static string ScopeText(ActionHotkeyKinds kinds) => kinds switch
+    /// <summary>删除整行（连同该行动作选择；未保存前不影响现行绑定）。</summary>
+    public ICommand RemoveActionHotkeyCommand { get; }
+
+    private void AddActionHotkey()
     {
-        ActionHotkeyKinds.All => "文件 / 文件夹 / 应用",
-        ActionHotkeyKinds.FileAndFolder => "文件 / 文件夹",
-        ActionHotkeyKinds.File => "文件",
-        ActionHotkeyKinds.App => "应用",
-        _ => "",
-    };
+        var used = UsedActionIds(except: null);
+        var next = ActionHotkeyCatalog.Entries.FirstOrDefault(e => !used.Contains(e.Id));
+        if (next is null)
+        {
+            StatusMessage = $"最多 {ActionHotkeyCatalog.Entries.Count} 个动作，已全部添加";
+            return;
+        }
+        ActionHotkeys.Add(new ActionHotkeyEditItem(next.Id, ""));
+        RefreshActionChoices();
+    }
+
+    private void RemoveActionHotkey(ActionHotkeyEditItem? row)
+    {
+        if (row is null) return;
+        ActionHotkeys.Remove(row);
+        RefreshActionChoices();
+    }
+
+    private HashSet<string> UsedActionIds(ActionHotkeyEditItem? except) =>
+        [.. ActionHotkeys.Where(r => !ReferenceEquals(r, except)).Select(r => r.Id)];
+
+    /// <summary>刷新每行 ComboBox 的可选集：目录减去其他行已占用的动作。</summary>
+    private void RefreshActionChoices()
+    {
+        foreach (var row in ActionHotkeys)
+        {
+            var others = UsedActionIds(except: row);
+            row.AvailableActions = ActionHotkeyCatalog.Entries
+                .Where(e => !others.Contains(e.Id))
+                .ToList();
+        }
+    }
 
     public WebEngineEditItem? SelectedEngine
     {

@@ -48,6 +48,16 @@ public static class ActionHotkeyCatalog
     public static Entry? Find(string id) =>
         Entries.FirstOrDefault(e => e.Id == id);
 
+    /// <summary>适用类型的设置页文案（行模型与设置页共用，避免两处漂移）。</summary>
+    public static string ScopeText(ActionHotkeyKinds kinds) => kinds switch
+    {
+        ActionHotkeyKinds.All => "文件 / 文件夹 / 应用",
+        ActionHotkeyKinds.FileAndFolder => "文件 / 文件夹",
+        ActionHotkeyKinds.File => "文件",
+        ActionHotkeyKinds.App => "应用",
+        _ => "",
+    };
+
     /// <summary>该动作是否适用于此目标 kind（file/folder/app）。未知 kind 恒 false。</summary>
     public static bool AppliesTo(string id, string? kind)
     {

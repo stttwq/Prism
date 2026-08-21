@@ -133,6 +133,105 @@
         </Style>
 
         <!-- 主题化勾选框：默认 Aero2 白底方块在深色页面上刺眼 -->
+        <!-- 深色 ComboBox（动作快捷键行选动作用；默认白底系统样式与页面割裂） -->
+        <Style x:Key="SettingsComboBoxItemStyle" TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Padding" Value="8,5"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgSettingsNavHover}"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="SettingsComboBoxStyle" TargetType="ComboBox">
+            <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
+            <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderSettingsInput}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="8,5"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="ItemContainerStyle" Value="{StaticResource SettingsComboBoxItemStyle}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <Border x:Name="Bd"
+                                    Grid.ColumnSpan="2"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"/>
+                            <!-- 命中整个框即展开（ClickMode=Press），不让 ToggleButton 挡内容 -->
+                            <ToggleButton x:Name="Toggle"
+                                          Grid.ColumnSpan="2"
+                                          Focusable="False"
+                                          ClickMode="Press"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="Transparent"/>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter Grid.Column="0"
+                                              Margin="{TemplateBinding Padding}"
+                                              HorizontalAlignment="Left"
+                                              VerticalAlignment="Center"
+                                              IsHitTestVisible="False"
+                                              TextElement.Foreground="{TemplateBinding Foreground}"/>
+                            <Path Grid.Column="1"
+                                  Data="M 0 0 L 4 4 L 8 0 Z"
+                                  Fill="{DynamicResource TextSubtitle}"
+                                  HorizontalAlignment="Right"
+                                  VerticalAlignment="Center"
+                                  Margin="0,0,10,0"/>
+                            <Popup IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   Placement="Bottom"
+                                   AllowsTransparency="True"
+                                   PopupAnimation="Fade"
+                                   Focusable="False">
+                                <Border Background="{DynamicResource BgSettingsInput}"
+                                        BorderBrush="{DynamicResource BorderSettingsInput}"
+                                        BorderThickness="1"
+                                        MinWidth="{TemplateBinding ActualWidth}"
+                                        MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                        Margin="0,2,0,0">
+                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                        <ItemsPresenter/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource TextMatch}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="SettingsCheckBoxStyle" TargetType="CheckBox">
             <Setter Property="Foreground" Value="{DynamicResource TextQuery}"/>
             <Setter Property="FontSize" Value="13"/>
@@ -394,10 +493,10 @@
 
                     <TextBlock Text="动作快捷键（搜索窗口内生效）" FontSize="13" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
-                    <TextBlock Text="为动作面板里的动作直接绑组合键，搜索窗口打开时按下即对当前选中项执行，无需按 → 进面板。清空即解绑；方向键、Enter、Esc、Ctrl+G、Ctrl+数字保留给导航，不可绑定。"
+                    <TextBlock Text="默认不绑定任何动作。点「添加动作」逐个添加：先选动作，再点右侧框录制组合键，搜索窗口打开时按下即对当前选中项执行。方向键、Enter、Esc、Ctrl+G、Ctrl+数字保留给导航，不可绑定。"
                                FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                                TextWrapping="Wrap" Margin="0,0,0,10"/>
-                    <ItemsControl ItemsSource="{Binding ActionHotkeys}" Margin="0,0,0,16">
+                    <ItemsControl ItemsSource="{Binding ActionHotkeys}" Margin="0,0,0,8">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
                                 <Grid Margin="0,0,0,6">
@@ -408,10 +507,13 @@
                                         <ColumnDefinition Width="Auto"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{Binding Label}"
-                                               FontSize="13"
-                                               Foreground="{DynamicResource TextQuery}"
-                                               VerticalAlignment="Center"/>
+                                    <ComboBox Style="{StaticResource SettingsComboBoxStyle}"
+                                              ItemsSource="{Binding AvailableActions}"
+                                              SelectedValuePath="Id"
+                                              SelectedValue="{Binding Id, Mode=TwoWay}"
+                                              DisplayMemberPath="Label"
+                                              Width="170"
+                                              VerticalAlignment="Center"/>
                                     <TextBlock Text="{Binding ScopeText}"
                                                FontSize="11" Foreground="{DynamicResource TextSubtitle}"
                                                Grid.Column="1" VerticalAlignment="Center"
@@ -419,8 +521,8 @@
                                     <controls:HotkeyRecorderBox Value="{Binding Value, Mode=TwoWay}"
                                                                 Width="200"
                                                                 Grid.Column="3"/>
-                                    <Button Content="清除"
-                                            Command="{Binding DataContext.ClearActionHotkeyCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                    <Button Content="删除"
+                                            Command="{Binding DataContext.RemoveActionHotkeyCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
                                             CommandParameter="{Binding}"
                                             Style="{StaticResource SettingsActionButton}"
                                             Padding="10,2,10,2"
@@ -429,6 +531,11 @@
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>
+                    <Button Content="＋ 添加动作"
+                            Command="{Binding AddActionHotkeyCommand}"
+                            Style="{StaticResource SettingsActionButton}"
+                            HorizontalAlignment="Left"
+                            Margin="0,0,0,16"/>
 
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
