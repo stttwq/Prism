@@ -4,10 +4,47 @@
     <!-- 暂存区条带（2026-08-22 暂存区计划）：搜索框下方、结果列表上方。
          空态整体收起；chips 由 code-behind 重建（≤32 项，非热路径）。
          工作集行（阶段三）为条带下方可展开的第二行：常驻入口做进搜索头
-         会动核心热路径视觉，这里保持条带自治。 -->
+         会动核心热路径视觉，这里保持条带自治。
+         第一轮 bug 修复：条带底透明融入卡片，chips 用 BgItemSelected 圆角令牌；
+         存/集/清为文字链接按钮（悬浮加粗提亮，不用整块底色强调）。 -->
+    <UserControl.Resources>
+        <Style x:Key="StripLinkButton" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontFamily" Value="{DynamicResource AppFontFamily}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextSubtitle}"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Padding" Value="8,4"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="Transparent"
+                                BorderThickness="0"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"
+                                              RecognizesAccessKey="False"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <!-- 悬浮强调 = 加粗 + 提亮，不用色块（用户反馈：淡蓝全色块过于刺激） -->
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="FontWeight" Value="Bold"/>
+                                <Setter Property="Foreground" Value="{DynamicResource TextMatch}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
     <StackPanel x:Name="RootPanel">
         <Border x:Name="Root"
-                Background="{DynamicResource BgItemSelected}"
+                Background="Transparent"
+                BorderBrush="{DynamicResource Divider}"
+                BorderThickness="0,0,0,1"
                 MinHeight="44"
                 Padding="20,0"
                 Visibility="Collapsed">
@@ -34,54 +71,28 @@
                 </ScrollViewer>
                 <Button x:Name="SaveButton"
                         Grid.Column="2"
+                        Style="{StaticResource StripLinkButton}"
                         Content="存"
-                        FontSize="12"
-                        FontFamily="{DynamicResource AppFontFamily}"
-                        Foreground="{DynamicResource TextSubtitle}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Focusable="False"
-                        Padding="8,4"
-                        VerticalAlignment="Center"
                         Margin="10,0,0,0"
-                        Cursor="Hand"
                         ToolTip="把暂存区当前全部文件存为工作集"/>
                 <Button x:Name="WorksetsButton"
                         Grid.Column="3"
+                        Style="{StaticResource StripLinkButton}"
                         Content="集"
-                        FontSize="12"
-                        FontFamily="{DynamicResource AppFontFamily}"
-                        Foreground="{DynamicResource TextSubtitle}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Focusable="False"
-                        Padding="8,4"
-                        VerticalAlignment="Center"
-                        Margin="0,0,0,0"
-                        Cursor="Hand"
                         ToolTip="工作集列表（点击展开/收起；或搜索框输入工作集名 Enter 载入）"/>
                 <Button x:Name="ClearButton"
                         Grid.Column="4"
+                        Style="{StaticResource StripLinkButton}"
                         Content="清"
-                        FontSize="12"
-                        FontFamily="{DynamicResource AppFontFamily}"
-                        Foreground="{DynamicResource TextSubtitle}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Focusable="False"
-                        Padding="8,4"
-                        VerticalAlignment="Center"
-                        Margin="0,0,0,0"
-                        Cursor="Hand"
                         ToolTip="清空未标记文件（工作集文件保留）"/>
             </Grid>
         </Border>
         <!-- 工作集行：名字+文件数，tooltip 备注与文件清单（"点开看一眼"），
              点击=载入，×=删除，整行拖拽=整组拖出。 -->
         <Border x:Name="WorksetPanel"
-                Background="{DynamicResource BgWindow}"
+                Background="Transparent"
                 BorderBrush="{DynamicResource Divider}"
-                BorderThickness="0,1,0,1"
+                BorderThickness="0,0,0,1"
                 Padding="20,4"
                 Visibility="Collapsed">
             <ScrollViewer VerticalScrollBarVisibility="Disabled"

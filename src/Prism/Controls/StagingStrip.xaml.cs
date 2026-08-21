@@ -121,7 +121,7 @@ public partial class StagingStrip : UserControl
             ToolTip = item.Path,
             Cursor = System.Windows.Input.Cursors.Hand,
         };
-        chip.SetResourceReference(Border.BackgroundProperty, "BgWindow");
+        chip.SetResourceReference(Border.BackgroundProperty, "BgItemSelected");
         chip.SetResourceReference(Border.BorderBrushProperty, "Divider");
         chip.BorderThickness = new Thickness(1);
 

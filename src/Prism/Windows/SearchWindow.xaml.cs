@@ -898,24 +898,81 @@ public partial class SearchWindow : Window
 
     /// <summary>
     /// 「存为工作集」对话框（阶段三）：起名 + 可选备注（写文件清单说不出来的
-    /// 状态/上下文）。同名覆盖需确认。存后当前全部条目转正（改标 + 落盘）。
-    /// 模态全程无 await（ShowDialog 阻塞），保持同步方法避免 CS1998 伪装异步。
+    /// 状态/上下文）。同名覆盖需确认——不用系统 MessageBox（风格割裂），改为
+    /// 对话框内两步确认：第一次点保存只提示将覆盖，按钮变「覆盖保存」。
+    /// 第一轮 bug 修复：整窗主题化（无边框圆角卡片 + AppFontFamily + 令牌色），
+    /// 与搜索卡同一视觉。模态全程无 await（ShowDialog 阻塞），保持同步方法
+    /// 避免 CS1998 伪装异步。
     /// </summary>
     private void ShowWorksetDialog()
     {
         if (_staging is null || _vm is null || _staging.Count == 0) return;
 
-        var nameInput = new System.Windows.Controls.TextBox
+        var font = (System.Windows.Media.FontFamily)Application.Current.FindResource("AppFontFamily");
+
+        System.Windows.Controls.TextBox ThemedInput(double fontSize) =>
+            new()
+            {
+                FontSize = fontSize,
+                FontFamily = font,
+                Padding = new Thickness(10, 7, 10, 7),
+                BorderThickness = new Thickness(1),
+            };
+
+        var nameInput = ThemedInput(14);
+        nameInput.SetResourceReference(System.Windows.Controls.TextBox.ForegroundProperty, "TextQuery");
+        nameInput.SetResourceReference(System.Windows.Controls.TextBox.BackgroundProperty, "BgSettingsInput");
+        nameInput.SetResourceReference(System.Windows.Controls.TextBox.BorderBrushProperty, "BorderSettingsInput");
+        var noteInput = ThemedInput(13);
+        noteInput.SetResourceReference(System.Windows.Controls.TextBox.ForegroundProperty, "TextQuery");
+        noteInput.SetResourceReference(System.Windows.Controls.TextBox.BackgroundProperty, "BgSettingsInput");
+        noteInput.SetResourceReference(System.Windows.Controls.TextBox.BorderBrushProperty, "BorderSettingsInput");
+
+        System.Windows.Controls.TextBlock Label(string text)
         {
-            FontSize = 14,
-            Padding = new Thickness(8, 6, 8, 6),
-        };
-        var noteInput = new System.Windows.Controls.TextBox
+            var label = new System.Windows.Controls.TextBlock
+            {
+                Text = text,
+                FontSize = 13,
+                FontFamily = font,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 12, 0, 5),
+            };
+            label.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextTitle");
+            return label;
+        }
+
+        var warn = new System.Windows.Controls.TextBlock
         {
-            FontSize = 13,
-            Padding = new Thickness(8, 6, 8, 6),
-            AcceptsReturn = false,
+            FontSize = 12,
+            FontFamily = font,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 10, 0, 0),
+            Visibility = Visibility.Collapsed,
         };
+        warn.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextMatch");
+
+        System.Windows.Controls.Button ThemedButton(string text, bool isDefault, bool isCancel)
+        {
+            var button = new System.Windows.Controls.Button
+            {
+                Content = text,
+                FontSize = 13,
+                FontFamily = font,
+                Padding = new Thickness(16, 7, 16, 7),
+                IsDefault = isDefault,
+                IsCancel = isCancel,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                BorderThickness = new Thickness(0),
+            };
+            button.SetResourceReference(System.Windows.Controls.Button.ForegroundProperty, "TextQuery");
+            button.SetResourceReference(System.Windows.Controls.Button.BackgroundProperty, "BgItemSelected");
+            return button;
+        }
+
+        var okButton = ThemedButton("保存", isDefault: true, isCancel: false);
+        var cancelButton = ThemedButton("取消", isDefault: false, isCancel: true);
+
         var dialog = new Window
         {
             Title = "存为工作集",
@@ -925,51 +982,73 @@ public partial class SearchWindow : Window
             Owner = this,
             ResizeMode = ResizeMode.NoResize,
             ShowInTaskbar = false,
-            WindowStyle = WindowStyle.ToolWindow,
+            WindowStyle = WindowStyle.None,
+            AllowsTransparency = true,
+            Background = System.Windows.Media.Brushes.Transparent,
         };
-        var panel = new StackPanel { Margin = new Thickness(16) };
-        panel.Children.Add(new TextBlock
+
+        var card = new Border
+        {
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(20, 16, 20, 18),
+            Margin = new Thickness(12),
+            BorderThickness = new Thickness(1),
+        };
+        card.SetResourceReference(Border.BackgroundProperty, "BgWindow");
+        card.SetResourceReference(Border.BorderBrushProperty, "Divider");
+        // 无边框窗拖动：卡片空白处按住即可移动。
+        card.MouseLeftButtonDown += (_, e) =>
+        {
+            if (e.OriginalSource is Border or System.Windows.Controls.TextBlock)
+                dialog.DragMove();
+        };
+
+        var panel = new StackPanel();
+        var intro = new System.Windows.Controls.TextBlock
         {
             Text = $"把暂存区当前 {_staging.Count} 个文件存为工作集（搜索框输入名字可召回整组）。",
             FontSize = 12,
+            FontFamily = font,
             TextWrapping = TextWrapping.Wrap,
-            Opacity = 0.7,
-            Margin = new Thickness(0, 0, 0, 10),
-        });
-        panel.Children.Add(new TextBlock
-        {
-            Text = "名字",
-            FontSize = 13,
-            FontWeight = FontWeights.SemiBold,
-            Margin = new Thickness(0, 0, 0, 4),
-        });
+            Margin = new Thickness(0, 0, 0, 2),
+        };
+        intro.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextSubtitle");
+        panel.Children.Add(intro);
+        panel.Children.Add(Label("名字"));
         panel.Children.Add(nameInput);
-        panel.Children.Add(new TextBlock
-        {
-            Text = "备注（可选；写进度/上下文这类文件名说不清的事）",
-            FontSize = 13,
-            FontWeight = FontWeights.SemiBold,
-            Margin = new Thickness(0, 10, 0, 4),
-        });
+        panel.Children.Add(Label("备注（可选；写进度/上下文这类文件名说不清的事）"));
         panel.Children.Add(noteInput);
-        var okButton = new System.Windows.Controls.Button { Content = "保存", Padding = new Thickness(16, 6, 16, 6), IsDefault = true };
-        var cancelButton = new System.Windows.Controls.Button { Content = "取消", Padding = new Thickness(16, 6, 16, 6), IsCancel = true };
+        panel.Children.Add(warn);
         var buttons = new StackPanel
         {
             Orientation = System.Windows.Controls.Orientation.Horizontal,
             HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
-            Margin = new Thickness(0, 14, 0, 0),
+            Margin = new Thickness(0, 16, 0, 0),
         };
         buttons.Children.Add(okButton);
         buttons.Children.Add(cancelButton);
         cancelButton.Margin = new Thickness(8, 0, 0, 0);
         panel.Children.Add(buttons);
-        dialog.Content = panel;
+        card.Child = panel;
+        dialog.Content = new Border { Child = card }; // 外层占位让圆角在透明窗里有呼吸边距
 
         var confirmed = false;
+        var overwriteArmed = false;
         okButton.Click += (_, _) =>
         {
-            if (string.IsNullOrWhiteSpace(nameInput.Text)) return;
+            var name = nameInput.Text.Trim();
+            if (string.IsNullOrWhiteSpace(name)) return;
+            var existing = _staging.Find(name);
+            if (existing is not null && !overwriteArmed)
+            {
+                // 同名覆盖是破坏性动作（旧成员列表被替换）：第一次点只提示，
+                // 再点才执行。不弹系统对话框（与软件风格割裂）。
+                overwriteArmed = true;
+                warn.Text = $"已存在同名工作集「{name}」（{existing.Paths.Count} 个文件），再次点击将覆盖其记录。";
+                warn.Visibility = Visibility.Visible;
+                okButton.Content = "覆盖保存";
+                return;
+            }
             confirmed = true;
             dialog.Close();
         };
@@ -977,21 +1056,12 @@ public partial class SearchWindow : Window
         dialog.ShowDialog();
         if (!confirmed) return;
 
-        var name = nameInput.Text.Trim();
+        var finalName = nameInput.Text.Trim();
         var note = string.IsNullOrWhiteSpace(noteInput.Text) ? null : noteInput.Text.Trim();
 
-        // 同名覆盖是破坏性动作（旧成员列表被替换）：先行确认。
-        if (_staging.Find(name) is not null
-            && MessageBox.Show(
-                $"已存在同名工作集「{name}」，覆盖其 {_staging.Find(name)!.Paths.Count} 个文件的记录？",
-                "Prism · 覆盖工作集",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Question) != MessageBoxResult.Yes)
-            return;
-
-        _staging.SaveAsWorkset(name, note);
+        _staging.SaveAsWorkset(finalName, note);
         if (_vm.State.Mode == PanelMode.Results)
-            _vm.State.StatusMessage = $"已存为工作集「{name}」（{_staging.Count} 个文件）";
+            _vm.State.StatusMessage = $"已存为工作集「{finalName}」（{_staging.Count} 个文件）";
     }
 
     /// <summary>
