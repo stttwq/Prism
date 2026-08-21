@@ -53,6 +53,15 @@ public sealed class SearchViewModel
     public event Action? HideRequested;
 
     /// <summary>
+    /// 复审 M1（2026-08-21）：copy_to/move_to 的目标文件夹选择是模态对话框，
+    /// 打开即夺走前台。键盘路径（动作面板 Enter）此前没有失活守卫——窗口在
+    /// 对话框后面自行隐藏并清空查询。窗口侧订阅这对事件，在弹窗期间挂起
+    /// 失活隐藏（与右键菜单路径的守卫同一纪律）。
+    /// </summary>
+    public event Action? ModalPickStarted;
+    public event Action? ModalPickEnded;
+
+    /// <summary>
     /// 查询从非空变为空时请求释放空闲内存（由 SearchWindow 订阅）。
     /// 清空查询会丢弃结果引用，但 GC 只在窗口隐藏时跑——这里让窗口在 idle 时
     /// 额外做一次轻量回收，避免反复搜索后工作集只涨不降。
@@ -600,7 +609,16 @@ public sealed class SearchViewModel
         // copy_to/move_to：弹出文件夹选择器。
         if (action.Id is "copy_to" or "move_to")
         {
-            var destination = PickDestinationFolder();
+            ModalPickStarted?.Invoke();
+            string? destination;
+            try
+            {
+                destination = PickDestinationFolder();
+            }
+            finally
+            {
+                ModalPickEnded?.Invoke();
+            }
             if (destination is null)
             {
                 // 用户取消了，不报错。

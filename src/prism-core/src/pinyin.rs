@@ -1079,6 +1079,27 @@ fn match_tokens_mixed(tokens: &[Token], query: &[u8]) -> Option<PinyinMatch> {
 mod tests {
     use super::*;
 
+    /// 复审 L3（2026-08-21）：encode_tokens 的词表分支按 readings.len() 索引
+    /// `chars[index + offset]`——词表条目一旦出现「字数 ≠ 读音数」（未来的
+    /// 手工编辑），首个含该词的文件名即越界 panic（release 下 abort 整个
+    /// 索引服务）。锚死不变量：改词表必过此测试（词表变更本就要求
+    /// PINYIN_DICTIONARY_VERSION bump）。
+    #[test]
+    fn phrases_table_char_count_matches_readings_count() {
+        for (phrase, readings) in PHRASES {
+            assert_eq!(
+                phrase.chars().count(),
+                readings.len(),
+                "PHRASES 条目「{phrase}」字数({})必须等于读音数({})，否则 encode_tokens 越界",
+                phrase.chars().count(),
+                readings.len(),
+            );
+            for reading in *readings {
+                assert!(!reading.is_empty(), "PHRASES 条目「{phrase}」不得有空读音");
+            }
+        }
+    }
+
     #[test]
     fn fixed_query_contract() {
         let cases = [

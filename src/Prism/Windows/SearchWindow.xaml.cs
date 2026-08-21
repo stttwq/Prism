@@ -181,6 +181,20 @@ public partial class SearchWindow : Window
             }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         };
         vm.State.PropertyChanged += OnStateChanged;
+        // 复审 M1（2026-08-21）：copy_to/move_to 的模态文件夹选择器夺走前台时，
+        // 挂起失活隐藏——否则窗口在对话框后面隐藏并清空查询/结果。与右键
+        // 菜单动作行的守卫（_contextMenuActionPending + 延时释放）同一纪律。
+        vm.ModalPickStarted += () =>
+        {
+            _contextMenuActionPending = true;
+            _ignoreDeactivate = true;
+        };
+        vm.ModalPickEnded += () =>
+        {
+            _contextMenuActionPending = false;
+            if (!_contextMenuOpen)
+                ReleaseDeactivateGuardAfterDelay();
+        };
         vm.RootRejected += rejection =>
         {
             // BeginInvoke 而非 Invoke：后台线程触发的 Invalidate 不能阻塞等待 UI，

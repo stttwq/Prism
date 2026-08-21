@@ -13,7 +13,7 @@
 //!   失效静默跳过。
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use crate::persistence::{
     AliasData, AliasEntry, VersionedEnvelope, ALIAS_MAX_WORD_CHARS, ALIAS_MAX_WORDS_PER_TARGET,
@@ -25,6 +25,11 @@ const ALIAS_FILE: &str = "aliases-v1.json";
 pub struct AliasStore {
     path: PathBuf,
     state: RwLock<AliasData>,
+    /// M2（复审 2026-08-21）：串行化 persist 的写盘段。set/delete 在
+    /// spawn_blocking 里可并发，共享同一个 `aliases-v1.json.tmp` 无锁交错会
+    /// 写出撕裂的 JSON 并被 atomic_replace 装上——load 侧吞掉解析失败，
+    /// 别名整表静默清零。快照在锁内取：磁盘顺序与内存最后写入对齐。
+    persist_lock: Mutex<()>,
 }
 
 /// set/delete 的结果：Ok 语义给协议层回执；Err 是校验/持久化失败。
@@ -51,6 +56,7 @@ impl AliasStore {
         Self {
             path,
             state: RwLock::new(AliasData { entries }),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -160,6 +166,12 @@ impl AliasStore {
     }
 
     fn persist(&self) -> Result<(), String> {
+        // M2：写盘段整体串行化，快照在锁内取——并发 set/delete 的持久化
+        // 不再共享同一个 tmp 名交错写。
+        let _guard = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = self
             .state
             .read()

@@ -328,6 +328,20 @@ fn zip_with_external(
 /// `validate_zip_request` 拦截。
 #[cfg(windows)]
 fn zip_with_shell_com(source: &str, output: &str) -> Result<ShellOutcome, ShellError> {
+    // M1（复审 2026-08-21）：失败清理外壳。validate_zip_request 只拒「已存在」
+    // 的输出——空 zip 写下之后任何一步失败（CoCreateInstance/NameSpace/
+    // CopyHere）都会把 22 字节残骸留在磁盘，后续同路径重试永远 Conflict，
+    // 直到用户手删。validate 保证走到这里时 output 是本函数自己创建的，
+    // 删除只清自己的产物。
+    let result = zip_with_shell_com_inner(source, output);
+    if result.is_err() {
+        let _ = std::fs::remove_file(output);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn zip_with_shell_com_inner(source: &str, output: &str) -> Result<ShellOutcome, ShellError> {
     use windows::core::{BSTR, VARIANT};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 

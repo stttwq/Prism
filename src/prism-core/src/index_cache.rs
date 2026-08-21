@@ -290,7 +290,13 @@ pub(crate) fn validate_before_save(state: &IndexState) -> Result<(), String> {
         while (record as usize) < volume.nodes.len() {
             let slot = &volume.nodes[record as usize];
             if record != root_record && slot.flags & crate::hierarchy::FLAG_PRESENT != 0 {
-                volume.path_for(record)?;
+                // M1（复审 2026-08-21）：与 load 侧 validate 同口径——祖先链上
+                // 任意墓碑（USN 重放中间态）容忍跳过，其余 path_for 错误硬拒。
+                if let Err(reason) = volume.path_for(record) {
+                    if !reason.starts_with("missing parent record") {
+                        return Err(reason);
+                    }
+                }
             }
             record = record.saturating_add(stride as u32);
         }

@@ -672,7 +672,17 @@ impl VolumeIndex {
                 continue;
             }
             self.name_at(slot.name_off)?;
-            self.path_for(record as u32)?;
+            // M1（复审 2026-08-21）：祖先链上**任意**墓碑都是 USN 重放的合法
+            // 中间态（目录删除记录先于后代删除记录到达/落盘）。直接父墓碑
+            // 上方已容忍；隔代墓碑曾走 path_for 报错——save 侧只抽 1% 节点，
+            // 该状态可被写进缓存，load 侧全量校验却拒绝它，缓存从此永久
+            // 不可装载（每次重启全量重建）。path_for 的其余错误（记录越界/
+            // 父环/超深）仍按损坏硬拒。
+            match self.path_for(record as u32) {
+                Ok(_) => {}
+                Err(reason) if reason.starts_with("missing parent record") => continue,
+                Err(reason) => return Err(reason),
+            }
         }
         Ok(())
     }
@@ -2190,6 +2200,39 @@ mod tests {
         volume.nodes[10].parent_record = 5;
         volume.nodes[10].name_off = 999;
         assert!(volume.validate().is_err());
+    }
+
+    /// M1（复审 2026-08-21）：祖先链上的**隔代**墓碑是 USN 重放的合法中间态
+    /// （目录删除先落、后代删除未到）——validate 与 save 侧抽样都不得拒绝，
+    /// 否则该状态写进缓存后每次启动全量重建。直接父墓碑容忍是既有行为。
+    #[test]
+    fn m1_validate_tolerates_tombstoned_ancestor_at_any_depth() {
+        let mut volume = volume(); // 根=5
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
+        volume.upsert(frn(11, 1), frn(10, 1), "child", true).unwrap();
+        volume.upsert(frn(12, 1), frn(11, 1), "grandchild.txt", false).unwrap();
+
+        // 直接父墓碑：record 12 的父 11 已删（既有容忍行为）。
+        volume.nodes[11].flags &= !FLAG_PRESENT;
+        assert!(volume.validate().is_ok());
+        assert!(crate::index_cache::validate_before_save(&IndexState {
+            volumes: vec![volume.clone()],
+            generation: 1,
+            events_since_checkpoint: 0,
+        })
+        .is_ok());
+
+        // 隔代墓碑：父 11 在位、祖父 10 已删——record 12 的 path_for 会撞上
+        // 墓碑祖先，修复前 validate 拒绝（缓存永久不可装载）。
+        volume.nodes[11].flags |= FLAG_PRESENT;
+        volume.nodes[10].flags &= !FLAG_PRESENT;
+        assert!(volume.validate().is_ok());
+        assert!(crate::index_cache::validate_before_save(&IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        })
+        .is_ok());
     }
 
     #[test]

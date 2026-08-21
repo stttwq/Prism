@@ -132,10 +132,20 @@ impl ShellExecutor {
         let worker = self.clone();
         tokio::task::spawn_blocking(move || {
             let (result, receiver) = mpsc::channel();
+            // M1：同 execute_blocking——满队列立即报错，不无限停泊 blocking 线程。
             worker
                 .sender
-                .send(WorkerMessage::ScanApps(result))
-                .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker is closed"))?;
+                .try_send(WorkerMessage::ScanApps(result))
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => ShellError::new(
+                        ShellErrorKind::System,
+                        "shell worker queue is saturated (worker stuck on a modal operation?)",
+                    ),
+                    mpsc::TrySendError::Disconnected(_) => ShellError::new(
+                        ShellErrorKind::System,
+                        "Shell worker is closed",
+                    ),
+                })?;
             // M4：清单扫描解析数百个 .lnk 可合法耗时，给满慢预算防挂死。
             receiver
                 .recv_timeout(std::time::Duration::from_secs(300))
@@ -180,13 +190,27 @@ impl ShellExecutor {
         // 失败），worker 仍可服务后续动作。预算在 move 前取好。
         let budget = sta_wait_budget(&operation);
         let (result, receiver) = mpsc::channel();
+        // M1（复审 2026-08-21）：入队用 try_send。阻塞 send 在队列满（容量
+        // 全是超时弃单留下的积压，worker 已被模态页挂住）时无限停泊调用方
+        // 的 spawn_blocking 线程——recv_timeout 的预算根本轮不到生效，反复
+        // 动作可耗尽 blocking 池。满队列时 worker 本就卡死，立即报错让调用
+        // 方看到真相比无限等待正确。
         self.sender
-            .send(WorkerMessage::Execute(WorkItem {
+            .try_send(WorkerMessage::Execute(WorkItem {
                 operation,
                 cancelled,
                 result,
             }))
-            .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker is closed"))?;
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ShellError::new(
+                    ShellErrorKind::System,
+                    "shell worker queue is saturated (worker stuck on a modal operation?)",
+                ),
+                mpsc::TrySendError::Disconnected(_) => ShellError::new(
+                    ShellErrorKind::System,
+                    "Shell worker is closed",
+                ),
+            })?;
         receiver
             .recv_timeout(budget)
             .map_err(|_| {
@@ -218,11 +242,14 @@ fn sta_wait_budget(operation: &ShellOperation) -> std::time::Duration {
 
 impl Drop for ShellExecutor {
     fn drop(&mut self) {
-        let _ = self.sender.send(WorkerMessage::Shutdown);
+        // M1（复审 2026-08-21）：不再 join。worker 被模态页/死网络路径挂住时
+        // join 会让 broker 的退出路径无限阻塞；Drop 只在进程退出（最后一个
+        // Arc 释放）时到达， detach 由进程终结统一收拾，等待没有价值。
+        // Shutdown 也用 try_send：队列被弃单填满时阻塞 send 等于把挂死从
+        // join 挪回 send。
+        let _ = self.sender.try_send(WorkerMessage::Shutdown);
         if let Ok(mut join) = self.join.lock() {
-            if let Some(handle) = join.take() {
-                let _ = handle.join();
-            }
+            drop(join.take());
         }
     }
 }

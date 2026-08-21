@@ -187,13 +187,15 @@ pub(crate) fn rename(target: &ActionTarget, new_name: &str) -> Result<ShellOutco
         ));
     }
 
-    // 检查新文件名是否与当前 leaf name 相同（不区分大小写）。
+    // 检查新文件名是否与当前 leaf name 完全相同（区分大小写）。
     // IFileOperation 在源=目标时返回 E_INVALIDARG (0x80070057)，提前拦截给出可读错误。
+    // 复审 L3（2026-08-21）：仅大小写不同的重命名在 Windows 上合法（Explorer
+    // 常态操作），eq_ignore_ascii_case 会把它误拒；字节相同才是 E_INVALIDARG。
     if let Some(current_leaf) = std::path::Path::new(&target.value)
         .file_name()
         .and_then(|n| n.to_str())
     {
-        if current_leaf.eq_ignore_ascii_case(trimmed) {
+        if current_leaf == trimmed {
             return Err(ShellError::new(
                 ShellErrorKind::TargetInvalid,
                 "新文件名与当前文件名相同",
@@ -343,16 +345,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn rename_rejects_same_name_case_insensitive() {
+    fn rename_rejects_identical_name_but_allows_case_only() {
         let target = ActionTarget::new(TargetKind::File, r"C:\temp\test.txt");
-        // 完全相同
+        // 字节完全相同：E_INVALIDARG 前置拦截。
         let err = rename(&target, "test.txt").unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("相同"));
-        // 大小写不同但名字相同
-        let err = rename(&target, "TEST.TXT").unwrap_err();
-        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
-        assert!(err.message.contains("相同"));
+        // 复审 L3（2026-08-21）：仅大小写不同在 Windows 上是合法重命名，
+        // 不得被「相同」预检误拒——用必然不存在的路径锚定：预检放行后
+        // 错误只能来自后续的 shell item 解析，消息里没有「相同」。
+        let absent = ActionTarget::new(TargetKind::File, r"C:\prism-rename-l3\test.txt");
+        let err = rename(&absent, "TEST.TXT").unwrap_err();
+        assert!(
+            !err.message.contains("相同"),
+            "case-only rename 不得被相同预检拒绝"
+        );
     }
 
     #[cfg(windows)]

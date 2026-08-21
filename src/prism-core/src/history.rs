@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +52,7 @@ pub struct HistoryWeight {
     pub last_used_utc: u64,
 }
 
+#[derive(Debug)]
 enum HistoryFileError {
     NotFound,
     Corrupt,
@@ -172,6 +173,17 @@ pub struct HistoryStore {
     /// G4（FRESH-AUDIT-2）：写盘节流。动作历史每条记录都全量 JSON+fsync 太密——
     /// 连续动作只落一次盘，脏数据由下一次到期写入或 Drop 兜底（丢失窗口 ≤ 节流间隔）。
     persist_gate: Mutex<HistoryPersistGate>,
+    /// H1（复审 2026-08-21）：persist 写盘段（临时文件 create/write/fsync/replace）
+    /// 的串行化锁。G4 门只串行化**决策**：record 走 spawn_blocking、定时冲刷在
+    /// 独立线程，两次 ≥250ms 间隔的判定仍可能在 I/O 上重叠（首个 fsync 被慢盘/
+    /// AV 拖住时），共享同一个 `history-v2.json.tmp` 交错写会产出撕裂 JSON 并被
+    /// atomic_replace 装上——下次启动解析失败整表隔离丢弃。持锁后 250ms 节流下
+    /// 实际不存在竞争等待。
+    persist_lock: Mutex<()>,
+    /// M2（复审 2026-08-21）：clear() 的代际号。record/冲刷线程在决策落盘时
+    /// 快照代际，persist 前复核——clear 已发生则放弃，防止在飞的旧快照把
+    /// 刚清空的历史文件复活。
+    epoch: AtomicU64,
 }
 
 /// G4: 节流间隔。动作通常成串发生（连续打开/定位），首条立即落盘，
@@ -212,6 +224,8 @@ impl HistoryStore {
             diagnostic: RwLock::new(diagnostic),
             weights_cache: Mutex::new(None),
             persist_gate: Mutex::new(HistoryPersistGate::default()),
+            persist_lock: Mutex::new(()),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -235,19 +249,10 @@ impl HistoryStore {
                     return;
                 };
                 // 只读判定：到期且（有真实变更留下的）脏标记才 clone+persist。
+                // M2：代际在判定前快照，persist 侧复核——clear 夹在中间时放弃。
+                let captured_epoch = store.epoch.load(Ordering::Acquire);
                 if store.persist_if_due_and_dirty() {
-                    // M2（复审 2026-08-21）：clone 在读锁内（纯 memcpy），锁释放
-                    // 后再 persist——编码+写盘+fsync+ReplaceFileW 曾整段持读锁，
-                    // record 写者与 async 线程上的 score() 会被一次慢盘 fsync
-                    // 拖住（与 record_at 的锁外 persist 同一纪律）。
-                    let snapshot = store
-                        .state
-                        .read()
-                        .ok()
-                        .map(|state| state.entries.clone());
-                    if let Some(entries) = snapshot {
-                        let _ = persist(&store.path, entries);
-                    }
+                    let _ = store.persist_snapshot(captured_epoch);
                 }
             });
     }
@@ -268,6 +273,13 @@ impl HistoryStore {
     }
 
     pub fn clear(&self) -> Result<(), String> {
+        // M2：与 persist_snapshot 同一把锁——clear 与在飞落盘互斥。否则 clear
+        // 可以插进「代际检查通过 → 快照读取完成」之间：旧快照随后写回磁盘，
+        // 已清空的历史复活。锁序恒为 persist_lock → state，与 persist 一致。
+        let _persist = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self
             .state
             .write()
@@ -291,6 +303,9 @@ impl HistoryStore {
         if let Ok(mut gate) = self.persist_gate.lock() {
             *gate = HistoryPersistGate::default();
         }
+        // M2：代际 +1——所有在飞（已快照代际、尚未落盘）的 persist 就此作废，
+        // 不把 clear 前的旧快照写回磁盘复活已清空的历史。
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -319,6 +334,8 @@ impl HistoryStore {
         if !self.is_enabled() || !is_recordable(target) {
             return Ok(());
         }
+        // M2：代际在变更前快照——落盘前复核，clear 夹在中间则放弃。
+        let captured_epoch = self.epoch.load(Ordering::Acquire);
         // 锁内：内存更新 + 仅超容量时 prune。JSON 编码 + fsync 出锁后执行，
         // 避免写锁持有期间阻塞所有搜索的 score()/weights() 读操作。
         // （审计 P3+M3：参考 Everything "数据库全驻内存、退出才写盘" 的思路——
@@ -373,17 +390,41 @@ impl HistoryStore {
         if let Ok(mut cache) = self.weights_cache.lock() {
             *cache = None;
         }
-        // G4 写盘节流：锁外判定 + 到期才 clone 全量条目并落盘（首条立即落盘）。
+        // G4 写盘节流：锁外判定 + 到期才落盘（首条立即落盘）。
         if !self.should_persist_now() {
             return Ok(());
         }
-        let snapshot = {
-            let Ok(state) = self.state.read() else {
-                return Ok(());
-            };
-            state.entries.clone()
-        };
-        persist(&self.path, snapshot)
+        self.persist_snapshot(captured_epoch)
+    }
+
+    /// H1+M2（复审 2026-08-21）：唯一的落盘入口。persist_lock 串行化写盘段
+    /// （防共享 tmp 名交错撕裂）；落盘前复核代际（clear 已发生则放弃，防复活）。
+    /// clone 在读锁内（纯 memcpy），锁释放后再 persist——编码+写盘+fsync+
+    /// ReplaceFileW 绝不持 state 锁（record 写者与 async 线程的 score() 不被
+    /// 一次慢盘 fsync 拖住）。
+    fn persist_snapshot(&self, captured_epoch: u64) -> Result<(), String> {
+        let _guard = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.epoch.load(Ordering::Acquire) != captured_epoch {
+            // 二轮复核 LOW：决策侧已把门上的脏标记消费掉，这里放弃落盘会让
+            // 「clear 后立刻到达的新 record」（内存新于磁盘）既不落盘也不置脏，
+            // Drop/定时冲刷都不再收敛。重新置脏交回下一拍。
+            if let Ok(mut gate) = self.persist_gate.lock() {
+                gate.dirty = true;
+            }
+            return Ok(());
+        }
+        let snapshot = self
+            .state
+            .read()
+            .ok()
+            .map(|state| state.entries.clone());
+        match snapshot {
+            Some(entries) => persist(&self.path, entries),
+            None => Ok(()),
+        }
     }
 
     /// G4: 到期判定并记账（record 路径：先改内存再调这里，置脏合理）。
@@ -760,6 +801,66 @@ mod tests {
             kind: "file".into(),
             value: value.into(),
         }
+    }
+
+    /// M2（复审 2026-08-21）：clear 之后，在飞的 persist（clear 前快照的代际）
+    /// 必须放弃落盘——旧快照写回会复活已清空的历史文件。
+    #[test]
+    fn clear_aborts_in_flight_persist() {
+        let dir = test_dir("clear-abort");
+        let store = HistoryStore::load_at(&dir, true, 1_000_000);
+        store
+            .record_at(&target("C:\\gone.txt"), HistoryUse::Execute, None, 1_000_000)
+            .unwrap();
+        assert!(store.path.exists(), "首条 record 立即落盘");
+        // 模拟在飞路径：快照代际 → clear → persist。
+        let captured = store.epoch.load(Ordering::Acquire);
+        store.clear().unwrap();
+        assert!(!store.path.exists());
+        store.persist_snapshot(captured).unwrap();
+        assert!(
+            !store.path.exists(),
+            "clear 后在飞 persist 必须放弃，不得复活历史文件"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// H1（复审 2026-08-21）：并发 persist_snapshot 全部经 persist_lock 串行化——
+    /// 收敛后文件可解析、无 .tmp 残留（共享 tmp 名的交错写曾可产出撕裂 JSON
+    /// 并被 atomic_replace 装上，下次启动整表隔离丢弃）。
+    #[test]
+    fn concurrent_persists_are_serialized_and_leave_no_torn_file() {
+        let dir = test_dir("persist-race");
+        let store = Arc::new(HistoryStore::load_at(&dir, true, 1_000_000));
+        for index in 0..16u64 {
+            store
+                .record_at(
+                    &target(format!("C:\\f{index}.txt")),
+                    HistoryUse::Execute,
+                    None,
+                    1_000_000 + index,
+                )
+                .unwrap();
+        }
+        let captured = store.epoch.load(Ordering::Acquire);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                store.persist_snapshot(captured).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let entries =
+            read_history_file(&store.path, 1_000_016).expect("历史文件必须保持可解析");
+        assert_eq!(entries.len(), 16);
+        assert!(
+            !dir.join(format!("{HISTORY_FILE}.tmp")).exists(),
+            "临时文件必须被 replace 消费干净"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
