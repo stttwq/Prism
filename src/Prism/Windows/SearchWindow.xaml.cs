@@ -37,6 +37,10 @@ public partial class SearchWindow : Window
     private ActionHotkeyTable _actionHotkeys = ActionHotkeyTable.Empty;
     private bool _suppressQueryEvent;
     private bool _hiding;
+    /// <summary>OLE 拖出进行中（2026-08-22 拖拽计划）：失焦隐藏闸的第六守卫。
+    /// 拖拽是阻塞式嵌套消息循环，期间激活变更被此闸挡下；结束后由
+    /// DragOutFinished 复核补判。</summary>
+    private bool _isDragging;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
     private bool _ignoreDeactivate;
     private bool _contextMenuOpen;
@@ -111,6 +115,22 @@ public partial class SearchWindow : Window
         _scope.Changed += OnScopeChanged;
         Results.SelectedIndexChanged += OnResultsSelected;
         Results.ContextMenuRequested += OnContextMenuRequested;
+        Results.DragOutStarted += () => _isDragging = true;
+        Results.DragOutFinished += () =>
+        {
+            _isDragging = false;
+            // 嵌套消息循环期间的激活变更被 isDragging 挡下且松手后不会重发——
+            // 不补判的话，拖到外部程序上松手后 Prism 会残留可见（违反验收 1.6-5）。
+            // 拖回本窗口取消/落点在自身时仍持有激活，不隐藏。
+            if (!IsActive && SearchWindowFocusPolicy.ShouldHide(
+                    _ignoreDeactivate,
+                    _contextMenuOpen,
+                    _contextMenuActionPending,
+                    IsPinned,
+                    _hiding,
+                    _isDragging))
+                HideAnimated();
+        };
         Results.ItemInvoked += async r =>
         {
             if (_vm is null) return;
@@ -476,7 +496,8 @@ public partial class SearchWindow : Window
                 _contextMenuOpen,
                 _contextMenuActionPending,
                 IsPinned,
-                _hiding))
+                _hiding,
+                _isDragging))
             return;
         HideAnimated();
     }
@@ -490,7 +511,7 @@ public partial class SearchWindow : Window
         // ShowAndFocus 在 Show() 之前设 _ignoreDeactivate=true，300ms 后才释放，
         // 此期间 Topmost 切换可能触发本回调，此时访问 WindowInteropHelper.Handle
         // 会强制创建未完成的 HwndSource，导致 coreclr.dll Access Violation。
-        if (_ignoreDeactivate || _hiding) return;
+        if (_ignoreDeactivate || _hiding || _isDragging) return;
         if (!IsVisible) return;
         if (hwnd != IntPtr.Zero && hwnd == _hwnd) return;
         if (!SearchWindowFocusPolicy.ShouldHide(
@@ -498,7 +519,8 @@ public partial class SearchWindow : Window
                 _contextMenuOpen,
                 _contextMenuActionPending,
                 IsPinned,
-                _hiding))
+                _hiding,
+                _isDragging))
             return;
         HideAnimated();
     }

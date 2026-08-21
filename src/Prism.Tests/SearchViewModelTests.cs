@@ -287,6 +287,20 @@ public sealed class SearchViewModelTests
         Assert.False(SearchWindowFocusPolicy.ShouldHide(false, false, false, false, true));
     }
 
+    // 2026-08-22 拖拽阶段一：OLE 拖出进行中不隐藏——鼠标按住拖离窗口时
+    // 激活/前台变更会先于松手到达，闸不挡则拖拽中途窗口消失、拖拽断裂。
+    [Fact]
+    public void FocusLossNeverHidesWhileDragging()
+    {
+        Assert.False(SearchWindowFocusPolicy.ShouldHide(false, false, false, false, false, true));
+        // 其余守卫为假时 isDragging 单独挡；与其余守卫组合时同样挡（任一为真即不隐藏）。
+        Assert.False(SearchWindowFocusPolicy.ShouldHide(false, false, false, false, false, isDragging: true));
+        Assert.False(SearchWindowFocusPolicy.ShouldHide(true, false, false, false, false, true));
+        Assert.False(SearchWindowFocusPolicy.ShouldHide(false, true, false, true, false, true));
+        // 拖拽结束后闸恢复常规语义。
+        Assert.True(SearchWindowFocusPolicy.ShouldHide(false, false, false, false, false, false));
+    }
+
     [Fact]
     public void ProtocolReaderAcceptsOldOptionalShapeAndUnknownKind()
     {

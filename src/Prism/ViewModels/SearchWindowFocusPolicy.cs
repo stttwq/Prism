@@ -7,6 +7,8 @@ public static class SearchWindowFocusPolicy
         bool contextMenuOpen,
         bool contextMenuActionPending,
         bool isPinned,
-        bool isHiding) =>
-        !(ignoreDeactivate || contextMenuOpen || contextMenuActionPending || isPinned || isHiding);
+        bool isHiding,
+        bool isDragging = false) =>
+        !(ignoreDeactivate || contextMenuOpen || contextMenuActionPending
+          || isPinned || isHiding || isDragging);
 }
