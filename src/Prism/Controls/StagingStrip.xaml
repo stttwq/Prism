@@ -2,43 +2,89 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <!-- 暂存区条带（2026-08-22 暂存区计划）：搜索框下方、结果列表上方。
-         空态整体收起；chips 由 code-behind 重建（≤32 项，非热路径）。 -->
-    <Border x:Name="Root"
-            Background="{DynamicResource BgItemSelected}"
-            MinHeight="44"
-            Padding="20,0"
-            Visibility="Collapsed">
-        <Grid VerticalAlignment="Center">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <TextBlock x:Name="CountText"
-                       FontSize="12"
-                       FontFamily="{DynamicResource AppFontFamily}"
-                       Foreground="{DynamicResource TextSubtitle}"
-                       VerticalAlignment="Center"
-                       Margin="0,0,10,0"
-                       ToolTip="暂存区文件数"/>
-            <ScrollViewer Grid.Column="1"
-                          VerticalScrollBarVisibility="Disabled"
+         空态整体收起；chips 由 code-behind 重建（≤32 项，非热路径）。
+         工作集行（阶段三）为条带下方可展开的第二行：常驻入口做进搜索头
+         会动核心热路径视觉，这里保持条带自治。 -->
+    <StackPanel x:Name="RootPanel">
+        <Border x:Name="Root"
+                Background="{DynamicResource BgItemSelected}"
+                MinHeight="44"
+                Padding="20,0"
+                Visibility="Collapsed">
+            <Grid VerticalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="CountText"
+                           FontSize="12"
+                           FontFamily="{DynamicResource AppFontFamily}"
+                           Foreground="{DynamicResource TextSubtitle}"
+                           VerticalAlignment="Center"
+                           Margin="0,0,10,0"
+                           ToolTip="暂存区文件数"/>
+                <ScrollViewer Grid.Column="1"
+                              VerticalScrollBarVisibility="Disabled"
+                              HorizontalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="ChipPanel" Orientation="Horizontal"/>
+                </ScrollViewer>
+                <Button x:Name="SaveButton"
+                        Grid.Column="2"
+                        Content="存"
+                        FontSize="12"
+                        FontFamily="{DynamicResource AppFontFamily}"
+                        Foreground="{DynamicResource TextSubtitle}"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="8,4"
+                        VerticalAlignment="Center"
+                        Margin="10,0,0,0"
+                        Cursor="Hand"
+                        ToolTip="把暂存区当前全部文件存为工作集"/>
+                <Button x:Name="WorksetsButton"
+                        Grid.Column="3"
+                        Content="集"
+                        FontSize="12"
+                        FontFamily="{DynamicResource AppFontFamily}"
+                        Foreground="{DynamicResource TextSubtitle}"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="8,4"
+                        VerticalAlignment="Center"
+                        Margin="0,0,0,0"
+                        Cursor="Hand"
+                        ToolTip="工作集列表（点击展开/收起；或搜索框输入工作集名 Enter 载入）"/>
+                <Button x:Name="ClearButton"
+                        Grid.Column="4"
+                        Content="清"
+                        FontSize="12"
+                        FontFamily="{DynamicResource AppFontFamily}"
+                        Foreground="{DynamicResource TextSubtitle}"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="8,4"
+                        VerticalAlignment="Center"
+                        Margin="0,0,0,0"
+                        Cursor="Hand"
+                        ToolTip="清空未标记文件（工作集文件保留）"/>
+            </Grid>
+        </Border>
+        <!-- 工作集行：名字+文件数，tooltip 备注与文件清单（"点开看一眼"），
+             点击=载入，×=删除，整行拖拽=整组拖出。 -->
+        <Border x:Name="WorksetPanel"
+                Background="{DynamicResource BgWindow}"
+                BorderBrush="{DynamicResource Divider}"
+                BorderThickness="0,1,0,1"
+                Padding="20,4"
+                Visibility="Collapsed">
+            <ScrollViewer VerticalScrollBarVisibility="Disabled"
                           HorizontalScrollBarVisibility="Auto">
-                <StackPanel x:Name="ChipPanel" Orientation="Horizontal"/>
+                <StackPanel x:Name="WorksetChipPanel" Orientation="Horizontal"/>
             </ScrollViewer>
-            <Button x:Name="ClearButton"
-                    Grid.Column="2"
-                    Content="清"
-                    FontSize="12"
-                    FontFamily="{DynamicResource AppFontFamily}"
-                    Foreground="{DynamicResource TextSubtitle}"
-                    Background="Transparent"
-                    BorderThickness="0"
-                    Padding="8,4"
-                    VerticalAlignment="Center"
-                    Margin="10,0,0,0"
-                    Cursor="Hand"
-                    ToolTip="清空未标记文件（工作集文件保留）"/>
-        </Grid>
-    </Border>
+        </Border>
+    </StackPanel>
 </UserControl>

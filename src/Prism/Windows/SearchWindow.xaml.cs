@@ -196,6 +196,36 @@ public partial class SearchWindow : Window
             Staging.DragOutStarted += () => _isDragging = true;
             Staging.DragOutFinished += OnDragOutFinished;
             Staging.OpenRequested += OpenStagedFile;
+            Staging.SaveWorksetRequested += async () =>
+            {
+                _contextMenuActionPending = true;
+                _ignoreDeactivate = true;
+                try
+                {
+                    await ShowWorksetDialogAsync().ConfigureAwait(true);
+                }
+                finally
+                {
+                    _contextMenuActionPending = false;
+                    if (!_contextMenuOpen)
+                        ReleaseDeactivateGuardAfterDelay();
+                }
+            };
+            // 对话框夺走前台期间挂起失活隐藏——与别名对话框同一纪律。
+            Staging.SetStatusFeedback(msg =>
+            {
+                if (_vm is not null && _vm.State.Mode == PanelMode.Results)
+                    _vm.State.StatusMessage = msg;
+            });
+            vm.WorksetRecallRequested += name =>
+            {
+                if (Staging is null || _staging is null) return;
+                if (_staging.LoadWorkset(name))
+                {
+                    if (_vm is not null && _vm.State.Mode == PanelMode.Results)
+                        _vm.State.StatusMessage = $"已载入工作集「{name}」";
+                }
+            };
         }
         vm.HideRequested += () =>
         {
@@ -861,6 +891,103 @@ public partial class SearchWindow : Window
             StagingAddResult.Duplicate => "已在暂存区",
             _ => "暂存区已满：工作集文件不会被挤掉",
         };
+    }
+
+    /// <summary>
+    /// 「存为工作集」对话框（阶段三）：起名 + 可选备注（写文件清单说不出来的
+    /// 状态/上下文）。同名覆盖需确认。存后当前全部条目转正（改标 + 落盘）。
+    /// </summary>
+    private async Task ShowWorksetDialogAsync()
+    {
+        if (_staging is null || _vm is null || _staging.Count == 0) return;
+
+        var nameInput = new System.Windows.Controls.TextBox
+        {
+            FontSize = 14,
+            Padding = new Thickness(8, 6, 8, 6),
+        };
+        var noteInput = new System.Windows.Controls.TextBox
+        {
+            FontSize = 13,
+            Padding = new Thickness(8, 6, 8, 6),
+            AcceptsReturn = false,
+        };
+        var dialog = new Window
+        {
+            Title = "存为工作集",
+            Width = 460,
+            SizeToContent = SizeToContent.Height,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            ResizeMode = ResizeMode.NoResize,
+            ShowInTaskbar = false,
+            WindowStyle = WindowStyle.ToolWindow,
+        };
+        var panel = new StackPanel { Margin = new Thickness(16) };
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"把暂存区当前 {_staging.Count} 个文件存为工作集（搜索框输入名字可召回整组）。",
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.7,
+            Margin = new Thickness(0, 0, 0, 10),
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = "名字",
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 4),
+        });
+        panel.Children.Add(nameInput);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "备注（可选；写进度/上下文这类文件名说不清的事）",
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 10, 0, 4),
+        });
+        panel.Children.Add(noteInput);
+        var okButton = new System.Windows.Controls.Button { Content = "保存", Padding = new Thickness(16, 6, 16, 6), IsDefault = true };
+        var cancelButton = new System.Windows.Controls.Button { Content = "取消", Padding = new Thickness(16, 6, 16, 6), IsCancel = true };
+        var buttons = new StackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+            Margin = new Thickness(0, 14, 0, 0),
+        };
+        buttons.Children.Add(okButton);
+        buttons.Children.Add(cancelButton);
+        cancelButton.Margin = new Thickness(8, 0, 0, 0);
+        panel.Children.Add(buttons);
+        dialog.Content = panel;
+
+        var confirmed = false;
+        okButton.Click += (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(nameInput.Text)) return;
+            confirmed = true;
+            dialog.Close();
+        };
+        dialog.Loaded += (_, _) => { nameInput.Focus(); };
+        dialog.ShowDialog();
+        if (!confirmed) return;
+
+        var name = nameInput.Text.Trim();
+        var note = string.IsNullOrWhiteSpace(noteInput.Text) ? null : noteInput.Text.Trim();
+
+        // 同名覆盖是破坏性动作（旧成员列表被替换）：先行确认。
+        if (_staging.Find(name) is not null
+            && MessageBox.Show(
+                $"已存在同名工作集「{name}」，覆盖其 {_staging.Find(name)!.Paths.Count} 个文件的记录？",
+                "Prism · 覆盖工作集",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question) != MessageBoxResult.Yes)
+            return;
+
+        _staging.SaveAsWorkset(name, note);
+        if (_vm.State.Mode == PanelMode.Results)
+            _vm.State.StatusMessage = $"已存为工作集「{name}」（{_staging.Count} 个文件）";
     }
 
     /// <summary>

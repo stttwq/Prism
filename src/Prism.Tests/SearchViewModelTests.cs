@@ -30,6 +30,56 @@ public sealed class SearchViewModelTests
         Assert.DoesNotContain(state.Results, item => item.ResultKind == SearchResultKind.More);
     }
 
+    // ── 工作集名字召回（2026-08-22 计划阶段三）────────────────────────
+
+    [Fact]
+    public async Task ExactWorksetNameQueryInjectsRecallRowAtTopAndEnterRaisesEvent()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("8月报告", false, 1, Result("alpha")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var staging = new StagingArea();
+        staging.Restore([], [new WorksetEntry("8月报告", "还差一张图", ["C:\\a.docx"])], null);
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler(), staging: staging);
+
+        vm.OnQueryChanged("8月报告");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 2);
+
+        var recall = state.Results[0];
+        Assert.Equal("workset", recall.Kind);
+        Assert.Equal("8月报告", recall.Title);
+        Assert.Equal("workset:8月报告", recall.RowKey);
+        // 后端文件结果仍在其后；默认选中第 0 行 = 合成行。
+        Assert.Equal("alpha", state.Results[1].Title);
+        Assert.Equal(0, state.SelectedIndex);
+
+        string? recalled = null;
+        vm.WorksetRecallRequested += name => recalled = name;
+        await vm.ExecuteSelectedAsync();
+        Assert.Equal("8月报告", recalled);
+        // 载入后窗口不隐藏：HideRequested 不触发（用状态佐证——无断言手段，仅行为不炸）。
+    }
+
+    [Fact]
+    public async Task NonExactWorksetNameQueryInjectsNothing()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("8月", false, 1, Result("alpha")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var staging = new StagingArea();
+        staging.Restore([], [new WorksetEntry("8月报告", null, ["C:\\a.docx"])], null);
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler(), staging: staging);
+
+        vm.OnQueryChanged("8月");
+        timers.Input.Fire();
+        await Eventually(() => state.Results.Count == 1);
+        Assert.Equal("alpha", state.Results[0].Title);
+        Assert.All(state.Results, r => Assert.NotEqual("workset", r.Kind));
+    }
+
     [Fact]
     public async Task CompletePrefixGrowthUsesCacheButTruncatedAndDeletionDoNot()
     {

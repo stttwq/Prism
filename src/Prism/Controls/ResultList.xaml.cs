@@ -442,6 +442,15 @@ public partial class ResultList : UserControl
                 continue;
             }
 
+            // 工作集合成行（阶段三）：ExecuteId 是名字不是路径，不查文件图标——
+            // 用内置文件夹矢量图（与 more 行同 DrawingImage 手法）。
+            if (item.Kind == "workset")
+            {
+                icon.Tag = "workset";
+                icon.Source = WorksetIcon();
+                continue;
+            }
+
             // "window" carries an enumeration token, not a path — asking the shell for an
             // icon from it would just fail per row.
             if (item.Kind == "web")
@@ -518,6 +527,29 @@ public partial class ResultList : UserControl
         var img = new DrawingImage(group);
         if (img.CanFreeze) img.Freeze();
         _moreIcon = img;
+        return img;
+    }
+
+    private ImageSource? _worksetIcon;
+
+    /// <summary>工作集合成行图标：暖色文件夹（DrawingImage，主题无关）。</summary>
+    private ImageSource WorksetIcon()
+    {
+        if (_worksetIcon is not null) return _worksetIcon;
+
+        var folder = Freeze(new SolidColorBrush(Color.FromRgb(0xD9, 0xA5, 0x4B)));
+        var flap = Freeze(new SolidColorBrush(Color.FromRgb(0xC2, 0x8E, 0x39)));
+
+        var group = new DrawingGroup();
+        using (var ctx = group.Open())
+        {
+            ctx.DrawRoundedRectangle(flap, null, new Rect(3, 6, 11, 6), 1.5, 1.5);
+            ctx.DrawRoundedRectangle(folder, null, new Rect(3, 9, 26, 17), 2, 2);
+        }
+        if (group.CanFreeze) group.Freeze();
+        var img = new DrawingImage(group);
+        if (img.CanFreeze) img.Freeze();
+        _worksetIcon = img;
         return img;
     }
 

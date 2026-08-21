@@ -79,9 +79,10 @@ public partial class App : Application
         _favicons = new FaviconCache(_store.DataDir);
         _stagingStore = new StagingStore(_store.DataDir);
         _staging = new StagingArea { Capacity = settings.StagingCapacity };
-        _staging.Restore(_stagingStore.Load().Items);
+        var stagingFile = _stagingStore.Load();
+        _staging.Restore(stagingFile.Items, stagingFile.Worksets, stagingFile.ActiveWorkset);
         _staging.Changed += () => _stagingStore!.Save(
-            _staging!.Items, Array.Empty<WorksetEntry>(), null);
+            _staging!.Items, _staging!.Worksets, _staging!.ActiveWorkset);
         _stagingAddHotkey = settings.StagingAddHotkey;
 
         _autoStart = new AutoStartService();
@@ -114,7 +115,8 @@ public partial class App : Application
             _state,
             _pipe,
             activator: new Win32WindowActivator(),
-            suggestions: new SuggestionService());
+            suggestions: new SuggestionService(),
+            staging: _staging);
         ApplySearchExclusions(settings);
         _vm.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
 

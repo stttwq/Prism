@@ -46,6 +46,9 @@ public sealed class SearchViewModel
     private IReadOnlyList<ActionItem> _allActions = Array.Empty<ActionItem>();
     /// <summary>mutation 完成后等待 generation 变化的信号源。</summary>
     private TaskCompletionSource? _mutationGenerationSignal;
+    /// <summary>暂存区（2026-08-22 计划阶段三）：工作集名字召回注入用。
+    /// 为空表示未装配，不注入合成行。</summary>
+    private readonly StagingArea? _staging;
 
     public AppState State => _state;
 
@@ -74,6 +77,13 @@ public sealed class SearchViewModel
     /// </summary>
     public event Action<RootRejection>? RootRejected;
 
+    /// <summary>
+    /// 工作集召回（阶段三）：Enter 落在 workset 合成行时触发，名字由订阅方
+    /// （SearchWindow → StagingArea.LoadWorkset）载入暂存区。窗口不隐藏——
+    /// 载入后通常要继续拖出使用。
+    /// </summary>
+    public event Action<string>? WorksetRecallRequested;
+
     private sealed record SearchCacheEntry(SearchResponse Response, SearchContext Context);
 
     public SearchViewModel(
@@ -83,12 +93,14 @@ public sealed class SearchViewModel
         ISearchScheduler? scheduler = null,
         IWindowActivator? activator = null,
         ISuggestionService? suggestions = null,
-        IFolderPicker? folderPicker = null)
+        IFolderPicker? folderPicker = null,
+        StagingArea? staging = null)
     {
         _state = state;
         _pipe = pipe;
         _activator = activator;
         _suggestions = suggestions;
+        _staging = staging;
         // P4a: 缺省保持 WinForms 对话框（照抄 ISuggestionService 的可选注入先例）。
         _folderPicker = folderPicker ?? new WinFormsFolderPicker();
         // P4c: 联想结果必须回 UI 线程写 Results；无 Application（单元测试）或已在
@@ -400,6 +412,13 @@ public sealed class SearchViewModel
             return;
         }
 
+        // 工作集合成行（阶段三）：Enter = 载入暂存区（不隐藏窗口、不经 broker）。
+        if (item.Kind == "workset")
+        {
+            WorksetRecallRequested?.Invoke(item.ExecuteId);
+            return;
+        }
+
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
         if (item.Kind == "window")
@@ -471,7 +490,8 @@ public sealed class SearchViewModel
     {
         if (_state.Mode == PanelMode.Actions) return;
         var item = _state.SelectedResult;
-        if (item is null || item.Kind is "more" or "web") return;
+        // workset 是前端合成行，没有可定位的文件系统对象。
+        if (item is null || item.Kind is "more" or "web" or "workset") return;
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
         try
@@ -950,6 +970,11 @@ public sealed class SearchViewModel
         list.AddRange(resp.Items);
         if (resp.IsTruncated)
             list.Add(SearchResult.More(query));
+        // 工作集名字召回（阶段三）：查询与工作集名完全一致时在列表头注入合成行。
+        // SearchResult.More 是前端合成行的先例——零协议改动，broker 无感知。
+        var recall = BuildWorksetRecallRow(query);
+        if (recall is not null)
+            list.Insert(0, recall);
 
         if (updateCache
             && !string.IsNullOrWhiteSpace(query)
@@ -1052,6 +1077,28 @@ public sealed class SearchViewModel
     /// 索引未建完时的提示文案。后端给出逐卷进度就显示可解释进度（G9 R4），
     /// 缺进度字段时回落到原来的等待文案，行为与旧后端一致。
     /// </summary>
+    /// <summary>查询完全命中工作集名（忽略大小写）时构造合成行；否则 null。
+    /// ExecuteId=工作集名（Enter 事件回传用），RowKey 与查询无关保稳定容器。</summary>
+    private SearchResult? BuildWorksetRecallRow(string query)
+    {
+        if (_staging is null || string.IsNullOrWhiteSpace(query)) return null;
+        foreach (var ws in _staging.Worksets)
+        {
+            if (!string.Equals(ws.Name, query, StringComparison.OrdinalIgnoreCase))
+                continue;
+            return new SearchResult(
+                Kind: "workset",
+                Title: ws.Name,
+                Subtitle: $"工作集 · {ws.Paths.Count} 个文件 · Enter 载入暂存区",
+                ExecuteId: ws.Name,
+                MatchSpans: [])
+            {
+                RowKey = "workset:" + ws.Name,
+            };
+        }
+        return null;
+    }
+
     private static string IndexingStatus(SearchResponse resp, bool hasResults)
     {
         var progress = resp.IndexProgress?.Describe();

@@ -6,10 +6,6 @@ using Prism.Models;
 
 namespace Prism.Services;
 
-/// <summary>工作集记录（2026-08-22 暂存区计划阶段三）：名字 → 路径列表 + 备注。
-/// 阶段二只随 schema 一起落盘（恒空表），模型提前定形避免文件格式中途迁移。</summary>
-public sealed record WorksetEntry(string Name, string? Note, List<string> Paths);
-
 /// <summary>
 /// 暂存区持久化：独立 staging.json，**不进 settings.json**——设置页是
 /// "载入快照、保存全量写盘"，搜索窗侧写入的暂存条目会被设置页保存整体覆盖。
