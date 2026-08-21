@@ -196,19 +196,22 @@ public partial class SearchWindow : Window
             Staging.DragOutStarted += () => _isDragging = true;
             Staging.DragOutFinished += OnDragOutFinished;
             Staging.OpenRequested += OpenStagedFile;
-            Staging.SaveWorksetRequested += async () =>
+            Staging.SaveWorksetRequested += () =>
             {
                 _contextMenuActionPending = true;
                 _ignoreDeactivate = true;
                 try
                 {
-                    await ShowWorksetDialogAsync().ConfigureAwait(true);
+                    ShowWorksetDialog();
                 }
                 finally
                 {
                     _contextMenuActionPending = false;
                     if (!_contextMenuOpen)
                         ReleaseDeactivateGuardAfterDelay();
+                    // 对话框夺走焦点后必须还给输入框，否则打字/Ctrl+D 落空。
+                    if (IsVisible && !_hiding)
+                        Header.FocusQuery();
                 }
             };
             // 对话框夺走前台期间挂起失活隐藏——与别名对话框同一纪律。
@@ -896,8 +899,9 @@ public partial class SearchWindow : Window
     /// <summary>
     /// 「存为工作集」对话框（阶段三）：起名 + 可选备注（写文件清单说不出来的
     /// 状态/上下文）。同名覆盖需确认。存后当前全部条目转正（改标 + 落盘）。
+    /// 模态全程无 await（ShowDialog 阻塞），保持同步方法避免 CS1998 伪装异步。
     /// </summary>
-    private async Task ShowWorksetDialogAsync()
+    private void ShowWorksetDialog()
     {
         if (_staging is null || _vm is null || _staging.Count == 0) return;
 

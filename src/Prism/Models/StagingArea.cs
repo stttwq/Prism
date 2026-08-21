@@ -175,7 +175,9 @@ public sealed class StagingArea
     public event Action? Changed;
 
     /// <summary>启动恢复（StagingStore.Load 的结果）；不合法条目由 store 侧过滤。
-    /// active 引用已删除的工作集时置空。</summary>
+    /// active 引用已删除的工作集时置空。
+    /// 不触发 Changed——恢复不是用户变更，落盘订阅者借此避免"损坏文件载入
+    /// 空态后立即覆写原文件"的复位窗口。</summary>
     public void Restore(IEnumerable<StagingItem> items, IReadOnlyList<WorksetEntry> worksets, string? active)
     {
         _items.Clear();
@@ -183,7 +185,6 @@ public sealed class StagingArea
         _worksets.Clear();
         _worksets.AddRange(worksets);
         _activeWorkset = Find(active) is not null ? active : null;
-        Changed?.Invoke();
     }
 
     public WorksetEntry? Find(string? name)

@@ -131,11 +131,15 @@ public partial class StagingStrip : UserControl
         chip.PreviewMouseLeftButtonDown += (_, e) =>
         {
             _dragStart.Begin(e.GetPosition(chip));
+            _openOnRelease = true;
             // 不置 Handled：不影响后续事件。
         };
         chip.MouseLeftButtonUp += (_, e) =>
         {
             _dragStart.End();
+            // 本次按下期间起过拖（拖回自身取消也算）：松手不再当"点击打开"。
+            if (!_openOnRelease) return;
+            _openOnRelease = false;
             OpenRequested?.Invoke(item.Path);
         };
         chip.MouseMove += (_, e) =>
@@ -143,6 +147,7 @@ public partial class StagingStrip : UserControl
             if (e.LeftButton != MouseButtonState.Pressed) return;
             if (!_dragStart.Exceeded(e.GetPosition(chip))) return;
             _dragStart.End();
+            _openOnRelease = false;
             // 快照路径 + 存在性过滤（原文件被删是路径引用的固有限制：不拖）。
             if (System.IO.File.Exists(item.Path) || System.IO.Directory.Exists(item.Path))
                 FileDragOut.Start(chip, [item.Path], DragOutStarted, DragOutFinished);
@@ -212,10 +217,17 @@ public partial class StagingStrip : UserControl
         chip.SetResourceReference(Border.BorderBrushProperty, "Divider");
         chip.BorderThickness = new Thickness(1);
 
-        chip.PreviewMouseLeftButtonDown += (_, e) => _wsDragStart.Begin(e.GetPosition(chip));
+        chip.PreviewMouseLeftButtonDown += (_, e) =>
+        {
+            _wsDragStart.Begin(e.GetPosition(chip));
+            _wsOpenOnRelease = true;
+        };
         chip.MouseLeftButtonUp += (_, e) =>
         {
             _wsDragStart.End();
+            // 与文件 chip 同纪律：本次按下起过拖（含拖回自身取消）就不再当点击。
+            if (!_wsOpenOnRelease) return;
+            _wsOpenOnRelease = false;
             if (_staging is not null && _staging.LoadWorkset(ws.Name) && _vmStatusFeedback is not null)
                 _vmStatusFeedback($"已载入工作集「{ws.Name}」");
         };
@@ -224,6 +236,7 @@ public partial class StagingStrip : UserControl
             if (e.LeftButton != MouseButtonState.Pressed) return;
             if (!_wsDragStart.Exceeded(e.GetPosition(chip))) return;
             _wsDragStart.End();
+            _wsOpenOnRelease = false;
             var existing = ws.Paths
                 .Where(p => System.IO.File.Exists(p) || System.IO.Directory.Exists(p))
                 .ToList();
@@ -240,4 +253,7 @@ public partial class StagingStrip : UserControl
 
     private DragOutStart _dragStart;
     private DragOutStart _wsDragStart;
+    /// <summary>本次按下尚未起过拖（松手才允许"点击打开"；起拖即置否）。</summary>
+    private bool _openOnRelease;
+    private bool _wsOpenOnRelease;
 }
