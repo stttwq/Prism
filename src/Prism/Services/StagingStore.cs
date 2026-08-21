@@ -29,10 +29,12 @@ public sealed class StagingStore
         Converters = { new JsonStringEnumConverter() },
     };
 
+    /// <summary>ActiveWorkset 已废弃（暂存区/工作集分离）：字段仅为旧文件反序列化保留，
+    /// 载入时忽略，保存恒写 null。</summary>
     public sealed record StagingFile(
         List<StagingItem> Items,
         List<WorksetEntry> Worksets,
-        string? ActiveWorkset);
+        string? ActiveWorkset = null);
 
     private readonly string _path;
 
@@ -55,8 +57,7 @@ public sealed class StagingStore
                 return new StagingFile([], [], null);
             return new StagingFile(
                 SanitizeItems(file.Items),
-                SanitizeWorksets(file.Worksets),
-                SanitizeName(file.ActiveWorkset, MaxNameLength));
+                SanitizeWorksets(file.Worksets));
         }
         catch
         {
@@ -64,10 +65,10 @@ public sealed class StagingStore
         }
     }
 
-    public void Save(IReadOnlyList<StagingItem> items, IReadOnlyList<WorksetEntry> worksets, string? activeWorkset)
+    public void Save(IReadOnlyList<StagingItem> items, IReadOnlyList<WorksetEntry> worksets)
     {
         var tmp = _path + ".tmp";
-        var file = new StagingFile([.. items], [.. worksets], activeWorkset);
+        var file = new StagingFile([.. items], [.. worksets], null);
         var json = JsonSerializer.Serialize(file, JsonOptions);
         File.WriteAllText(tmp, json, Encoding.UTF8);
         File.Move(tmp, _path, overwrite: true);

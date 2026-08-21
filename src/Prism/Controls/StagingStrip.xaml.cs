@@ -56,10 +56,7 @@ public partial class StagingStrip : UserControl
         ChipPanel.Children.Clear();
         Root.Visibility = _staging.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         CountText.Text = _staging.Count.ToString();
-        // 活跃工作集名挂计数 tooltip（角标已是真相，名字只是"当前在哪个集"提示）。
-        CountText.ToolTip = _staging.ActiveWorkset is { } active && _staging.Find(active) is { } activeEntry
-            ? $"当前工作集：{active}" + (string.IsNullOrWhiteSpace(activeEntry.Note) ? "" : $"\n备注：{activeEntry.Note}")
-            : "暂存区文件数";
+        CountText.ToolTip = "暂存区文件数（带点 = 属于某个工作集）";
         foreach (var item in _staging.Items)
             ChipPanel.Children.Add(BuildChip(item));
 

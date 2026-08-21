@@ -80,9 +80,8 @@ public partial class App : Application
         _stagingStore = new StagingStore(_store.DataDir);
         _staging = new StagingArea { Capacity = settings.StagingCapacity };
         var stagingFile = _stagingStore.Load();
-        _staging.Restore(stagingFile.Items, stagingFile.Worksets, stagingFile.ActiveWorkset);
-        _staging.Changed += () => _stagingStore!.Save(
-            _staging!.Items, _staging!.Worksets, _staging!.ActiveWorkset);
+        _staging.Restore(stagingFile.Items, stagingFile.Worksets);
+        _staging.Changed += () => _stagingStore!.Save(_staging!.Items, _staging!.Worksets);
         _stagingAddHotkey = settings.StagingAddHotkey;
 
         _autoStart = new AutoStartService();

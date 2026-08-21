@@ -84,7 +84,7 @@ public sealed class StagingPolicyTests
         var area = new StagingArea { Capacity = 0 };
         var changes = 0;
         area.Changed += () => changes++;
-        area.Restore([new StagingItem("C:\\a", null)], [], null);
+        area.Restore([new StagingItem("C:\\a", null)], []);
         Assert.Equal(StagingAddResult.Added, area.Add("C:\\b"));
         // Capacity=0 被钳为 1：加入 b 前先挤掉 a。
         Assert.Equal(["C:\\b"], area.Items.Select(i => i.Path).ToArray());
@@ -98,7 +98,7 @@ public sealed class StagingPolicyTests
     public void RemoveAndClearUnmarkedFireChangedOnlyWhenSomethingChanged()
     {
         var area = new StagingArea { Capacity = 5 };
-        area.Restore([new StagingItem("C:\\a", null), new StagingItem("C:\\b", "W")], [], null);
+        area.Restore([new StagingItem("C:\\a", null), new StagingItem("C:\\b", "W")], []);
         var changes = 0;
         area.Changed += () => changes++;
 
@@ -175,33 +175,46 @@ public sealed class StagingPolicyTests
     }
 
     [Fact]
-    public void ActiveWorksetAutoMembershipOnAddAndRemove()
+    public void AddNeverTouchesWorksetRecords_StagingAndWorksetAreSeparate()
     {
+        // 暂存区/工作集分离（第一轮 bug 修复）：Ctrl+D 只进暂存区，
+        // 无论之前载入/存为过哪个工作集，档案路径列表分毫不动。
         var area = new StagingArea { Capacity = 5 };
-        area.Restore([], [new WorksetEntry("W", null, ["C:\\init"])], "W");
+        area.Restore([], [new WorksetEntry("W", null, ["C:\\init"])]);
 
+        area.LoadWorkset("W");
         area.Add("C:\\new.txt");
-        // 零摩擦加入：自动带标 + 落盘成员。
-        Assert.Equal("W", Assert.Single(area.Items).Workset);
-        Assert.Equal(["C:\\init", "C:\\new.txt"], area.Find("W")!.Paths);
-
-        // 移除带标条目同步移除成员。
-        area.Remove(area.Items[0]);
+        Assert.Null(area.Items.Last(i => i.Path == "C:\\new.txt").Workset);
         Assert.Equal(["C:\\init"], area.Find("W")!.Paths);
 
-        // 工作集被删后 active 失效：新加入不带标。
-        area.Add("C:\\x");
-        area.DeleteWorkset("W");
-        area.Add("C:\\y");
-        Assert.Null(area.Items.Last(i => i.Path == "C:\\y").Workset);
+        // 移除带标条目（载入进来的 W 成员）仍同步给档案减员——
+        // 减员是显式动作，与"加入不自动归档"不对称是有意的。
+        var marked = area.Items.First(i => i.Workset == "W");
+        area.Remove(marked);
+        Assert.Empty(area.Find("W")!.Paths);
+
+        area.SaveAsWorkset("W2", null);
+        area.Add("C:\\x.txt");
+        Assert.Null(area.Items.Last(i => i.Path == "C:\\x.txt").Workset);
+        Assert.DoesNotContain("C:\\x.txt", area.Find("W2")!.Paths);
     }
 
     [Fact]
-    public void RestoreDropsActiveWorksetReferenceWhenRecordMissing()
+    public void DifferentWorksetsKeepDistinctPathsAfterLoads()
     {
-        var area = new StagingArea();
-        area.Restore([], [], "幽灵");
-        Assert.Null(area.ActiveWorkset);
+        var area = new StagingArea { Capacity = 8 };
+        area.Restore(
+            [],
+            [new WorksetEntry("A", null, ["C:\\a1"]), new WorksetEntry("B", null, ["C:\\b1"])]);
+
+        area.LoadWorkset("A");
+        area.Add("C:\\temp.txt");
+        area.LoadWorkset("B");
+
+        // 载入 B 后暂存区只剩 B 的成员 + 未标记项；A 的档案仍是 A 的。
+        Assert.Equal(["C:\\temp.txt", "C:\\b1"], area.Items.Select(i => i.Path).ToArray());
+        Assert.Equal(["C:\\a1"], area.Find("A")!.Paths);
+        Assert.Equal(["C:\\b1"], area.Find("B")!.Paths);
     }
 
     [Fact]

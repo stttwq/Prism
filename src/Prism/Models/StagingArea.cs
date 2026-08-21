@@ -11,6 +11,13 @@ public sealed record StagingItem(string Path, string? Workset);
 /// </summary>
 public sealed record WorksetEntry(string Name, string? Note, IReadOnlyList<string> Paths);
 
+// ── 暂存区与工作集的边界（第一轮 bug 修复 2026-08-22）─────────────────────
+// 旧版有"活跃工作集"：载入/存为后 Ctrl+D 加入的文件自动带标并写进该工作集
+// 记录——用户视角即"暂存区就是工作集，加文件两边都有"，且不同工作集内容
+// 互相污染。现在：Ctrl+D 只进暂存区（未标记），永远不改任何工作集档案；
+// 工作集只能被「存」（整组覆盖）显式更新。带标条目仍存在于暂存区（载入后
+// 的展示形态），但那只影响展示/LRU 保护，不构成"加入即归档"。
+
 /// <summary>加入暂存区的结果。</summary>
 public enum StagingAddResult
 {
@@ -116,18 +123,7 @@ public static class StagingPolicy
         return true;
     }
 
-    /// <summary>活跃工作集自动落盘成员（零摩擦加入的延伸）：追加路径。</summary>
-    public static void AppendMember(List<WorksetEntry> worksets, string name, string path)
-    {
-        var idx = FindIndexByName(worksets, name);
-        if (idx < 0) return;
-        var ws = worksets[idx];
-        if (ws.Paths.Any(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase)))
-            return;
-        worksets[idx] = ws with { Paths = [.. ws.Paths, path] };
-    }
-
-    /// <summary>移除带标条目时同步移除工作集成员（工作集不锁死，加减更新落盘）。</summary>
+    /// <summary>移除带标条目时同步移除工作集成员（工作集不锁死，减员更新落盘）。</summary>
     public static void RemoveMember(List<WorksetEntry> worksets, string name, string path)
     {
         var idx = FindIndexByName(worksets, name);
@@ -158,7 +154,6 @@ public sealed class StagingArea
 {
     private readonly List<StagingItem> _items = [];
     private readonly List<WorksetEntry> _worksets = [];
-    private string? _activeWorkset;
 
     /// <summary>容量上限，App 从设置注入并在保存后热更新。仅约束未标记加入。</summary>
     public int Capacity { get; set; } = 5;
@@ -167,24 +162,18 @@ public sealed class StagingArea
     public int Count => _items.Count;
     public IReadOnlyList<WorksetEntry> Worksets => _worksets;
 
-    /// <summary>当前活跃工作集名（最近载入/存为的）；之后加入的文件自动带标
-    /// 并落盘为该工作集成员（零摩擦加入的延伸）。无活跃工作集时为 null。</summary>
-    public string? ActiveWorkset => _activeWorkset;
-
     /// <summary>任何变更（加入/移除/清空/载入/存为/删除）后触发一次；订阅方负责落盘。</summary>
     public event Action? Changed;
 
     /// <summary>启动恢复（StagingStore.Load 的结果）；不合法条目由 store 侧过滤。
-    /// active 引用已删除的工作集时置空。
     /// 不触发 Changed——恢复不是用户变更，落盘订阅者借此避免"损坏文件载入
     /// 空态后立即覆写原文件"的复位窗口。</summary>
-    public void Restore(IEnumerable<StagingItem> items, IReadOnlyList<WorksetEntry> worksets, string? active)
+    public void Restore(IEnumerable<StagingItem> items, IReadOnlyList<WorksetEntry> worksets)
     {
         _items.Clear();
         _items.AddRange(items);
         _worksets.Clear();
         _worksets.AddRange(worksets);
-        _activeWorkset = Find(active) is not null ? active : null;
     }
 
     public WorksetEntry? Find(string? name)
@@ -196,17 +185,12 @@ public sealed class StagingArea
         return null;
     }
 
+    /// <summary>加入暂存区：永远未标记（Ctrl+D 不改任何工作集档案——见文件头边界注释）。</summary>
     public StagingAddResult Add(string path)
     {
-        // 活跃工作集存在才自动带标（且该工作集记录仍存在——被删后不复活）。
-        var mark = Find(_activeWorkset) is not null ? _activeWorkset : null;
-        var result = StagingPolicy.Add(_items, path, Math.Max(1, Capacity), mark);
+        var result = StagingPolicy.Add(_items, path, Math.Max(1, Capacity), mark: null);
         if (result == StagingAddResult.Added)
-        {
-            if (mark is not null)
-                StagingPolicy.AppendMember(_worksets, mark, path);
             Changed?.Invoke();
-        }
         return result;
     }
 
@@ -229,12 +213,11 @@ public sealed class StagingArea
         return removed;
     }
 
-    /// <summary>存为工作集：当前全部条目转正（改标 + upsert 落盘记录），成为活跃。
+    /// <summary>存为工作集：当前全部条目转正（改标 + upsert 落盘记录）。
     /// 同名覆盖由 UI 层先行确认。</summary>
     public void SaveAsWorkset(string name, string? note)
     {
         StagingPolicy.SaveAsWorkset(_items, _worksets, name, note);
-        _activeWorkset = name;
         Changed?.Invoke();
     }
 
@@ -243,7 +226,6 @@ public sealed class StagingArea
     {
         if (Find(name) is null) return false;
         StagingPolicy.LoadWorkset(_items, _worksets, name);
-        _activeWorkset = name;
         Changed?.Invoke();
         return true;
     }
@@ -252,8 +234,6 @@ public sealed class StagingArea
     public bool DeleteWorkset(string name)
     {
         if (!StagingPolicy.DeleteWorkset(_items, _worksets, name)) return false;
-        if (string.Equals(_activeWorkset, name, StringComparison.OrdinalIgnoreCase))
-            _activeWorkset = null;
         Changed?.Invoke();
         return true;
     }

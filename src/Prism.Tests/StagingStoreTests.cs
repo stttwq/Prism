@@ -37,7 +37,7 @@ public sealed class StagingStoreTests : IDisposable
             new("C:\\子目录\\报告.docx", "8月报告"),
         };
         var worksets = new List<WorksetEntry> { new("8月报告", "还差一张图", ["C:\\子目录\\报告.docx"]) };
-        store.Save(items, worksets, "8月报告");
+        store.Save(items, worksets);
 
         var loaded = store.Load();
         Assert.Equal(2, loaded.Items.Count);
@@ -51,7 +51,22 @@ public sealed class StagingStoreTests : IDisposable
         Assert.Equal("8月报告", ws.Name);
         Assert.Equal("还差一张图", ws.Note);
         Assert.Equal("C:\\子目录\\报告.docx", Assert.Single(ws.Paths));
-        Assert.Equal("8月报告", loaded.ActiveWorkset);
+        // ActiveWorkset 已废弃：旧文件可读，保存恒写 null。
+        Assert.Null(loaded.ActiveWorkset);
+    }
+
+    [Fact]
+    public void LegacyActiveWorksetFieldIsIgnoredOnLoad()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(Path.Combine(_dir, "staging.json"), """
+        {
+          "Items": [{ "Path": "C:\\a.txt", "Workset": null }],
+          "Worksets": [],
+          "ActiveWorkset": "旧名"
+        }
+        """, Encoding.UTF8);
+        Assert.Null(CreateStore().Load().ActiveWorkset);
     }
 
     [Fact]
@@ -88,17 +103,17 @@ public sealed class StagingStoreTests : IDisposable
         var ws = Assert.Single(file.Worksets); // 空名工作集丢弃
         Assert.Equal("W", ws.Name);
         Assert.Equal(["C:\\ok.txt"], ws.Paths); // 空路径成员丢弃
-        Assert.Equal("W", file.ActiveWorkset);
+        Assert.Null(file.ActiveWorkset); // 废弃字段：读到的值一律丢弃
     }
 
     [Fact]
     public void SaveIsAtomicViaTempFileOverwrite()
     {
         var store = CreateStore();
-        store.Save([new StagingItem("C:\\a", null)], [], null);
+        store.Save([new StagingItem("C:\\a", null)], []);
         var firstWrite = File.GetLastWriteTimeUtc(Path.Combine(_dir, "staging.json"));
         Thread.Sleep(20);
-        store.Save([new StagingItem("C:\\b", null)], [], null);
+        store.Save([new StagingItem("C:\\b", null)], []);
         // 直接覆盖第二次写入成功，无 .tmp 残留。
         Assert.False(File.Exists(Path.Combine(_dir, "staging.json.tmp")));
         var loaded = store.Load();

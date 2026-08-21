@@ -40,7 +40,7 @@ public sealed class SearchViewModelTests
         var timers = new ManualTimerFactory();
         var state = new AppState();
         var staging = new StagingArea();
-        staging.Restore([], [new WorksetEntry("8月报告", "还差一张图", ["C:\\a.docx"])], null);
+        staging.Restore([], [new WorksetEntry("8月报告", "还差一张图", ["C:\\a.docx"])]);
         var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler(), staging: staging);
 
         vm.OnQueryChanged("8月报告");
@@ -70,7 +70,7 @@ public sealed class SearchViewModelTests
         var timers = new ManualTimerFactory();
         var state = new AppState();
         var staging = new StagingArea();
-        staging.Restore([], [new WorksetEntry("8月报告", null, ["C:\\a.docx"])], null);
+        staging.Restore([], [new WorksetEntry("8月报告", null, ["C:\\a.docx"])]);
         var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler(), staging: staging);
 
         vm.OnQueryChanged("8月");
