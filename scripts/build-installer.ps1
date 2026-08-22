@@ -71,16 +71,14 @@ Write-Step "Installer version = $fullVersion  (from HEAD $shortHash)"
 # real build so the committed .iss never needs a manual edit between builds.
 # The committed version is restored after ISCC finishes so git status stays clean.
 Write-Step "Stamping $IssPath"
-# Read the committed .iss from HEAD (not the on-disk one, which a prior failed
-# run may have left stamped). git show prints raw bytes; capture as one string.
-$originalContent = & git -C $RepoRoot show 'HEAD:dist/prism.iss' | Out-String
-if ([string]::IsNullOrEmpty($originalContent)) { throw 'could not read committed dist/prism.iss from HEAD' }
-$content = $originalContent
+# Ensure a clean starting point: a prior aborted run may have left .iss stamped.
+& git -C $RepoRoot checkout HEAD -- 'dist/prism.iss' 2>$null
+# Read on-disk UTF-8 (NOT `git show | Out-String`, which re-encodes Chinese via
+# the console code page and corrupts quoted values for ISCC).
+$content = Get-Content -LiteralPath $IssPath -Raw -Encoding UTF8
 $pattern = '(?m)^#define MyAppVersion "[^"]*"'
 if ($content -notmatch $pattern) { throw 'MyAppVersion define not found in prism.iss' }
 $content = $content -replace $pattern, "#define MyAppVersion `"$fullVersion`""
-# Inno Setup reads .iss as plain text; keep it UTF-8 without BOM to match the
-# committed file and avoid a stray BOM confusing the line parser.
 [System.IO.File]::WriteAllText($IssPath, $content, (New-Object System.Text.UTF8Encoding($false)))
 Write-Ok "MyAppVersion -> $fullVersion"
 
