@@ -12,7 +12,9 @@
 ;
 ; 编译（路径按实际安装位置调整）：
 ;   "D:\LS\Setup 7\ISCC.exe" prism.iss
-; 产物：dist\PrismSetup-1.1beta.exe
+; 产物：dist\PrismSetup-<MyAppVersion>.exe
+; MyAppVersion 由 scripts\build-installer.ps1 在编译前从最后一次提交的短哈希
+; 自动注入（格式 1.1.<short-hash>），见该脚本说明。手编时用此处定义的占位值。
 
 #define MyAppName "Prism"
 #define MyAppVersion "1.1beta"
