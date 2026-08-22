@@ -395,7 +395,9 @@ impl ServiceState {
         self.connections.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// 记录一次活动（搜索请求或 USN 批次 apply），刷新空闲计时起点。
+    /// 记录一次用户活动（搜索请求；maintenance tick 修剪后也重置以防连拍），
+    /// 刷新空闲计时起点。USN 批次不在此刷新——OS 后台文件活动不应阻塞修剪
+    ///（见 watch_volume 中不调用 touch_activity 的注释）。
     fn touch_activity(&self) {
         self.last_activity_ms.store(unix_ms_now(), Ordering::Release);
     }
@@ -2854,7 +2856,6 @@ mod tests {
         state.last_activity_ms.store(now.saturating_add(60_000), Ordering::Release);
         assert!(!state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
     }
-
 
     /// M1（FRESH-AUDIT-3-2026-08-20）: 首次到达立即准入；退避窗口内拒绝且不动
     /// 计数；到点再次准入且 attempt 递增。
