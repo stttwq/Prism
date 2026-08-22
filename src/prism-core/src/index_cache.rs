@@ -100,9 +100,7 @@ fn load_envelope_with_retry(path: &Path) -> Result<CacheEnvelope<IndexState>, St
             Err(LoadEnvelopeError::IoOpen) if attempt == 0 => {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
-            Err(LoadEnvelopeError::IoOpen) => {
-                return Err("open v5 cache failed after retry".into())
-            }
+            Err(LoadEnvelopeError::IoOpen) => return Err("open v5 cache failed after retry".into()),
             Err(LoadEnvelopeError::Legacy) => {
                 let legacy: CacheEnvelopeLegacy<IndexState> = match open_and_decode(path) {
                     Ok(legacy) => legacy,
@@ -390,7 +388,9 @@ mod tests {
         let clean = state();
         let mut altered = state();
         // 同长度、仅一字节之差的名字——结构校验全部通过（父=root_record 5）。
-        altered.volumes[0].upsert(10, 5, "corrupt-name", false).unwrap();
+        altered.volumes[0]
+            .upsert(10, 5, "corrupt-name", false)
+            .unwrap();
         // 用干净状态的校验和 + 被改内容组装 envelope。
         let bytes = postcard::to_allocvec(&CacheEnvelope {
             magic: *CACHE_MAGIC,

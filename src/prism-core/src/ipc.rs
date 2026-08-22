@@ -413,8 +413,7 @@ fn current_user_sid() -> std::io::Result<&'static str> {
         let _ = CloseHandle(token);
         let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
         let mut sid_string = windows::core::PWSTR::null();
-        ConvertSidToStringSidW(user.User.Sid, &mut sid_string)
-            .map_err(std::io::Error::other)?;
+        ConvertSidToStringSidW(user.User.Sid, &mut sid_string).map_err(std::io::Error::other)?;
         let len = PCWSTR(sid_string.0).len();
         let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_string.0, len));
         let _ = LocalFree(HLOCAL(sid_string.0 as _));
@@ -799,8 +798,7 @@ async fn handle_connection(
     let writer_task = tokio::spawn(ordered_writer(writer, rx));
     // B5：在途 search 并发上限。超出（本地进程灌请求）立即回错——仍走保序
     // 通道，不破配对。Arc<Semaphore> 的 permit 随任务结束释放。
-    let search_permits =
-        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_SEARCHES));
+    let search_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_SEARCHES));
 
     let mut next_seq: u64 = 0;
     let mut first_line = true;
@@ -889,9 +887,16 @@ async fn handle_connection(
                 });
             }
             Ok(req) => {
-                let response =
-                    dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows, &aliases)
-                        .await;
+                let response = dispatch_non_search(
+                    req,
+                    &engines,
+                    &shell,
+                    &history,
+                    &preferences,
+                    &windows,
+                    &aliases,
+                )
+                .await;
                 let _ = tx.send((seq, response));
             }
             Err(e) => {
@@ -928,8 +933,7 @@ async fn ordered_writer<W>(
 {
     let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
     const RESPONSE_BUFFER_KEEP: usize = 256 * 1024;
-    let mut buffered: std::collections::BTreeMap<u64, Response> =
-        std::collections::BTreeMap::new();
+    let mut buffered: std::collections::BTreeMap<u64, Response> = std::collections::BTreeMap::new();
     let mut next_seq: u64 = 0;
     while let Some((seq, response)) = rx.recv().await {
         buffered.insert(seq, response);
@@ -939,8 +943,7 @@ async fn ordered_writer<W>(
                 // 序列化中途失败：丢掉半截字节，回一条自造的错误行（与旧行为一致）。
                 out.clear();
                 out.extend_from_slice(
-                    format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}")
-                        .as_bytes(),
+                    format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}").as_bytes(),
                 );
             }
             out.push(b'\n');
@@ -1908,7 +1911,12 @@ async fn search_service(
         let alias_word = name_query.trim().to_lowercase();
         let alias_limit = result_slots;
         tokio::task::spawn_blocking(move || {
-            alias_search_hits(&aliases_for_blocking, &alias_word, &history_for_alias, alias_limit)
+            alias_search_hits(
+                &aliases_for_blocking,
+                &alias_word,
+                &history_for_alias,
+                alias_limit,
+            )
         })
         .await
         .unwrap_or_default()
@@ -1920,13 +1928,10 @@ async fn search_service(
         //（既有行的 class/kind 不会更差，保既有行改动最小）。
         let existing: HashSet<String> = ranked
             .iter()
-            .map(|item| {
-                crate::history::target_key(&item.target.kind, &item.target.value)
-            })
+            .map(|item| crate::history::target_key(&item.target.kind, &item.target.value))
             .collect();
         for row in alias_rows {
-            let key =
-                crate::history::target_key(&row.target.kind, &row.target.value);
+            let key = crate::history::target_key(&row.target.kind, &row.target.value);
             if !existing.contains(&key) {
                 ranked.push(row);
             }
@@ -2180,7 +2185,10 @@ async fn path_query_results(
             path_bytes_eq(trimmed_path(item.path.as_str()).as_bytes(), path.as_bytes())
         });
         let (self_name, self_is_dir) = match self_index {
-            Some(index) => (reply.items[index].name.clone(), reply.items[index].is_directory),
+            Some(index) => (
+                reply.items[index].name.clone(),
+                reply.items[index].is_directory,
+            ),
             None => (
                 path.rsplit('\\').next().unwrap_or(path.as_str()).to_owned(),
                 true,
@@ -3549,7 +3557,12 @@ mod protocol_tests {
         let _ = std::fs::remove_dir_all(&history_dir);
         let history = Arc::new(HistoryStore::load(&history_dir, true));
         let rows = alias_search_hits(&aliases, "WX", &history, 8);
-        assert_eq!(rows.len(), 2, "悬空绑定静默跳过：{:?}", rows.iter().map(|r| r.title.as_ref()).collect::<Vec<_>>());
+        assert_eq!(
+            rows.len(),
+            2,
+            "悬空绑定静默跳过：{:?}",
+            rows.iter().map(|r| r.title.as_ref()).collect::<Vec<_>>()
+        );
         for row in &rows {
             let metadata = row.match_metadata.unwrap();
             assert_eq!(metadata.class, 0);
@@ -3573,7 +3586,9 @@ mod protocol_tests {
             r#"{"type":"alias_set","target":{"kind":"file","value":"C:\\a.exe"},"words":["wx","微信"]}"#,
         )
         .unwrap();
-        assert!(matches!(set, Request::AliasSet { ref target, ref words } if target.kind == "file" && words.len() == 2));
+        assert!(
+            matches!(set, Request::AliasSet { ref target, ref words } if target.kind == "file" && words.len() == 2)
+        );
         let delete: Request = serde_json::from_str(
             r#"{"type":"alias_delete","target":{"kind":"file","value":"C:\\a.exe"}}"#,
         )
@@ -4441,7 +4456,10 @@ mod query_parser_tests {
         );
         assert_eq!(normalize_path_query("E:/x/y/").as_deref(), Some(r"E:\x\y"));
         assert_eq!(normalize_path_query(r"E:\").as_deref(), Some("E:"));
-        assert_eq!(normalize_path_query("  E:\\x\\  ").as_deref(), Some(r"E:\x"));
+        assert_eq!(
+            normalize_path_query("  E:\\x\\  ").as_deref(),
+            Some(r"E:\x")
+        );
         assert_eq!(normalize_path_query("   ").as_deref(), None);
         assert_eq!(normalize_path_query(r#""""#).as_deref(), None);
 
@@ -4700,9 +4718,30 @@ mod pipe_lifecycle_tests {
         let writer = tokio::spawn(super::ordered_writer(server, rx));
 
         // 乱序投递：2 先到、0 后到，1 最晚。
-        tx.send((2, Response::Error { message: "two".into(), category: None })).unwrap();
-        tx.send((0, Response::Error { message: "zero".into(), category: None })).unwrap();
-        tx.send((1, Response::Error { message: "one".into(), category: None })).unwrap();
+        tx.send((
+            2,
+            Response::Error {
+                message: "two".into(),
+                category: None,
+            },
+        ))
+        .unwrap();
+        tx.send((
+            0,
+            Response::Error {
+                message: "zero".into(),
+                category: None,
+            },
+        ))
+        .unwrap();
+        tx.send((
+            1,
+            Response::Error {
+                message: "one".into(),
+                category: None,
+            },
+        ))
+        .unwrap();
         drop(tx);
 
         // 给 writer 一点时间写完（三条消息都很小）。

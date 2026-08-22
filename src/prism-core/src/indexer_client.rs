@@ -265,9 +265,7 @@ async fn search_on_persistent(
             // Transport-level failure: drop the connection, reconnect, retry once.
             // 语义错误（semantic / root_rejection）不在其列——服务已明确拒绝
             // 该请求，重连重试只会得到同一答案并白白丢弃健康连接。
-            Err(failure)
-                if failure.root_rejection.is_none() && !failure.semantic =>
-            {
+            Err(failure) if failure.root_rejection.is_none() && !failure.semantic => {
                 *conn = None; // drop the broken connection
                 let mut new_conn = PersistentConnection::connect(INDEXER_PIPE_NAME).await?;
                 handshake(&mut new_conn).await?;
@@ -694,9 +692,9 @@ async fn read_response<R: tokio::io::AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use crate::hierarchy::{IndexState, VolumeId, VolumeIndex};
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use crate::indexer_runtime::{handle_connection, ServiceState};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use tokio::net::windows::named_pipe::ServerOptions;
 
     #[tokio::test]

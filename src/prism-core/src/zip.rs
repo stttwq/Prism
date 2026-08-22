@@ -501,7 +501,11 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err2.kind, ShellErrorKind::Conflict);
-        assert_eq!(std::fs::read(&output).unwrap(), b"existing", "已存在的 zip 不得被覆写");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"existing",
+            "已存在的 zip 不得被覆写"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

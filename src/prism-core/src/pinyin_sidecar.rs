@@ -16,8 +16,8 @@ use crate::hierarchy::{
     RootFilter, FLAG_DIRECTORY, FLAG_PRESENT,
 };
 use crate::pinyin::{
-    encode_compact, encode_compact_with_chain, match_compact_normalized, normalize_query,
-    name_has_han, name_initials, PinyinMatch, PinyinMatchKind, PINYIN_DICTIONARY_VERSION,
+    encode_compact, encode_compact_with_chain, match_compact_normalized, name_has_han,
+    name_initials, normalize_query, PinyinMatch, PinyinMatchKind, PINYIN_DICTIONARY_VERSION,
 };
 
 const MAGIC: [u8; 8] = *b"PRPYG2\0\0";
@@ -129,8 +129,10 @@ impl PinyinDelta {
             self.chinese_count += usize::from(counts_chinese);
         }
         self.entries.insert(key, value);
-        Ok(self.chinese_count >= MAX_DELTA_RECORDS
-            || self.entries.len() >= MAX_DELTA_TOTAL_RECORDS)
+        Ok(
+            self.chinese_count >= MAX_DELTA_RECORDS
+                || self.entries.len() >= MAX_DELTA_TOTAL_RECORDS,
+        )
     }
 }
 
@@ -331,10 +333,7 @@ fn record_chain(
 
 /// P2：为一批 USN 记录计算各自的新链（delta 编码用）。一次性缓存，
 /// 批内同父目录共享。
-pub fn chains_for_delta(
-    volume: &crate::hierarchy::VolumeIndex,
-    records: &[u32],
-) -> Vec<Vec<u8>> {
+pub fn chains_for_delta(volume: &crate::hierarchy::VolumeIndex, records: &[u32]) -> Vec<Vec<u8>> {
     let mut cache: DirChainCache = std::collections::HashMap::new();
     let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
     records
@@ -495,7 +494,15 @@ impl PinyinSidecar {
         max: usize,
         exclusion_paths: &[String],
     ) -> PinyinSearchOutcome {
-        self.search_in_root(delta, index, query, max, exclusion_paths, None, &QueryFilters::none())
+        self.search_in_root(
+            delta,
+            index,
+            query,
+            max,
+            exclusion_paths,
+            None,
+            &QueryFilters::none(),
+        )
     }
 
     /// Pinyin candidates are filtered by the same root rule as the literal path, before
@@ -1062,7 +1069,10 @@ mod tests {
         assert_eq!(sidecar.search(&delta, &index, "zfb", 8).items.len(), 1);
         // 同一快照不带 delta：主表内容原样（从未被变异）。
         assert_eq!(
-            sidecar.search(&PinyinDelta::new(), &index, "wx", 8).items.len(),
+            sidecar
+                .search(&PinyinDelta::new(), &index, "wx", 8)
+                .items
+                .len(),
             1
         );
     }
@@ -1088,8 +1098,7 @@ mod tests {
         assert_ne!(index_identity(&first), index_identity(&renamed));
 
         // v5 往返：serde skip 使指纹归零，载入整算后 identity 与活索引一致。
-        let dir =
-            std::env::temp_dir().join(format!("prism-f3-identity-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("prism-f3-identity-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         crate::index_cache::save(&first, &dir).unwrap();
         let loaded = crate::index_cache::load(&dir).unwrap();
@@ -1128,7 +1137,8 @@ mod tests {
         });
 
         assert_eq!(sidecar.search(&delta, &index, "wx", 8).items.len(), 3);
-        let scoped = sidecar.search_in_root(&delta, &index, "wx", 8, &[], root, &QueryFilters::none());
+        let scoped =
+            sidecar.search_in_root(&delta, &index, "wx", 8, &[], root, &QueryFilters::none());
         assert_eq!(scoped.items.len(), 1, "{:?}", scoped.items);
         assert_eq!(scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(
@@ -1206,8 +1216,13 @@ mod tests {
         index.volumes[0].upsert(20, 5, "秘密", true).unwrap();
         index.volumes[0].upsert(21, 20, "微信", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
-        let outcome =
-            sidecar.search_with_exclusions(&PinyinDelta::new(), &index, "wx", 8, &["C:\\秘密".to_owned()]);
+        let outcome = sidecar.search_with_exclusions(
+            &PinyinDelta::new(),
+            &index,
+            "wx",
+            8,
+            &["C:\\秘密".to_owned()],
+        );
         assert!(outcome
             .items
             .iter()
@@ -1311,7 +1326,9 @@ mod tests {
             assert_eq!(rebuild, record as usize + 1 >= MAX_DELTA_RECORDS);
         }
         assert_eq!(delta.entries.len(), MAX_DELTA_RECORDS);
-        assert!(delta.apply(0, MAX_DELTA_RECORDS as u32, Some("微信"), &[]).unwrap());
+        assert!(delta
+            .apply(0, MAX_DELTA_RECORDS as u32, Some("微信"), &[])
+            .unwrap());
         assert_eq!(delta.entries.len(), MAX_DELTA_RECORDS);
     }
 
@@ -1321,7 +1338,9 @@ mod tests {
     fn m3_english_name_storm_does_not_trigger_rebuild() {
         let mut delta = PinyinDelta::new();
         for record in 0..(MAX_DELTA_RECORDS as u32 * 2) {
-            let rebuild = delta.apply(0, record, Some("body-styles.css"), &[]).unwrap();
+            let rebuild = delta
+                .apply(0, record, Some("body-styles.css"), &[])
+                .unwrap();
             assert!(!rebuild, "纯英文名变更不得触发全量重建");
         }
         assert_eq!(delta.chinese_count, 0);
@@ -1366,10 +1385,7 @@ mod tests {
         index.volumes[0].delete(10).unwrap();
         let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx", 8);
         assert!(outcome.items.is_empty());
-        assert_eq!(
-            outcome.matched_count, 0,
-            "已删记录不得计入 matched_count"
-        );
+        assert_eq!(outcome.matched_count, 0, "已删记录不得计入 matched_count");
     }
 
     /// S4（PRISM-IMPL-PLAN-4-2026-08-20）：拼音去重口径与字面路径一致——
@@ -1385,7 +1401,11 @@ mod tests {
         index.volumes[0].upsert(21, 5, "wxzfb微信", false).unwrap();
         let sidecar = PinyinSidecar::build(&index).unwrap();
         let outcome = sidecar.search(&PinyinDelta::new(), &index, "wx zfb", 8);
-        let names: Vec<&str> = outcome.items.iter().map(|item| item.name.as_str()).collect();
+        let names: Vec<&str> = outcome
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
         assert!(
             names.contains(&"微信支付宝"),
             "字面 AND 不命中的拼音命中应出行：{names:?}"

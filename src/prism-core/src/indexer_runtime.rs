@@ -28,7 +28,10 @@ use crate::{log, INDEXER_PIPE_NAME, INDEXER_PROTOCOL};
 #[derive(Clone)]
 enum RebuildRequest {
     /// 单卷重建：只重建该卷，merge_and_publish 按 volume_id 替换。
-    SingleVolume { descriptor: VolumeDescriptor, reason: String },
+    SingleVolume {
+        descriptor: VolumeDescriptor,
+        reason: String,
+    },
     /// 全量重建（卷集合变化等）。当前无发送点，保留为未来扩展。
     #[allow(dead_code)]
     Full(String),
@@ -72,8 +75,6 @@ fn trim_working_set() {
 
 #[cfg(not(windows))]
 fn trim_working_set() {}
-
-
 
 /// M1（FRESH-AUDIT-3-2026-08-20）：单卷重建的退避簿记。
 /// 连续重建按 `apps::app_scan_retry_delay` 指数拉开（30s 起步、封顶 1h、永不放弃），
@@ -258,7 +259,10 @@ impl BuildProgressCounters {
         self.records_estimate
             .store(records_estimate.unwrap_or(0), Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut guard = self.current_volume.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .current_volume
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *guard = None;
         }
@@ -267,7 +271,10 @@ impl BuildProgressCounters {
 
     fn begin_volume(&self, mount_path: &str) {
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut guard = self.current_volume.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .current_volume
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *guard = Some(mount_path.to_owned());
         }
@@ -290,7 +297,10 @@ impl BuildProgressCounters {
     fn finish(&self) {
         self.active.store(false, Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut guard = self.current_volume.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .current_volume
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *guard = None;
         }
@@ -399,7 +409,8 @@ impl ServiceState {
     /// 刷新空闲计时起点。USN 批次不在此刷新——OS 后台文件活动不应阻塞修剪
     ///（见 watch_volume 中不调用 touch_activity 的注释）。
     fn touch_activity(&self) {
-        self.last_activity_ms.store(unix_ms_now(), Ordering::Release);
+        self.last_activity_ms
+            .store(unix_ms_now(), Ordering::Release);
     }
 
     /// 距上次活动是否已超过阈值（毫秒）。用于 maintenance tick 判定是否
@@ -420,7 +431,8 @@ impl ServiceState {
             generation_notify: Notify::new(),
             progress: BuildProgressCounters::default(),
             first_build_complete: AtomicBool::new(false),
-            pinyin: RwLock::new(None),            pinyin_status: RwLock::new(PinyinStatus::Building),
+            pinyin: RwLock::new(None),
+            pinyin_status: RwLock::new(PinyinStatus::Building),
             pinyin_delta: RwLock::new(PinyinDelta::new()),
             pinyin_data_dir: RwLock::new(None),
             pinyin_needs_rebuild: AtomicBool::new(false),
@@ -433,7 +445,10 @@ impl ServiceState {
 
     fn set_pinyin_data_dir(&self, data_dir: &Path) {
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut slot = self.pinyin_data_dir.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = self
+            .pinyin_data_dir
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *slot = Some(data_dir.to_path_buf());
         }
@@ -448,7 +463,10 @@ impl ServiceState {
 
     fn set_pinyin_status(&self, status: PinyinStatus) {
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut current = self.pinyin_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current = self
+            .pinyin_status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *current = status;
         }
@@ -457,7 +475,10 @@ impl ServiceState {
     fn release_pinyin(&self) {
         self.pinyin_enabled.store(false, Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut sidecar = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sidecar = self
+            .pinyin
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *sidecar = None;
         }
@@ -470,7 +491,10 @@ impl ServiceState {
 
     fn begin_pinyin_rebuild(&self) {
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut sidecar = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sidecar = self
+            .pinyin
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *sidecar = None;
         }
@@ -545,7 +569,10 @@ impl ServiceState {
                     return;
                 }
                 // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-                let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut current = self
+                    .pinyin
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 {
                     *current = Some(Arc::new(sidecar));
                 }
@@ -584,7 +611,10 @@ impl ServiceState {
                     return;
                 }
                 // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-                let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut current = self
+                    .pinyin
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 {
                     *current = Some(Arc::new(sidecar));
                 }
@@ -603,7 +633,10 @@ impl ServiceState {
                     return;
                 }
                 // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-                let mut current = self.pinyin.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut current = self
+                    .pinyin
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 {
                     *current = None;
                 }
@@ -635,8 +668,12 @@ impl ServiceState {
         // 之前在 read guard 内直接调 rebuild_pinyin，百万级中文文件下持锁
         // 数秒~数十秒，阻塞 USN 写者和搜索读者。
         let snapshot = {
-            let Ok(guard) = self.index.read() else { return; };
-            let Some(index) = guard.as_ref() else { return; };
+            let Ok(guard) = self.index.read() else {
+                return;
+            };
+            let Some(index) = guard.as_ref() else {
+                return;
+            };
             index.clone()
         };
         self.rebuild_pinyin(&snapshot, &data_dir);
@@ -812,7 +849,10 @@ impl ServiceState {
     /// front-end caches keyed on it fall out of date on their own.
     pub(crate) fn merge_and_publish(&self, volume: VolumeIndex) {
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut guard = self.index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             let index = guard.get_or_insert_with(IndexState::default);
             // A rebuilt volume replaces its earlier copy rather than duplicating it.
@@ -829,7 +869,10 @@ impl ServiceState {
         }
         self.degraded.store(false, Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut message = self
+            .message
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *message = None;
         }
@@ -862,14 +905,20 @@ impl ServiceState {
             .unwrap_or(0);
         state.generation = previous_generation.saturating_add(1).max(state.generation);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut guard = self.index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *guard = Some(state);
         }
         self.building.store(false, Ordering::Release);
         self.degraded.store(false, Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut message = self
+            .message
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *message = None;
         }
@@ -884,7 +933,10 @@ impl ServiceState {
         self.degraded.store(true, Ordering::Release);
         self.building.store(false, Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut message = self
+            .message
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *message = Some(error);
         }
@@ -895,7 +947,10 @@ impl ServiceState {
     fn clear_error(&self) {
         self.degraded.store(false, Ordering::Release);
         // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-        let mut message = self.message.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut message = self
+            .message
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             *message = None;
         }
@@ -905,11 +960,7 @@ impl ServiceState {
     ///（`state` 借自它）；缓存锁只在此处获取，与 index 锁无反向嵌套，无死序
     /// 风险。命中条件：同 root + 卷仍在原索引位 + 卷身份一致 + 该卷 next_usn
     /// 未前移。next_usn 前移或卷表变化即重解析并覆盖。
-    fn resolve_root_bound(
-        &self,
-        state: &IndexState,
-        root: &str,
-    ) -> RootBoundOutcome {
+    fn resolve_root_bound(&self, state: &IndexState, root: &str) -> RootBoundOutcome {
         const ROOT_CACHE_SLOTS: usize = 4;
         {
             let cache = self
@@ -920,13 +971,9 @@ impl ServiceState {
                 if entry.root != root {
                     continue;
                 }
-                let valid = state
-                    .volumes
-                    .get(entry.volume_index)
-                    .is_some_and(|volume| {
-                        volume.volume_id == entry.volume_id
-                            && volume.next_usn == entry.next_usn
-                    });
+                let valid = state.volumes.get(entry.volume_index).is_some_and(|volume| {
+                    volume.volume_id == entry.volume_id && volume.next_usn == entry.next_usn
+                });
                 if valid {
                     return RootBoundOutcome::Bound(Some(entry.bound));
                 }
@@ -1069,11 +1116,7 @@ impl ServiceState {
             // A1（AUDIT-4 批次B）：delta 拆出为独立表后，扫描期间持有的是
             // delta 的**读锁**（watcher 的增量写被压到毫秒级扫描窗口内，与字面
             // 路径持 index.read() 的既有取舍一致）；主表快照自身永不变异。
-            let snapshot = self
-                .pinyin
-                .read()
-                .ok()
-                .and_then(|sidecar| sidecar.clone());
+            let snapshot = self.pinyin.read().ok().and_then(|sidecar| sidecar.clone());
             if let Some(sidecar) = snapshot {
                 let delta_guard = self
                     .pinyin_delta
@@ -1615,11 +1658,7 @@ async fn acquire_initial_index(
             }
             let replay_descriptors: Vec<VolumeDescriptor> = descriptors
                 .iter()
-                .filter(|descriptor| {
-                    !rebuild
-                        .iter()
-                        .any(|target| target.id == descriptor.id)
-                })
+                .filter(|descriptor| !rebuild.iter().any(|target| target.id == descriptor.id))
                 .cloned()
                 .collect();
             for volume in &volumes {
@@ -1654,7 +1693,9 @@ async fn acquire_initial_index(
     }
 
     // S2: 只重建需要重建的卷（Miss = 全部；Partial = 坏卷 + 新卷）。
-    state.progress.begin(rebuild_targets.len(), records_estimate);
+    state
+        .progress
+        .begin(rebuild_targets.len(), records_estimate);
     // 二次重试后仍失败的卷：跳过并记录，绝不拖垮其余卷（全部失败才算真失败）。
     let mut failed_volumes: Vec<String> = Vec::new();
 
@@ -1902,8 +1943,7 @@ fn load_cached(data_dir: &std::path::Path) -> CachedLoad {
             let replayable_journal = ntfs::open_volume(descriptor, false)
                 .and_then(|handle| ntfs::query_journal(&handle))
                 .is_ok_and(|journal| {
-                    journal.journal_id == volume.journal_id
-                        && volume.next_usn >= journal.first_usn
+                    journal.journal_id == volume.journal_id && volume.next_usn >= journal.first_usn
                 });
             if replayable_journal {
                 volume.mount_path.clone_from(&descriptor.mount_path);
@@ -1913,7 +1953,9 @@ fn load_cached(data_dir: &std::path::Path) -> CachedLoad {
             }
         }
         if replayable.is_empty() {
-            log("v5 cache has no replayable volume; rebuilding while old state remains unpublished");
+            log(
+                "v5 cache has no replayable volume; rebuilding while old state remains unpublished",
+            );
             return CachedLoad::Miss {
                 descriptors,
                 records_estimate: (total_cached_records > 0).then_some(total_cached_records),
@@ -2192,7 +2234,11 @@ fn usn_drop_exceeds_resync_threshold(dropped_unreachable: u64) -> bool {
     dropped_unreachable > USN_UNREACHABLE_RESYNC_THRESHOLD
 }
 
-fn checkpoint(state: &ServiceState, data_dir: &std::path::Path, flush_pinyin: bool) -> Result<(), String> {
+fn checkpoint(
+    state: &ServiceState,
+    data_dir: &std::path::Path,
+    flush_pinyin: bool,
+) -> Result<(), String> {
     // R2 gate: a first build in flight means the live index covers only some volumes.
     // Writing it now would produce a file that later looks like a complete cache, so
     // every exit path — including SCM Stop — skips the write and forces a full rebuild.
@@ -2333,7 +2379,10 @@ fn checkpoint_after_save(
         state.rebuild_pinyin_from_live();
     }
     // AUDIT-2026-08-18 R-B5: lock poisoning only occurs in unwind/test builds; take the lock directly instead of silently skipping.
-    let mut guard = state.index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = state
+        .index
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     {
         if let Some(index) = guard.as_mut() {
             index.events_since_checkpoint = index
@@ -2420,10 +2469,7 @@ fn compact_one_volume_off_lock(
         if !compacted.compact_names_if_needed()? {
             return Ok(false);
         }
-        let mut guard = state
-            .index
-            .write()
-            .map_err(|_| "index lock is poisoned")?;
+        let mut guard = state.index.write().map_err(|_| "index lock is poisoned")?;
         let index = guard.as_mut().ok_or("index is not ready")?;
         let Some(slot) = index
             .volumes
@@ -2647,7 +2693,8 @@ pub(crate) async fn handle_connection(
     // SET_PINYIN_LAST（原先记在每连接局部，见其注释）。
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
-        let response = match serde_json::from_str::<IndexerRequest>(&line) {            // `status()` takes `index.read()` synchronously. Calling it directly
+        let response = match serde_json::from_str::<IndexerRequest>(&line) {
+            // `status()` takes `index.read()` synchronously. Calling it directly
             // on a worker thread lets a USN flood (watcher holding `index.write()`)
             // block the whole runtime: with 2 workers, two concurrent Status
             // requests starve the accept loop and new clients get
@@ -2853,7 +2900,9 @@ mod tests {
         assert!(state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
         // 时钟回跳：last_activity_ms 比当前还新。saturating_sub 归零，
         // 判定未达——修剪被保守推迟，不产生误修剪。防回归到 wrapping_sub。
-        state.last_activity_ms.store(now.saturating_add(60_000), Ordering::Release);
+        state
+            .last_activity_ms
+            .store(now.saturating_add(60_000), Ordering::Release);
         assert!(!state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
     }
 
@@ -2863,7 +2912,10 @@ mod tests {
     fn m1_backoff_admits_first_and_defers_within_window() {
         let start = Instant::now();
         let mut entry = VolumeRebuildBackoff {
-            id: VolumeId { guid: "v".into(), serial: 1 },
+            id: VolumeId {
+                guid: "v".into(),
+                serial: 1,
+            },
             attempt: 0,
             next_due: start,
             last_rebuild_at: None,
@@ -2887,7 +2939,10 @@ mod tests {
     fn m1_backoff_grows_exponentially() {
         let mut now = Instant::now();
         let mut entry = VolumeRebuildBackoff {
-            id: VolumeId { guid: "v".into(), serial: 1 },
+            id: VolumeId {
+                guid: "v".into(),
+                serial: 1,
+            },
             attempt: 0,
             next_due: now,
             last_rebuild_at: None,
@@ -2907,7 +2962,10 @@ mod tests {
     fn m1_quiet_volume_resets_attempts() {
         let start = Instant::now();
         let mut entry = VolumeRebuildBackoff {
-            id: VolumeId { guid: "v".into(), serial: 1 },
+            id: VolumeId {
+                guid: "v".into(),
+                serial: 1,
+            },
             attempt: 9,
             next_due: start,
             last_rebuild_at: Some(start - VOLUME_REBUILD_QUIET),
@@ -2998,7 +3056,12 @@ mod tests {
         volume.upsert(10, 5, "抖音", true).unwrap();
         for record in 11..51u32 {
             volume
-                .upsert(u64::from(record), 5, &format!("body-{record:03}.css"), false)
+                .upsert(
+                    u64::from(record),
+                    5,
+                    &format!("body-{record:03}.css"),
+                    false,
+                )
                 .unwrap();
         }
         state.publish(IndexState {
@@ -3055,8 +3118,7 @@ mod tests {
             volume_with_id("a", "C:\\", "one.txt", descriptors[0].id.clone()),
             volume_with_id("b", "D:\\", "two.txt", descriptors[1].id.clone()),
         ];
-        let (matched, rebuild, dropped) =
-            partition_volume_sets(cached, &descriptors);
+        let (matched, rebuild, dropped) = partition_volume_sets(cached, &descriptors);
         assert_eq!(matched.len(), 2);
         assert_eq!(rebuild.len(), 1, "现场新增卷必须进重建列表");
         assert_eq!(rebuild[0].id, descriptors[2].id);
@@ -3084,12 +3146,7 @@ mod tests {
     #[test]
     fn s2_partition_disjoint_sets_rebuild_everything() {
         let descriptors = vec![descriptor('C')];
-        let cached = vec![volume_with_id(
-            "z",
-            "Z:\\",
-            "gone.txt",
-            descriptor('Z').id,
-        )];
+        let cached = vec![volume_with_id("z", "Z:\\", "gone.txt", descriptor('Z').id)];
         let (matched, rebuild, dropped) = partition_volume_sets(cached, &descriptors);
         assert!(matched.is_empty());
         assert_eq!(rebuild.len(), 1);
@@ -3105,9 +3162,9 @@ mod tests {
         assert!(state.status().ready);
         assert!(state.status().building, "重建未全部落定前 R2 门保持关闭");
         assert!(!state.first_build_is_complete());
-        assert!(state
-            .search("keep", 8, None, None)
-            .is_ok_and(|r| matches!(r, IndexerResponse::Results { ref items, .. } if items.len() == 2)));
+        assert!(state.search("keep", 8, None, None).is_ok_and(
+            |r| matches!(r, IndexerResponse::Results { ref items, .. } if items.len() == 2)
+        ));
     }
 
     fn test_volume(guid: &str, mount_path: &str, name: &str) -> VolumeIndex {
@@ -3180,7 +3237,12 @@ mod tests {
         let mut volume = test_volume("v1", "C:\\", "keep.txt");
         for record in 11..50u32 {
             volume
-                .upsert(frn2(record, 1), frn2(10, 1), &format!("dead-{record}.bin"), false)
+                .upsert(
+                    frn2(record, 1),
+                    frn2(10, 1),
+                    &format!("dead-{record}.bin"),
+                    false,
+                )
                 .unwrap();
             volume.delete(frn2(record, 1)).unwrap();
         }
@@ -3219,9 +3281,9 @@ mod tests {
         };
         assert!(names_after < names_before, "压缩必须收缩名字池");
         assert_eq!(dead, 0, "换入后死字节计数归零");
-        assert!(state
-            .search("keep", 8, None, None)
-            .is_ok_and(|r| matches!(r, IndexerResponse::Results { ref items, .. } if !items.is_empty())));
+        assert!(state.search("keep", 8, None, None).is_ok_and(
+            |r| matches!(r, IndexerResponse::Results { ref items, .. } if !items.is_empty())
+        ));
     }
 
     /// clone 窗口内 USN 到达（next_usn 前移）：换入必须被拒——live 卷的游标
@@ -3272,9 +3334,9 @@ mod tests {
             "压缩换入绝不能把 USN 游标回退到旧快照"
         );
         // 无论是否成功换入，搜索必须始终可用。
-        assert!(state
-            .search("keep", 8, None, None)
-            .is_ok_and(|r| matches!(r, IndexerResponse::Results { ref items, .. } if !items.is_empty())));
+        assert!(state.search("keep", 8, None, None).is_ok_and(
+            |r| matches!(r, IndexerResponse::Results { ref items, .. } if !items.is_empty())
+        ));
     }
 
     #[test]
@@ -3396,13 +3458,17 @@ mod tests {
 
         // 卷 v1 的内容仍在——没被全量替换清掉。
         let search_v1 = state.search("alpha", 8, None, None).unwrap();
-        assert!(matches!(search_v1, IndexerResponse::Results { ref items, .. } if items.len() == 1),
-            "健康卷 v1 的索引应保留");
+        assert!(
+            matches!(search_v1, IndexerResponse::Results { ref items, .. } if items.len() == 1),
+            "健康卷 v1 的索引应保留"
+        );
 
         // 卷 v2 的重建结果可见。
         let search_v2 = state.search("beta_rebuilt", 8, None, None).unwrap();
-        assert!(matches!(search_v2, IndexerResponse::Results { ref items, .. } if items.len() == 1),
-            "重建卷 v2 的新内容应可见");
+        assert!(
+            matches!(search_v2, IndexerResponse::Results { ref items, .. } if items.len() == 1),
+            "重建卷 v2 的新内容应可见"
+        );
     }
 
     #[tokio::test]
@@ -3851,7 +3917,12 @@ mod tests {
         // root 自身（depth 0 在范围内）+ 直接子项 + 深层后代；范围外不进。
         assert_eq!(
             paths,
-            vec![r"C:\项目", r"C:\项目\inside.txt", r"C:\项目\子目录", r"C:\项目\子目录\deep.txt"]
+            vec![
+                r"C:\项目",
+                r"C:\项目\inside.txt",
+                r"C:\项目\子目录",
+                r"C:\项目\子目录\deep.txt"
+            ]
         );
 
         // 文件 root：结构化拒绝（broker 侧据此改走父目录 + 末段精确命中）。
@@ -3953,7 +4024,10 @@ mod tests {
     fn b1_root_bound_cache_survives_other_volume_activity_but_not_own_changes() {
         let state = ServiceState::new();
         let mut c = VolumeIndex::new(
-            VolumeId { guid: "c".into(), serial: 1 },
+            VolumeId {
+                guid: "c".into(),
+                serial: 1,
+            },
             "C:\\".into(),
             7,
             9,
@@ -3963,7 +4037,10 @@ mod tests {
         c.upsert(10, 5, "项目", true).unwrap();
         c.upsert(11, 10, "微信.txt", false).unwrap();
         let mut d = VolumeIndex::new(
-            VolumeId { guid: "d".into(), serial: 2 },
+            VolumeId {
+                guid: "d".into(),
+                serial: 2,
+            },
             "D:\\".into(),
             7,
             9,
@@ -4098,8 +4175,7 @@ mod tests {
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "微信.txt"));
         state.pinyin_enabled.store(true, Ordering::Release);
-        let dir = std::env::temp_dir()
-            .join(format!("prism-rb1-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("prism-rb1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         state.set_pinyin_data_dir(&dir);
@@ -4150,9 +4226,8 @@ mod tests {
     #[test]
     fn protocol_mismatch_error_contains_both_versions() {
         let client_version = 1u32;
-        let message = format!(
-            "protocol_mismatch: server={INDEXER_PROTOCOL} client={client_version}"
-        );
+        let message =
+            format!("protocol_mismatch: server={INDEXER_PROTOCOL} client={client_version}");
         assert!(
             message.starts_with("protocol_mismatch"),
             "error must start with protocol_mismatch prefix, got: {message}"

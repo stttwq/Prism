@@ -444,8 +444,9 @@ pub(crate) fn name_initials(name: &str, out: &mut Vec<u8>) {
 /// P1-2：名字是否含汉字（delta 阈值计数用——纯 ASCII 名 + 中文链不计数，
 /// 与 M3「英文风暴不触发重建」的语义一致）。
 pub(crate) fn name_has_han(name: &str) -> bool {
-    name.chars()
-        .any(|ch| ('\u{3400}'..='\u{9FFF}').contains(&ch) || ('\u{F900}'..='\u{FAFF}').contains(&ch))
+    name.chars().any(|ch| {
+        ('\u{3400}'..='\u{9FFF}').contains(&ch) || ('\u{F900}'..='\u{FAFF}').contains(&ch)
+    })
 }
 
 fn token_initials(body: &CompactBody<'_>, scratch: &mut Vec<u8>) -> Option<()> {
@@ -483,7 +484,11 @@ pub(crate) fn match_compact_terms(
     let mut parts = Vec::with_capacity(terms.len());
     for term in terms {
         let normalized = normalize_query(term)?;
-        parts.push(match_compact_normalized(bytes, normalized.as_bytes(), scratch)?);
+        parts.push(match_compact_normalized(
+            bytes,
+            normalized.as_bytes(),
+            scratch,
+        )?);
     }
     Some(combine_term_matches(parts))
 }
@@ -641,9 +646,9 @@ fn match_compact_chain(
                 let mut qi = qi;
                 let mut cursor = 0usize;
                 while cursor < tokens_bytes.len() && qi < query.len() {
-                let token = compact_token(tokens_bytes, cursor)?;
-                let initial = *compact_readings(&token).next()?.first()?;
-                if initial != query[qi] {
+                    let token = compact_token(tokens_bytes, cursor)?;
+                    let initial = *compact_readings(&token).next()?.first()?;
+                    if initial != query[qi] {
                         break;
                     }
                     qi += 1;
@@ -1176,7 +1181,11 @@ mod tests {
     ///（apps.rs 有同款锚定；这里直接覆盖 compact 侧的混用正例）。
     #[test]
     fn s3_compact_mixed_matches_live_path() {
-        for (name, query) in [("微信", "wxin"), ("网易云音乐", "wangyiyy"), ("微信开发", "wxkaifa")] {
+        for (name, query) in [
+            ("微信", "wxin"),
+            ("网易云音乐", "wangyiyy"),
+            ("微信开发", "wxkaifa"),
+        ] {
             let encoded = encode_compact(name).unwrap();
             let compact = match_compact(&encoded, query).unwrap();
             let live = match_name(name, query).unwrap();
@@ -1256,11 +1265,20 @@ mod tests {
         // 重要=zhongyao，但 重 另有 chong 读音；行为 xingwei/hangwei 同理。
         // 「按目录名搜文件」的精确语义项交给 PHRASES 词表（银行=hang 等）。
         assert!(match_name("重要", "zhongyao").is_some());
-        assert!(match_name("重要", "chongyao").is_some(), "多读音分支：重 chong 有效");
+        assert!(
+            match_name("重要", "chongyao").is_some(),
+            "多读音分支：重 chong 有效"
+        );
         assert!(match_name("行为", "xingwei").is_some());
-        assert!(match_name("行为", "hangwei").is_some(), "多读音分支：行 hang 有效");
+        assert!(
+            match_name("行为", "hangwei").is_some(),
+            "多读音分支：行 hang 有效"
+        );
         assert!(match_name("模型", "moxing").is_some());
-        assert!(match_name("模型", "muxing").is_some(), "多读音分支：模 mu 有效（模样/模板）");
+        assert!(
+            match_name("模型", "muxing").is_some(),
+            "多读音分支：模 mu 有效（模样/模板）"
+        );
         // 负例：不是该字任何读音的音节绝不命中（防召回无界放宽）。
         assert!(match_name("重庆", "hongqing").is_none());
         assert!(match_name("银行", "yinkuan").is_none());

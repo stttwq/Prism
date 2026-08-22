@@ -181,68 +181,66 @@ fn apply_records_inner(
     next_usn: i64,
     tolerate_unreachable: bool,
 ) -> Result<(ApplyOutcome, usize), String> {
-        let snapshot = volume.snapshot_mutations(records.iter().map(|record| record.frn))?;
-        let result = (|| {
-            let mut pending = BTreeMap::<u32, &UsnRecord>::new();
-            for record in records {
-                let record_number = VolumeIndex::split_frn(record.frn)?.0;
-                // A later event for the same slot supersedes an earlier deferred create/rename.
-                pending.remove(&record_number);
-                if record.reason & USN_REASON_FILE_DELETE != 0 {
-                    // Delete is terminal when NTFS coalesces several reasons into one record.
-                    volume.delete(record.frn).map_err(|e| e.to_string())?;
-                } else if record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
-                    match volume.upsert(
-                        record.frn,
-                        record.parent_frn,
-                        &record.name,
-                        record.is_directory,
-                    ) {
-                        Ok(ApplyOutcome::Applied) => {}
-                        Ok(ApplyOutcome::RebuildRequired) => {
-                            return Ok((ApplyOutcome::RebuildRequired, 0));
-                        }
-                        // F9: 类型化匹配取代文案前缀——父未到场的乱序是延迟重试，不是重建。
-                        Err(
-                            VolumeError::BrokenParentChain { .. },
-                        ) => {
-                            pending.insert(record_number, record);
-                        }
-                        Err(error) => return Err(error.to_string()),
+    let snapshot = volume.snapshot_mutations(records.iter().map(|record| record.frn))?;
+    let result = (|| {
+        let mut pending = BTreeMap::<u32, &UsnRecord>::new();
+        for record in records {
+            let record_number = VolumeIndex::split_frn(record.frn)?.0;
+            // A later event for the same slot supersedes an earlier deferred create/rename.
+            pending.remove(&record_number);
+            if record.reason & USN_REASON_FILE_DELETE != 0 {
+                // Delete is terminal when NTFS coalesces several reasons into one record.
+                volume.delete(record.frn).map_err(|e| e.to_string())?;
+            } else if record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
+                match volume.upsert(
+                    record.frn,
+                    record.parent_frn,
+                    &record.name,
+                    record.is_directory,
+                ) {
+                    Ok(ApplyOutcome::Applied) => {}
+                    Ok(ApplyOutcome::RebuildRequired) => {
+                        return Ok((ApplyOutcome::RebuildRequired, 0));
                     }
-                }
-                // RENAME_OLD carries the old name. The following RENAME_NEW updates the same slot.
-            }
-
-            loop {
-                let before = pending.len();
-                let deferred = std::mem::take(&mut pending);
-                for (record_number, record) in deferred {
-                    match volume.upsert(
-                        record.frn,
-                        record.parent_frn,
-                        &record.name,
-                        record.is_directory,
-                    ) {
-                        Ok(ApplyOutcome::Applied) => {}
-                        Ok(ApplyOutcome::RebuildRequired) => {
-                            return Ok((ApplyOutcome::RebuildRequired, 0));
-                        }
-                        Err(VolumeError::BrokenParentChain { .. }) => {
-                            pending.insert(record_number, record);
-                        }
-                        Err(error) => return Err(error.to_string()),
+                    // F9: 类型化匹配取代文案前缀——父未到场的乱序是延迟重试，不是重建。
+                    Err(VolumeError::BrokenParentChain { .. }) => {
+                        pending.insert(record_number, record);
                     }
-                }
-                if pending.is_empty() || pending.len() == before {
-                    break;
+                    Err(error) => return Err(error.to_string()),
                 }
             }
+            // RENAME_OLD carries the old name. The following RENAME_NEW updates the same slot.
+        }
 
-            if !pending.is_empty() && !tolerate_unreachable {
-                let record = pending.keys().next().copied().unwrap_or_default();
-                return Err(VolumeError::BrokenParentChain { record }.to_string());
+        loop {
+            let before = pending.len();
+            let deferred = std::mem::take(&mut pending);
+            for (record_number, record) in deferred {
+                match volume.upsert(
+                    record.frn,
+                    record.parent_frn,
+                    &record.name,
+                    record.is_directory,
+                ) {
+                    Ok(ApplyOutcome::Applied) => {}
+                    Ok(ApplyOutcome::RebuildRequired) => {
+                        return Ok((ApplyOutcome::RebuildRequired, 0));
+                    }
+                    Err(VolumeError::BrokenParentChain { .. }) => {
+                        pending.insert(record_number, record);
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+
+        if !pending.is_empty() && !tolerate_unreachable {
+            let record = pending.keys().next().copied().unwrap_or_default();
+            return Err(VolumeError::BrokenParentChain { record }.to_string());
+        }
         volume.next_usn = next_usn;
         Ok((ApplyOutcome::Applied, pending.len()))
     })();
@@ -400,12 +398,7 @@ mod platform {
     /// F9: 携带原始 HRESULT 的查询版，供 `query_or_create_journal` 按错误码分支。
     fn query_journal_code(handle: &VolumeHandle) -> Result<JournalInfo, IoctlError> {
         let mut output = [0u8; std::mem::size_of::<USN_JOURNAL_DATA_V0>()];
-        let bytes = ioctl_buffer_code(
-            handle.0,
-            FSCTL_QUERY_USN_JOURNAL,
-            &(),
-            &mut output,
-        )?;
+        let bytes = ioctl_buffer_code(handle.0, FSCTL_QUERY_USN_JOURNAL, &(), &mut output)?;
         if bytes < std::mem::size_of::<USN_JOURNAL_DATA_V0>() {
             return Err(IoctlError {
                 message: "FSCTL_QUERY_USN_JOURNAL returned a truncated record".into(),
@@ -483,12 +476,7 @@ mod platform {
                 if name.is_empty() {
                     continue;
                 }
-                match volume.upsert(
-                    record.frn,
-                    record.parent_frn,
-                    name,
-                    record.is_directory,
-                ) {
+                match volume.upsert(record.frn, record.parent_frn, name, record.is_directory) {
                     Ok(_) => {}
                     // F9: 类型化匹配取代文案前缀。
                     Err(VolumeError::BrokenParentChain { .. }) => next.push(record),
@@ -845,7 +833,10 @@ mod tests {
         assert_eq!(next, 99);
         assert_eq!(records.len(), 2, "both records should parse");
         // 第一条含 U+FFFD 替换字符
-        assert!(records[0].name.contains('\u{FFFD}'), "bad name should contain replacement char");
+        assert!(
+            records[0].name.contains('\u{FFFD}'),
+            "bad name should contain replacement char"
+        );
         // 第二条完全正常
         assert_eq!(records[1].name, "ok.txt");
     }
