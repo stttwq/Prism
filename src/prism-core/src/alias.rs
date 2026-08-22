@@ -97,20 +97,14 @@ impl AliasStore {
                 .state
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let existing_word_count: usize = state
-                .entries
-                .iter()
-                .filter(|entry| entry.words.iter().any(|word| normalized.contains(word)))
-                .map(|entry| entry.words.len())
-                .sum();
+            // L12（全仓复审 2026-08-22）：上限口径与 persistence::validate 对齐——
+            // 只数 entries.len()。原先把「同词目标的既有词数」加进来比较，热词多绑
+            // 几个目标就会在 ~1936 条提前拒绝，却仍报「已达上限（2000）」。
             let replacing = state
                 .entries
                 .iter()
                 .any(|entry| entry.kind == kind && entry.target == target.value);
-            if !replacing
-                && state.entries.len() + existing_word_count
-                    >= crate::persistence::ALIAS_MAX_ENTRIES
-            {
+            if !replacing && state.entries.len() >= crate::persistence::ALIAS_MAX_ENTRIES {
                 return Err("别名总条数已达上限（2000）".into());
             }
             state

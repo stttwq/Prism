@@ -25,7 +25,10 @@
 
 [CmdletBinding()]
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # L29（全仓复审 2026-08-22）：ISCC 路径可注入/自动发现——原硬编码
+    # D:\LS\Setup 7\ISCC.exe 换机器即断。优先注册表安装位置，找不到再回退默认。
+    [string]$IsccPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,7 +39,14 @@ $DistDir     = Join-Path $RepoRoot 'dist'
 $IssPath     = Join-Path $DistDir 'prism.iss'
 $CoreOut     = Join-Path $RepoRoot 'src\prism-core\target\release'
 $AppOut      = Join-Path $RepoRoot 'src\Prism\bin\Release\net8.0-windows'
-$IsccPath    = 'D:\LS\Setup 7\ISCC.exe'
+if ([string]::IsNullOrEmpty($IsccPath)) {
+    $IsccPath = 'D:\LS\Setup 7\ISCC.exe'
+    $regLoc = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1' -ErrorAction SilentlyContinue).InstallLocation
+    if ($regLoc) {
+        $candidate = Join-Path $regLoc 'ISCC.exe'
+        if (Test-Path $candidate) { $IsccPath = $candidate }
+    }
+}
 $VersionBase = '1.1'
 
 function Write-Step([string]$text) {
@@ -50,8 +60,16 @@ function Write-Bad([string]$text)  { Write-Host "    FAIL $text" -ForegroundColo
 
 if (-not $SkipBuild) {
     Write-Step 'Building all binaries (prism-build.ps1 -SkipInstall)'
-    & (Join-Path $PSScriptRoot 'prism-build.ps1') -SkipInstall
-    if ($LASTEXITCODE -ne 0) { throw "prism-build.ps1 failed (exit $LASTEXITCODE)" }
+    # L30（全仓复审 2026-08-22）：用 try/catch 而非 $LASTEXITCODE——prism-build
+    # 以 throw 报错并以 exit 0 结束成功路径，& 调用下 $LASTEXITCODE 恒 0，
+    # 原守卫给出的「构建失败会被退出码抓住」是假象。 terminating error 在
+    # $ErrorActionPreference='Stop' 下直接中止本脚本，这才是真实的守。
+    try {
+        & (Join-Path $PSScriptRoot 'prism-build.ps1') -SkipInstall
+        if ($LASTEXITCODE -ne 0) { throw "prism-build.ps1 failed (exit $LASTEXITCODE)" }
+    } catch {
+        throw "prism-build.ps1 failed: $($_.Exception.Message)"
+    }
     Write-Ok 'build done'
 } else {
     Write-Step 'Skipping build (-SkipBuild); reusing existing target outputs'
@@ -72,7 +90,9 @@ Write-Step "Installer version = $fullVersion  (from HEAD $shortHash)"
 # The committed version is restored after ISCC finishes so git status stays clean.
 Write-Step "Stamping $IssPath"
 # Ensure a clean starting point: a prior aborted run may have left .iss stamped.
+# L29：还原失败必须中止——继续跑会把旧 stamp 叠加出新版本，或让工作树留脏。
 & git -C $RepoRoot checkout HEAD -- 'dist/prism.iss' 2>$null
+if ($LASTEXITCODE -ne 0) { throw 'git checkout dist/prism.iss failed (dirty index or no HEAD?)' }
 # Read on-disk UTF-8 (NOT `git show | Out-String`, which re-encodes Chinese via
 # the console code page and corrupts quoted values for ISCC).
 $content = Get-Content -LiteralPath $IssPath -Raw -Encoding UTF8
@@ -112,8 +132,14 @@ try {
 } finally {
     Pop-Location
     # Restore the committed .iss so the working tree matches HEAD (git status clean).
+    # L29：同上，还原失败要在 finally 里可见地报告（finally 里不宜 throw 覆盖
+    # 原异常，写 FAIL 行 + 保留脏文件让人看见）。
     & git -C $RepoRoot checkout HEAD -- 'dist/prism.iss' 2>$null
-    Write-Ok 'prism.iss restored to committed placeholder'
+    if ($LASTEXITCODE -ne 0) {
+        Write-Bad 'git checkout dist/prism.iss failed in finally — working tree may hold a stamped .iss; restore manually'
+    } else {
+        Write-Ok 'prism.iss restored to committed placeholder'
+    }
 }
 
 $output = Join-Path $DistDir "PrismSetup-$fullVersion.exe"

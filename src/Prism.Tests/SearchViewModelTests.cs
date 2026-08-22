@@ -149,6 +149,22 @@ public sealed class SearchViewModelTests
         Assert.Equal(expected, SearchViewModel.IsAbsolutePathQuery(query));
     }
 
+    /// <summary>H7（全仓复审 2026-08-22）：ext:/path: 过滤词查询的识别口径。
+    /// 宽松超集：空值（"path:"）broker 会回退为普通文本，这里仍判 true——
+    /// 宁可少缓存，不可错过滤。</summary>
+    [Theory]
+    [InlineData("ext:pdf", true)]
+    [InlineData("EXT:PDF", true)]            // 大小写不敏感，与 broker 一致
+    [InlineData("note ext:pdf", true)]       // token 起点在查询中段也识别
+    [InlineData(@"path:""E:\foo""", true)]   // 带引号的 path 值
+    [InlineData("path:", true)]              // 空值也按过滤词排除（保守超集）
+    [InlineData("foo:bar", false)]           // 未知前缀
+    [InlineData("extent", false)]            // 前缀必须顶 token 头
+    public void FilterTokenDetectionMatchesBrokerPrefixes(string query, bool expected)
+    {
+        Assert.Equal(expected, SearchViewModel.HasFilterToken(query));
+    }
+
     [Fact]
     public async Task PinyinEnabledResponseDoesNotSeedLiteralPrefixCache()
     {

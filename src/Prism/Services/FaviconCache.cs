@@ -145,9 +145,11 @@ public sealed class FaviconCache
 
             var imgPath = GetImagePath(key);
             var metaPath = GetMetadataPath(key);
-            if (File.Exists(imgPath))
-                File.Delete(imgPath);
-            File.Move(tmpPath, imgPath);
+            // M16（全仓复审 2026-08-22）：原子的 overwrite-Move 取代
+            // Delete+Move——两步之间的窗口里没有图，且崩溃会留下无 .meta 的
+            // 孤儿 .img（TrimCache 只枚举 *.meta，永不淘汰）。对齐 SettingsStore/
+            // StagingStore 的 File.Move(tmp, path, overwrite: true) 写法。
+            File.Move(tmpPath, imgPath, overwrite: true);
 
             // 写 metadata
             var metadata = new FaviconMetadata
@@ -297,6 +299,15 @@ public sealed class FaviconCache
     {
         try
         {
+            // M16：顺手清掉无 .meta 的孤儿 .img（历史版本 Delete+Move 窗口 /
+            // .meta 写入前崩溃留下的），否则它们永不进淘汰视野。
+            foreach (var orphan in Directory.GetFiles(_cacheDir, "*.img"))
+            {
+                var meta = Path.ChangeExtension(orphan, ".meta");
+                if (!File.Exists(meta))
+                    try { File.Delete(orphan); } catch { /* ignore */ }
+            }
+
             var files = Directory.GetFiles(_cacheDir, "*.meta");
             if (files.Length <= MaxEntries)
                 return;

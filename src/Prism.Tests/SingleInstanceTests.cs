@@ -29,7 +29,13 @@ public sealed class SingleInstanceDumbClientTests
 
     private static void Run()
     {
-        using var si = new SingleInstance();
+        // M2（全仓复审 2026-08-22）：注入随机 mutex/pipe 名——此前测试用生产全局名
+        // Local\PrismSingleInstance / prism-foreground，在任何装着 Prism 的机器上
+        // 与真进程抢锁必败（12ms 即输），也让哑客户端连上真实例的监听管道。
+        var token = Guid.NewGuid().ToString("N");
+        using var si = new SingleInstance(
+            $@"Local\PrismTest_{token}",
+            $"prism-test-{token}");
         Assert.True(si.TryAcquire());
 
         var shown = new ManualResetEventSlim(false);
@@ -38,7 +44,7 @@ public sealed class SingleInstanceDumbClientTests
 
         // 1) 哑客户端：连上、不发任何数据、保持打开。
         var dumb = new NamedPipeClientStream(
-            ".", "prism-foreground", PipeDirection.Out, PipeOptions.Asynchronous);
+            ".", $"prism-test-{token}", PipeDirection.Out, PipeOptions.Asynchronous);
         dumb.Connect(3000);
 
         // 2) 等 2s 读超时 + 余量：监听循环应已丢弃哑连接。
@@ -46,7 +52,7 @@ public sealed class SingleInstanceDumbClientTests
 
         // 3) 正常客户端发送 show —— 必须仍能唤出（泵消息让 BeginInvoke 执行）。
         using (var client = new NamedPipeClientStream(
-            ".", "prism-foreground", PipeDirection.Out, PipeOptions.Asynchronous))
+            ".", $"prism-test-{token}", PipeDirection.Out, PipeOptions.Asynchronous))
         {
             client.Connect(3000);
             using var writer = new StreamWriter(client, new UTF8Encoding(false))

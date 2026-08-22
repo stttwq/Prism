@@ -55,8 +55,20 @@ $CoreOut     = Join-Path $RepoRoot 'src\prism-core\target\release'
 $CoreDebug   = Join-Path $RepoRoot 'src\prism-core\target\debug'
 $AppProject  = Join-Path $RepoRoot 'src\Prism\Prism.csproj'
 $AppOut      = Join-Path $RepoRoot 'src\Prism\bin\Release\net8.0-windows'
-$InstallDir  = 'C:\Program Files\Prism'
 $ServiceName = 'PrismIndexer'
+# L28（全仓复审 2026-08-22）：安装目录优先取现有服务注册路径——安装器允许
+# 自选目录（本机装在 D:\LS\Prism），硬编码 C:\Program Files\Prism 会让
+# -Bootstrap 在 C 盘造出第二份安装并把服务指过去，而真实安装与自启项
+# 仍指着旧盘。服务不存在（全新机器）时保持默认。
+$InstallDir  = 'C:\Program Files\Prism'
+$svcRegistered = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+if ($null -ne $svcRegistered -and $svcRegistered.PathName) {
+    if ($svcRegistered.PathName -match '^"([^"]+\\)[^"\\]+\.exe"') {
+        $InstallDir = $Matches[1].TrimEnd('\')
+    } elseif ($svcRegistered.PathName -match '^(.*?\\)[^"\\]+\.exe(?:\s|$)') {
+        $InstallDir = $Matches[1].TrimEnd('\')
+    }
+}
 
 # name -> @{ Built = <path>; Installed = <path> }
 $Artifacts = [ordered]@{
@@ -108,8 +120,15 @@ function Get-Sha([string]$path) {
         return (Get-FileHash -Path $path -Algorithm SHA256).Hash
     }
     # Last resort: certutil is always present and needs no modules.
+    # L26（全仓复审 2026-08-22）：解析结果必须是 64 位十六进制——certutil 输出
+    # 布局随区域设置变化时，按位置取行可能拿到本地化文案，哈希比较静默失配
+    # （好在会用 Substring 抛错，但那是碰运气）。显式校验，坏输入立刻报真错。
     $line = (& certutil.exe -hashfile $path SHA256 | Select-Object -Skip 1 -First 1)
-    return ($line -replace '\s', '').ToUpperInvariant()
+    $hash = ($line -replace '\s', '').ToUpperInvariant()
+    if ($hash -notmatch '^[0-9A-F]{64}$') {
+        throw "certutil hash parse failed for ${path}: $line"
+    }
+    return $hash
 }
 
 function Test-Admin {
@@ -248,7 +267,14 @@ function Assert-OutputsFresh {
         $builtAt  = (Get-Item $path).LastWriteTime
         $newestSrc = Get-NewestSourceTime $sourceSets[$name]
 
-        if ($null -ne $newestSrc -and $builtAt -lt $newestSrc) {
+        # L25（全仓复审 2026-08-22）：newestSrc 为空必须报错——排除规则按
+        # 「路径相对仓库根」匹配后，唯一剩下的空集成因是源路径本身配错
+        #（或仓库被克隆进名字含 bin/obj/target 的目录）。原先 null 直接
+        # 跳过检查，任意陈旧二进制都报 OK。
+        if ($null -eq $newestSrc) {
+            Write-Bad "$name found no source files (source set misconfigured?)"
+            $stale += $name
+        } elseif ($builtAt -lt $newestSrc) {
             Write-Bad "$name is OLDER than its sources"
             Write-Host "         built  $($builtAt.ToString('MM-dd HH:mm:ss'))" -ForegroundColor Red
             Write-Host "         source $($newestSrc.ToString('MM-dd HH:mm:ss'))" -ForegroundColor Red
@@ -266,8 +292,12 @@ function Assert-OutputsFresh {
 
 # Newest LastWriteTime across the given files/directories, ignoring build
 # output dirs so bin/obj/target do not mask a genuinely stale artifact.
+# L25：排除匹配用「相对仓库根」的路径——原先在 FullName 上匹配 \\(bin|obj|target)\\，
+# 仓库克隆进含这些词的目录（如 D:\obj\listary）时所有源文件都被排除，
+# $newest 恒为 null，新鲜度门整体短路。
 function Get-NewestSourceTime([string[]]$paths) {
     $newest = $null
+    $rootPrefix = $RepoRoot.TrimEnd('\') + '\'
     foreach ($path in $paths) {
         if (-not (Test-Path $path)) { continue }
         $item = Get-Item $path
@@ -276,7 +306,13 @@ function Get-NewestSourceTime([string[]]$paths) {
             continue
         }
         Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\(bin|obj|target)\\' } |
+            Where-Object {
+                $rel = $_.FullName
+                if ($rel.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                    $rel = $rel.Substring($rootPrefix.Length)
+                }
+                $rel -notmatch '(^|\\)(bin|obj|target)(\\|$)'
+            } |
             ForEach-Object {
                 if ($null -eq $newest -or $_.LastWriteTime -gt $newest) { $newest = $_.LastWriteTime }
             }
@@ -438,13 +474,40 @@ function Invoke-Verify {
     # Cross-check that the service really points at the file we verified.
     $svcWmi = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
     if ($null -ne $svcWmi) {
-        $svcPath = $svcWmi.PathName.Trim('"')
+        # L27（全仓复审 2026-08-22）：先剥出可执行路径再比对——原先只 Trim('"')
+        # 后整串 -ieq，注册路径带参数（"…exe" -flag）或未加引号含空格时必报
+        # 假 drift 并 exit 1。解析规则与 Bench.Common.psm1 的同款。
+        $rawPath = [string]$svcWmi.PathName
+        $svcPath = if ($rawPath -match '^"([^"]+\.exe)"') { $Matches[1] }
+                   elseif ($rawPath -match '^(.*?\.exe)(?:\s|$)') { $Matches[1] }
+                   else { $rawPath.Trim('"') }
         $expected = $Artifacts['prism-indexer-service.exe'].Installed
         if ($svcPath -ieq $expected) {
             Write-Ok "service binary path matches"
         } else {
             Write-Bad "service points at $svcPath, expected $expected"
             $drift += 'service path'
+        }
+    }
+
+    # L36（全仓复审 2026-08-22）：dist/ 的追踪二进制也纳入比对——它们是安装包
+    # 的直接来源，且 git 里追踪（曾让一份陈旧副本盖住新构建好几天）。
+    # Invoke-Verify 从来只比 target/release 与安装目录，dist/ 无人看守。
+    $distDir = Join-Path $RepoRoot 'dist'
+    foreach ($name in @('prism-core.exe', 'prism-indexer-service.exe', 'Prism.exe', 'Prism.dll')) {
+        $distPath = Join-Path $distDir $name
+        $builtPath = if ($name -eq 'Prism.dll') { Join-Path $AppOut 'Prism.dll' }
+                     else { $Artifacts[$name].Built }
+        $builtHash = Get-Sha $builtPath
+        if ($null -eq $builtHash) { continue }
+        $distHash = Get-Sha $distPath
+        if ($null -eq $distHash) {
+            Write-Warn2 "dist\$name missing (run scripts\build-installer.ps1 to refresh dist)"
+        } elseif ($distHash -ne $builtHash) {
+            Write-Bad "dist\$name DIFFERS from build (stale dist copy would ship)"
+            $drift += "dist\$name"
+        } else {
+            Write-Ok "dist\$name  $($distHash.Substring(0,12))"
         }
     }
 

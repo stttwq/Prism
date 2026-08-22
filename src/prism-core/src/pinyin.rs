@@ -319,7 +319,16 @@ pub(crate) fn combine_term_matches(mut parts: Vec<PinyinMatch>) -> PinyinMatch {
         .iter()
         .find(|part| part.kind == PinyinMatchKind::Full)
         .map_or(PinyinMatchKind::Initials, |part| part.kind);
-    let class = parts.iter().map(|part| part.class).min().unwrap_or(2);
+    // M14（全仓复审 2026-08-22）：多 term 合并 class 对齐字面侧规则
+    // （hierarchy.rs：多 term 不产生 class 0，任一 term 锚定 ⇒ 1，否则 2）。
+    // 原 min() 会让「某 term 整名全拼命中（class 0）」的多 term 结果压过
+    // 一切单口径全拼命中；钳到 ≥1 消除两侧档位不对称。
+    let class = parts
+        .iter()
+        .map(|part| part.class)
+        .min()
+        .unwrap_or(2)
+        .max(1);
     let position = parts.iter().map(|part| part.position).min().unwrap_or(0);
     let score = parts.iter().map(|part| part.score).max().unwrap_or(0);
     let mut ranges: Vec<(i32, i32)> = Vec::new();

@@ -29,6 +29,9 @@ enum ZipProgram {
 }
 
 /// 获取缓存的压缩程序探测结果；探测输入（custom_path）变化时重新探测。
+/// L3（全仓复审 2026-08-22）：缓存的外部 exe 不存在时（会话中卸载/移动了
+/// 7-Zip 或自定义程序）也重新探测——否则继续 spawn 一个已消失的路径，
+/// 每次压缩都失败。
 fn get_zip_program(custom_path: Option<&str>) -> ZipProgram {
     let normalized = custom_path
         .map(str::trim)
@@ -39,7 +42,13 @@ fn get_zip_program(custom_path: Option<&str>) -> ZipProgram {
         .unwrap_or_else(|poison| poison.into_inner());
     if let (Some(cached_input), Some(cached)) = &*guard {
         if Some(cached_input.as_str()) == normalized.as_deref() {
-            return cached.clone();
+            let still_valid = match cached {
+                ZipProgram::External { exe_path, .. } => std::path::Path::new(exe_path).is_file(),
+                _ => true,
+            };
+            if still_valid {
+                return cached.clone();
+            }
         }
     }
     let detected = detect_zip_program(normalized.as_deref());
@@ -48,14 +57,21 @@ fn get_zip_program(custom_path: Option<&str>) -> ZipProgram {
 }
 
 /// 探测可用的压缩程序。按优先级：
-/// 1. 用户自定义路径（如果设置且文件存在）
+/// 1. 用户自定义路径（如果设置、文件存在且是 .exe）
 /// 2. 注册表查找 7-Zip
 /// 3. Windows 内置 Shell COM
 fn detect_zip_program(custom_path: Option<&str>) -> ZipProgram {
     // 1. 用户自定义路径
+    // L2（全仓复审 2026-08-22）：要求 .exe 扩展名——settings.json 是用户可改
+    // 的配置，至少把「必须是可执行映像」钉住；spawn 语义 <exe> <source> <output>
+    // 决定了任何非可执行文件被选中都只会浪费一次进程创建。
     if let Some(path) = custom_path {
         let trimmed = path.trim();
-        if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
+        let is_exe = std::path::Path::new(trimmed)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+        if is_exe && std::path::Path::new(trimmed).is_file() {
             return ZipProgram::External {
                 exe_path: trimmed.to_string(),
                 is_seven_zip: false, // 自定义程序可能不是 7-Zip，用通用调用方式
@@ -322,9 +338,9 @@ fn zip_with_external(
 /// B4（AUDIT-4 批次C，2026-08-21）：`CopyHere` 是异步提交——立即返回 Success
 /// 意味着 zip 还在后台写、甚至失败也无人知晓。修法：flags 带
 /// FOF_SILENT|FOF_NOCONFIRMATION|FOF_NOERRORUI（broker 无控制台，任何 UI
-/// 挂起都会拖死 STA worker），调用后轮询 zip 目录条目数稳定（连续两个采样
-/// 窗口数量一致）再上报；有界等待（60s）后按完成上报——轮询是启发式，
-/// 宁可乐观上报也不无限占住唯一 STA 队列。输出已存在的冲突在
+/// 挂起都会拖死 STA worker），调用后轮询「条目数 + 文件尺寸」双稳定再上报
+///（见 H6 注释）；有界等待（60s）后按完成上报——轮询是启发式，宁可乐观
+/// 上报也不无限占住唯一 STA 队列。输出已存在的冲突在
 /// `validate_zip_request` 拦截。
 #[cfg(windows)]
 fn zip_with_shell_com(source: &str, output: &str) -> Result<ShellOutcome, ShellError> {
@@ -378,26 +394,56 @@ fn zip_with_shell_com_inner(source: &str, output: &str) -> Result<ShellOutcome, 
             .CopyHere(&source_var, &VARIANT::from(4i16 | 16 | 1024))
             .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
 
-        // 轮询条目数稳定：CopyHere 异步填充 zip。初始为空/复制完成后数量
-        // 不再变化；连续两个窗口一致且非零即认为完成（有界 60s）。
+        // H6（全仓复审 2026-08-22）：完成判定改为「条目数 + zip 文件尺寸」
+        // 双稳定。原先只看 Items().Count()——压目录时目录节点一出现 count 即 1，
+        // 首个 500ms 窗口就可能与预采样相等而提前判完成（内容还在流式写入）；
+        // 而 Items() 失败时 count=-1 永不满足 >0，空转 60s 后仍 fall through
+        // 到 Ok——22 字节残骸被报成压缩成功。新口径：
+        // - count>0 且 size>空 zip 骨架（22B）且连续 2 个窗口不变 ⇒ 完成；
+        // - 到 deadline 从未见过有效采样（count≤0 或 size≤22）⇒ 判失败，
+        //   外层清理逻辑会移除残骸；
+        // - 见过有效采样但迟迟不稳定 ⇒ 60s 截断按完成上报（轮询是启发式，
+        //   宁可乐观也不无限占住唯一 STA 队列，原行为保留）。
+        const EMPTY_ZIP_BYTES: u64 = 22;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let zip_entry_count = || -> i32 {
-            folder
+        let zip_stats = || -> (i32, u64) {
+            let count = folder
                 .Items()
                 .ok()
                 .and_then(|items| items.Count().ok())
-                .unwrap_or(-1)
+                .unwrap_or(-1);
+            let size = std::fs::metadata(output)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            (count, size)
         };
-        let mut last_count = zip_entry_count();
+        let mut last = zip_stats();
+        let mut stable_rounds = 0u32;
+        let mut ever_progressed = false;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let count = zip_entry_count();
-            if count > 0 && count == last_count {
-                break;
+            let current = zip_stats();
+            let progressed = current.0 > 0 && current.1 > EMPTY_ZIP_BYTES;
+            if progressed {
+                ever_progressed = true;
             }
-            last_count = count;
+            if current == last && progressed {
+                stable_rounds += 1;
+                if stable_rounds >= 2 {
+                    break;
+                }
+            } else {
+                stable_rounds = 0;
+            }
+            last = current;
             if std::time::Instant::now() >= deadline {
                 crate::logging::event("warn", "zip_shell_com_wait_timeout", None, None);
+                if !ever_progressed {
+                    return Err(ShellError::new(
+                        ShellErrorKind::System,
+                        "zip via Shell COM made no progress within 60s",
+                    ));
+                }
                 break;
             }
         }

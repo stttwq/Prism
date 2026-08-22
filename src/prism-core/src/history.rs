@@ -693,6 +693,10 @@ fn seed_legacy_frecency(entries: &mut [HistoryEntry]) {
 
 /// G4（FRESH-AUDIT-2）：Drop 兜底冲刷节流窗口内的脏数据——broker 退出时
 /// 最近 250ms 内的动作记录不丢。
+/// M8（全仓复审 2026-08-22）：Drop 也走 persist_lock——当前安全只靠
+/// 「HistoryStore 恒在 Arc 里、定时线程 upgrade 后强引用>0」这一约定；
+/// 未来任何非 Arc 用法/不持强引用的写盘路径出现时，绕锁直写会让两个
+/// 写者交错撕裂同一个 .tmp 文件。锁在 Drop 里独占可得，零成本。
 impl Drop for HistoryStore {
     fn drop(&mut self) {
         let gate = self
@@ -702,6 +706,10 @@ impl Drop for HistoryStore {
         if !gate.dirty || !self.is_enabled() {
             return;
         }
+        let _guard = self
+            .persist_lock
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner());
         let Ok(state) = self.state.read() else {
             return;
         };

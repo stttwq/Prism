@@ -10,6 +10,9 @@
 # Usage:  sh scripts/setup.sh   (or: source scripts/setup.sh — both work)
 
 set -u
+# L38（全仓复审 2026-08-22）：-e 让任何一步失败都中止脚本，不再打印
+# 「done. pre-commit will block…」的假确认；hooksPath 与钩子可执行位
+# 逐一核对后才宣告就绪。
 
 # Resolve repo root even when sourced from elsewhere.
 # When sourced, $0 is the shell ("/usr/bin/bash") and BASH_SOURCE is this
@@ -34,8 +37,20 @@ if [ ! -d "scripts/hooks" ]; then
   return 1 2>/dev/null || exit 1
 fi
 
-git config core.hooksPath scripts/hooks
+# L38：写失败必须中止——git config 失败后照样宣告「门已就位」是假确认。
+if ! git config core.hooksPath scripts/hooks; then
+  echo "setup: git config core.hooksPath failed" >&2
+  return 1 2>/dev/null || exit 1
+fi
 echo "setup: core.hooksPath = $(git config core.hooksPath)"
+
+# L38：钩子必须可执行（WSL/Linux 上 100644 的钩子会被 git 静默跳过；
+# Windows 检测不到差别）。仓库内已提交执行位；本地缺失则提示修复。
+if [ ! -x scripts/hooks/pre-commit ]; then
+  echo "setup: scripts/hooks/pre-commit is not executable" >&2
+  echo "setup: fix with: chmod +x scripts/hooks/pre-commit" >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 # 2. Verify the toolchain the hook relies on is reachable.
 _miss=0

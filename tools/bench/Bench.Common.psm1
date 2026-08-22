@@ -87,9 +87,17 @@ function Assert-MemoryAcceptance {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][UInt64]$MaximumPrivateWorkingSetBytes,
+        # M1（全仓复审 2026-08-22）：样本数与最小值。唯一输入是已算好的最大值时，
+        # 空采样跑出的 0 也能过 100MB 硬门——与 New-SearchSummary 的「非空 + ≥30」
+        # 双断言对齐：调用方提供样本数即强制非空与下限。
+        [int]$SampleCount = 0,
+        [int]$MinimumSampleCount = 1,
         [UInt64]$LimitBytes = (100 * 1024 * 1024)
     )
 
+    if ($SampleCount -gt 0 -and $SampleCount -lt $MinimumSampleCount) {
+        throw "Memory acceptance requires at least $MinimumSampleCount sample(s); got $SampleCount."
+    }
     if ($MaximumPrivateWorkingSetBytes -gt $LimitBytes) {
         throw "Three-process Private Working Set maximum $MaximumPrivateWorkingSetBytes bytes exceeds the $LimitBytes-byte hard gate."
     }
@@ -309,9 +317,8 @@ function Get-IndexerStatus {
         if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 2) {
             throw 'Indexer protocol 2 handshake failed.'
         }
-        if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 2) {
-            throw 'Indexer protocol 2 handshake failed.'
-        }
+        # L33（全仓复审 2026-08-22）：原第二段逐字节相同的断言是一次协议 bump 改重
+        # 的痕迹（第二份本该检查别的字段），删除重复。
         $status = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'status' })
         if ($status.Response.type -ne 'status') { throw "Expected indexer status, got $($status.Response.type)." }
         return $status.Response

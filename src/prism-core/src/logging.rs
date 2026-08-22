@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 static LOGGER: OnceLock<Mutex<Option<RollingLogger>>> = OnceLock::new();
+/// L1（全仓复审 2026-08-22）：init 参数留存，供写失败后的懒恢复重开使用。
+static INIT_PARAMS: OnceLock<(String, PathBuf)> = OnceLock::new();
 
 struct RollingLogger {
     path: PathBuf,
@@ -15,6 +17,7 @@ struct RollingLogger {
 }
 
 pub fn init(process: &str, directory: &Path) {
+    let _ = INIT_PARAMS.set((process.to_string(), directory.to_path_buf()));
     let logger = RollingLogger::open(process, directory).ok();
     if let Some(slot) = LOGGER.get() {
         if let Ok(mut guard) = slot.lock() {
@@ -25,6 +28,42 @@ pub fn init(process: &str, directory: &Path) {
     }
 }
 
+/// L1（全仓复审 2026-08-22）：写失败不再永久禁用全进程日志。可移动盘/网络盘
+/// 抖动、轮转时 `broker.jsonl.1` 被查看器锁住，都是**暂时性**失败——原实现
+/// 一次失败即 `*guard = None`，此后 panic hook 的记录也一起丢，正是本文件
+/// 注释要防的「崩溃了 broker.jsonl 里什么都没有」。现在：写失败先置 None，
+/// 本条与后续每条 event 都会按 init 参数尝试重开；恢复成功即继续记录。
+/// 目录永久不可写时每次 event 多一次失败的 open（事件频率低，代价可忽略），
+/// fail-open 语义不变。
+fn write_with_recovery(
+    guard: &mut Option<RollingLogger>,
+    level: &str,
+    event: &str,
+    detail: Option<&str>,
+    elapsed_ms: Option<u128>,
+    generation: Option<u64>,
+) {
+    if let Some(logger) = guard.as_mut() {
+        if logger
+            .write(level, event, detail, elapsed_ms, generation)
+            .is_ok()
+        {
+            return;
+        }
+        *guard = None;
+    }
+    if let Some((process, directory)) = INIT_PARAMS.get() {
+        if let Ok(mut logger) = RollingLogger::open(process, directory) {
+            if logger
+                .write(level, event, detail, elapsed_ms, generation)
+                .is_ok()
+            {
+                *guard = Some(logger);
+            }
+        }
+    }
+}
+
 pub fn event(level: &str, event: &str, elapsed_ms: Option<u128>, generation: Option<u64>) {
     let Some(slot) = LOGGER.get() else {
         return;
@@ -32,15 +71,7 @@ pub fn event(level: &str, event: &str, elapsed_ms: Option<u128>, generation: Opt
     let Ok(mut guard) = slot.lock() else {
         return;
     };
-    let Some(logger) = guard.as_mut() else {
-        return;
-    };
-    if logger
-        .write(level, event, None, elapsed_ms, generation)
-        .is_err()
-    {
-        *guard = None;
-    }
+    write_with_recovery(&mut guard, level, event, None, elapsed_ms, generation);
 }
 
 /// Like [`event`] but also writes a human-readable `detail` field (after sanitization)
@@ -61,15 +92,14 @@ pub fn event_detail(
     let Ok(mut guard) = slot.lock() else {
         return;
     };
-    let Some(logger) = guard.as_mut() else {
-        return;
-    };
-    if logger
-        .write(level, event, Some(&sanitized), elapsed_ms, generation)
-        .is_err()
-    {
-        *guard = None;
-    }
+    write_with_recovery(
+        &mut guard,
+        level,
+        event,
+        Some(&sanitized),
+        elapsed_ms,
+        generation,
+    );
 }
 
 pub fn redacted_message(message: &str) {

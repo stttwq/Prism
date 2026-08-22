@@ -132,7 +132,12 @@ public sealed class WebIconProvider
         if (_faviconCache is not null)
         {
             var origin = FaviconCache.NormalizeOrigin(url);
-            if (origin is not null && _isGranted?.Invoke(origin) != false)
+            // L40（全仓复审 2026-08-22）：委托缺失 = 未接线 = 不授权——原先
+            // `_isGranted?.Invoke(origin) != false` 把 null 读作「已授权」，
+            // 让 FaviconCache.GetFavicon 的 !granted 守卫在本路径成死码。
+            // 生产侧 App 恒注入委托，这里是把意图写死、不留空子。
+            var granted = _isGranted is not null && _isGranted(origin);
+            if (origin is not null && granted)
             {
                 if (_resolved.TryGetValue(origin, out var hit))
                     return hit;
@@ -151,7 +156,7 @@ public sealed class WebIconProvider
                     var cache = _faviconCache;
                     _ = Task.Run(() =>
                     {
-                        var favicon = cache.GetFavicon(origin, granted: true);
+                        var favicon = cache.GetFavicon(origin, granted);
                         void Finish()
                         {
                             lock (_sync)

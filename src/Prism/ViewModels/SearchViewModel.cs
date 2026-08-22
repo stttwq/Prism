@@ -220,6 +220,24 @@ public sealed class SearchViewModel
     }
 
     /// <summary>
+    /// H7（全仓复审 2026-08-22）：查询里含 ext:/path: 过滤 token（与 broker
+    /// parse_query 的 known_prefixes 同口径，宽松版：不校验值合法性——凡是
+    /// 形似过滤词的查询一律不进/清前缀缓存，宁可少缓存不可错过滤）。broker
+    /// 会把这些 token 从名字查询里剥掉，但回显仍是原文；前缀缓存按 Title
+    /// 子串过滤，标题永远不会包含 "ext:" 文本——下一击键会把整页结果滤空。
+    /// </summary>
+    internal static bool HasFilterToken(string query)
+    {
+        foreach (var token in query.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (token.StartsWith("ext:", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("path:", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// 解析 `>` 前缀（G5）。模式来自输入文本本身而不是环境状态，所以每次请求都就地推导，
     /// 不把它存进 <see cref="_searchContext"/>——存起来就会和输入框脱节。
     ///
@@ -733,6 +751,10 @@ public sealed class SearchViewModel
         }
         if (!string.IsNullOrWhiteSpace(_state.Query) || !string.IsNullOrWhiteSpace(_searchContext.Root))
         {
+            // L22（全仓复审 2026-08-22）：入口捕获查询——等待 generation/超时期间用户
+            // 可能继续打字，_state.Query 已是新文本；刷新该刷的是触发它的那次查询，
+            // 而防抖路径自己去读最新值，两者互不冒领。
+            var query = _state.Query;
             _resultLimit = InitialResultLimit;
             _completeCache = null;
             _state.Results = Array.Empty<SearchResult>();
@@ -753,14 +775,16 @@ public sealed class SearchViewModel
             if (completed == timeoutTask)
             {
                 // generation 超时：先搜索一次（用当前索引），再提示索引尚未刷新。
-                await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
+                await RunSearchAsync(query, _resultLimit).ConfigureAwait(true);
                 _state.StatusMessage = "索引尚未刷新，结果可能不完整";
             }
             else
             {
                 // generation 变化：OnIndexGenerationChanged 已经触发了一次搜索，
                 // 但 generation debounce 可能在 Mode != Results 时被跳过，所以再搜一次。
-                await RunSearchAsync(_state.Query, _resultLimit).ConfigureAwait(true);
+                // L22：generation 已到手，武装中的 debounce 只会再搜一次旧查询——停掉。
+                _generationDebounce.Stop();
+                await RunSearchAsync(query, _resultLimit).ConfigureAwait(true);
             }
         }
     }
@@ -905,8 +929,14 @@ public sealed class SearchViewModel
         // 完整查询（如 "E"），路径增长（"E:\foo"）是其前缀，但语义是"换了一个
         // 路径"，按标题子串过滤缓存必得空集——清缓存，直接发 broker。
         // 窗口结果按枚举逐次签发，也绝不能从前缀缓存供给。
-        if (!isEmptyQuery && !context.IsWindowMode && IsAbsolutePathQuery(query))
+        // H7：ext:/path: 过滤词同理——broker 剥掉 token 后按名字过滤，回显却是
+        // 原文，Title.Contains("ext:pdf") 永远为假，下一击键整页滤空。
+        if (!isEmptyQuery
+            && !context.IsWindowMode
+            && (IsAbsolutePathQuery(query) || HasFilterToken(query)))
+        {
             _completeCache = null;
+        }
         if (!isEmptyQuery && !context.IsWindowMode && TryFilterCompleteCache(query, out var cached))
         {
             ApplySearchResponse(cached, query, max, seq, startPoll: false, updateCache: false);
@@ -1019,6 +1049,8 @@ public sealed class SearchViewModel
             // those three does not silently start caching volatile tokens. A unit test
             // cannot isolate it for exactly that reason.
             && !IsWindowQuery(query)
+            // H7：过滤词查询不入缓存（TryFilterCompleteCache 的子串过滤对它们必然失真）。
+            && !HasFilterToken(query)
             && !resp.IsIndexing
             && string.IsNullOrWhiteSpace(resp.IndexError)
             && !resp.IsTruncated

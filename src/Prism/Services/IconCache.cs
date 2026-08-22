@@ -60,9 +60,16 @@ public sealed class IconCache
         }
 
         // B9：无扩展名路径需要探盘才能定键（dir: 还是 file:）——后台执行。
+        // L18（全仓复审 2026-08-22）：token 已取消时返回 null 而非抛
+        // TaskCanceledException——Task.Run(..., ct) 的取消语义会把异常沿
+        // dispatcher 冒到 UI 线程，与本类其余路径（LoadIcon32 失败返 null）
+        // 的契约不一致。调用方本就丢弃取消结果。
+        if (ct.IsCancellationRequested)
+            return Task.FromResult<ImageSource?>(null);
         return Task.Run(() =>
         {
-            ct.ThrowIfCancellationRequested();
+            if (ct.IsCancellationRequested)
+                return null;
             var key = CacheKey(path) + "@" + size;
             lock (_lock)
             {
@@ -74,7 +81,7 @@ public sealed class IconCache
                 }
             }
             return LoadAndStore(key, path, pixelSize, ct);
-        }, ct);
+        });
     }
 
     /// <summary>锁外加载图标并入缓存（加载期间可能有并发插入，复查复用）。</summary>

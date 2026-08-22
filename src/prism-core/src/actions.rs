@@ -241,10 +241,13 @@ fn action_item(id: ActionId) -> ActionItem {
 ///
 /// broker 在此处重新解析 `ActionId`，未知 id 被拒。mutation 动作在第一批
 /// 尚未接入 Shell worker，显式返回 `Unsupported`。
-pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), String> {
+/// L4（全仓复审 2026-08-22）：返回类型化 ShellError，错误类别在构造点显式
+/// 给出——此前 shell.rs 用中文子串从消息文本反推类别，改一句文案就会改掉
+/// 前端分支的错误分类。
+pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), ShellError> {
     let id = action
         .parse::<ActionId>()
-        .map_err(|_| format!("未知动作：{action}"))?;
+        .map_err(|_| ShellError::new(ShellErrorKind::Unsupported, format!("未知动作：{action}")))?;
     validate_path(path)?;
     match id {
         ActionId::OpenFolder => reveal_in_explorer(path),
@@ -259,35 +262,45 @@ pub(crate) fn run_action_direct(path: &str, action: &str) -> Result<(), String> 
         | ActionId::OpenWith
         | ActionId::LocateApp
         | ActionId::AppProperties
-        | ActionId::RunAsAdmin => Err(format!(
-            "{action} 由 Shell 路由直接处理，不应进入 run_action_direct"
+        | ActionId::RunAsAdmin => Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            format!("{action} 由 Shell 路由直接处理，不应进入 run_action_direct"),
         )),
         ActionId::Rename
         | ActionId::CopyTo
         | ActionId::MoveTo
         | ActionId::Recycle
         | ActionId::DeletePermanent
-        | ActionId::Zip => Err(format!("{action} 尚未实现（mutation 动作第二批接入）")),
+        | ActionId::Zip => Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            format!("{action} 尚未实现（mutation 动作第二批接入）"),
+        )),
     }
 }
 
-fn validate_path(path: &str) -> Result<(), String> {
+fn validate_path(path: &str) -> Result<(), ShellError> {
     let path = path.trim();
     if path.is_empty() {
-        return Err("路径为空".into());
+        return Err(ShellError::new(ShellErrorKind::TargetInvalid, "路径为空"));
     }
     if path.contains('\0') {
-        return Err("路径含非法字符".into());
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "路径含非法字符",
+        ));
     }
     if !std::path::Path::new(path).is_absolute() {
-        return Err("拒绝相对路径".into());
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "拒绝相对路径",
+        ));
     }
     Ok(())
 }
 
 /// explorer /select,"path"
 #[cfg(windows)]
-fn reveal_in_explorer(path: &str) -> Result<(), String> {
+fn reveal_in_explorer(path: &str) -> Result<(), ShellError> {
     use std::os::windows::process::CommandExt;
 
     let normalized = path.replace('/', "\\");
@@ -295,19 +308,24 @@ fn reveal_in_explorer(path: &str) -> Result<(), String> {
     std::process::Command::new("explorer")
         .raw_arg(arg)
         .spawn()
-        .map(|_| crate::logging::event("info", "shell_reveal_complete", None, None))
-        .map_err(|e| e.to_string())
+        .map(|_| {
+            crate::logging::event("info", "shell_reveal_complete", None, None);
+        })
+        .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))
 }
 
 #[cfg(not(windows))]
-fn reveal_in_explorer(path: &str) -> Result<(), String> {
-    Err(format!("非 Windows 平台无法定位：{path}"))
+fn reveal_in_explorer(path: &str) -> Result<(), ShellError> {
+    Err(ShellError::new(
+        ShellErrorKind::Unsupported,
+        format!("非 Windows 平台无法定位：{path}"),
+    ))
 }
 
 // ── 剪贴板：文本 ──────────────────────────────────────────────
 
 #[cfg(windows)]
-fn clipboard_set_text(text: &str) -> Result<(), String> {
+fn clipboard_set_text(text: &str) -> Result<(), ShellError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows::Win32::System::DataExchange::{EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -322,26 +340,36 @@ fn clipboard_set_text(text: &str) -> Result<(), String> {
 
     unsafe {
         if OpenClipboard(HWND::default()).is_err() {
-            return Err("无法打开剪贴板".into());
+            return Err(ShellError::new(ShellErrorKind::System, "无法打开剪贴板"));
         }
         let _close = scopeguard_close();
-        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
-
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(|e| format!("GlobalAlloc：{e}"))?;
+        // L6（全仓复审 2026-08-22）：先分配并锁定，再清空——EmptyClipboard 之后
+        // 任何失败路径都会让用户白丢原有剪贴板内容。
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes)
+            .map_err(|e| ShellError::new(ShellErrorKind::System, format!("GlobalAlloc：{e}")))?;
         if hmem.is_invalid() {
-            return Err("GlobalAlloc 返回空".into());
+            return Err(ShellError::new(
+                ShellErrorKind::System,
+                "GlobalAlloc 返回空",
+            ));
         }
         let ptr = GlobalLock(hmem);
         if ptr.is_null() {
             let _ = GlobalFree(hmem);
-            return Err("GlobalLock 失败".into());
+            return Err(ShellError::new(ShellErrorKind::System, "GlobalLock 失败"));
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, bytes);
         let _ = GlobalUnlock(hmem);
 
+        EmptyClipboard()
+            .map_err(|e| ShellError::new(ShellErrorKind::System, format!("清空剪贴板失败：{e}")))?;
+
         if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)).is_err() {
             let _ = GlobalFree(hmem);
-            return Err("SetClipboardData 文本失败".into());
+            return Err(ShellError::new(
+                ShellErrorKind::System,
+                "SetClipboardData 文本失败",
+            ));
         }
         // 成功后系统接管 hmem，不要 GlobalFree。
         crate::logging::event("info", "clipboard_copy_path_complete", None, None);
@@ -350,9 +378,12 @@ fn clipboard_set_text(text: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn clipboard_set_text(text: &str) -> Result<(), String> {
+fn clipboard_set_text(text: &str) -> Result<(), ShellError> {
     let _ = text;
-    Err("非 Windows 平台无剪贴板".into())
+    Err(ShellError::new(
+        ShellErrorKind::Unsupported,
+        "非 Windows 平台无剪贴板",
+    ))
 }
 
 // ── 剪贴板：文件（CF_HDROP + Preferred DropEffect） ───────────
@@ -367,7 +398,7 @@ fn preferred_drop_effect_move() -> u32 {
 }
 
 #[cfg(windows)]
-fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
+fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), ShellError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
@@ -391,20 +422,24 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
 
     unsafe {
         if OpenClipboard(HWND::default()).is_err() {
-            return Err("无法打开剪贴板".into());
+            return Err(ShellError::new(ShellErrorKind::System, "无法打开剪贴板"));
         }
         let _close = scopeguard_close();
-        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
 
-        // CF_HDROP
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, total).map_err(|e| format!("GlobalAlloc：{e}"))?;
+        // L6（全仓复审 2026-08-22）：先分配并填充，再清空——EmptyClipboard 之后
+        // 的失败路径会白丢用户原有剪贴板内容。
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, total)
+            .map_err(|e| ShellError::new(ShellErrorKind::System, format!("GlobalAlloc：{e}")))?;
         if hmem.is_invalid() {
-            return Err("GlobalAlloc 返回空".into());
+            return Err(ShellError::new(
+                ShellErrorKind::System,
+                "GlobalAlloc 返回空",
+            ));
         }
         let ptr = GlobalLock(hmem) as *mut u8;
         if ptr.is_null() {
             let _ = GlobalFree(hmem);
-            return Err("GlobalLock 失败".into());
+            return Err(ShellError::new(ShellErrorKind::System, "GlobalLock 失败"));
         }
         // 清零并写 DROPFILES 头。
         std::ptr::write_bytes(ptr, 0, total);
@@ -414,12 +449,20 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
         std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr.add(header_size), list_bytes);
         let _ = GlobalUnlock(hmem);
 
+        EmptyClipboard()
+            .map_err(|e| ShellError::new(ShellErrorKind::System, format!("清空剪贴板失败：{e}")))?;
+
+        // CF_HDROP
         if SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0)).is_err() {
             let _ = GlobalFree(hmem);
-            return Err("SetClipboardData HDROP 失败".into());
+            return Err(ShellError::new(
+                ShellErrorKind::System,
+                "SetClipboardData HDROP 失败",
+            ));
         }
 
         // Preferred DropEffect（复制 vs 剪切）；失败不回滚 HDROP（资源管理器仍可粘贴为复制）。
+        // L6：失败记事件日志——剪切静默降级为复制时，至少留有诊断痕迹。
         let fmt_name: Vec<u16> =
             OsStrExt::encode_wide(std::ffi::OsStr::new("Preferred DropEffect"))
                 .chain(std::iter::once(0))
@@ -436,6 +479,12 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
                         let _ = GlobalUnlock(heffect);
                         if SetClipboardData(fmt, HANDLE(heffect.0)).is_err() {
                             let _ = GlobalFree(heffect);
+                            crate::logging::event(
+                                "warn",
+                                "clipboard_drop_effect_failed",
+                                None,
+                                None,
+                            );
                         }
                     }
                 }
@@ -462,9 +511,12 @@ fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), String> {
+fn clipboard_set_files(path: &str, drop_effect: u32) -> Result<(), ShellError> {
     let _ = (path, drop_effect);
-    Err("非 Windows 平台无剪贴板".into())
+    Err(ShellError::new(
+        ShellErrorKind::Unsupported,
+        "非 Windows 平台无剪贴板",
+    ))
 }
 
 /// RAII：离开作用域时 CloseClipboard。
@@ -558,7 +610,7 @@ mod tests {
     #[test]
     fn run_unknown_action_errors() {
         let err = run_action_direct(r"C:\Windows\explorer.exe", "nope").unwrap_err();
-        assert!(err.contains("未知动作"));
+        assert!(err.message.contains("未知动作"));
     }
 
     #[test]
@@ -605,8 +657,9 @@ mod tests {
         ] {
             let err = run_action_direct(path, action).unwrap_err();
             assert!(
-                err.contains("尚未实现"),
-                "mutation action {action} should be rejected in batch 1: {err}"
+                err.message.contains("尚未实现"),
+                "mutation action {action} should be rejected in batch 1: {:?}",
+                err
             );
         }
     }
@@ -623,8 +676,9 @@ mod tests {
         ] {
             let err = run_action_direct(path, action).unwrap_err();
             assert!(
-                err.contains("Shell 路由直接处理"),
-                "action {action} should be routed via ShellOperation: {err}"
+                err.message.contains("Shell 路由直接处理"),
+                "action {action} should be routed via ShellOperation: {:?}",
+                err
             );
         }
     }

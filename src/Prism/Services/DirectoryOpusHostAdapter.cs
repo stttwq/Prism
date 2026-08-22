@@ -461,7 +461,17 @@ public sealed class ProcessDirectoryOpusRuntime : IDirectoryOpusRuntime
             var stderrTask = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit((int)Math.Clamp(timeout.TotalMilliseconds, 1, 60_000)))
             {
-                try { process.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                // L17（全仓复审 2026-08-22）：不杀进程树——dopusrt 不派生用户进程，
+                // entireProcessTree:true 是全仓唯一一处杀树，与 PipeClient 的 Bug 3
+                // 政策（broker 打开的用户应用不能陪葬）相悖；被杀进程的管道读取
+                // 任务也要观察掉，不能弃管成 unobserved exception。
+                try { process.Kill(); } catch { /* ignore */ }
+                try
+                {
+                    stdoutTask.Wait(TimeSpan.FromSeconds(1));
+                    stderrTask.Wait(TimeSpan.FromSeconds(1));
+                }
+                catch { /* ignore */ }
                 return new DirectoryOpusCommandResult(true, -1, "", "timed out");
             }
 

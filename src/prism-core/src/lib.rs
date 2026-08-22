@@ -29,7 +29,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 构建指纹：源码树最新 mtime + 构建 profile，由 `build.rs` 注入。
 ///
 /// `VERSION` 取自 Cargo.toml，改代码不会变，所以回答不了「跑的是不是我刚编的那份」。
-/// 装完可用 `scripts/prism-build.ps1 -VerifyOnly` 比对运行中进程与源码是否一致。
+/// M20（全仓复审 2026-08-22）：-VerifyOnly 只比磁盘文件哈希，不比运行中进程
+/// 的 stamp——「运行中的进程是否是刚编的那份」目前只能靠 hello 握手回传的
+/// `build_id` 人工比对（见 build.rs 头注释的两个限定）。
 pub const BUILD_STAMP: &str = env!("PRISM_BUILD_STAMP");
 pub const BUILD_PROFILE: &str = env!("PRISM_BUILD_PROFILE");
 

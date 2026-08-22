@@ -21,10 +21,27 @@ internal sealed class SingleInstance : IDisposable
 
     private const int ERROR_ALREADY_EXISTS = 183;
 
+    private readonly string _mutexName;
+    private readonly string _pipeName;
+
     private Mutex? _mutex;
     private bool _ownsMutex;
     private CancellationTokenSource? _listenCts;
     private Task? _listenTask;
+    /// <summary>L24：连续监听失败计数，用于短退避到慢退避的升级；成功连接后清零。</summary>
+    private int _listenFailures;
+
+    /// <summary>
+    /// M2（全仓复审 2026-08-22）：测试注入构造。生产用默认全局名；测试注入
+    /// 随机名，避免与真机运行的 Prism.exe 抢同一个 Local\ 互斥锁——此前
+    /// SingleInstanceDumbClientTests 在任何装了 Prism 的机器上必败（12ms 即输），
+    /// 让「dotnet 全绿」门在最需要跑它的机器上失效。
+    /// </summary>
+    internal SingleInstance(string? mutexName = null, string? pipeName = null)
+    {
+        _mutexName = mutexName ?? MutexName;
+        _pipeName = pipeName ?? PipeName;
+    }
 
     /// <summary>
     /// 尝试获取命名互斥锁。返回 true 表示这是首个实例（调用方应继续启动）；
@@ -32,7 +49,7 @@ internal sealed class SingleInstance : IDisposable
     /// </summary>
     public bool TryAcquire()
     {
-        _mutex = new Mutex(initiallyOwned: true, name: MutexName, createdNew: out _ownsMutex);
+        _mutex = new Mutex(initiallyOwned: true, name: _mutexName, createdNew: out _ownsMutex);
         return _ownsMutex;
     }
 
@@ -42,7 +59,7 @@ internal sealed class SingleInstance : IDisposable
         try
         {
             using var client = new NamedPipeClientStream(
-                ".", PipeName, PipeDirection.Out, PipeOptions.Asynchronous);
+                ".", _pipeName, PipeDirection.Out, PipeOptions.Asynchronous);
             client.Connect((int)TimeSpan.FromSeconds(3).TotalMilliseconds);
             using var writer = new StreamWriter(client, new UTF8Encoding(false))
             {
@@ -78,10 +95,11 @@ internal sealed class SingleInstance : IDisposable
                 // FirstPipeInstance 声明独占：我们已持有单实例互斥锁，
                 // 正常情况下不存在第二个监听者。
                 server = new NamedPipeServerStream(
-                    PipeName, PipeDirection.In, 1,
+                    _pipeName, PipeDirection.In, 1,
                     PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance);
                 await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
+                _listenFailures = 0;
 
                 // AUDIT-2026-08-18 C-D8: 读加 2s 超时。哑客户端（连上不发数据）
                 // 此前会无限期占死这个监听槽，之后所有双开唤出全部失灵。
@@ -114,11 +132,19 @@ internal sealed class SingleInstance : IDisposable
             }
             catch
             {
-                // 单个连接/构造异常不应终止监听循环，但也不能零退避空转烧满一核
-                //（构造持续失败时每秒重试一次；取消令牌驱动，正常路径零延迟）。
+                // 单个连接/构造异常不应终止监听循环，但也不能零退避空转烧满一核。
+                // L24（全仓复审 2026-08-22）：FirstPipeInstance 的管道名释回不是
+                // 瞬时的，上一连接 Dispose 后立刻重建可能撞 IOException——先短退避
+                // （50ms×10）让循环顶快速重建监听槽；连续失败耗尽才落回 1s 慢退避。
+                // 慢退避期间监听槽是空的，双开唤出会撞进 SignalExistingInstance
+                // 的静默 catch，用户按启动器毫无反应。
+                var delay = _listenFailures < 10
+                    ? TimeSpan.FromMilliseconds(50)
+                    : TimeSpan.FromSeconds(1);
+                _listenFailures++;
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                    await Task.Delay(delay, ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {

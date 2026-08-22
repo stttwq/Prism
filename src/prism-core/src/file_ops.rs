@@ -1,13 +1,19 @@
 //! 文件操作：回收站、永久删除、复制到、移动到、重命名。
 //!
 //! 所有操作使用 `IFileOperation`，在 STA worker 上执行。Windows 标准 UI 处理
-//! 重名、权限、进度和取消。永久删除强制不可关闭的系统确认。
+//! 重名、权限、进度和取消。
 //!
 //! 设计原则：
 //! - broker 重新验证目标路径（绝对路径、非空、非 NUL）
+//! - M4（全仓复审 2026-08-22）：破坏性操作前复核磁盘状态——目标仍存在、
+//!   类型与客户端声明一致（搜索快照可能已过期数秒）
 //! - `IFileOperation::SetOperationFlags` 控制行为
+//! - H3（全仓复审 2026-08-22）：所有操作挂 STA 线程的 message-only 属主窗口，
+//!   确认/进度对话框有属主可停靠，不会被桌面吞掉
 //! - 用户取消映射 `ShellOutcome::Cancelled`
-//! - 永久删除使用 `FOF_WANTNUKEWARNING`，不可关闭确认
+//! - 永久删除使用 `FOF_WANTNUKEWARNING`：**请求**系统删除警告。注意这不是
+//!   「强制弹窗」的同义词——真正的保障是属主窗口 + 默认确认开关
+//!   （不设 FOF_NOCONFIRMATION）。
 
 #[cfg(windows)]
 use crate::shell::{ActionTarget, ShellError, ShellErrorKind, ShellOutcome, TargetKind};
@@ -23,6 +29,34 @@ fn validate_file_target(target: &ActionTarget) -> Result<TargetKind, ShellError>
         ));
     }
     Ok(kind)
+}
+
+/// M4（全仓复审 2026-08-22）：破坏性操作前的磁盘复核。搜索快照可能已过期
+/// 数秒到数分钟，枚举与执行之间路径也可能被替换——经典 TOCTOU，尾巴是
+/// 删除/移动。这里按**链接本身**（symlink_metadata 不穿透）复核：
+/// - 目标不存在 ⇒ TargetInvalid（给出可读错误，而不是把 DeleteItem 交给
+///   一个过期路径）；
+/// - 磁盘类型与客户端声明的 kind 不一致 ⇒ TargetInvalid（文件被换成目录、
+///   或反之，快照误导了用户，停下来是对的）。
+///
+/// reparse point 本身不拒：删除/重命名一个 junction/symlink 作用在链接上，
+/// 是合法操作（symlink_metadata 已保证不穿透到目标）。
+#[cfg(windows)]
+fn verify_target_on_disk(target: &ActionTarget, kind: TargetKind) -> Result<(), ShellError> {
+    let metadata = std::fs::symlink_metadata(&target.value).map_err(|_| {
+        ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "目标在执行前已不存在（路径可能来自过期的搜索结果）",
+        )
+    })?;
+    let on_disk_is_dir = metadata.is_dir();
+    if on_disk_is_dir != (kind == TargetKind::Directory) {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "目标类型与搜索结果不一致（磁盘上的内容已改变）",
+        ));
+    }
+    Ok(())
 }
 
 /// 将 Rust 字符串路径转为 Windows 宽字符 Vec<u16>（带 NUL 结尾）。
@@ -45,13 +79,59 @@ fn shell_item_from_path(path: &str) -> Result<windows::Win32::UI::Shell::IShellI
     Ok(item)
 }
 
+// H3（全仓复审 2026-08-22）：STA worker 线程的 message-only 属主窗口。
+// IFileOperation / ShellExecuteEx 的确认、进度、冲突对话框都需要一个属主
+// HWND：无属主时对话框要么沉到桌面底层无法交互，要么（对 FOF_WANTNUKEWARNING
+// 这类「请求警告」的 flag）干脆被抑制——文件在没有任何确认的情况下被
+// 不可恢复地删除。message-only 窗口不可见、不进枚举、不抢焦点，只做
+// 对话框锚点。thread_local 保证与 COM 调用同线程（STA 要求）。
+#[cfg(windows)]
+std::thread_local! {
+    static OWNER_WINDOW: windows::Win32::Foundation::HWND = create_owner_window();
+}
+
+#[cfg(windows)]
+fn create_owner_window() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, WINDOW_EX_STYLE, WS_OVERLAPPED,
+    };
+    // 系统类 STATIC 免注册；父窗口 HWND_MESSAGE(-3) 把它变成 message-only。
+    // 创建失败（极端：桌面堆耗尽）不阻塞操作——退回无属主行为，与修复前一致。
+    let hwnd_message = windows::Win32::Foundation::HWND(-3isize as _);
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            windows::core::w!("STATIC"),
+            None,
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            hwnd_message,
+            None,
+            None,
+            None,
+        )
+    }
+    .unwrap_or_default()
+}
+
 /// 创建 `IFileOperation` COM 实例。
 #[cfg(windows)]
 fn create_file_operation() -> Result<windows::Win32::UI::Shell::IFileOperation, ShellError> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::FileOperation;
-    unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
-        .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))
+    let op: windows::Win32::UI::Shell::IFileOperation =
+        unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
+    // H3：挂属主窗口，让确认/进度对话框有停靠点。失败不致命（同上）。
+    OWNER_WINDOW.with(|hwnd| {
+        if !hwnd.0.is_null() {
+            let _ = unsafe { op.SetOwnerWindow(*hwnd) };
+        }
+    });
+    Ok(op)
 }
 
 // ── 公开操作 ──────────────────────────────────────────────────
@@ -64,7 +144,8 @@ fn create_file_operation() -> Result<windows::Win32::UI::Shell::IFileOperation, 
 pub(crate) fn recycle(target: &ActionTarget) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR};
 
-    validate_file_target(target)?;
+    let kind = validate_file_target(target)?;
+    verify_target_on_disk(target, kind)?;
     let item = shell_item_from_path(&target.value)?;
     let op = create_file_operation()?;
 
@@ -89,12 +170,15 @@ pub(crate) fn recycle(target: &ActionTarget) -> Result<ShellOutcome, ShellError>
 pub(crate) fn delete_permanent(target: &ActionTarget) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_WANTNUKEWARNING};
 
-    validate_file_target(target)?;
+    let kind = validate_file_target(target)?;
+    verify_target_on_disk(target, kind)?;
     let item = shell_item_from_path(&target.value)?;
     let op = create_file_operation()?;
 
     // 不设 FOF_ALLOWUNDO: 不可恢复。
-    // FOF_WANTNUKEWARNING: 强制显示永久删除警告，不可关闭。
+    // FOF_WANTNUKEWARNING: 请求系统「永久删除」警告（而非普通删除确认）。
+    // 注意：该 flag 是「请求」不是「强制」——无属主窗口时它可能被抑制，
+    // 这正是 create_file_operation 里 SetOwnerWindow 的意义。
     // 不设 FOF_NOCONFIRMATION: 让 Windows 显示确认。
     unsafe {
         op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_WANTNUKEWARNING.0))
@@ -143,7 +227,8 @@ pub(crate) fn move_to(
 ) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::{FILEOPERATION_FLAGS, FOF_NOCONFIRMMKDIR};
 
-    validate_file_target(target)?;
+    let kind = validate_file_target(target)?;
+    verify_target_on_disk(target, kind)?;
     let src_item = shell_item_from_path(&target.value)?;
     let dst_item = shell_item_from_path(destination)?;
     let op = create_file_operation()?;
@@ -163,9 +248,19 @@ pub(crate) fn move_to(
 pub(crate) fn rename(target: &ActionTarget, new_name: &str) -> Result<ShellOutcome, ShellError> {
     use windows::Win32::UI::Shell::FILEOPERATION_FLAGS;
 
-    validate_file_target(target)?;
+    let kind = validate_file_target(target)?;
 
-    // 验证新 leaf name
+    // M5（全仓复审 2026-08-22）：卷根/UNC 根没有 leaf name，RenameItem 作用在
+    // 卷根上没有意义且必败——显式拒绝，给可读错误。
+    let lexical_path = std::path::Path::new(&target.value);
+    if lexical_path.file_name().is_none() {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "不能对卷根重命名",
+        ));
+    }
+
+    // 验证新 leaf name（纯词法校验在前：错误信息稳定，不依赖磁盘状态）。
     let trimmed = new_name.trim();
     if trimmed.is_empty() {
         return Err(ShellError::new(
@@ -187,19 +282,26 @@ pub(crate) fn rename(target: &ActionTarget, new_name: &str) -> Result<ShellOutco
         ));
     }
 
+    // M4：词法校验全部通过后再复核磁盘状态（存在性 + 类型一致）。
+    verify_target_on_disk(target, kind)?;
+
     // 检查新文件名是否与当前 leaf name 完全相同（区分大小写）。
     // IFileOperation 在源=目标时返回 E_INVALIDARG (0x80070057)，提前拦截给出可读错误。
     // 复审 L3（2026-08-21）：仅大小写不同的重命名在 Windows 上合法（Explorer
     // 常态操作），eq_ignore_ascii_case 会把它误拒；字节相同才是 E_INVALIDARG。
-    if let Some(current_leaf) = std::path::Path::new(&target.value)
-        .file_name()
-        .and_then(|n| n.to_str())
-    {
-        if current_leaf == trimmed {
-            return Err(ShellError::new(
-                ShellErrorKind::TargetInvalid,
-                "新文件名与当前文件名相同",
-            ));
+    // M5（全仓复审 2026-08-22）：叶子名取**磁盘真名**（canonicalize 吃掉尾点/
+    // 尾空格的 Win32 归一化），不再信任调用方字符串的末段——`file.txt.` 的
+    // 字面 leaf 是 `file.txt.`，真实文件是 `file.txt`，重命名为 `file.txt`
+    // 本就该在这里被拦下，而不是撞 E_INVALIDARG 的不透明 0x80070057。
+    // 路径不存在时 canonicalize 失败：留给后续 shell item 解析报错。
+    if let Ok(canonical) = std::fs::canonicalize(&target.value) {
+        if let Some(current_leaf) = canonical.file_name().and_then(|n| n.to_str()) {
+            if current_leaf == trimmed {
+                return Err(ShellError::new(
+                    ShellErrorKind::TargetInvalid,
+                    "新文件名与当前文件名相同",
+                ));
+            }
         }
     }
 
@@ -346,11 +448,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rename_rejects_identical_name_but_allows_case_only() {
-        let target = ActionTarget::new(TargetKind::File, r"C:\temp\test.txt");
+        // M5：相同名预检按磁盘真名比对——需要一个真实存在的文件。
+        let temp = std::env::temp_dir().join(format!(
+            "prism-rename-same-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&temp, "x").unwrap();
+        let target = ActionTarget::new(TargetKind::File, temp.to_str().unwrap());
         // 字节完全相同：E_INVALIDARG 前置拦截。
-        let err = rename(&target, "test.txt").unwrap_err();
+        let err = rename(&target, temp.file_name().unwrap().to_str().unwrap()).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("相同"));
+        let _ = std::fs::remove_file(&temp);
         // 复审 L3（2026-08-21）：仅大小写不同在 Windows 上是合法重命名，
         // 不得被「相同」预检误拒——用必然不存在的路径锚定：预检放行后
         // 错误只能来自后续的 shell item 解析，消息里没有「相同」。
@@ -388,6 +501,39 @@ mod tests {
         let err = rename(&target, &long_name).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
         assert!(err.message.contains("过长"));
+    }
+
+    /// M5：卷根没有 leaf name，必须在词法层拒绝（可读错误，而非 COM 层的
+    /// 不透明失败）。
+    #[cfg(windows)]
+    #[test]
+    fn rename_rejects_volume_root() {
+        for root in [r"C:\", r"\\server\share\"] {
+            let target = ActionTarget::new(TargetKind::Directory, root);
+            let err = rename(&target, "newname").unwrap_err();
+            assert_eq!(err.kind, ShellErrorKind::TargetInvalid, "root {root}");
+            assert!(err.message.contains("卷根"), "root {root}");
+        }
+    }
+
+    /// M4：磁盘类型与声明不符 ⇒ 拒绝。声明为 file、磁盘上是目录。
+    #[cfg(windows)]
+    #[test]
+    fn recycle_rejects_kind_mismatch_with_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-m4-kind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = ActionTarget::new(TargetKind::File, dir.to_str().unwrap());
+        let err = recycle(&target).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::TargetInvalid);
+        assert!(err.message.contains("类型"));
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[cfg(windows)]

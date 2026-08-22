@@ -1,1 +1,4 @@
-edition = "2021"  
+edition = "2021"
+# L35: edition 只影响解析。风格旋钮由本地 rustfmt 版本决定，
+# 本仓库用 pre-commit 钩子(检查的是每个开发者自己的 cargo fmt)守门，
+# 而不是靠本文件锁死风格——跨版本漂移由钩子当场暴露。

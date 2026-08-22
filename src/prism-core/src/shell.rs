@@ -1,6 +1,5 @@
 //! Typed Shell boundary owned by the normal-user broker.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -74,7 +73,6 @@ pub enum ShellOperation {
 
 struct WorkItem {
     operation: ShellOperation,
-    cancelled: Arc<AtomicBool>,
     result: mpsc::Sender<Result<ShellOutcome, ShellError>>,
 }
 
@@ -121,11 +119,9 @@ impl ShellExecutor {
         operation: ShellOperation,
     ) -> Result<ShellOutcome, ShellError> {
         let worker = self.clone();
-        tokio::task::spawn_blocking(move || {
-            worker.execute_blocking(operation, Arc::new(AtomicBool::new(false)))
-        })
-        .await
-        .map_err(|error| ShellError::new(ShellErrorKind::System, error.to_string()))?
+        tokio::task::spawn_blocking(move || worker.execute_blocking(operation))
+            .await
+            .map_err(|error| ShellError::new(ShellErrorKind::System, error.to_string()))?
     }
 
     pub async fn scan_apps(self: &Arc<Self>) -> Result<Vec<crate::apps::AppEntry>, ShellError> {
@@ -154,14 +150,7 @@ impl ShellExecutor {
         .map_err(|error| ShellError::new(ShellErrorKind::System, error.to_string()))?
     }
 
-    fn execute_blocking(
-        &self,
-        operation: ShellOperation,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<ShellOutcome, ShellError> {
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(ShellOutcome::Cancelled);
-        }
+    fn execute_blocking(&self, operation: ShellOperation) -> Result<ShellOutcome, ShellError> {
         // S2a：外部进程 zip（7-Zip/自定义压缩程序）不进 STA 队列——纯
         // std::process 调用分钟级等待，会占死唯一的 Shell worker；当前
         // spawn_blocking 线程正好是它的归宿。Windows Shell COM 压缩路径
@@ -195,11 +184,7 @@ impl ShellExecutor {
         // 动作可耗尽 blocking 池。满队列时 worker 本就卡死，立即报错让调用
         // 方看到真相比无限等待正确。
         self.sender
-            .try_send(WorkerMessage::Execute(WorkItem {
-                operation,
-                cancelled,
-                result,
-            }))
+            .try_send(WorkerMessage::Execute(WorkItem { operation, result }))
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => ShellError::new(
                     ShellErrorKind::System,
@@ -240,10 +225,17 @@ impl Drop for ShellExecutor {
     fn drop(&mut self) {
         // M1（复审 2026-08-21）：不再 join。worker 被模态页/死网络路径挂住时
         // join 会让 broker 的退出路径无限阻塞；Drop 只在进程退出（最后一个
-        // Arc 释放）时到达， detach 由进程终结统一收拾，等待没有价值。
-        // Shutdown 也用 try_send：队列被弃单填满时阻塞 send 等于把挂死从
-        // join 挪回 send。
-        let _ = self.sender.try_send(WorkerMessage::Shutdown);
+        // Arc 释放）时到达，detach 由进程终结统一收拾，等待没有价值。
+        // L5（全仓复审 2026-08-22）：Shutdown 用有界重试的 try_send——队列被
+        // 弃单填满但 worker 仍在缓慢消化时，直接放弃会让 worker 收不到
+        // Shutdown，CoUninitialize 不执行（STA 线程泄漏）。真挂死（重试期间
+        // 队列不退）在 200ms 后放弃，与 M1 的「不无限阻塞退出路径」一致。
+        for _ in 0..20 {
+            if self.sender.try_send(WorkerMessage::Shutdown).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         if let Ok(mut join) = self.join.lock() {
             drop(join.take());
         }
@@ -262,11 +254,7 @@ fn worker_loop(receiver: mpsc::Receiver<WorkerMessage>, ready: SyncSender<Result
     while let Ok(message) = receiver.recv() {
         match message {
             WorkerMessage::Execute(item) => {
-                let outcome = if item.cancelled.load(Ordering::Acquire) {
-                    Ok(ShellOutcome::Cancelled)
-                } else {
-                    execute_on_sta(item.operation)
-                };
+                let outcome = execute_on_sta(item.operation);
                 let _ = item.result.send(outcome);
             }
             WorkerMessage::ScanApps(result) => {
@@ -353,11 +341,11 @@ fn execute_run_action(
             }
             shell_execute(&target, "runas")
         }
-        // 剪贴板动作（已有实现，无 mutation）。
+        // 剪贴板动作（已有实现，无 mutation）。L4：run_action_direct 已返回
+        // 类型化 ShellError，不再从中文消息反推类别。
         ActionId::Copy | ActionId::Cut | ActionId::CopyPath | ActionId::CopyAppPath => {
             crate::actions::run_action_direct(&target.value, id.as_str())
                 .map(|()| ShellOutcome::Success)
-                .map_err(|message| ShellError::new(classify_message(&message), message))
         }
         // mutation 动作：IFileOperation 在 STA worker 上执行。
         ActionId::Recycle => crate::file_ops::recycle(&target),
@@ -443,6 +431,7 @@ impl ActionTarget {
         })?;
         if self.value.is_empty()
             || self.value.contains('\0')
+            || self.value.contains('"')
             || self.value.chars().any(char::is_control)
         {
             return Err(ShellError::new(
@@ -450,6 +439,10 @@ impl ActionTarget {
                 "target is invalid",
             ));
         }
+        // L7（全仓复审 2026-08-22）：双引号在 NTFS 文件名里非法，但 validate 此前
+        // 放行——reveal 的 explorer /select,"{path}" 用 raw_arg 刻意绕开转义，
+        // 值里带引号即可塑形 explorer 命令行。真实磁盘路径永不包含引号，
+        // 这里拒绝只会拦下构造载荷。
         let maximum = if kind == TargetKind::Web {
             MAX_WEB_BYTES
         } else {
@@ -660,22 +653,6 @@ fn classify_io_error(error: &std::io::Error) -> ShellErrorKind {
     }
 }
 
-fn classify_message(message: &str) -> ShellErrorKind {
-    if message.contains("权限") || message.contains("拒绝") {
-        ShellErrorKind::AccessDenied
-    } else if message.contains("路径") || message.contains("目标") {
-        ShellErrorKind::TargetInvalid
-    } else if message.contains("未知")
-        || message.contains("未实现")
-        || message.contains("尚未实现")
-        || message.contains("由 Shell 路由直接处理")
-    {
-        ShellErrorKind::Unsupported
-    } else {
-        ShellErrorKind::System
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,18 +740,10 @@ mod tests {
         worker.scan_apps().await.unwrap();
     }
 
-    #[test]
-    fn cancellation_before_queueing_is_not_an_error() {
-        let worker = ShellExecutor::start().unwrap();
-        let cancelled = Arc::new(AtomicBool::new(true));
-        let outcome = worker
-            .execute_blocking(
-                ShellOperation::Open(ActionTarget::new(TargetKind::File, r"C:\x")),
-                cancelled,
-            )
-            .unwrap();
-        assert_eq!(outcome, ShellOutcome::Cancelled);
-    }
+    // M3（全仓复审 2026-08-22）：取消旗标整条链路（execute 每次传全新
+    // `AtomicBool::new(false)`、无任何调用方能置位、PerformOperations 期间
+    // 也从不检查）是死代码，已删除。取消语义由 IFileOperation 自身的确认
+    // 对话框承担（COPYENGINE_S_USER_CANCELLED → ShellOutcome::Cancelled）。
 
     /// S2a：zip 分流发生在进 STA 队列之前，验证错误必须与走 STA 路径时一致
     /// （zip 与 zip_external 共用同一校验）。
@@ -786,15 +755,12 @@ mod tests {
             ActionTarget::new(TargetKind::Web, "https://example.com"),
         ] {
             let error = worker
-                .execute_blocking(
-                    ShellOperation::RunAction {
-                        target,
-                        action: "zip".into(),
-                        args: Default::default(),
-                        zip_program: None,
-                    },
-                    Arc::new(AtomicBool::new(false)),
-                )
+                .execute_blocking(ShellOperation::RunAction {
+                    target,
+                    action: "zip".into(),
+                    args: Default::default(),
+                    zip_program: None,
+                })
                 .unwrap_err();
             assert_eq!(error.kind, ShellErrorKind::Unsupported);
             assert!(error.message.contains("zip requires"));

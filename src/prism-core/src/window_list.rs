@@ -53,6 +53,10 @@ pub struct WindowEntry {
     pub title: String,
     pub app_name: String,
     pub app_path: String,
+    /// M11（全仓复审 2026-08-22）：Win32 窗口类名。pid+app_name 对「同应用关一窗
+    /// 开另一窗、句柄表回收同一 HWND」的场景无区分力；类名跨句柄回收保持稳定
+    ///（同一应用的同类窗口本就无法仅凭用户态信号区分——那正是标题/历史键的职责）。
+    pub class_name: String,
     pub is_minimized: bool,
 }
 
@@ -138,6 +142,7 @@ pub fn select(raw: Vec<RawWindow>, self_pids: &[u32]) -> (Vec<WindowEntry>, bool
             title: window.title,
             app_name: window.app_name,
             app_path: window.app_path,
+            class_name: window.class_name,
             is_minimized: window.is_minimized,
         });
     }
@@ -180,10 +185,24 @@ pub struct WindowSnapshotStore {
     inner: RwLock<Snapshot>,
 }
 
+/// M10（全仓复审 2026-08-22）：保留最近 [`SNAPSHOT_HISTORY] 代快照。此前 resolve
+/// 要求 generation 严格等于最新发布，而窗口模式每击键全量枚举一次——打
+/// `>chrome` 六个字符就有六次发布，任意一次晚于前端拿到 token 完成，回车
+/// 即被判 Conflict（目标窗口明明活着）。环带让上一拍 token 仍可按当时的
+/// 条目身份解析（身份复核照走 probe，安全不受影响）。
+const SNAPSHOT_HISTORY: usize = 16;
+
+/// M10：枚举合并窗口。相邻击键间隔（100~300ms）内的重复窗口查询复用上一份
+/// 快照，不再各自触发一次可能被挂死窗口卡住的 EnumWindows。
+const ENUM_COALESCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 #[derive(Default)]
 struct Snapshot {
     generation: u64,
     entries: Vec<WindowEntry>,
+    /// (generation, entries) 旧代环带，新在前。仅存 Arc 引用，不复制条目。
+    history: Vec<(u64, std::sync::Arc<Vec<WindowEntry>>)>,
+    published_at: Option<std::time::Instant>,
 }
 
 impl Default for WindowSnapshotStore {
@@ -207,14 +226,43 @@ impl WindowSnapshotStore {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if guard.generation > 0 {
+            let previous_generation = guard.generation;
+            let historic = std::sync::Arc::new(std::mem::take(&mut guard.entries));
+            guard.history.insert(0, (previous_generation, historic));
+            guard.history.truncate(SNAPSHOT_HISTORY);
+        }
         guard.generation = guard.generation.saturating_add(1);
         guard.entries = entries;
+        guard.published_at = Some(std::time::Instant::now());
         guard
             .entries
             .iter()
             .enumerate()
             .map(|(index, entry)| (encode_token(guard.generation, index), entry.clone()))
             .collect()
+    }
+
+    /// M10：快照仍在合并窗口期内时重发当前代 token，省一次 EnumWindows。
+    pub fn recent_tokens(&self) -> Option<Vec<(String, WindowEntry)>> {
+        let guard = self.inner.read().ok()?;
+        if guard.generation == 0 {
+            return None;
+        }
+        let fresh = guard
+            .published_at
+            .is_some_and(|at| at.elapsed() < ENUM_COALESCE);
+        if !fresh {
+            return None;
+        }
+        Some(
+            guard
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (encode_token(guard.generation, index), entry.clone()))
+                .collect(),
+        )
     }
 
     pub fn generation(&self) -> u64 {
@@ -233,14 +281,30 @@ impl WindowSnapshotStore {
         let (generation, index) = decode_token(value);
         let entry = {
             let guard = self.inner.read().map_err(|_| ResolveError::Malformed)?;
-            if generation == 0 || generation != guard.generation {
+            if generation == 0 {
                 return Err(ResolveError::StaleGeneration);
             }
-            guard
-                .entries
-                .get(index)
-                .cloned()
-                .ok_or(ResolveError::Malformed)?
+            if generation == guard.generation {
+                // 当前代：索引直接命中。
+                guard
+                    .entries
+                    .get(index)
+                    .cloned()
+                    .ok_or(ResolveError::Malformed)?
+            } else if let Some((_, historic)) = guard
+                .history
+                .iter()
+                .find(|(historic_generation, _)| *historic_generation == generation)
+            {
+                // M10：上一拍 token 按其发布时的条目解析——晚到的重新发布
+                // 不再把活目标判成 Conflict。身份仍由下方 probe 复核。
+                historic
+                    .get(index)
+                    .cloned()
+                    .ok_or(ResolveError::Malformed)?
+            } else {
+                return Err(ResolveError::StaleGeneration);
+            }
         };
 
         let live = probe.probe(entry.handle).ok_or(ResolveError::WindowGone)?;
@@ -253,6 +317,16 @@ impl WindowSnapshotStore {
         // The title may legitimately change while the window stays the same (tab switch,
         // dirty marker), so only the app identity is required to hold.
         if !live.app_name.is_empty() && !live.app_name.eq_ignore_ascii_case(&entry.app_name) {
+            return Err(ResolveError::IdentityChanged);
+        }
+        // M11：类名参与身份复核——同应用换窗、HWND 被句柄表回收复用时，
+        // pid 与 app_name 都不变，类名是最后一个稳定区分信号。
+        //（app_name 为空的提权/受保护进程同样能取到类名——GetClassNameW
+        // 不需要进程句柄。）
+        if !entry.class_name.is_empty()
+            && !live.class_name.is_empty()
+            && !live.class_name.eq_ignore_ascii_case(&entry.class_name)
+        {
             return Err(ResolveError::IdentityChanged);
         }
         Ok(WindowEntry {
@@ -486,10 +560,16 @@ impl WindowProbe for SystemWindowProbe {
 }
 
 /// Enumerate, filter, and publish in one step. Returns tokens paired with entries.
+/// M10：300ms 合并窗口内的重复查询直接复用上一份快照——EnumWindows 可能被
+/// 挂死窗口的 GetWindowTextW 卡住，逐击键全量枚举只会在阻塞池里堆任务。
 pub fn enumerate_and_publish(
     store: &WindowSnapshotStore,
     self_pids: &[u32],
 ) -> Vec<(String, WindowEntry)> {
+    if let Some(recent) = store.recent_tokens() {
+        return recent;
+    }
+
     #[cfg(windows)]
     let raw = platform::enumerate();
     #[cfg(not(windows))]
@@ -767,6 +847,7 @@ mod tests {
             title: "Untitled - Notepad".into(),
             app_name: "notepad".into(),
             app_path: r"C:\Windows\notepad.exe".into(),
+            class_name: "Notepad".into(),
             is_minimized: false,
         }
     }
@@ -781,11 +862,28 @@ mod tests {
         assert_eq!(resolved.pid, 100);
     }
 
+    /// M10 语义更新：上一拍的 token 仍可解析（晚到的重新发布不再把活目标判成
+    /// Conflict）；只有掉出环带（SNAPSHOT_HISTORY 代之前）的 token 才算过期。
     #[test]
-    fn token_from_a_previous_enumeration_is_rejected() {
+    fn token_from_the_previous_enumeration_still_resolves() {
+        let store = WindowSnapshotStore::new();
+        let previous = store.publish(vec![entry()])[0].0.clone();
+        store.publish(vec![entry()]);
+        let probe = FakeProbe::with(0x1234, switchable());
+        let resolved = store
+            .resolve(&previous, &probe)
+            .expect("one generation old is inside the snapshot ring");
+        assert_eq!(resolved.handle, 0x1234);
+    }
+
+    #[test]
+    fn token_older_than_the_snapshot_ring_is_rejected() {
         let store = WindowSnapshotStore::new();
         let stale = store.publish(vec![entry()])[0].0.clone();
-        store.publish(vec![entry()]);
+        // 环带保留 SNAPSHOT_HISTORY(16) 代：要把它挤出去需要 17 次新发布。
+        for _ in 0..SNAPSHOT_HISTORY + 1 {
+            store.publish(vec![entry()]);
+        }
         let probe = FakeProbe::with(0x1234, switchable());
         assert_eq!(
             store.resolve(&stale, &probe),
@@ -846,14 +944,14 @@ mod tests {
     }
 
     #[test]
-    fn recycled_handle_with_a_new_pid_is_rejected() {
+    fn recycled_handle_with_a_new_app_is_rejected() {
         let store = WindowSnapshotStore::new();
         let token = store.publish(vec![entry()])[0].0.clone();
         // Same handle, different process: Windows reused the HWND.
         let probe = FakeProbe::with(
             0x1234,
             RawWindow {
-                pid: 999,
+                app_name: "calc".into(),
                 ..switchable()
             },
         );
@@ -863,14 +961,16 @@ mod tests {
         );
     }
 
+    /// M11：同应用换窗、HWND 回收复用——pid 与 app_name 都没变，类名变了，
+    /// 必须判身份已变。
     #[test]
-    fn recycled_handle_with_a_new_app_is_rejected() {
+    fn recycled_handle_with_a_new_window_class_is_rejected() {
         let store = WindowSnapshotStore::new();
         let token = store.publish(vec![entry()])[0].0.clone();
         let probe = FakeProbe::with(
             0x1234,
             RawWindow {
-                app_name: "calc".into(),
+                class_name: "Chrome_WidgetWin_1".into(),
                 ..switchable()
             },
         );

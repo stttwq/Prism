@@ -14,10 +14,13 @@
 ;   "D:\LS\Setup 7\ISCC.exe" prism.iss
 ; 产物：dist\PrismSetup-<MyAppVersion>.exe
 ; MyAppVersion 由 scripts\build-installer.ps1 在编译前从最后一次提交的短哈希
-; 自动注入（格式 1.1.<short-hash>），见该脚本说明。手编时用此处定义的占位值。
+; 自动注入（格式 1.1.<short-hash>），见该脚本说明。
+; M21（全仓复审 2026-08-22）：手编占位值改为 1.1.0-manual——按字符串序恒低于
+; 任何正式 hash 版（1.1.<hex>），手动旧包配合 ignoreversion 也不会静默盖掉
+; 新安装；原先的 "1.1beta" 反而高于所有 hash 版（'b'>'5'）。
 
 #define MyAppName "Prism"
-#define MyAppVersion "1.1beta"
+#define MyAppVersion "1.1.0-manual"
 #define MyAppPublisher "Prism"
 #define MyAppExeName "Prism.exe"
 #define MyFullSourceDir "."
@@ -68,9 +71,13 @@ Name: "autostart"; Description: "开机自动启动 Prism(&A)"; GroupDescription
 
 [Files]
 ; 安装源：dist 目录下的三个 exe、前端 DLL/运行时配置与图标。
-; Prism.exe 是 framework-dependent（非自包含），需要 Prism.dll 与 runtimeconfig.json 同目录。
+; Prism.exe 是 framework-dependent（非自包含），需要 Prism.dll、deps.json 与
+; runtimeconfig.json 同目录。M21（全仓复审 2026-08-22）：Prism.deps.json 此前
+; 被 build-installer.ps1 拷进 dist 却从不打包——安装出来的产物与冒烟测试的
+; dist 内容不一致。
 Source: "Prism.exe";        DestDir: "{app}"; Flags: ignoreversion
 Source: "Prism.dll";         DestDir: "{app}"; Flags: ignoreversion
+Source: "Prism.deps.json";   DestDir: "{app}"; Flags: ignoreversion
 Source: "Prism.runtimeconfig.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "prism-core.exe";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#IndexerServiceExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -107,6 +114,11 @@ Type: dirifempty; Name: "{app}"
 ; 卸载时整个 ProgramData 目录不得残留。
 Type: filesandordirs; Name: "{commonappdata}\Prism"
 ; G8 favicon 缓存目录（用户级安装时数据在 LocalAppData）。
+; M23（全仓复审 2026-08-22）：已知局限——卸载器提权运行时 {localappdata} 展开
+; 为**执行提权的账户**：标准用户输管理员凭据卸载时删的是管理员的目录
+;（通常不存在，等于无害的 no-op），真实用户的 favicon 缓存留存。favicon 是
+; 可重建缓存，泄留无害；正确清理需要按 Profile 枚举所有用户目录，不值得
+; 为一个缓存目录引入那种复杂度。
 Type: filesandordirs; Name: "{localappdata}\Prism\favicons"
 
 [Code]
@@ -124,6 +136,50 @@ begin
     Result := -1
   else
     Result := ResultCode;
+end;
+
+function RunIcacls(const Parameters: String): Integer;
+var
+  ResultCode: Integer;
+begin
+  if not Exec(ExpandConstant('{sys}\icacls.exe'), Parameters, '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
+    Result := -1
+  else
+    Result := ResultCode;
+end;
+
+// H1（全仓复审 2026-08-22）：收紧安装目录 ACL。
+// 索引服务以 LocalSystem 运行，而安装目录允许用户改到 Program Files 之外
+//（自定义目录的继承 ACL 常给 Authenticated Users 可写权）——任意标准用户
+// 替换 prism-indexer-service.exe，下次开机即拿到 SYSTEM。装完后显式重设
+// 整棵 {app} 的 ACL：Administrators/SYSTEM 完全控制，Users 只读执行。
+// 用 SID 而非组名（*S-1-5-32-544 等）避开本地化组名差异。
+// 失败仅记日志不中止：FAT/exFAT 卷不支持 ACL（icacls 必失败），此前也不设防，
+// 行为不回退；NTFS 上管理员身份下失败几乎不可能。
+procedure HardenInstallDirAcl();
+var
+  AppDir: String;
+  ResultCode: Integer;
+begin
+  AppDir := ExpandConstant('{app}');
+  ResultCode := RunIcacls('"' + AppDir + '" /inheritance:r /grant:r ' +
+    '*S-1-5-32-544:(OI)(CI)F ' +      // Administrators
+    '*S-1-5-18:(OI)(CI)F ' +           // SYSTEM
+    '*S-1-5-32-545:(OI)(CI)RX ' +      // Users（读+执行）
+    '/T');
+  if ResultCode <> 0 then
+    Log(Format('Unable to tighten install dir ACL (icacls: %d).', [ResultCode]));
+
+  // 既有便携安装的 {app}\data 保留用户写权限（升级前已存在的数据目录）；
+  // 新装没有 data 目录，Prism 首次自检发现目录不可写会退回 LocalAppData——
+  // 恰是安全的方向。
+  if DirExists(AppDir + '\data') then
+  begin
+    ResultCode := RunIcacls('"' + AppDir + '\data" /grant *S-1-5-32-545:(OI)(CI)M /T');
+    if ResultCode <> 0 then
+      Log(Format('Unable to grant user write on legacy data dir (icacls: %d).', [ResultCode]));
+  end;
 end;
 
 const
@@ -241,13 +297,21 @@ begin
   ResultCode := RunSc('failure {#IndexerServiceName} reset= 86400 actions= restart/5000/restart/15000/""/0');
   if ResultCode <> 0 then
     RaiseException(Format('Unable to configure Prism indexer recovery (sc.exe: %d).', [ResultCode]));
-  RunSc('failureflag {#IndexerServiceName} 1');
+  // L31（全仓复审 2026-08-22）：failureflag 结果此前被丢弃——它是唯一一个
+  // 不检查返回值的 RunSc 调用；失败即装出一个「非崩溃故障不自动重启」的
+  // 服务而安装器报告成功。与其他调用同纪律：非零即中止。
+  ResultCode := RunSc('failureflag {#IndexerServiceName} 1');
+  if ResultCode <> 0 then
+    RaiseException(Format('Unable to set Prism indexer failureflag (sc.exe: %d).', [ResultCode]));
 
   ResultCode := RunSc('start {#IndexerServiceName}');
   if (ResultCode <> 0) and (ResultCode <> 1056) then
     RaiseException(Format('Unable to start Prism indexer service (sc.exe: %d).', [ResultCode]));
   if not WaitForServiceState(SERVICE_RUNNING, False, 30000) then
     RaiseException('Timed out waiting for the Prism indexer service to start.');
+
+  // H1：服务就位后收紧目录 ACL（文件已复制完成，/T 能覆盖到它们）。
+  HardenInstallDirAcl();
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

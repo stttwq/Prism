@@ -129,6 +129,12 @@ $processSummary = foreach ($target in $targets) {
 }
 $totalPrivateWs = [double[]]@($records | ForEach-Object { $_.totals.private_working_set_bytes })
 $totalWs = [double[]]@($records | ForEach-Object { $_.totals.working_set_bytes })
+# M1（全仓复审 2026-08-22）：空样本必须显式失败——空数组过 Measure-Object
+# -Maximum 得 $null、强转 [UInt64] 得 0，「0 ≤ 100MB」让 100MB 内存硬门零样本
+# 即通过。Invoke-RebuildMemoryGate 有同款守卫，这里是纵深防御。
+if ($records.Count -eq 0) {
+    throw 'No memory samples were captured; refusing to evaluate the memory gate on an empty run.'
+}
 $memoryGateLimitBytes = [UInt64](100 * 1024 * 1024)
 $maximumPrivateWorkingSetBytes = [UInt64](($totalPrivateWs | Measure-Object -Maximum).Maximum)
 $summary = [ordered]@{
@@ -156,7 +162,7 @@ $summary = [ordered]@{
 }
 try {
     Write-JsonLines -Path $rawPath -Values @($records)
-    Assert-MemoryAcceptance -MaximumPrivateWorkingSetBytes $maximumPrivateWorkingSetBytes `
+    Assert-MemoryAcceptance -MaximumPrivateWorkingSetBytes $maximumPrivateWorkingSetBytes -SampleCount $records.Count `
         -LimitBytes $memoryGateLimitBytes
     Write-Utf8NoBom -Path $summaryPath -Value (($summary | ConvertTo-Json -Depth 20) + "`n")
 } catch {

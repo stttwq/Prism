@@ -474,7 +474,7 @@ public partial class App : Application
     }
 
     /// <summary>投递一行日志（时间戳在此打）。队满即丢弃。</summary>
-    private static void LogToFile(string msg)
+    internal static void LogToFile(string msg)
     {
         _ = LogQueue.Value.Writer.TryWrite($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}");
     }
@@ -515,7 +515,7 @@ public partial class App : Application
         }
     }
 
-    private static void LogException(string source, Exception ex)
+    internal static void LogException(string source, Exception ex)
     {
         LogToFile($"{source}: {ex.GetType().Name}: {ex.Message}\r\n{ex.StackTrace}");
         // 同步输出到调试通道，方便开发期即时看到。

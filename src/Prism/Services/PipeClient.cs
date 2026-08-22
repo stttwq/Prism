@@ -956,12 +956,23 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
     public void Dispose()
     {
-        // G3（FRESH-AUDIT-2）：退出 Dispose 移后台线程——排干 watchdog（最多 12s）与
-        // Kill 整树最坏会阻塞 UI。墓碑同步先立，后续清理交给后台；Prism 若在清理
-        // 完成前就退出，Job Object 关闭时 OS 仍会回收 broker，不留孤儿。
+        // G3（FRESH-AUDIT-2）：重活（排干 watchdog 最多 12s、拆连接、句柄回收）
+        // 移后台线程，退出路径不阻塞 UI。
+        // M7（全仓复审 2026-08-22）：Kill broker 改为**同步**先做——WPF 关闭不等待
+        // ThreadPool，墓碑+后台队列的组合曾让进程在 DisposeCore 走到 Kill 之前就
+        // 退出（watchdog 排干最长 12s 排在 Kill 之前）；而 KILL_ON_JOB_CLOSE 已被
+        // JobObjectGuard 刻意移除，再无兜底 ⇒ 孤儿 broker 占着 \\.\pipe\prism-core。
+        // 同步 Kill 很快（不杀树），watchdog tick 入口与 EnsureBackendRunning 都已
+        // 检查 _disposed 墓碑，不会把杀掉的 broker 重新拉活。
         if (_disposed)
             return;
         _disposed = true;
+        try
+        {
+            if (_backend is { HasExited: false })
+                _backend.Kill();
+        }
+        catch { /* ignore */ }
         ThreadPool.QueueUserWorkItem(_ => DisposeCore());
     }
 
@@ -991,6 +1002,7 @@ public sealed class PipeClient : ISearchClient, IDisposable
             // Bug 3: 只杀 broker 本身，不杀进程树——broker 经 ShellExecuteExW 打开的用户应用
             // 是 broker 的子进程，entireProcessTree:true 会把它们一起杀掉。KILL_ON_JOB_CLOSE
             // 已移除（JobObjectGuard 不再设该标志），此处也不再杀树，用户应用随 Prism 退出存活。
+            // M7：Dispose 已同步 Kill 过；这里对仍存活的 broker 补一刀（幂等，正常为 no-op）。
             if (_backend is { HasExited: false })
                 _backend.Kill();
         }
@@ -1208,7 +1220,11 @@ public sealed class PipeClient : ISearchClient, IDisposable
             string? line;
             if (readTask == await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false))
             {
-                line = readTask.Result;
+                // L39（全仓复审 2026-08-22）：await 而非 .Result——WhenAny 只保证
+                // 完成，不保证成功；.Result 会把 IOException 包成 AggregateException，
+                // StartAsync 的过滤层只认 IOException，真实的 broker 错误既不上报
+                // 也不进日志，只剩一句泛化的「无法连接到后端」。
+                line = await readTask.ConfigureAwait(false);
             }
             else
             {

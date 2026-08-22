@@ -59,6 +59,8 @@ public partial class SearchWindow : Window
     private int _captureSeq;
     /// <summary>隐藏后延迟 Trim 的计时器；再呼出时取消，避免影响下次呼出响应。</summary>
     private DispatcherTimer? _idleTrimTimer;
+    /// <summary>L20：当前在飞的失活守卫释放计时器（重置式，不叠加）。</summary>
+    private DispatcherTimer? _releaseGuardTimer;
 
     // ── Win32 foreground hook ─────────────────────────────────────────────
     // Deactivated 事件在两个 Topmost 窗口交互时可能不触发，SetWinEventHook 以
@@ -131,10 +133,18 @@ public partial class SearchWindow : Window
         Results.DragOutFinished += OnDragOutFinished;
         Results.ItemInvoked += async r =>
         {
-            if (_vm is null) return;
-            var idx = IndexOfResult(r);
-            if (idx >= 0) _vm.State.SelectedIndex = idx;
-            await _vm.ExecuteSelectedAsync();
+            // M19（全仓复审 2026-08-22）：async lambda 兜底，理由同 OnHeaderKeyDown。
+            try
+            {
+                if (_vm is null) return;
+                var idx = IndexOfResult(r);
+                if (idx >= 0) _vm.State.SelectedIndex = idx;
+                await _vm.ExecuteSelectedAsync();
+            }
+            catch (Exception ex)
+            {
+                App.LogException("Results.ItemInvoked", ex);
+            }
         };
         Actions.SelectedIndexChanged += idx =>
         {
@@ -142,18 +152,26 @@ public partial class SearchWindow : Window
         };
         Actions.ActionInvoked += async a =>
         {
-            if (_vm is null) return;
-            // 同步选中再执行。
-            var list = _vm.State.Actions;
-            for (var i = 0; i < list.Count; i++)
+            // M19：同上。
+            try
             {
-                if (ReferenceEquals(list[i], a) || list[i].Id == a.Id && list[i].Label == a.Label)
+                if (_vm is null) return;
+                // 同步选中再执行。
+                var list = _vm.State.Actions;
+                for (var i = 0; i < list.Count; i++)
                 {
-                    _vm.State.SelectedActionIndex = i;
-                    break;
+                    if (ReferenceEquals(list[i], a) || list[i].Id == a.Id && list[i].Label == a.Label)
+                    {
+                        _vm.State.SelectedActionIndex = i;
+                        break;
+                    }
                 }
+                await _vm.ExecuteActionAsync();
             }
-            await _vm.ExecuteActionAsync();
+            catch (Exception ex)
+            {
+                App.LogException("Actions.ActionInvoked", ex);
+            }
         };
         Pin.IsPinnedChanged += pinned =>
         {
@@ -438,7 +456,14 @@ public partial class SearchWindow : Window
             var hwnd = helper.EnsureHandle();
             if (hwnd == IntPtr.Zero) return;
 
-            ForegroundInterop.ShowWindow(hwnd, ForegroundInterop.SW_SHOW);
+            // M17（全仓复审 2026-08-22）：最小化态（Win+D / Show Desktop）下
+            // SW_SHOW 不还原窗口——IsVisible 仍为 true，热键从此在切换一个
+            // 看不见的窗口。IsIconic 时用 SW_RESTORE。
+            ForegroundInterop.ShowWindow(
+                hwnd,
+                ForegroundInterop.IsIconic(hwnd)
+                    ? ForegroundInterop.SW_RESTORE
+                    : ForegroundInterop.SW_SHOW);
             if (ForegroundInterop.TryForceForeground(hwnd))
             {
                 Activate();
@@ -621,6 +646,19 @@ public partial class SearchWindow : Window
 
     private async void OnContextMenuRequested(SearchResult target)
     {
+        // M19（全仓复审 2026-08-22）：async void 兜底，理由同 OnHeaderKeyDown。
+        try
+        {
+            await OnContextMenuRequestedCore(target);
+        }
+        catch (Exception ex)
+        {
+            App.LogException("OnContextMenuRequested", ex);
+        }
+    }
+
+    private async Task OnContextMenuRequestedCore(SearchResult target)
+    {
         if (_vm is null) return;
 
         var requestSeq = ++_contextMenuRequestSeq;
@@ -773,6 +811,14 @@ public partial class SearchWindow : Window
         if (_pipe is null || _vm is null) return;
         var aliasTarget = target.ExecutionTarget;
 
+        // M18（全仓复审 2026-08-22）：_modalDialogs 占位提前到第一个 await 之前。
+        // AliasListAsync 在飞时 App.ToggleSearchWindow（热键/托盘）可直达
+        // HideAnimated——此刻 _modalDialogs 仍是 0，主窗被隐藏、
+        // ReleaseIdleMemory 清空查询结果，随后 ShowDialog 在一个已隐藏的属主上
+        // 打开：Owner.Hide 不隐藏 owned 窗口，对话框孤儿化悬在半空。
+        _modalDialogs++;
+        try
+        {
         // 预填：拉取现有词表（失败静默按空处理）。
         var existing = Array.Empty<string>();
         try
@@ -845,15 +891,7 @@ public partial class SearchWindow : Window
             dialog.Close();
         };
         dialog.Loaded += (_, _) => { input.Focus(); input.SelectAll(); };
-        _modalDialogs++;
-        try
-        {
-            dialog.ShowDialog();
-        }
-        finally
-        {
-            _modalDialogs--;
-        }
+        dialog.ShowDialog();
         if (!confirmed) return;
 
         var words = input.Text
@@ -876,10 +914,21 @@ public partial class SearchWindow : Window
         {
             _vm.State.StatusMessage = "别名保存失败：" + ex.Message;
         }
+        }
+        finally
+        {
+            // M18：与方法入口的 _modalDialogs++ 配对，覆盖全部退出路径。
+            _modalDialogs--;
+        }
     }
 
     private void ReleaseDeactivateGuardAfterDelay()
     {
+        // L20（全仓复审 2026-08-22）：先停旧计时器——每次调用新建无根
+        // DispatcherTimer，快速开关右键菜单会叠出多个 300ms 计时器，早先那个
+        // 可能在新对话框准备期间触发并清掉 _ignoreDeactivate。字段化后每次
+        // 调用是「重置」而不是「追加」。
+        _releaseGuardTimer?.Stop();
         var timer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(300),
@@ -890,6 +939,7 @@ public partial class SearchWindow : Window
             if (!_contextMenuOpen && !_contextMenuActionPending && !_hiding)
                 _ignoreDeactivate = false;
         };
+        _releaseGuardTimer = timer;
         timer.Start();
     }
 
@@ -1204,6 +1254,22 @@ public partial class SearchWindow : Window
     }
 
     private async void OnHeaderKeyDown(KeyEventArgs e)
+    {
+        // M19（全仓复审 2026-08-22）：async void 事件处理器兜底——await 之后任何
+        // 非 IPC 异常都会冒到 App.OnDispatcherUnhandledException 的 50 次/60s
+        // 吞异常预算，预算耗尽即 Handled=false、托盘进程静默死亡。在这里记
+        // 日志并吞掉，一次按键永远不该击穿进程。
+        try
+        {
+            await OnHeaderKeyDownCore(e);
+        }
+        catch (Exception ex)
+        {
+            App.LogException("OnHeaderKeyDown", ex);
+        }
+    }
+
+    private async Task OnHeaderKeyDownCore(KeyEventArgs e)
     {
         if (_vm is null) return;
 

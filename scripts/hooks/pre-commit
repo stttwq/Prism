@@ -9,53 +9,69 @@
 # Bypass: `git commit --no-verify` (emergencies only).
 #
 # Requires: cargo + rustfmt on PATH (git for Windows sh inherits user PATH).
+#
+# H2（全仓复审 2026-08-22）：全部列表改用 -z + 精确整行比对。
+# 旧实现有两类洞：
+#   1) `for f in $staged` 按空白分词——带空格/非 ASCII 的路径被拆碎或
+#      因 git 的 core.quotePath 八进制转义而永匹配不上（非 ASCII 的未格式化
+#      文件静默放行）；
+#   2) `case "$dirty" in *"$f"*)` 子串匹配——staged 的 mod.rs 会撞上 dirty 的
+#      my mod.rs / domain.rs（反向的误拦）。
+# 现在两条列表都用 NUL 分隔读取（git -z、cargo fmt 输出按行读），
+# 比对用 grep -Fx 整行精确匹配。
 
 set -e
 
 root=$(git rev-parse --show-toplevel)
 
-# Collect staged .rs files (added/modified/renamed), relative to root, forward slashes.
-staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+# Collect staged .rs files (added/modified/renamed), relative to root, forward
+# slashes. -z + core.quotePath=false: paths with spaces / non-ASCII survive
+# byte-for-byte instead of arriving as quoted octal escapes.
+staged_file=$(mktemp)
+dirty_file=$(mktemp)
+trap 'rm -f "$staged_file" "$dirty_file"' EXIT
+: > "$staged_file"
+git -c core.quotePath=false diff --cached --name-only -z --diff-filter=ACM -- '*.rs' |
+  while IFS= read -r -d '' f; do
+    printf '%s\n' "$f"
+  done > "$staged_file"
 
-if [ -z "$staged" ]; then
+if [ ! -s "$staged_file" ]; then
   exit 0
 fi
 
 # Find every crate (dir containing Cargo.toml) and run cargo fmt --check there.
-# Collect dirty files as relative paths with forward slashes.
-dirty=""
+# Collect dirty files as relative paths with forward slashes, one per line.
+: > "$dirty_file"
 for toml in $(git ls-files '*/Cargo.toml' ':!**/target/**'); do
   crate_dir=$(dirname "$toml")
   abs_crate="$root/$crate_dir"
   if [ ! -d "$abs_crate" ]; then
     continue
   fi
-  # cargo fmt -l --check lists files needing formatting (absolute UNC paths).
-  raw=$(cd "$abs_crate" && cargo fmt -- -l --check 2>/dev/null || true)
-  for line in $raw; do
-    # Normalize \\?\E:\path\to\file.rs -> relative path from root
-    # Strip the \\?\ prefix and the root, convert backslashes.
-    rel=$(echo "$line" | sed 's|^\\\\?\\||' | tr '\\' '/')
-    case "$rel" in
-      "$root"/*) rel=${rel#"$root"/} ;;
-    esac
-    dirty="$dirty
-$rel"
-  done
+  # cargo fmt -l --check lists files needing formatting (absolute UNC paths),
+  # one per line. Paths may contain spaces (but never newlines), so read
+  # line-by-line instead of word-splitting.
+  (cd "$abs_crate" && cargo fmt -- -l --check 2>/dev/null || true) |
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      # Normalize \\?\E:\path\to\file.rs -> relative path from root
+      # Strip the \\?\ prefix and the root, convert backslashes.
+      rel=$(printf '%s' "$line" | sed 's|^\\\\?\\||' | tr '\\' '/')
+      case "$rel" in
+        "$root"/*) rel=${rel#"$root"/} ;;
+      esac
+      printf '%s\n' "$rel"
+    done >> "$dirty_file"
 done
 
-# Intersect: is any staged file in the dirty list?
-blocked=""
-for f in $staged; do
-  case "$dirty" in
-    *"$f"*) blocked="$blocked
-  $f" ;;
-  esac
-done
+# Intersect via exact whole-line match (grep -Fx): no substring false hits,
+# no word-splitting of space-containing names.
+blocked=$(grep -Fx -f "$staged_file" "$dirty_file" || true)
 
 if [ -n "$blocked" ]; then
   echo "pre-commit: staged Rust file(s) not rustfmt-clean:" 1>&2
-  echo "$blocked" 1>&2
+  printf '%s\n' "$blocked" 1>&2
   echo "" 1>&2
   echo "Fix: cargo fmt in the relevant crate, re-stage, retry." 1>&2
   echo "Bypass: git commit --no-verify (emergencies only)." 1>&2

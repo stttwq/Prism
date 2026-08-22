@@ -858,30 +858,43 @@ async fn handle_connection(
                     ));
                     continue;
                 };
-                let tx = tx.clone();
+                // H4（全仓复审 2026-08-22）：seq 由本分支领走后必须回包，否则 ordered_writer
+                // 的 next_seq 永久停摆，整条连接静默卡死。双层 spawn：内层算响应，外层
+                // await JoinHandle——内层 panic（debug/tests 下）时外层仍回一条错误响应。
                 let apps = apps.clone();
                 let engines = engines.clone();
                 let history = history.clone();
                 let preferences = preferences.clone();
                 let windows = windows.clone();
                 let aliases = aliases.clone();
+                let tx = tx.clone();
                 tokio::spawn(async move {
-                    let response = search_service(
-                        SearchArgs {
-                            query: &query,
-                            max,
-                            filters,
-                            root: root.as_deref(),
-                            mode: mode.unwrap_or_default(),
+                    let mode = mode.unwrap_or_default();
+                    let inner = tokio::spawn(async move {
+                        search_service(
+                            SearchArgs {
+                                query: &query,
+                                max,
+                                filters,
+                                root: root.as_deref(),
+                                mode,
+                            },
+                            &apps,
+                            &engines,
+                            &history,
+                            &preferences,
+                            &windows,
+                            &aliases,
+                        )
+                        .await
+                    });
+                    let response = match inner.await {
+                        Ok(response) => response,
+                        Err(_) => Response::Error {
+                            message: "search task panicked".to_string(),
+                            category: None,
                         },
-                        &apps,
-                        &engines,
-                        &history,
-                        &preferences,
-                        &windows,
-                        &aliases,
-                    )
-                    .await;
+                    };
                     let _ = tx.send((seq, response));
                     drop(permit);
                 });
@@ -1223,7 +1236,9 @@ fn alias_search_hits(
             kind: MatchKind::Literal,
             class: 0,
             position: 0,
-            score: u32::try_from(entry.bound_at_utc.min(u32::MAX as u64)).unwrap_or(0),
+            // L10（全仓复审 2026-08-22）：min 已保证 ≤ u32::MAX，直接 as 即可；
+            // 原 unwrap_or(0) 是死码，反而掩盖饱和语义。
+            score: entry.bound_at_utc.min(u32::MAX as u64) as u32,
             history_score: history.score(&target),
         };
         rows.push(SearchResult {
@@ -1769,7 +1784,12 @@ async fn search_service(
     // 文件名子串用（旧版整串进名字匹配，文件全路径与目录路径都搜不到任何
     // 东西）。仅全局无 ext:/path: 过滤时接管；exclude_path 照常透传（用户
     // 排除的目录不能靠路径查询绕开）；目录范围/窗口模式维持原路径。
+    // M13（全仓复审 2026-08-22）：路径链（浏览→父目录→全局兜底）共享同一条
+    // CHAIN_BUDGET，超时后不再发起新的索引器请求——挂死的索引器每次击键
+    // 最坏只烧一条预算，不再串成 3×8s。
+    let mut chain_deadline: Option<std::time::Instant> = None;
     if root.is_none() && !has_filters && is_absolute_path_query(&name_query) {
+        let deadline = std::time::Instant::now() + CHAIN_BUDGET;
         if let Some(response) = path_query_results(
             query,
             &name_query,
@@ -1777,12 +1797,14 @@ async fn search_service(
             filters.as_deref(),
             preferences.pinyin_enabled(),
             history,
+            deadline,
         )
         .await
         {
             return response;
         }
         // 接管失败（路径与其父目录都不在索引内）→ 落回常规全局搜索（旧行为）。
+        chain_deadline = Some(deadline);
     }
     let mut items = Vec::with_capacity(max.min(128));
     // G7: when ext:/path: filters are present, only files/folders are returned — no apps,
@@ -1864,6 +1886,8 @@ async fn search_service(
         filters.as_deref(),
         preferences.pinyin_enabled(),
         root,
+        // M13：路径分支留下的 deadline 继续管住兜底链；非路径查询则新开一条。
+        chain_deadline.unwrap_or_else(|| std::time::Instant::now() + CHAIN_BUDGET),
     )
     .await;
     let IndexerReplyFields {
@@ -2016,7 +2040,7 @@ async fn empty_query_results(
         Err(reason) => (None, Some(reason), Some(reason.message().to_owned())),
     };
 
-    let items = match root {
+    let mut items = match root {
         Some(root) if history.is_enabled() => {
             let weights = history.weights();
             let root_owned = root.to_owned();
@@ -2031,7 +2055,9 @@ async fn empty_query_results(
                     &exclusions,
                     Some(&root_owned),
                     &filter_set,
-                    max,
+                    // L9（全仓复审 2026-08-22）：多取 1 条以区分「恰好 max 条即全部」
+                    // 与「还有更多」，避免边界上给出点了没反应的「更多」行。
+                    max.saturating_add(1),
                 )
             })
             .await
@@ -2041,8 +2067,9 @@ async fn empty_query_results(
     };
 
     // FRESH-AUDIT-2 G2: is_truncated 口径统一为「结果集被截断，UI 可提供 more」。
-    // 候选收集按 limit 即停，装满 max 即意味着历史里可能还有更多条目。
-    let is_truncated = items.len() >= max;
+    // L9：按 max 截断后，只有真取到了第 max+1 条才算截断。
+    let is_truncated = items.len() > max;
+    items.truncate(max);
 
     Response::Results {
         // Echo the client query unchanged (may be "" or whitespace) so the frontend
@@ -2083,6 +2110,12 @@ fn indexer_request_max(result_slots: usize) -> usize {
         .clamp(1, crate::indexer_ipc::MAX_SEARCH_RESULTS)
 }
 
+/// M13（全仓复审 2026-08-22）：一次搜索请求内所有索引器请求共享的预算。
+/// 单条 `search_in_root` 内部另有 8s `REQUEST_BUDGET`；本预算限制的是
+/// 「一次击键最多串几条请求」——路径链（浏览→父目录→全局兜底）最坏 3 条，
+/// 挂死的索引器不再把一次击键拖成 24s。健康索引器毫秒级响应，永不触顶。
+const CHAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Runs the indexer search for an optional current-directory root.
 ///
 /// A root the service cannot use never fails the whole search: the request is reissued
@@ -2095,6 +2128,7 @@ async fn search_index_with_root_fallback(
     filters: Option<&[SearchFilter]>,
     pinyin_enabled: bool,
     root: Option<&str>,
+    deadline: std::time::Instant,
 ) -> (
     Result<indexer_client::SearchReply, String>,
     Option<RootRejection>,
@@ -2119,6 +2153,14 @@ async fn search_index_with_root_fallback(
     match reply {
         Err(failure) if failure.root_rejection.is_some() && root.is_some() => {
             let reason = failure.root_rejection.expect("checked above");
+            // M13：预算耗尽不再重试，直接把拒绝上报给前端（UI 自会回退全局视图）。
+            if std::time::Instant::now() >= deadline {
+                return (
+                    Err("indexer chain budget exhausted".to_string()),
+                    Some(reason),
+                    Some(failure.message),
+                );
+            }
             let retried =
                 indexer_client::search_in_root(query, max, filters, pinyin_enabled, None).await;
             (
@@ -2157,6 +2199,7 @@ async fn path_query_results(
     filters: Option<&[SearchFilter]>,
     pinyin_enabled: bool,
     history: &Arc<HistoryStore>,
+    deadline: std::time::Instant,
 ) -> Option<Response> {
     let path = normalize_path_query(name_query)?;
 
@@ -2206,6 +2249,10 @@ async fn path_query_results(
 
     // 尝试 2：父目录 + 末段（文件全路径精确命中 / 未打完路径前缀收窄）。
     // 父目录不可用（含传输错误）一律回退全局搜索。
+    // M13：链预算耗尽时不再发第二条索引器请求，直接回退全局搜索。
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
     let (parent, tail) = split_path_query(&path)?;
     let probe = indexer_client::search_in_root(
         tail.as_str(),
@@ -3023,6 +3070,7 @@ mod window_protocol_tests {
             title: "报告.docx - Word".into(),
             app_name: "winword".into(),
             app_path: r"C:\Office\winword.exe".into(),
+            class_name: "OpusApp".into(),
             is_minimized: false,
         }
     }
@@ -3223,7 +3271,11 @@ mod window_protocol_tests {
         let store = Arc::new(WindowSnapshotStore::new());
         let history = history_store("stale");
         let stale = store.publish(vec![entry()])[0].0.clone();
-        store.publish(vec![entry()]);
+        // M10：上一拍 token 现在仍可解析（快照环带），「stale」指掉出环带的
+        // 旧 token——多发布几代把它挤出 SNAPSHOT_HISTORY。
+        for _ in 0..20 {
+            store.publish(vec![entry()]);
+        }
         let response = record_window_switch(
             &ActionTarget::new(TargetKind::Window, &stale),
             &store,
@@ -4413,18 +4465,34 @@ mod protocol_tests {
         // No indexer service is running in tests, so the index part fails; what matters is
         // that a locally detectable rejection is reported as a field, not as an error.
         let too_long = format!("C:\\{}", "a".repeat(crate::root_scope::MAX_ROOT_PATH_BYTES));
+        let budget = std::time::Instant::now() + CHAIN_BUDGET;
         let (_, rejection, message) =
-            search_index_with_root_fallback("needle", 8, None, false, Some(&too_long)).await;
+            search_index_with_root_fallback("needle", 8, None, false, Some(&too_long), budget)
+                .await;
         assert_eq!(rejection, Some(RootRejection::TooLong));
         assert_eq!(message.as_deref(), Some(RootRejection::TooLong.message()));
 
-        let (_, rejection, message) =
-            search_index_with_root_fallback("needle", 8, None, false, None).await;
+        let (_, rejection, message) = search_index_with_root_fallback(
+            "needle",
+            8,
+            None,
+            false,
+            None,
+            std::time::Instant::now() + CHAIN_BUDGET,
+        )
+        .await;
         assert_eq!(rejection, None, "a global search reports no rejection");
         assert_eq!(message, None);
 
-        let (_, rejection, _) =
-            search_index_with_root_fallback("needle", 8, None, false, Some("   ")).await;
+        let (_, rejection, _) = search_index_with_root_fallback(
+            "needle",
+            8,
+            None,
+            false,
+            Some("   "),
+            std::time::Instant::now() + CHAIN_BUDGET,
+        )
+        .await;
         assert_eq!(rejection, None, "a blank root is a global search");
     }
 }

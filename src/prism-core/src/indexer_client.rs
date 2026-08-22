@@ -208,6 +208,27 @@ async fn handshake(conn: &mut PersistentConnection) -> Result<(), String> {
     }
 }
 
+/// M12（全仓复审 2026-08-22）：超时熔断。超时把持久连接置 None 后，下一个击键会
+/// 重新走满 connect+handshake+status+search 的 8s 预算——索引器慢期里每次击键
+/// 都卡满预算（正是模块头注释声称修掉的 ERROR_PIPE_BUSY 风暴的同款表现）。
+/// 超时后短暂熔断：窗口内的请求立刻失败（前端 index_error 呈现），窗口过后
+/// 放行一个探测请求探活。健康索引器毫秒级往返，熔断永不触发。
+const BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
+static BREAKER_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn breaker_tripped() -> bool {
+    BREAKER_UNTIL
+        .lock()
+        .map(|guard| guard.is_some_and(|until| std::time::Instant::now() < until))
+        .unwrap_or(false)
+}
+
+fn trip_breaker() {
+    if let Ok(mut guard) = BREAKER_UNTIL.lock() {
+        *guard = Some(std::time::Instant::now() + BREAKER_COOLDOWN);
+    }
+}
+
 /// Run a search, preferring the warm persistent connection.
 ///
 /// The singleton lock is taken with `try_lock` only (audit batch 2, M2
@@ -223,6 +244,11 @@ async fn search_via_persistent(
     pinyin_enabled: bool,
     root: Option<&str>,
 ) -> Result<SearchReply, SearchFailure> {
+    if breaker_tripped() {
+        return Err(SearchFailure::from(
+            "indexer unavailable (circuit breaker open after timeout)".to_string(),
+        ));
+    }
     match connection_lock().try_lock() {
         Ok(conn) => search_on_persistent(conn, query, max, filters, pinyin_enabled, root).await,
         Err(_contention) => {
@@ -286,6 +312,7 @@ async fn search_on_persistent(
             // Cancelled mid-exchange: the connection may sit on a half-read
             // response line — it must never be reused.
             *conn = None;
+            trip_breaker();
             Err(SearchFailure::from("indexer request timed out".to_string()))
         }
     }
@@ -332,7 +359,10 @@ async fn search_one_off(
     };
     tokio::time::timeout(REQUEST_BUDGET, attempt)
         .await
-        .map_err(|_| SearchFailure::from("indexer request timed out".to_string()))?
+        .map_err(|_| {
+            trip_breaker();
+            SearchFailure::from("indexer request timed out".to_string())
+        })?
 }
 
 /// 在途计数 RAII：构造 +1，drop -1，供闸测试观测峰值。

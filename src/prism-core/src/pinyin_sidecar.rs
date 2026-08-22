@@ -278,6 +278,10 @@ type DirChainCache = std::collections::HashMap<u32, Arc<[u8]>>;
 /// 「含目录自身名字首字母在内的全链」（root→本目录）。文件/目录 r 的链 =
 /// 父目录的该条目。超长（>255B）从根侧截断（近祖优先）；父链损坏（环/越界）
 /// 归为空链——宁少结果不错结果。`visiting` 防环（损坏索引的合法防护）。
+/// M9（全仓复审 2026-08-22）：visiting.len() 兼作深度上限（对齐
+/// hierarchy::MAX_ANCESTOR_DEPTH=63）——索引器走 MFT，树深不受 Win32 路径
+/// 260 字符限制，刻意构造的深树会让无上限递归打爆默认 2MB 栈；release 是
+/// panic=abort，挂掉的是 LocalSystem 索引服务 + SCM 自动重启 = 崩溃循环。
 fn dir_chain_with_own(
     volume: &crate::hierarchy::VolumeIndex,
     record: u32,
@@ -291,6 +295,7 @@ fn dir_chain_with_own(
     if record == volume.root_record
         || (record as usize) >= volume.nodes.len()
         || !visiting.insert(record)
+        || visiting.len() > crate::hierarchy::MAX_ANCESTOR_DEPTH
     {
         let empty = empty_chain();
         cache.insert(record, empty.clone());
@@ -450,6 +455,20 @@ impl PinyinSidecar {
                 .map_err(io_load_error)?;
             bytes
         };
+        // L14（全仓复审 2026-08-22）：反序列化前先做总尺寸闸。postcard 按
+        // 文件内容分配 Vec——无闸时手改/撕裂的 pinyin-v2.bin 可让索引器常驻
+        // 超预算甚至分配失败（panic=abort ⇒ 服务崩溃重启循环）而无任何诊断。
+        // 侧车只装名字拼音编码，正常远低于该上限；超限按损坏处理、静默重建。
+        const MAX_SIDECAR_FILE_BYTES: usize = 1 << 30; // 1 GiB
+        if bytes.len() > MAX_SIDECAR_FILE_BYTES {
+            return Err(LoadError {
+                kind: LoadErrorKind::Corrupt,
+                message: format!(
+                    "pinyin sidecar file exceeds sanity cap: {} bytes",
+                    bytes.len()
+                ),
+            });
+        }
         let disk: SidecarDisk = postcard::from_bytes(bytes).map_err(|error| LoadError {
             kind: LoadErrorKind::Corrupt,
             message: error.to_string(),
