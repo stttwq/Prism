@@ -107,18 +107,25 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 
 ---
 
-## Memory Acceptance (≤100MB hard gate)
+## Memory Acceptance (≤100MB hard gate — two gates)
 
 ### 1. Scope / Trigger
 
-Apply this gate to an idle Release build after the LocalSystem indexer reports
-`ready=true`, `building=false`, and `degraded=false`. The gate covers all three
-resident product processes: `Prism.exe`, `prism-core.exe`, and
-`prism-indexer-service.exe`.
+Two independent gates, both ≤100 MiB, both covering all three resident
+product processes: `Prism.exe`, `prism-core.exe`, `prism-indexer-service.exe`.
+
+- **Idle gate** (unchanged): an idle Release build after the LocalSystem
+  indexer reports `ready=true`, `building=false`, and `degraded=false`.
+  Measured by `tools\bench\Measure-ProcessMemory.ps1`.
+- **Rebuild-window gate** (added 2026-08-22): the memory peak while a full
+  volume rebuild is in flight — exactly the window the idle gate declares
+  invalid. The user-facing budget ("after one search, still ≤100MB") is only
+  honest if the rebuild spike is measured, not skipped. Measured by
+  `tools\bench\Invoke-RebuildMemoryGate.ps1`.
 
 ### 2. Signatures
 
-Run the synchronized sampler from a normal-user shell:
+Run the synchronized idle sampler from a normal-user shell:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Measure-ProcessMemory.ps1 `
@@ -127,24 +134,48 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Measure-ProcessM
   -RunId <run-id>
 ```
 
+Run the rebuild-window gate from an **elevated** shell (it stops/starts the
+`PrismIndexer` service and deletes the v5 cache to drive the rebuild):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Invoke-RebuildMemoryGate.ps1 `
+  -OutputDirectory <explicit-output-directory> `
+  -ReleaseDirectory <three-binary-release-directory> `
+  -RunId <run-id>
+# optional: -Passive samples a naturally occurring rebuild window without
+# elevation or service control (pre-fix rebuild storms provide windows).
+```
+
 The installed `PrismIndexer` service binary must have the same SHA-256 as
-`<three-binary-release-directory>\prism-indexer-service.exe`.
+`<three-binary-release-directory>\prism-indexer-service.exe` (both gates;
+the rebuild gate checks it before touching the service).
 
 ### 3. Contracts
 
-- Hard-gate metric: the synchronized sum of
+- Hard-gate metric (both gates): the synchronized sum of
   `Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`, mapped by PID,
   for the three processes above. The maximum sampled sum must be at most
   100 MiB (`100 * 1024 * 1024` bytes).
 - `WorkingSet64` and `PrivateMemorySize64` are diagnostics only.
   `PrivateMemorySize64` is committed private bytes and is not Private Working
   Set; it must never be substituted for `WorkingSetPrivate`.
-- Every sample records all three PIDs, per-process values, the synchronized
-  total, and a healthy indexer status. PIDs must remain unchanged throughout
-  the series.
+- Idle gate: every sample records all three PIDs, per-process values, the
+  synchronized total, and a healthy indexer status. PIDs must remain
+  unchanged throughout the series.
+- Rebuild gate: allows `ready=false` / `building=true` mid-run (that window
+  is the measurement); the run ends only at `ready && !building`. The
+  indexer PID may change across the stop/start boundary, but a PID change
+  between two consecutive successful samples fails the run. Frontend/broker
+  PIDs must stay stable throughout.
 - A generation may advance between samples because the service applies live
   USN events. Each memory record owns the healthy status and generation read at
   that sample point; cross-sample generation equality is not required.
+- Frontend trim timing (affects any Prism.exe sampling): the full
+  `GC.Collect(2, Forced, blocking, compacting)` + LOH compaction runs 3
+  minutes after the window hides (`SearchWindow.ReleaseIdleMemory`), and a
+  re-show cancels it. Within that 3-minute window the frontend is expected
+  to sit at its post-usage high; two people sampling the same machine inside
+  vs. outside that window will get different numbers by design.
 - G0 baseline, Windows build 22631.5696, five one-second samples, commit
   `0bcb42f0862dd1badf942f786a3eeefbe5049cc7`:
 
@@ -161,9 +192,11 @@ input, not a profile change or a new target.
 | Condition | Required result |
 | --- | --- |
 | Missing, duplicate, exited, or changed PID | Fail the run; publish no success summary. |
-| Service PID differs from `PrismIndexer` SCM PID | Fail the run. |
+| Service PID differs from `PrismIndexer` SCM PID | Fail the run (both gates; rebuild gate re-resolves after restart). |
 | Frontend/broker path or installed service hash differs from the Release set | Fail the run. |
-| Indexer is not ready, is building/degraded, or reports generation zero | Fail the run. |
+| Idle gate: indexer not ready, building/degraded, or generation zero | Fail the run. |
+| Rebuild gate: no rebuild window observed within the timeout, or zero samples captured | Fail the run. |
+| Rebuild gate: indexer PID changes between consecutive successful samples | Fail the run. |
 | Fewer than three process records in any sample | Fail the run. |
 | Maximum synchronized Private Working Set exceeds 100 MiB | Fail acceptance and retain raw evidence. |
 
