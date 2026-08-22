@@ -18,17 +18,18 @@
 #   .\scripts\build-installer.ps1 -SkipBuild   # skip the cargo/dotnet build, just
 #                                             # re-stamp + re-pack from existing
 #                                             # target outputs (fast iteration)
+#   -IsccPath <path>                           # override the ISCC location
 #
 # REQUIRES
-#   ISCC.exe at D:\LS\Setup 7\ISCC.exe (as referenced in dist\prism.iss comment).
+#   ISCC.exe (auto-discovered from the registry install location; falls back
+#   to D:\LS\Setup 7\ISCC.exe as referenced in dist\prism.iss comment).
 #   The Rust + dotnet + MSVC toolchain is located by prism-build.ps1.
 
+# L29 (quanguo fushi 2026-08-22): -IsccPath injectable; auto-discovery first.
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
-    # L29（全仓复审 2026-08-22）：ISCC 路径可注入/自动发现——原硬编码
-    # D:\LS\Setup 7\ISCC.exe 换机器即断。优先注册表安装位置，找不到再回退默认。
-    [string]$IsccPath = ''
+    [string]$IsccPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,7 +42,12 @@ $CoreOut     = Join-Path $RepoRoot 'src\prism-core\target\release'
 $AppOut      = Join-Path $RepoRoot 'src\Prism\bin\Release\net8.0-windows'
 if ([string]::IsNullOrEmpty($IsccPath)) {
     $IsccPath = 'D:\LS\Setup 7\ISCC.exe'
-    $regLoc = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1' -ErrorAction SilentlyContinue).InstallLocation
+    # StrictMode: property may be absent -- probe PSObject.Properties first.
+    $regKey = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1' -ErrorAction SilentlyContinue
+    $regLoc = $null
+    if ($regKey -and $regKey.PSObject.Properties['InstallLocation']) {
+        $regLoc = [string]$regKey.InstallLocation
+    }
     if ($regLoc) {
         $candidate = Join-Path $regLoc 'ISCC.exe'
         if (Test-Path $candidate) { $IsccPath = $candidate }
@@ -58,12 +64,13 @@ function Write-Bad([string]$text)  { Write-Host "    FAIL $text" -ForegroundColo
 
 # --- 1. Build -------------------------------------------------------------
 
+# L30 (quanguo fushi 2026-08-22): try/catch instead of $LASTEXITCODE alone --
+# prism-build reports failures via `throw` and ends success with `exit 0`,
+# so $LASTEXITCODE stays 0 under `&` invocation and the old guard could not
+# catch a failed build. Terminating errors abort this script under
+# $ErrorActionPreference='Stop'; the exit-code check stays as belt-and-braces.
 if (-not $SkipBuild) {
     Write-Step 'Building all binaries (prism-build.ps1 -SkipInstall)'
-    # L30（全仓复审 2026-08-22）：用 try/catch 而非 $LASTEXITCODE——prism-build
-    # 以 throw 报错并以 exit 0 结束成功路径，& 调用下 $LASTEXITCODE 恒 0，
-    # 原守卫给出的「构建失败会被退出码抓住」是假象。 terminating error 在
-    # $ErrorActionPreference='Stop' 下直接中止本脚本，这才是真实的守。
     try {
         & (Join-Path $PSScriptRoot 'prism-build.ps1') -SkipInstall
         if ($LASTEXITCODE -ne 0) { throw "prism-build.ps1 failed (exit $LASTEXITCODE)" }
@@ -90,7 +97,8 @@ Write-Step "Installer version = $fullVersion  (from HEAD $shortHash)"
 # The committed version is restored after ISCC finishes so git status stays clean.
 Write-Step "Stamping $IssPath"
 # Ensure a clean starting point: a prior aborted run may have left .iss stamped.
-# L29：还原失败必须中止——继续跑会把旧 stamp 叠加出新版本，或让工作树留脏。
+# L29: a failed restore must abort -- continuing would stack stamps on an old
+# version or leave the working tree dirty.
 & git -C $RepoRoot checkout HEAD -- 'dist/prism.iss' 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'git checkout dist/prism.iss failed (dirty index or no HEAD?)' }
 # Read on-disk UTF-8 (NOT `git show | Out-String`, which re-encodes Chinese via
@@ -132,11 +140,11 @@ try {
 } finally {
     Pop-Location
     # Restore the committed .iss so the working tree matches HEAD (git status clean).
-    # L29：同上，还原失败要在 finally 里可见地报告（finally 里不宜 throw 覆盖
-    # 原异常，写 FAIL 行 + 保留脏文件让人看见）。
+    # L29: a failed restore in finally must be visible (no throw here -- it would
+    # mask the original exception); print FAIL and leave the file for manual fix.
     & git -C $RepoRoot checkout HEAD -- 'dist/prism.iss' 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Bad 'git checkout dist/prism.iss failed in finally — working tree may hold a stamped .iss; restore manually'
+        Write-Bad 'git checkout dist/prism.iss failed in finally -- working tree may hold a stamped .iss; restore manually'
     } else {
         Write-Ok 'prism.iss restored to committed placeholder'
     }

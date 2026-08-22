@@ -136,8 +136,11 @@ public sealed class WebIconProvider
             // `_isGranted?.Invoke(origin) != false` 把 null 读作「已授权」，
             // 让 FaviconCache.GetFavicon 的 !granted 守卫在本路径成死码。
             // 生产侧 App 恒注入委托，这里是把意图写死、不留空子。
+            // origin 为 null 时委托可能不接受 null——先判 origin 再问委托。
+            if (origin is null)
+                return _genericIcon;
             var granted = _isGranted is not null && _isGranted(origin);
-            if (origin is not null && granted)
+            if (granted)
             {
                 if (_resolved.TryGetValue(origin, out var hit))
                     return hit;
