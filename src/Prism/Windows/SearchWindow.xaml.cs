@@ -505,6 +505,12 @@ public partial class SearchWindow : Window
                 // 停表后再呼出）的竞态下，阻塞式 Gen2 压缩会撞上正在使用的 UI 线程
                 // （违背 A4 承诺）——收集前再核一次窗口状态。
                 if (IsVisible || _hiding) return;
+                // 2026-08-22 内存收口：强制压缩只压缩 Gen0-2，默认不碰 LOH——
+                // 1000 结果展开的响应行/字符串拷贝稳定落在 LOH，隐藏后 3 分钟的
+                // 这道 trim 压不掉它们，Prism.exe 常驻 ~50MB。CompactOnce 让本次
+                // Collect 连 LOH 一起压缩（一次性标志，不留全局行为变化）。
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+                    System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
                 GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             };
             _idleTrimTimer.Start();
