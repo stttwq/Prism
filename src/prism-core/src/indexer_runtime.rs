@@ -34,6 +34,47 @@ enum RebuildRequest {
     Full(String),
 }
 
+/// 2026-08-22 内存收口：当前 Unix 毫秒。ServiceState::last_activity_ms 的时间源。
+/// 用 SystemTime 而非 Instant：后者是单调时钟相对值，无法跨重启/线程语义稳定比较
+/// 「距上次活动多久」，而毫秒绝对值直白且与 maintenance tick 的 Instant 节拍解耦。
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 2026-08-22 内存收口：indexer 空闲后修剪工作集的等待阈值。与前端 3 分钟 trim
+/// 同节奏——用户「单次搜索后立即破线」的诉求靠这一拍把 indexer 从 ~64MB 降到
+/// 数 MB（OS 自发修剪要约 1 小时）。仅 !building && ready 时执行，重建窗口绝不
+/// 碰工作集（正在高强度建卷/合并，修剪只会触发海量软缺页拖慢重建）。
+const IDLE_TRIM_THRESHOLD_MS: u64 = 3 * 60 * 1000;
+
+/// 2026-08-22 内存收口：修剪本进程工作集。SetProcessWorkingSetSizeEx 传
+/// (SIZE_T)-1, (SIZE_T)-1 是微软文档记录的「尽可能清空工作集」惯用法，
+/// 等价于 K32EmptyWorkingSet（前端同款）。仅 Windows；非 Windows 空实现。
+#[cfg(windows)]
+fn trim_working_set() {
+    use windows::Win32::System::Memory::SetProcessWorkingSetSizeEx;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    // 安全：GetCurrentProcess 返回伪句柄（-1），无需 CloseHandle；
+    // SetProcessWorkingSetSizeEx 失败只意味着「没修成」，无副作用——
+    // 下次搜索/USN 批次按需软缺页调入。忽略返回值，与前端 catch{} 同义。
+    unsafe {
+        let _ = SetProcessWorkingSetSizeEx(
+            GetCurrentProcess(),
+            usize::MAX,
+            usize::MAX,
+            windows::Win32::System::Memory::SETPROCESSWORKINGSETSIZEEX_FLAGS(0),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_working_set() {}
+
+
+
 /// M1（FRESH-AUDIT-3-2026-08-20）：单卷重建的退避簿记。
 /// 连续重建按 `apps::app_scan_retry_delay` 指数拉开（30s 起步、封顶 1h、永不放弃），
 /// 卷静默 `VOLUME_REBUILD_QUIET` 后 attempt 归零——偶发失败不背历史包袱。
@@ -308,6 +349,13 @@ pub struct ServiceState {
     /// AUDIT-2026-08-18 R-A3: 活跃连接数。每个连接一个 tokio 任务 + 1MB 行缓冲，
     /// 无上限时任凭本地进程堆积连接即可耗尽 2 worker 的 runtime。
     connections: AtomicUsize,
+    /// 2026-08-22 内存收口：最近一次用户/系统活动的 Unix 毫秒（搜索请求或
+    /// USN 批次 apply）。maintenance tick 据此判定空闲——单次搜索会把整卷
+    /// MFT 索引的随机节点拉进工作集（indexer 常驻 ~64MB），OS 自发修剪要
+    /// 约 1 小时；在 3 分钟空闲点主动 SetProcessWorkingSetSizeEx(-1,-1)
+    /// 提前释放，与前端 3 分钟 trim 同节奏。AtomicU64 存 Unix 毫秒（Instant
+    /// 不可跨 async 任务持久比较的偏移场景，毫秒绝对值更直白）。
+    last_activity_ms: AtomicU64,
     /// B1（AUDIT-4 批次C，2026-08-21）：RootBound 解析缓存（4 槽）。
     /// 失效粒度从全局 generation 放宽到「被解析卷自身 next_usn」（与流式
     /// checkpoint 的按卷核对同思路）：USN 洪峰期（浏览器/WU 持续写盘）
@@ -347,6 +395,20 @@ impl ServiceState {
         self.connections.fetch_sub(1, Ordering::AcqRel);
     }
 
+    /// 记录一次活动（搜索请求或 USN 批次 apply），刷新空闲计时起点。
+    fn touch_activity(&self) {
+        self.last_activity_ms.store(unix_ms_now(), Ordering::Release);
+    }
+
+    /// 距上次活动是否已超过阈值（毫秒）。用于 maintenance tick 判定是否
+    /// 该修剪工作集。启动后从未有活动时 last_activity_ms 即启动时刻，
+    /// 仍按「自启动起算」判定——首轮建卷完成后若空闲也该修剪。
+    fn idle_for_at_least(&self, threshold_ms: u64) -> bool {
+        let last = self.last_activity_ms.load(Ordering::Acquire);
+        let now = unix_ms_now();
+        now.saturating_sub(last) >= threshold_ms
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             index: RwLock::new(None),
@@ -362,6 +424,7 @@ impl ServiceState {
             pinyin_needs_rebuild: AtomicBool::new(false),
             pinyin_enabled: AtomicBool::new(true),
             connections: AtomicUsize::new(0),
+            last_activity_ms: AtomicU64::new(unix_ms_now()),
             root_bound_cache: RwLock::new(Vec::new()),
         })
     }
@@ -1313,6 +1376,20 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 }
             }
             _ = maintenance.tick() => {
+                // 2026-08-22 内存收口：空闲 ≥3 分钟且未在重建时修剪 indexer 工作集。
+                // 单次搜索把整卷 MFT 随机节点拉进工作集（~64MB 常驻），OS 自发修剪
+                // 要约 1 小时；这里与前端 3 分钟 trim 同节奏主动释放。重建窗口
+                //（building=true）绝不修剪——正在高强度建卷/合并，修剪只会触发
+                // 海量软缺页拖慢重建。ready=false（尚未首建完成）也跳过：没东西可修。
+                // 失败完全无声且无后果：下次搜索/USN 批次按需软缺页调入，与冷启动
+                // 同路径。touch_activity 已在修剪前推进，避免连续 tick 重复修剪。
+                if !state.building.load(Ordering::Acquire)
+                    && state.first_build_complete.load(Ordering::Acquire)
+                    && state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS)
+                {
+                    state.touch_activity();
+                    trim_working_set();
+                }
                 // S5: 每小时一行内存趋势——零常驻成本（5s tick 只做一次时间比较）。
                 // L 批次（FRESH-AUDIT-3-2026-08-20）：trend 与 generation 都要
                 // index.read()，挪 spawn_blocking——USN 洪峰期 watcher 持写锁时
@@ -2086,6 +2163,7 @@ fn watch_volume(
         if changed > 0 {
             service.apply_pinyin_records(volume_number, &records);
             service.generation_notify.notify_waiters();
+            service.touch_activity();
         }
         if let Some(reason) = rebuild_reason {
             return Err(reason);
@@ -2583,6 +2661,7 @@ pub(crate) async fn handle_connection(
                 root,
                 ..
             }) => {
+                state.touch_activity();
                 let state = state.clone();
                 match tokio::task::spawn_blocking(move || {
                     state.search(&query, max, filters.as_deref(), root.as_deref())
@@ -2736,6 +2815,34 @@ mod tests {
         assert!(!usn_drop_exceeds_resync_threshold(0));
         assert!(!usn_drop_exceeds_resync_threshold(4096));
         assert!(usn_drop_exceeds_resync_threshold(4097));
+    }
+
+    /// 2026-08-22 内存收口：touch_activity 推进 last_activity_ms，idle_for_at_least
+    /// 据此判定是否到达空闲阈值（>= 语义：恰达阈值即 true）。锚定三件事：
+    /// (1) 构造即记当前时刻，立即判定未达 3 分钟；(2) touch_activity 后再次立即
+    /// 判定仍未达（证明推进而非回拨）；(3) 手动把 last_activity_ms 回拨到阈值前
+    /// 1ms 判定 false、回拨到阈值即判定 true。这锁住「搜索/USN 批次刷新计时、
+    /// maintenance tick 据此决定是否修剪」的契约。
+    #[test]
+    fn touch_activity_drives_idle_threshold() {
+        let state = ServiceState::new();
+        // 刚构造：距「启动时刻」几乎为 0，未达 3 分钟阈值。
+        assert!(!state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
+        // 一次活动刷新计时起点——仍未达阈值（证明推进而非回拨）。
+        state.touch_activity();
+        assert!(!state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
+        // 回拨到阈值前 1ms：未达；回拨到恰好阈值：>= 成立达阈值。
+        let now = unix_ms_now();
+        state.last_activity_ms.store(
+            now.saturating_sub(IDLE_TRIM_THRESHOLD_MS - 1),
+            Ordering::Release,
+        );
+        assert!(!state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
+        state.last_activity_ms.store(
+            now.saturating_sub(IDLE_TRIM_THRESHOLD_MS),
+            Ordering::Release,
+        );
+        assert!(state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
     }
 
     /// M1（FRESH-AUDIT-3-2026-08-20）: 首次到达立即准入；退避窗口内拒绝且不动

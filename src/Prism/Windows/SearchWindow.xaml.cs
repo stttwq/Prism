@@ -73,6 +73,10 @@ public partial class SearchWindow : Window
         uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
         WinEventProc lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
     [DllImport("user32.dll")] private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+    // Win11 24H2+ 的 kernel32 没有 "EmptyWorkingSet" 转发名（实机 26200 实测
+    // EntryPointNotFoundException），K32EmptyWorkingSet 是唯一稳定入口。
+    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "K32EmptyWorkingSet")]
+    private static extern bool EmptyWorkingSet(IntPtr hProcess);
 
     private WinEventProc? _foregroundHookProc; // keep-alive: GC must not collect the delegate
     private IntPtr _foregroundHook;
@@ -512,6 +516,21 @@ public partial class SearchWindow : Window
                 System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
                     System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
                 GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                // 收完再修剪工作集：首次真实搜索会把 WPF/JSON/JIT/COM 本体
+                // （~40MB，实测零结果查询也 54.7MB——与图标无关）拉进进程，GC
+                // 收不掉框架常驻。EmptyWorkingSet 把这些页移出工作集（私有提交
+                // 不变、WorkingSetPrivate 下降），与 OS 空闲约 1 小时后的自发
+                // 修剪同一机制，只是提前到既定的 3 分钟 trim 点。这推翻 C-D4 的
+                // 删除决定：验收口径=WorkingSetPrivate 且用户要求"用完即降"；
+                // 代价仅是再呼出时的软缺页（NVMe 上远短于淡入动画），且只在
+                // 隐藏态执行。先 GC 后修剪，垃圾页不进页面文件。单次调用——
+                // 不自检不重试：紧跟阻塞式 GC 之后，进程内 Environment.WorkingSet
+                // 读取会因调度器队列中的挂起工作而抖动，重试+Thread.Sleep 反而
+                // 阻塞 UI 线程拖出窗口、阻碍 OS 自身的工作集修剪。一次性调用
+                // 是 EmptyWorkingSet 的惯用法，失败完全无声且无后果：下次呼出
+                // 按需软缺页调入，与正常冷启动路径一致。
+                try { EmptyWorkingSet(System.Diagnostics.Process.GetCurrentProcess().Handle); }
+                catch { /* 修剪失败不影响任何功能 */ }
             };
             _idleTrimTimer.Start();
         }
