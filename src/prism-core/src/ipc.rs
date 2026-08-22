@@ -2213,7 +2213,16 @@ async fn path_query_results(
             let empty = HashSet::new();
             let fields =
                 process_indexer_reply(reply, tail.as_str(), history, &empty, &empty, &mut ranked);
+            // 复审2-M1（T7 二轮）：请求放宽 3×（indexer_request_max）后，索引器
+            // 的 is_truncated 按放宽口径判定；截回 max 后必须像全局路径一样
+            // 重算（ipc.rs search_service 的 is_truncated 同式），否则命中数
+            // 落在 (max, 3×max] 的结果既显示不全又没有"更多"行可展开。
+            let truncated = fields.is_truncated || ranked.len() > max;
             ranked.truncate(max);
+            let fields = IndexerReplyFields {
+                is_truncated: truncated,
+                ..fields
+            };
             Some(path_response(raw_query, fields, ranked))
         }
         Err(_) => None,

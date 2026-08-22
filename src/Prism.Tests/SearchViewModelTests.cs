@@ -138,9 +138,12 @@ public sealed class SearchViewModelTests
     [InlineData("e:/x", true)]
     [InlineData(@"\\server\share", true)]
     [InlineData("//srv/x", true)]
+    [InlineData("\"E:\\foo bar\"", true)]   // Explorer 复制文件地址形态
+    [InlineData(" \"E:\\foo\" ", true)]     // 引号外再带空白
     [InlineData("note:foo", false)]
     [InlineData("E", false)]
     [InlineData(@"foo\bar", false)]
+    [InlineData("\"\"", false)]
     public void PathQueryDetectionMatchesBrokerRules(string query, bool expected)
     {
         Assert.Equal(expected, SearchViewModel.IsAbsolutePathQuery(query));
