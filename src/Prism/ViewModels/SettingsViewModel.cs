@@ -110,6 +110,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             ActionHotkeyCatalog.Entries
                 .Where(e => !string.IsNullOrWhiteSpace(settings.ActionHotkeys.GetValueOrDefault(e.Id)))
                 .Select(e => new ActionHotkeyEditItem(e.Id, settings.ActionHotkeys[e.Id])));
+        // 行上换选动作也要刷新各行的可选项（复审 E：只在增删行时刷新会让
+        // 旧行的下拉还列着别行已占用的动作，可选出重复 Id）。
+        foreach (var row in ActionHotkeys)
+            HookRowIdChanges(row);
         RefreshActionChoices();
 
         AddEngineCommand = new RelayCommand(_ => AddEngine());
@@ -254,15 +258,27 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             StatusMessage = $"最多 {ActionHotkeyCatalog.Entries.Count} 个动作，已全部添加";
             return;
         }
-        ActionHotkeys.Add(new ActionHotkeyEditItem(next.Id, ""));
+        var row = new ActionHotkeyEditItem(next.Id, "");
+        HookRowIdChanges(row);
+        ActionHotkeys.Add(row);
         RefreshActionChoices();
     }
 
     private void RemoveActionHotkey(ActionHotkeyEditItem? row)
     {
         if (row is null) return;
+        row.PropertyChanged -= OnRowIdChanged;
         ActionHotkeys.Remove(row);
         RefreshActionChoices();
+    }
+
+    private void HookRowIdChanges(ActionHotkeyEditItem row) =>
+        row.PropertyChanged += OnRowIdChanged;
+
+    private void OnRowIdChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(ActionHotkeyEditItem.Id))
+            RefreshActionChoices();
     }
 
     private HashSet<string> UsedActionIds(ActionHotkeyEditItem? except) =>
@@ -513,9 +529,23 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
 
         // 动作快捷键（2026-08-21 设想）：先逐行规范化，再整表校验（保留键/撞键）。
+        // 复审 E：行 Id 为空（下拉正在换选）或两行撞同一动作时明确报错，
+        // 不做静默丢绑（旧写字典键覆盖会无声吞掉先到的那行）。
         var actionHotkeys = new Dictionary<string, string>();
         foreach (var row in ActionHotkeys)
         {
+            if (string.IsNullOrWhiteSpace(row.Id))
+            {
+                StatusMessage = "有未选择动作的快捷键行，请选好动作或删除该行";
+                SelectedTab = TabIndex.QuickAccess;
+                return;
+            }
+            if (actionHotkeys.ContainsKey(row.Id))
+            {
+                StatusMessage = $"「{row.Label}」被添加了两次，请删除多余的一行";
+                SelectedTab = TabIndex.QuickAccess;
+                return;
+            }
             var raw = row.Value.Trim();
             if (raw.Length == 0) continue;
             var canonical = ActionHotkeyTable.Canonicalize(raw);

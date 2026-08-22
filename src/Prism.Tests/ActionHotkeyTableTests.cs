@@ -308,6 +308,43 @@ public sealed class SettingsViewModelActionHotkeyTests
         }
     }
 
+    [Fact]
+    public void ChangingRowSelectionRefreshesOtherRowsAndSaveBlocksDuplicates()
+    {
+        var directory = TestDir();
+        try
+        {
+            var store = new SettingsStore(directory);
+            store.Save(Settings.Default);
+            var vm = new SettingsViewModel(store, new AutoStartService());
+
+            vm.AddActionHotkeyCommand.Execute(null);
+            vm.AddActionHotkeyCommand.Execute(null);
+            Assert.Equal("open_folder", vm.ActionHotkeys[0].Id);
+            Assert.Equal("copy", vm.ActionHotkeys[1].Id);
+
+            // 复审 E：换选第二行后，第一行的可选项不再包含新占用的动作。
+            vm.ActionHotkeys[1].Id = "zip";
+            Assert.DoesNotContain(vm.ActionHotkeys[0].AvailableActions, e => e.Id == "zip");
+
+            // 强行构造重复 Id（绕过 UI）：保存必须明确报错，不静默丢绑。
+            vm.ActionHotkeys[0].Id = "zip";
+            vm.ActionHotkeys[0].Value = "Ctrl+Shift+O";
+            vm.ActionHotkeys[1].Value = "Ctrl+Shift+P";
+            vm.SaveCommand.Execute(null);
+            Assert.Contains("两次", vm.StatusMessage);
+
+            // 空 Id（下拉正在换选）：同样拦下。
+            vm.ActionHotkeys[0].Id = "";
+            vm.SaveCommand.Execute(null);
+            Assert.Contains("未选择动作", vm.StatusMessage);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static string TestDir()
     {
         var path = Path.Combine(Path.GetTempPath(), "prism-actionhotkey-vm-tests", Guid.NewGuid().ToString("N"));

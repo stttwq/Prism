@@ -201,18 +201,22 @@ public sealed class SearchViewModel
 
     /// <summary>
     /// 绝对路径形查询（P1，第一轮 bug 修复）：盘符+分隔符（E:\… / e:/…）或
-    /// UNC 前缀。与 broker 侧 is_absolute_path_query 同规则——broker 把这类
-    /// 查询当路径解析，前端据此跳过前缀缓存（见 RunSearchAsync 注释）。
+    /// UNC 前缀。外层包裹引号先剥（Explorer「复制文件地址」形态）。与 broker
+    /// 侧 is_absolute_path_query 同规则——broker 把这类查询当路径解析，前端
+    /// 据此跳过前缀缓存（见 RunSearchAsync 注释）。
     /// </summary>
     internal static bool IsAbsolutePathQuery(string query)
     {
-        if (query.Length >= 3
-            && char.IsAsciiLetter(query[0])
-            && query[1] == ':'
-            && (query[2] == '\\' || query[2] == '/'))
+        var body = query.Trim().AsSpan();
+        if (body.Length >= 2 && body[0] == '"' && body[^1] == '"')
+            body = body[1..^1].Trim();
+        if (body.Length >= 3
+            && char.IsAsciiLetter(body[0])
+            && body[1] == ':'
+            && (body[2] == '\\' || body[2] == '/'))
             return true;
-        return query.StartsWith(@"\\", StringComparison.Ordinal)
-            || query.StartsWith("//", StringComparison.Ordinal);
+        return body.StartsWith(@"\\", StringComparison.Ordinal)
+            || body.StartsWith("//", StringComparison.Ordinal);
     }
 
     /// <summary>

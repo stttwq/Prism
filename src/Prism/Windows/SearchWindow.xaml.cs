@@ -46,6 +46,9 @@ public partial class SearchWindow : Window
     private bool _isDragging;
     /// <summary>呼出后短时间内忽略失焦，避免 Show/Activate 过程中被立刻关掉。</summary>
     private bool _ignoreDeactivate;
+    /// <summary>属主模态对话框计数（工作集/别名对话框、文件夹选择器）：
+    /// 呼出键切换路径据此在模态期间拒绝隐藏主窗（见 HideAnimated）。</summary>
+    private int _modalDialogs;
     private bool _contextMenuOpen;
     private bool _contextMenuActionPending;
     private int _contextMenuRequestSeq;
@@ -200,12 +203,14 @@ public partial class SearchWindow : Window
             {
                 _contextMenuActionPending = true;
                 _ignoreDeactivate = true;
+                _modalDialogs++;
                 try
                 {
                     ShowWorksetDialog();
                 }
                 finally
                 {
+                    _modalDialogs--;
                     _contextMenuActionPending = false;
                     if (!_contextMenuOpen)
                         ReleaseDeactivateGuardAfterDelay();
@@ -261,9 +266,11 @@ public partial class SearchWindow : Window
         {
             _contextMenuActionPending = true;
             _ignoreDeactivate = true;
+            _modalDialogs++;
         };
         vm.ModalPickEnded += () =>
         {
+            _modalDialogs--;
             _contextMenuActionPending = false;
             if (!_contextMenuOpen)
                 ReleaseDeactivateGuardAfterDelay();
@@ -445,6 +452,15 @@ public partial class SearchWindow : Window
     public void HideAnimated()
     {
         if (_hiding || !IsVisible) return;
+        // 复审 G（T6 全仓复审）：属主模态对话框开着时绝不隐藏主窗——
+        // Owner.Hide 不会隐藏 owned 窗口，对话框会孤儿化悬在半空，且
+        // ReleaseIdleMemory 会在对话框底下清空状态。改为推自己到前台，
+        // 用户先处理对话框。
+        if (_modalDialogs > 0)
+        {
+            Activate();
+            return;
+        }
         _hiding = true;
         _generationClient.SetActive(false);
         _ignoreDeactivate = true;
@@ -802,7 +818,15 @@ public partial class SearchWindow : Window
             dialog.Close();
         };
         dialog.Loaded += (_, _) => { input.Focus(); input.SelectAll(); };
-        dialog.ShowDialog();
+        _modalDialogs++;
+        try
+        {
+            dialog.ShowDialog();
+        }
+        finally
+        {
+            _modalDialogs--;
+        }
         if (!confirmed) return;
 
         var words = input.Text
@@ -1034,6 +1058,14 @@ public partial class SearchWindow : Window
 
         var confirmed = false;
         var overwriteArmed = false;
+        // 复审 F：改名必须解除覆盖确认——否则给 A 装好的「覆盖保存」会无声
+        // 覆盖改成 B 的另一个已存在工作集。
+        nameInput.TextChanged += (_, _) =>
+        {
+            overwriteArmed = false;
+            warn.Visibility = Visibility.Collapsed;
+            okButton.Content = "保存";
+        };
         okButton.Click += (_, _) =>
         {
             var name = nameInput.Text.Trim();

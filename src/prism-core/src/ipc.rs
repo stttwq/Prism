@@ -1764,10 +1764,18 @@ async fn search_service(
     }
     // P1（第一轮 bug 修复）：绝对路径形查询走路径语义——路径当路径用，不当
     // 文件名子串用（旧版整串进名字匹配，文件全路径与目录路径都搜不到任何
-    // 东西）。仅全局无过滤时接管；目录范围/过滤态/窗口模式维持原路径。
+    // 东西）。仅全局无 ext:/path: 过滤时接管；exclude_path 照常透传（用户
+    // 排除的目录不能靠路径查询绕开）；目录范围/窗口模式维持原路径。
     if root.is_none() && !has_filters && is_absolute_path_query(&name_query) {
-        if let Some(response) =
-            path_query_results(&name_query, max, preferences.pinyin_enabled(), history).await
+        if let Some(response) = path_query_results(
+            query,
+            &name_query,
+            max,
+            filters.as_deref(),
+            preferences.pinyin_enabled(),
+            history,
+        )
+        .await
         {
             return response;
         }
@@ -2132,25 +2140,39 @@ async fn search_index_with_root_fallback(
 /// 响应不带 `index_generation`：路径分支的结果绝不能进前端前缀缓存——
 /// 缓存按标题子串过滤，而路径查询的"前缀增长"（E:\foo → E:\foo2）是
 /// 换了一个路径，不是更长的同名过滤。
+/// 复审1/3/4（T6 全仓复审）：echo 必须是**原始**查询——`parse_query` 会把空白
+/// 归一（去首尾、折叠连续空格），用它回显会被前端 staleness 检查丢弃；
+/// exclude_path 过滤透传给两次索引器请求（用户排除的目录不因路径查询复活）；
+/// root 拒绝（路径不存在/是文件）才降级下一尝试，传输/语义错误立刻回退
+/// 全局搜索——否则一次挂死的索引器要连吃 3×8s 请求链。
 async fn path_query_results(
     raw_query: &str,
+    name_query: &str,
     max: usize,
+    filters: Option<&[SearchFilter]>,
     pinyin_enabled: bool,
     history: &Arc<HistoryStore>,
 ) -> Option<Response> {
-    let path = normalize_path_query(raw_query)?;
+    let path = normalize_path_query(name_query)?;
 
     // 尝试 1：路径本身当目录浏览。文件路径/不存在路径会以 root 拒绝回来。
     // 首行留给自身，浏览请求只要 max-1 条（下限 1：max=1 时也要能探到自身）。
     let browse = indexer_client::search_in_root(
         "",
         (max.saturating_sub(1)).max(1),
-        None,
+        filters,
         pinyin_enabled,
         Some(path.as_str()),
     )
     .await;
-    if let Ok(reply) = browse {
+    let reply = match browse {
+        Ok(reply) => Some(reply),
+        // 路径不是目录/不在索引内：降级到父目录 + 末段。
+        Err(failure) if failure.root_rejection.is_some() => None,
+        // 传输/语义错误：立刻让调用方走全局搜索（错误在那里浮出）。
+        Err(_) => return None,
+    };
+    if let Some(reply) = reply {
         // 自身行：浏览结果包含 root 自身（RootFilter 收 depth 0），但不保证
         // 排在 top-K 里（短名后代可能把它挤出去）——在场就取用，不在场合成
         // （browse 成功即证明目录存在且在索引内）。
@@ -2175,11 +2197,12 @@ async fn path_query_results(
     }
 
     // 尝试 2：父目录 + 末段（文件全路径精确命中 / 未打完路径前缀收窄）。
+    // 父目录不可用（含传输错误）一律回退全局搜索。
     let (parent, tail) = split_path_query(&path)?;
     let probe = indexer_client::search_in_root(
         tail.as_str(),
         indexer_request_max(max),
-        None,
+        filters,
         pinyin_enabled,
         Some(parent.as_str()),
     )
@@ -2260,10 +2283,21 @@ fn folder_self_row(path: &str, name: &str, is_directory: bool) -> SearchResult {
     }
 }
 
+/// 剥掉外层空白与包裹引号（Explorer「复制文件地址」给 `"E:\foo"` 形态）。
+/// 判定与规范化共用，保证带引号输入两端一致。
+fn unquote_query(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        return trimmed[1..trimmed.len() - 1].trim();
+    }
+    trimmed
+}
+
 /// 识别绝对路径形查询：盘符 + 分隔符（`E:\…` / `e:/…`）或 UNC 前缀（`\\…`）。
 /// 只认"长得像"，是否真实存在交给 root 解析判定（不碰磁盘）。
 fn is_absolute_path_query(query: &str) -> bool {
-    let bytes = query.as_bytes();
+    let body = unquote_query(query);
+    let bytes = body.as_bytes();
     if bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
@@ -2271,20 +2305,17 @@ fn is_absolute_path_query(query: &str) -> bool {
     {
         return true;
     }
-    query.starts_with(r"\\") || query.starts_with("//")
+    body.starts_with(r"\\") || body.starts_with("//")
 }
 
 /// 路径查询规范化：剥粘贴带回的包裹引号、去尾部分隔符、统一正斜杠。
 /// `E:\` 归一为 `E:`（root 解析两侧同型，显示由 RootScope::display 负责）。
 fn normalize_path_query(raw: &str) -> Option<String> {
-    let mut trimmed = raw.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        trimmed = trimmed[1..trimmed.len() - 1].trim();
-    }
-    if trimmed.is_empty() {
+    let body = unquote_query(raw);
+    if body.is_empty() {
         return None;
     }
-    let unified = trimmed.replace('/', "\\");
+    let unified = body.replace('/', "\\");
     let trimmed = unified.trim_end_matches('\\');
     if trimmed.is_empty() {
         return None;
@@ -4385,6 +4416,9 @@ mod query_parser_tests {
         assert!(is_absolute_path_query("e:/foo"));
         assert!(is_absolute_path_query(r"\\server\share"));
         assert!(is_absolute_path_query("//srv/share"));
+        // 复审 B：粘贴带引号的路径也要能进路径分支（gate 与归一化共用剥引号）。
+        assert!(is_absolute_path_query(r#""E:\foo bar""#));
+        assert!(is_absolute_path_query(" \"E:\\foo\" "));
         // 不是路径：普通词、盘符无分隔符、相对路径。
         assert!(!is_absolute_path_query("note:foo"));
         assert!(!is_absolute_path_query("E:"));
