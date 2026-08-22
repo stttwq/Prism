@@ -1,0 +1,43 @@
+{
+    "schema_version":  1,
+    "run_id":  "idle-gate-B-after-fix",
+    "sample_count":  5,
+    "memory_gate_metric":  "sum(private_working_set_bytes) for Prism.exe + prism-core.exe + prism-indexer-service.exe",
+    "memory_gate_limit_bytes":  104857600,
+    "memory_gate_passed":  true,
+    "diagnostic_metric":  "working_set_bytes and private_bytes are reported separately; private_bytes is not private working set",
+    "process_aggregates":  [
+                               {
+                                   "label":  "frontend",
+                                   "private_working_set_p50_bytes":  10543104,
+                                   "private_working_set_max_bytes":  10571776
+                               },
+                               {
+                                   "label":  "broker",
+                                   "private_working_set_p50_bytes":  2727936,
+                                   "private_working_set_max_bytes":  2727936
+                               },
+                               {
+                                   "label":  "indexer",
+                                   "private_working_set_p50_bytes":  64524288,
+                                   "private_working_set_max_bytes":  64528384
+                               }
+                           ],
+    "totals":  {
+                   "private_working_set_p50_bytes":  77795328,
+                   "private_working_set_max_bytes":  77828096,
+                   "working_set_p50_bytes":  166526976,
+                   "working_set_max_bytes":  166563840
+               },
+    "indexer":  {
+                    "generations":  [
+                                        88,
+                                        99,
+                                        110
+                                    ],
+                    "generation_changed_during_sampling":  true,
+                    "consistency":  "Each memory record includes a healthy indexer status captured at that sample point.",
+                    "volume_count":  3,
+                    "reported_index_memory_bytes":  79930586
+                }
+}

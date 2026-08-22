@@ -73,7 +73,20 @@ public partial class App : Application
         try { AttachConsole(AttachParentProcess); } catch { /* ignore */ }
 
         _store = new SettingsStore();
-        var settings = _store.Load();
+        // 读失败（文件被锁且重试无效）带默认值继续运行，但绝不碰自启注册表——
+        // 拿不到磁盘真值时，按默认 AutoStart=false 注销注册表等于替用户关自启。
+        var settingsLoadFailed = false;
+        Settings settings;
+        try
+        {
+            settings = _store.Load();
+        }
+        catch (Exception ex)
+        {
+            settingsLoadFailed = true;
+            settings = Settings.Default;
+            Log("设置读取失败，本次使用默认设置：" + ex.Message);
+        }
         _hostSettings = settings;
         _actionHotkeyBindings = settings.ActionHotkeys;
         _favicons = new FaviconCache(_store.DataDir);
@@ -85,13 +98,16 @@ public partial class App : Application
         _stagingAddHotkey = settings.StagingAddHotkey;
 
         _autoStart = new AutoStartService();
-        try
+        if (!settingsLoadFailed)
         {
-            _autoStart.Apply(settings.AutoStart);
-        }
-        catch (Exception ex)
-        {
-            Log("自启同步失败：" + ex.Message);
+            try
+            {
+                _autoStart.Apply(settings.AutoStart);
+            }
+            catch (Exception ex)
+            {
+                Log("自启同步失败：" + ex.Message);
+            }
         }
 
         _state = new AppState();
@@ -365,10 +381,18 @@ public partial class App : Application
             _state.IsBackendConnected = true;
             if (_store is not null)
             {
-                var settings = _store.Load();
-                await _pipe.UpdatePreferencesAsync(
-                    settings.HistoryEnabled,
-                    settings.PinyinEnabled).ConfigureAwait(true);
+                try
+                {
+                    var settings = _store.Load();
+                    await _pipe.UpdatePreferencesAsync(
+                        settings.HistoryEnabled,
+                        settings.PinyinEnabled).ConfigureAwait(true);
+                }
+                catch (Exception ex)
+                {
+                    // 设置暂时读不到或偏好下发失败都不算后端故障：跳过本次即可。
+                    Log("后端连接后同步偏好失败：" + ex.Message);
+                }
             }
             try
             {

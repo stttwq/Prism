@@ -39,6 +39,8 @@ public partial class SearchWindow : Window
     private StagingArea? _staging;
     private (System.Windows.Input.Key Key, System.Windows.Input.ModifierKeys Mods)? _stagingAddHotkey;
     private bool _suppressQueryEvent;
+    /// <summary>上一次 ApplyState 应用过的面板模式：只用于识别「离开动作面板」的转换。</summary>
+    private PanelMode _lastAppliedMode = PanelMode.Idle;
     private bool _hiding;
     /// <summary>OLE 拖出进行中（2026-08-22 拖拽计划）：失焦隐藏闸的第六守卫。
     /// 拖拽是阻塞式嵌套消息循环，期间激活变更被此闸挡下；结束后由
@@ -1519,6 +1521,19 @@ public partial class SearchWindow : Window
     private void ApplyState(AppState? state, bool animatePanel)
     {
         if (state is null) return;
+
+        // 离开动作面板时必须把输入框拉回 State.Query：进面板时 Header 被清空供
+        // 动作过滤/重命名编辑用，而 VM 侧的 LeaveActions()（RefreshAsync 在
+        // rename/copy_to/move_to 成功后调用）只恢复 State.Query，不经
+        // LeaveActionsUi——不回写的话结果按旧查询刷新、输入框却显示新文件名
+        // 或空文本，下一次 Enter 会顶着对不上的查询执行选中行。
+        if (_lastAppliedMode == PanelMode.Actions && state.Mode != PanelMode.Actions)
+        {
+            _suppressQueryEvent = true;
+            Header.Query = state.Query;
+            _suppressQueryEvent = false;
+        }
+        _lastAppliedMode = state.Mode;
 
         Header.SetMode(state.Mode);
 

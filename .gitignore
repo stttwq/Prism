@@ -68,6 +68,10 @@ artifacts/g4-test-build/*.dll
 artifacts/g4-test-build/*.pdb
 artifacts/g4-test-build/Prism.*.json
 
+# Bench 目录直接子级的索引快照是运行时数据（同 data/index.bin 类），40MB 级
+# 不入库；子目录里的小型 fixture（如 g2 的 pinyin-v1.valid.bin）不受影响。
+artifacts/bench/*.bin
+
 # Debug symbols never ship with the installer payload.
 dist/*.pdb
 

@@ -592,13 +592,16 @@ public sealed class SearchViewModel
         if (_state.Mode != PanelMode.Actions) return;
         _state.RenameTarget = null;
         _state.RenameNewName = null;
+        // 先恢复 Query 再切 Mode：窗口侧 ApplyState 在「离开动作面板」转换时把
+        // Header 拉回 State.Query，若 Mode 先变，转换瞬间读到的 Query 还是
+        // 动作过滤/重命名留下的旧文本，之后 Query 恢复不再触发回写。
+        _state.Query = _queryBeforeActions;
+        _pendingQuery = _queryBeforeActions;
         _state.Mode = PanelMode.Results;
         _state.Actions = Array.Empty<ActionItem>();
         _state.SelectedActionIndex = -1;
         _state.ActionTarget = null;
         _allActions = Array.Empty<ActionItem>();
-        _state.Query = _queryBeforeActions;
-        _pendingQuery = _queryBeforeActions;
         _state.StatusMessage = "";
     }
 

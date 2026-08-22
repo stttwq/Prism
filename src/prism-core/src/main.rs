@@ -56,6 +56,35 @@ async fn main() {
         });
     }
 
+    // 全量审查（2026-08-22）：broker 启动时把拼音偏好推给 indexer 服务，并周期
+    // 重推。此前只有前端 UpdatePreferences 会下发——broker 崩溃被拉起 / indexer
+    // 服务独立重启（SCM 侧标志回默认 true）后，用户关掉的拼音结果会重新混入，
+    // 且无人再推。指数退避重试直到送达；成功后每小时重推一次对齐漂移（幂等，
+    // 受 indexer 侧 G5 每秒一次限速约束）。每次推送读共享态当前值，不盖用户
+    // 刚改的偏好。
+    {
+        let preferences = preferences.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                let enabled = preferences.pinyin_enabled();
+                match prism_core::indexer_client::set_pinyin_enabled(enabled).await {
+                    Ok(()) => {
+                        delay = std::time::Duration::from_secs(3600);
+                    }
+                    Err(error) => {
+                        log(format!(
+                            "pinyin preference push to indexer failed, retry in {}s: {error}",
+                            delay.as_secs()
+                        ));
+                        delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
+
     log(format!("broker pipe listening at {PIPE_NAME}"));
     if let Err(error) = ipc::serve(
         PIPE_NAME,

@@ -712,11 +712,32 @@ impl ServiceState {
             return;
         }
         // P2：delta 编码需要每条记录的目录链（按批从活索引算，批内同父共享缓存）。
+        // 2026-08-22 审查：名字与链一律取**活树现值**，不取事件载荷里的新名——
+        // 批内被跳过的记录（父链不可达，活树保持旧名）与整批回滚的记录若按
+        // 新名编码，拼音命中会顶着旧名/旧路径出现，直到周期 checkpoint 才纠正。
+        // 活树现值编码对这两类只会产生与主表一致的冗余掩蔽，不会错。
+        let mut bad_frn = false;
         let delta_records: Vec<u32> = records
             .iter()
-            .filter_map(|record| VolumeIndex::split_frn(record.frn).ok().map(|(r, _)| r))
+            .filter_map(|record| {
+                let has_mutation_reason = record.reason
+                    & (ntfs::USN_REASON_FILE_DELETE
+                        | ntfs::USN_REASON_FILE_CREATE
+                        | ntfs::USN_REASON_RENAME_NEW_NAME)
+                    != 0;
+                if !has_mutation_reason {
+                    return None;
+                }
+                match VolumeIndex::split_frn(record.frn) {
+                    Ok((record_number, _)) => Some(record_number),
+                    Err(_) => {
+                        bad_frn = true;
+                        None
+                    }
+                }
+            })
             .collect();
-        let chains = {
+        let facts = {
             let Ok(guard) = self.index.read() else {
                 self.pinyin_needs_rebuild.store(true, Ordering::Release);
                 return;
@@ -728,9 +749,9 @@ impl ServiceState {
             index
                 .volumes
                 .get(volume)
-                .map(|live| crate::pinyin_sidecar::chains_for_delta(live, &delta_records))
+                .map(|live| crate::pinyin_sidecar::names_and_chains_for_delta(live, &delta_records))
         };
-        let Some(chains) = chains else {
+        let Some(facts) = facts else {
             self.begin_pinyin_rebuild();
             self.pinyin_needs_rebuild.store(true, Ordering::Release);
             return;
@@ -739,23 +760,9 @@ impl ServiceState {
             .pinyin_delta
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut invalidate = false;
-        for (record, chain) in records.iter().zip(chains.iter()) {
-            let Ok((record_number, _)) = VolumeIndex::split_frn(record.frn) else {
-                invalidate = true;
-                break;
-            };
-            let name = if record.reason & ntfs::USN_REASON_FILE_DELETE != 0 {
-                None
-            } else if record.reason
-                & (ntfs::USN_REASON_FILE_CREATE | ntfs::USN_REASON_RENAME_NEW_NAME)
-                != 0
-            {
-                Some(record.name.as_str())
-            } else {
-                continue;
-            };
-            match delta.apply(volume, record_number, name, chain) {
+        let mut invalidate = bad_frn;
+        for ((name, chain), record_number) in facts.iter().zip(delta_records.iter()) {
+            match delta.apply(volume, *record_number, name.as_deref(), chain) {
                 Ok(true) | Err(_) => {
                     invalidate = true;
                     break;

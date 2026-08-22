@@ -54,8 +54,9 @@ pub const FLAG_DIRECTORY: u16 = 0x0002;
 pub const FLAG_EXCLUDED: u16 = 0x0004;
 /// 槽表按 MFT 记录号预分配（12 字节/槽，resize 全量落实）。
 /// 上限 2M 会拒绝现代系统盘（2~8M 记录很常见），且 build 失败会让整个索引
-/// 服务退出。16M ≈ 192MB 槽表上限，实际按卷真实记录数落实；病态稀疏卷
-/// 仍由 prepare_initial_capacity 的 32× 密度检查拦截。
+/// 服务退出。16M ≈ 192MB 槽表上限，实际按卷真实记录数落实；粗坏的 MFT
+/// 解析（天文数字 FRN 配极小活跃数）仍由 prepare_initial_capacity 的
+/// 4096× 密度检查拦截。
 const MAX_RECORD_NUMBER: usize = 16_777_216;
 const MAX_PATH_DEPTH: usize = 64;
 const NO_NAME: u32 = u32::MAX;
@@ -457,7 +458,11 @@ impl VolumeIndex {
                 "MFT record {max_record} exceeds compact-index limit"
             ));
         }
-        if required > 65_536 && required > live_records.max(1).saturating_mul(32) {
+        // 2026-08-22 审查：NTFS 大批删除后槽表不缩、活跃数缩——曾冲上 2M 文件
+        // 再清理到 60k 的合法数据卷（33× 密度）会被旧 32× 阈值判成病态稀疏，
+        // build 确定性失败、延迟重试永久空转。4096× 仍拦得住粗坏解析
+        //（解析 bug 产出的近 16M FRN 配极小活跃数，密度数万倍起）。
+        if required > 65_536 && required > live_records.max(1).saturating_mul(4096) {
             return Err(format!(
                 "MFT slot table is pathologically sparse: {required}/{live_records}"
             ));
@@ -842,8 +847,9 @@ impl VolumeIndex {
         }
         if required > self.nodes.len() {
             // G4: 稀疏度防线改读维护计数（此前每次增长全表扫描计数）。
+            // 阈值与 prepare_initial_capacity 同为 4096×（理由见彼处注释）。
             let present = self.present_slots.max(1);
-            if required > 65_536 && required > present.saturating_mul(32) {
+            if required > 65_536 && required > present.saturating_mul(4096) {
                 return Err(VolumeError::SparseSlots { required, present });
             }
             self.nodes.resize(required, NodeSlot::default());
@@ -1997,6 +2003,17 @@ mod tests {
         assert!(volume
             .prepare_initial_capacity(16_777_216, 16_777_216)
             .is_err());
+    }
+
+    /// 全量审查（2026-08-22）：NTFS 大批删除后槽表不缩、活跃数缩——
+    /// 冲上 2M 文件再清理到 60k 的合法数据卷（33× 密度）必须可索引；
+    /// 旧的 32× 阈值会把它判成病态稀疏，build 确定性失败、重试永久空转。
+    /// 粗坏解析（16M 级 FRN 配 1k 活跃，16000×）仍要拒绝。
+    #[test]
+    fn initial_capacity_accepts_legitimately_shrunken_volumes() {
+        let mut volume = volume();
+        volume.prepare_initial_capacity(2_000_000, 60_000).unwrap();
+        assert!(volume.prepare_initial_capacity(16_000_000, 1_000).is_err());
     }
 
     /// AUDIT-2026-08-18 R-C3: 高记录号节点删除后，names 压缩必须同步回收

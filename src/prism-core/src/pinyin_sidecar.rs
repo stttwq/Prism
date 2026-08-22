@@ -331,17 +331,33 @@ fn record_chain(
     dir_chain_with_own(volume, parent, cache, visiting)
 }
 
-/// P2：为一批 USN 记录计算各自的新链（delta 编码用）。一次性缓存，
-/// 批内同父目录共享。
-pub fn chains_for_delta(volume: &crate::hierarchy::VolumeIndex, records: &[u32]) -> Vec<Vec<u8>> {
+/// P2：为一批 USN 记录从**活树现值**取（名字, 目录链）。delta 编码必须与
+/// 展示一致：USN 批里的记录可能被跳过（父链不可达，活树保持旧名）或整批
+/// 回滚，若按事件载荷里的新名字编码，拼音命中会顶着活树旧名/旧路径出现。
+/// 名字 `None` = 该槽位当前不存在（已删除或从未落树）。
+pub fn names_and_chains_for_delta(
+    volume: &crate::hierarchy::VolumeIndex,
+    records: &[u32],
+) -> Vec<(Option<String>, Vec<u8>)> {
     let mut cache: DirChainCache = std::collections::HashMap::new();
     let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
     records
         .iter()
         .map(|record| {
-            record_chain(volume, *record, &mut cache, &mut visiting)
-                .as_ref()
-                .to_vec()
+            let name = volume
+                .nodes
+                .get(*record as usize)
+                .filter(|slot| slot.flags & crate::hierarchy::FLAG_PRESENT != 0)
+                .and_then(|slot| volume.name_at(slot.name_off).ok().map(str::to_owned));
+            match name {
+                Some(name) => (
+                    Some(name),
+                    record_chain(volume, *record, &mut cache, &mut visiting)
+                        .as_ref()
+                        .to_vec(),
+                ),
+                None => (None, Vec::new()),
+            }
         })
         .collect()
 }
@@ -1042,6 +1058,21 @@ mod tests {
             generation: 9,
             events_since_checkpoint: 0,
         }
+    }
+
+    /// 全量审查（2026-08-22）：delta 编码取活树现值，不取事件载荷。USN 批里
+    /// 被跳过的 rename（父链不可达，活树保持旧名）若按事件新名编码，拼音
+    /// 命中会顶着旧名/旧路径出现；本函数只回答「活树现在叫什么」。
+    #[test]
+    fn delta_facts_come_from_the_live_tree_not_the_event() {
+        let mut index = state();
+        // 删除记录 10：活树现值变 None，无论后续事件载荷带什么名字。
+        index.volumes[0].delete(10).unwrap();
+        let facts = names_and_chains_for_delta(&index.volumes[0], &[10, 11, 999]);
+        assert_eq!(facts[0].0, None);
+        assert_eq!(facts[1].0.as_deref(), Some("重庆"));
+        // 从未落树的槽位同样是 None（掩蔽为删除，主表无此键时无效果）。
+        assert_eq!(facts[2].0, None);
     }
 
     #[test]

@@ -291,6 +291,44 @@ public sealed class SettingsStoreTests
         }
     }
 
+    [Fact]
+    public void CorruptJsonFallsBackToDefaults()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            File.WriteAllText(Path.Combine(directory, "settings.json"), "{ not json");
+            var settings = new SettingsStore(directory).Load();
+            Assert.Equal(Settings.Default.ComboHotkey, settings.ComboHotkey);
+            Assert.Equal(Settings.CurrentSchemaVersion, settings.SchemaVersion);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    // 瞬时锁文件（杀软/备份软件共享冲突）≠ 损坏：Load 必须抛 IOException 让调用方
+    // 按「读取失败」处理。曾经过往缺陷：catch-all 回退默认值 → 启动路径按默认
+    // AutoStart=false 注销自启注册表，设置页保存再拿默认值覆盖完好文件。
+    [Fact]
+    public void LockedFileThrowsInsteadOfFallingBackToDefaults()
+    {
+        var directory = TestDirectory();
+        try
+        {
+            var store = new SettingsStore(directory);
+            store.Save(Settings.Default with { ComboHotkey = "Ctrl+Alt+P" });
+            using var lockStream = new FileStream(
+                store.SettingsPath, FileMode.Open, FileAccess.Read, FileShare.None);
+            Assert.Throws<IOException>(() => store.Load());
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static string TestDirectory()
     {
         var path = Path.Combine(Path.GetTempPath(), "prism-settings-tests", Guid.NewGuid().ToString("N"));

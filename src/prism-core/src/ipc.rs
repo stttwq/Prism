@@ -58,7 +58,7 @@ impl BrokerPreferences {
         }
     }
 
-    fn pinyin_enabled(&self) -> bool {
+    pub fn pinyin_enabled(&self) -> bool {
         self.pinyin_enabled.load(Ordering::Acquire)
     }
 

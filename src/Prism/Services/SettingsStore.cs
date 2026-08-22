@@ -42,40 +42,63 @@ public sealed class SettingsStore
         DataDir = dataDir;
         Directory.CreateDirectory(DataDir);
     }
-    /// <summary>从磁盘加载设置；文件不存在或损坏时返回默认值。</summary>
+    /// <summary>
+    /// 从磁盘加载设置；文件不存在或 JSON 损坏时返回默认值（design.md 回滚策略）。
+    /// 读取 IO 失败（杀软/备份软件短暂锁文件的共享冲突）重试一次后上抛——
+    /// 那不是损坏，回退默认值会让启动路径按默认注销自启注册表、设置页保存
+    /// 用默认值覆盖完好文件。
+    /// </summary>
     public Settings Load()
     {
+        string json;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                if (!File.Exists(SettingsPath))
+                    return Settings.Default;
+                json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+                break;
+            }
+            catch (IOException)
+            {
+                if (attempt == 2) throw;
+                Thread.Sleep(50);
+            }
+        }
+
         try
         {
-            if (!File.Exists(SettingsPath))
-                return Settings.Default;
-
-            var json = File.ReadAllText(SettingsPath, Encoding.UTF8);
-            var settings = JsonSerializer.Deserialize<Settings>(json, JsonOptions);
-            if (settings is null || settings.SchemaVersion > Settings.CurrentSchemaVersion)
-                return Settings.Default;
-            var actionHotkeys = NormalizeActionHotkeys(settings.ActionHotkeys);
-            return settings with
-            {
-                ComboHotkey = settings.ComboHotkey ?? Settings.Default.ComboHotkey,
-                WebEngines = settings.WebEngines ?? [],
-                ExcludedPaths = settings.ExcludedPaths ?? [],
-                ZipProgram = string.IsNullOrWhiteSpace(settings.ZipProgram) ? null : settings.ZipProgram,
-                ActionHotkeys = actionHotkeys,
-                StagingCapacity = settings.StagingCapacity is < 1 or > 32
-                    ? 5
-                    : settings.StagingCapacity,
-                // 缺字段（旧文件）→ 默认 Ctrl+D；有值但非法（手改）→ 置空禁用。
-                StagingAddHotkey = settings.StagingAddHotkey is null
-                    ? Settings.Default.StagingAddHotkey
-                    : NormalizeStagingAddHotkey(settings.StagingAddHotkey, actionHotkeys),
-            };
+            return LoadFromJson(json);
         }
-        catch
+        catch (JsonException)
         {
-            // 损坏时恢复默认，不抛出（design.md 回滚策略）。
+            // 真损坏：回滚默认，不抛出（design.md 回滚策略）。
             return Settings.Default;
         }
+    }
+
+    private Settings LoadFromJson(string json)
+    {
+        var settings = JsonSerializer.Deserialize<Settings>(json, JsonOptions);
+        if (settings is null || settings.SchemaVersion > Settings.CurrentSchemaVersion)
+            return Settings.Default;
+        var actionHotkeys = NormalizeActionHotkeys(settings.ActionHotkeys);
+        return settings with
+        {
+            ComboHotkey = settings.ComboHotkey ?? Settings.Default.ComboHotkey,
+            WebEngines = settings.WebEngines ?? [],
+            ExcludedPaths = settings.ExcludedPaths ?? [],
+            ZipProgram = string.IsNullOrWhiteSpace(settings.ZipProgram) ? null : settings.ZipProgram,
+            ActionHotkeys = actionHotkeys,
+            StagingCapacity = settings.StagingCapacity is < 1 or > 32
+                ? 5
+                : settings.StagingCapacity,
+            // 缺字段（旧文件）→ 默认 Ctrl+D；有值但非法（手改）→ 置空禁用。
+            StagingAddHotkey = settings.StagingAddHotkey is null
+                ? Settings.Default.StagingAddHotkey
+                : NormalizeStagingAddHotkey(settings.StagingAddHotkey, actionHotkeys),
+        };
     }
 
     /// <summary>将设置持久化到磁盘（原子写：先写临时文件再替换）。</summary>

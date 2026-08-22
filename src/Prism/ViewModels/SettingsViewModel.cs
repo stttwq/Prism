@@ -84,7 +84,19 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onAliasList = onAliasList;
         _onAliasDelete = onAliasDelete;
 
-        var settings = store.Load();
+        // 读失败（文件被锁/ACL 拒绝）带默认值打开设置页：Load 在持续 IO 失败时会
+        // 上抛，不接住的话构造器在 UI 线程炸掉、设置窗无声打不开。Save 前会重新
+        // Load 并守卫，文件恢复前保存会被拦下，不会用这里的默认值覆盖好文件。
+        Settings settings;
+        try
+        {
+            settings = store.Load();
+        }
+        catch (Exception)
+        {
+            settings = Settings.Default;
+            StatusMessage = "设置文件暂时读不到，当前显示默认值";
+        }
         _autoStartEnabled = settings.AutoStart;
         _hotkeyMode = settings.HotkeyMode;
         _comboHotkey = settings.ComboHotkey;
@@ -588,7 +600,18 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
 
         // G8: 保存前的旧设置，用于检测自定义引擎 origin 变化。
-        var prevSettings = _store.Load();
+        // 读不到磁盘真值就放弃保存——拿默认值当 prevSettings 会把用户已有的
+        // 引擎/快捷键/授权全部覆盖掉（设置文件被短暂锁住即触发）。
+        Settings prevSettings;
+        try
+        {
+            prevSettings = _store.Load();
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = "保存失败：无法读取当前设置文件（" + ex.Message + "）";
+            return;
+        }
 
         var engines = new List<WebEngine>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -742,12 +765,30 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 continue;
 
             // 授权成功：更新内存中的 FaviconGrants，并落盘。
-            var disk = _store.Load();
+            // 读不到磁盘真值就不落盘——拿默认值当底会把已授权列表整个覆盖掉。
+            Settings disk;
+            try
+            {
+                disk = _store.Load();
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = "授权未保存（设置文件暂时读不到：" + ex.Message + "），稍后重新授权即可";
+                break;
+            }
             var grants = new Dictionary<string, FaviconGrant>(disk.FaviconGrants)
             {
                 [origin] = new FaviconGrant(origin, DateTimeOffset.UtcNow.ToString("o")),
             };
-            _store.Save(disk with { FaviconGrants = grants });
+            try
+            {
+                _store.Save(disk with { FaviconGrants = grants });
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = "授权写盘失败：" + ex.Message;
+                break;
+            }
 
             // 触发下载：缓存落盘 + 图标内存缓存失效后，搜索结果下一次装饰即换上真图标。
             _onFaviconGranted?.Invoke(origin);
