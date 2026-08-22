@@ -155,21 +155,36 @@ end;
 // 替换 prism-indexer-service.exe，下次开机即拿到 SYSTEM。装完后显式重设
 // 整棵 {app} 的 ACL：Administrators/SYSTEM 完全控制，Users 只读执行。
 // 用 SID 而非组名（*S-1-5-32-544 等）避开本地化组名差异。
-// 失败仅记日志不中止：FAT/exFAT 卷不支持 ACL（icacls 必失败），此前也不设防，
-// 行为不回退；NTFS 上管理员身份下失败几乎不可能。
+//
+// H1 修复（2026-08-23 实机回归）：**分两步**。原实现用一条
+// /inheritance:r /grant:r …/T 重设整棵树：目录的 (OI)(CI) 容器旗标不能
+// 给文件本体，/T 到文件时那些 ACE 在文件上不生效；已存在文件（升级覆盖
+// 前的旧例）断了继承源又没拿到 Users RX ⇒ 装出来 Prism.exe 拒绝访问。
+// 正确顺序：先设目录（含继承标记），再补文件本体 RX。
+// 失败不吞：ACL 收紧失败 = 服务暴露在用户可写目录（安全隐患）或文件
+// 不可读（等同这次装的机器），都必须中止而不是继续报成功。FAT/exFAT 卷
+// icacls 会报错——那本身就是「此卷无法安全承载 LocalSystem 服务」的信号，
+// 中止让用户知情,而不是静默装出提权漏洞。
 procedure HardenInstallDirAcl();
 var
   AppDir: String;
   ResultCode: Integer;
 begin
   AppDir := ExpandConstant('{app}');
+
+  // 1) 目录：剥继承 + 重设（目录 ACE 带 (OI)(CI)，继承标记给后代）。
   ResultCode := RunIcacls('"' + AppDir + '" /inheritance:r /grant:r ' +
     '*S-1-5-32-544:(OI)(CI)F ' +      // Administrators
     '*S-1-5-18:(OI)(CI)F ' +           // SYSTEM
     '*S-1-5-32-545:(OI)(CI)RX ' +      // Users（读+执行）
-    '/T');
+    '');
   if ResultCode <> 0 then
-    Log(Format('Unable to tighten install dir ACL (icacls: %d).', [ResultCode]));
+    RaiseException(Format('Unable to tighten install dir ACL (icacls: %d).', [ResultCode]));
+
+  // 2) 文件本体：逐一补 Users RX——继承断掉后 (OI)(CI) 不会流到文件。
+  ResultCode := RunIcacls('"' + AppDir + '\*" /grant *S-1-5-32-545:RX');
+  if ResultCode <> 0 then
+    RaiseException(Format('Unable to set file ACLs in install dir (icacls: %d).', [ResultCode]));
 
   // 既有便携安装的 {app}\data 保留用户写权限（升级前已存在的数据目录）；
   // 新装没有 data 目录，Prism 首次自检发现目录不可写会退回 LocalAppData——
@@ -178,7 +193,7 @@ begin
   begin
     ResultCode := RunIcacls('"' + AppDir + '\data" /grant *S-1-5-32-545:(OI)(CI)M /T');
     if ResultCode <> 0 then
-      Log(Format('Unable to grant user write on legacy data dir (icacls: %d).', [ResultCode]));
+      RaiseException(Format('Unable to grant user write on legacy data dir (icacls: %d).', [ResultCode]));
   end;
 end;
 
