@@ -112,6 +112,41 @@ public sealed class SearchViewModelTests
     }
 
     [Fact]
+    public async Task PathQueryBypassesPrefixCacheAndGoesToBroker()
+    {
+        // P1（第一轮 bug 修复）："E" 的完整缓存不得拦截 "E:\foo"——路径前缀增长
+        // 是换路径，不是同名过滤；必须发 broker（那里按路径语义处理）。
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("E", false, 7, Result("Excel")));
+        client.Enqueue(Response(@"E:\foo", false, 7, Result("bar")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+
+        vm.OnQueryChanged("E");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1 && state.Results.Count == 1);
+
+        vm.OnQueryChanged(@"E:\foo");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2 && state.Results.Count == 1);
+        Assert.Equal("bar", state.Results[0].Title);
+    }
+
+    [Theory]
+    [InlineData(@"E:\foo", true)]
+    [InlineData("e:/x", true)]
+    [InlineData(@"\\server\share", true)]
+    [InlineData("//srv/x", true)]
+    [InlineData("note:foo", false)]
+    [InlineData("E", false)]
+    [InlineData(@"foo\bar", false)]
+    public void PathQueryDetectionMatchesBrokerRules(string query, bool expected)
+    {
+        Assert.Equal(expected, SearchViewModel.IsAbsolutePathQuery(query));
+    }
+
+    [Fact]
     public async Task PinyinEnabledResponseDoesNotSeedLiteralPrefixCache()
     {
         var client = new FakeSearchClient();

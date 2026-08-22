@@ -1398,7 +1398,8 @@ fn search_volumes_impl(
     // G7: an empty name query normally means "no search", but when ext:/path:
     // filters are present the empty name matches every candidate (match_metadata
     // returns Some for empty query), so we must not short-circuit.
-    if (query.is_empty() && filters.is_empty()) || max == 0 {
+    // P1（第一轮 bug 修复）：空查询 + root 同理 = 浏览该目录（路径查询分支）。
+    if (query.is_empty() && filters.is_empty() && root.is_none()) || max == 0 {
         return SearchOutcome {
             items: Vec::new(),
             is_truncated: false,

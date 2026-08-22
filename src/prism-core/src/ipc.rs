@@ -1762,6 +1762,17 @@ async fn search_service(
     if query.trim().is_empty() {
         return empty_query_results(query, max, filters.as_deref(), root, history).await;
     }
+    // P1（第一轮 bug 修复）：绝对路径形查询走路径语义——路径当路径用，不当
+    // 文件名子串用（旧版整串进名字匹配，文件全路径与目录路径都搜不到任何
+    // 东西）。仅全局无过滤时接管；目录范围/过滤态/窗口模式维持原路径。
+    if root.is_none() && !has_filters && is_absolute_path_query(&name_query) {
+        if let Some(response) =
+            path_query_results(&name_query, max, preferences.pinyin_enabled(), history).await
+        {
+            return response;
+        }
+        // 接管失败（路径与其父目录都不在索引内）→ 落回常规全局搜索（旧行为）。
+    }
     let mut items = Vec::with_capacity(max.min(128));
     // G7: when ext:/path: filters are present, only files/folders are returned — no apps,
     // web, or window results mixed in.
@@ -2105,6 +2116,191 @@ async fn search_index_with_root_fallback(
         }
         other => (other.map_err(|failure| failure.message), None, None),
     }
+}
+
+/// ── P1 路径查询（第一轮 bug 修复）────────────────────────────────────────
+///
+/// 绝对路径查询（`E:\foo`、`E:\foo\bar.txt`、粘贴的带引号路径）从来不是文件名
+/// 子串——名字匹配整串搜不到任何东西。路径分支把路径当路径用：
+///
+/// 1. 路径本身是索引内**目录** → 首行 = 目录自身，其后 = 目录下条目
+///    （空查询 + root 浏览，排序沿用索引器的名字长度序）。
+/// 2. 否则**父目录 + 末段**做范围搜索：完整文件路径精确命中排首（class 0），
+///    未打完的路径末段做前缀过滤（边打边收窄，行为同目录导航）。
+/// 3. 父目录也不可用 → 返回 None，调用方落回常规全局搜索（旧行为）。
+///
+/// 响应不带 `index_generation`：路径分支的结果绝不能进前端前缀缓存——
+/// 缓存按标题子串过滤，而路径查询的"前缀增长"（E:\foo → E:\foo2）是
+/// 换了一个路径，不是更长的同名过滤。
+async fn path_query_results(
+    raw_query: &str,
+    max: usize,
+    pinyin_enabled: bool,
+    history: &Arc<HistoryStore>,
+) -> Option<Response> {
+    let path = normalize_path_query(raw_query)?;
+
+    // 尝试 1：路径本身当目录浏览。文件路径/不存在路径会以 root 拒绝回来。
+    // 首行留给自身，浏览请求只要 max-1 条（下限 1：max=1 时也要能探到自身）。
+    let browse = indexer_client::search_in_root(
+        "",
+        (max.saturating_sub(1)).max(1),
+        None,
+        pinyin_enabled,
+        Some(path.as_str()),
+    )
+    .await;
+    if let Ok(reply) = browse {
+        // 自身行：浏览结果包含 root 自身（RootFilter 收 depth 0），但不保证
+        // 排在 top-K 里（短名后代可能把它挤出去）——在场就取用，不在场合成
+        // （browse 成功即证明目录存在且在索引内）。
+        let self_index = reply.items.iter().position(|item| {
+            path_bytes_eq(trimmed_path(item.path.as_str()).as_bytes(), path.as_bytes())
+        });
+        let (self_name, self_is_dir) = match self_index {
+            Some(index) => (reply.items[index].name.clone(), reply.items[index].is_directory),
+            None => (
+                path.rsplit('\\').next().unwrap_or(path.as_str()).to_owned(),
+                true,
+            ),
+        };
+        let mut ranked = Vec::with_capacity(reply.items.len() + 1);
+        ranked.push(folder_self_row(&path, &self_name, self_is_dir));
+        let empty = HashSet::new();
+        let fields = process_indexer_reply(reply, "", history, &empty, &empty, &mut ranked);
+        // 浏览项里也含 root 自身（未跌出 top-K 的情形）——去掉首行之后的重复。
+        dedupe_after_self_row(&mut ranked, path.as_str());
+        ranked.truncate(max);
+        return Some(path_response(raw_query, fields, ranked));
+    }
+
+    // 尝试 2：父目录 + 末段（文件全路径精确命中 / 未打完路径前缀收窄）。
+    let (parent, tail) = split_path_query(&path)?;
+    let probe = indexer_client::search_in_root(
+        tail.as_str(),
+        indexer_request_max(max),
+        None,
+        pinyin_enabled,
+        Some(parent.as_str()),
+    )
+    .await;
+    match probe {
+        Ok(reply) => {
+            let mut ranked = Vec::with_capacity(reply.items.len());
+            let empty = HashSet::new();
+            let fields =
+                process_indexer_reply(reply, tail.as_str(), history, &empty, &empty, &mut ranked);
+            ranked.truncate(max);
+            Some(path_response(raw_query, fields, ranked))
+        }
+        Err(_) => None,
+    }
+}
+
+/// 路径分支的响应外壳：echo 原查询（前端 staleness 检查按原文比对），
+/// `index_generation` 恒 None（禁止进前端前缀缓存，见函数头注释）。
+fn path_response(query: &str, fields: IndexerReplyFields, ranked: Vec<SearchResult>) -> Response {
+    Response::Results {
+        query: query.to_owned(),
+        items: ranked,
+        is_indexing: fields.is_indexing,
+        index_progress: fields.index_progress,
+        index_error: fields.index_error,
+        index_generation: None,
+        is_truncated: fields.is_truncated,
+        matched_count: fields.index_matched_count,
+        scanned_nodes: fields.scanned_nodes,
+        name_candidates: fields.name_candidates,
+        entered_top_k: fields.entered_top_k,
+        path_constructions: fields.path_constructions,
+        pinyin_status: fields.pinyin_status,
+        history_status: None,
+        root_rejection: None,
+        root_message: None,
+    }
+}
+
+/// 首行之后的条目里去掉与自身路径重复的项（浏览结果含 root 自身）。
+fn dedupe_after_self_row(ranked: &mut Vec<SearchResult>, path: &str) {
+    let mut index = 1;
+    while index < ranked.len() {
+        if path_bytes_eq(
+            trimmed_path(ranked[index].subtitle.as_ref()).as_bytes(),
+            path.as_bytes(),
+        ) {
+            ranked.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// 浏览首行：目录/文件自身。title=末段名，subtitle=完整路径。metadata 不给：
+/// 该分支不再排序，首行位置由插入顺序保证。
+fn folder_self_row(path: &str, name: &str, is_directory: bool) -> SearchResult {
+    let kind = if is_directory {
+        TargetKind::Directory
+    } else {
+        TargetKind::File
+    };
+    let target = ActionTarget::new(kind, path);
+    let path_arc = Arc::from(path);
+    SearchResult {
+        kind: if is_directory {
+            SearchResultKind::Folder
+        } else {
+            SearchResultKind::File
+        },
+        title: Arc::from(name),
+        subtitle: Arc::clone(&path_arc),
+        target,
+        execute_id: path_arc,
+        match_spans: Vec::new(),
+        match_metadata: None,
+    }
+}
+
+/// 识别绝对路径形查询：盘符 + 分隔符（`E:\…` / `e:/…`）或 UNC 前缀（`\\…`）。
+/// 只认"长得像"，是否真实存在交给 root 解析判定（不碰磁盘）。
+fn is_absolute_path_query(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    query.starts_with(r"\\") || query.starts_with("//")
+}
+
+/// 路径查询规范化：剥粘贴带回的包裹引号、去尾部分隔符、统一正斜杠。
+/// `E:\` 归一为 `E:`（root 解析两侧同型，显示由 RootScope::display 负责）。
+fn normalize_path_query(raw: &str) -> Option<String> {
+    let mut trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unified = trimmed.replace('/', "\\");
+    let trimmed = unified.trim_end_matches('\\');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// 拆父目录与末段：`E:\foo\bar` → (`E:\foo`, `bar`)；`E:`（卷根）无父可拆 → None。
+fn split_path_query(path: &str) -> Option<(String, String)> {
+    let idx = path.rfind('\\')?;
+    let (parent, tail) = path.split_at(idx);
+    let tail = &tail[1..];
+    if parent.is_empty() || tail.is_empty() {
+        return None;
+    }
+    Some((parent.to_owned(), tail.to_owned()))
 }
 
 /// History file/directory injection.
@@ -4181,6 +4377,42 @@ mod protocol_tests {
 #[cfg(test)]
 mod query_parser_tests {
     use super::*;
+
+    /// P1（第一轮 bug 修复）：路径查询三件套——识别、规范化、父/末段拆分。
+    #[test]
+    fn p1_path_query_helpers_classify_normalize_and_split() {
+        assert!(is_absolute_path_query(r"E:\foo"));
+        assert!(is_absolute_path_query("e:/foo"));
+        assert!(is_absolute_path_query(r"\\server\share"));
+        assert!(is_absolute_path_query("//srv/share"));
+        // 不是路径：普通词、盘符无分隔符、相对路径。
+        assert!(!is_absolute_path_query("note:foo"));
+        assert!(!is_absolute_path_query("E:"));
+        assert!(!is_absolute_path_query(r"foo\bar"));
+        assert!(!is_absolute_path_query(""));
+
+        // 粘贴引号剥离、正斜杠统一、尾分隔符剥离（卷根 E:\ 归一为 E:）。
+        assert_eq!(
+            normalize_path_query(r#""E:\foo bar""#).as_deref(),
+            Some(r"E:\foo bar")
+        );
+        assert_eq!(normalize_path_query("E:/x/y/").as_deref(), Some(r"E:\x\y"));
+        assert_eq!(normalize_path_query(r"E:\").as_deref(), Some("E:"));
+        assert_eq!(normalize_path_query("  E:\\x\\  ").as_deref(), Some(r"E:\x"));
+        assert_eq!(normalize_path_query("   ").as_deref(), None);
+        assert_eq!(normalize_path_query(r#""""#).as_deref(), None);
+
+        assert_eq!(
+            split_path_query(r"E:\foo\bar.txt"),
+            Some((r"E:\foo".to_owned(), "bar.txt".to_owned()))
+        );
+        assert_eq!(
+            split_path_query(r"E:\foo"),
+            Some(("E:".to_owned(), "foo".to_owned()))
+        );
+        // 卷根无父可拆。
+        assert_eq!(split_path_query("E:"), None);
+    }
 
     fn ext(value: &str) -> SearchFilter {
         SearchFilter {

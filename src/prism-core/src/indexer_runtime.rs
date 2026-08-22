@@ -953,7 +953,10 @@ impl ServiceState {
         // filters are present the user wants all files matching the filters — the
         // empty name matches every candidate in match_metadata, so we must not
         // short-circuit here.
-        if query.is_empty() && !has_query_filters {
+        // P1（第一轮 bug 修复）：空查询 + 可用 root = 浏览该目录（路径查询分支：
+        // 输入 E:\foo 时首行目录自身、其后目录内容）。仅 root 在场才放行，
+        // 全局空查询维持"不搜索"的旧语义。
+        if query.is_empty() && !has_query_filters && root_bound.is_none() {
             return Ok(IndexerResponse::Results {
                 generation,
                 items: Vec::new(),
@@ -993,7 +996,9 @@ impl ServiceState {
         // `dy` 永远搜不到「抖音」。配额放开为完整 max，拼音候选以全量参与下方
         // 合并排序（S1：class 优先），随后 truncate(max) 保证最终条数不变。
         // 中文/单字母查询成本零变化（normalize_query 在 sidecar 内短路）。
-        if pinyin_enabled {
+        // P1：空查询（目录浏览）跳过拼音——空查询没有"拼音命中"语义，
+        // 只会白扫全表并可能引入与字面路径重复的条目。
+        if pinyin_enabled && !query.is_empty() {
             // G4（FRESH-AUDIT-2）：clone Arc 快照后立刻放 pinyin 读锁——拼音全表扫
             // 不再占住 pinyin.read()，USN 的 delta 写入不必等一次长扫描。
             // A1（AUDIT-4 批次B）：delta 拆出为独立表后，扫描期间持有的是
@@ -3635,6 +3640,65 @@ mod tests {
             value: "x".repeat(MAX_FILTER_VALUE_BYTES + 1),
         };
         assert!(validate_search_request(8, Some(&[long_value])).is_err());
+    }
+
+    /// P1（第一轮 bug 修复）：空查询 + 可用 root = 浏览该目录（root 自身 +
+    /// 全部后代，空名字匹配一切）；全局空查询仍短路为空（不搜索）。
+    /// 文件 root 被结构化拒绝（NotADirectory）——调用方据此走父目录+末段。
+    #[test]
+    fn p1_empty_query_with_root_browses_and_global_stays_empty() {
+        let state = ServiceState::new();
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "root".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            9,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "项目", true).unwrap();
+        volume.upsert(11, 10, "inside.txt", false).unwrap();
+        volume.upsert(12, 10, "子目录", true).unwrap();
+        volume.upsert(13, 12, "deep.txt", false).unwrap();
+        volume.upsert(20, 5, "outside.txt", false).unwrap();
+        volume.upsert(30, 5, "报告.docx", false).unwrap();
+        state.publish(IndexState {
+            volumes: vec![volume],
+            generation: 3,
+            events_since_checkpoint: 0,
+        });
+
+        let browse = state.search("", 8, None, Some(r"c:\项目")).unwrap();
+        let IndexerResponse::Results { items, .. } = browse else {
+            panic!("expected browse results for a valid root");
+        };
+        let mut paths: Vec<&str> = items.iter().map(|item| item.path.as_str()).collect();
+        paths.sort_unstable();
+        // root 自身（depth 0 在范围内）+ 直接子项 + 深层后代；范围外不进。
+        assert_eq!(
+            paths,
+            vec![r"C:\项目", r"C:\项目\inside.txt", r"C:\项目\子目录", r"C:\项目\子目录\deep.txt"]
+        );
+
+        // 文件 root：结构化拒绝（broker 侧据此改走父目录 + 末段精确命中）。
+        let file_root = state.search("", 8, None, Some(r"c:\报告.docx")).unwrap();
+        assert!(matches!(
+            file_root,
+            IndexerResponse::RootUnavailable {
+                reason: crate::root_scope::RootRejection::NotADirectory,
+                ..
+            }
+        ));
+
+        // 全局空查询维持旧语义：不搜索，空结果。
+        let global = state.search("", 8, None, None).unwrap();
+        let IndexerResponse::Results { items, .. } = global else {
+            panic!("expected results");
+        };
+        assert!(items.is_empty());
     }
 
     #[test]

@@ -200,6 +200,22 @@ public sealed class SearchViewModel
     private const char WindowModePrefix = '>';
 
     /// <summary>
+    /// 绝对路径形查询（P1，第一轮 bug 修复）：盘符+分隔符（E:\… / e:/…）或
+    /// UNC 前缀。与 broker 侧 is_absolute_path_query 同规则——broker 把这类
+    /// 查询当路径解析，前端据此跳过前缀缓存（见 RunSearchAsync 注释）。
+    /// </summary>
+    internal static bool IsAbsolutePathQuery(string query)
+    {
+        if (query.Length >= 3
+            && char.IsAsciiLetter(query[0])
+            && query[1] == ':'
+            && (query[2] == '\\' || query[2] == '/'))
+            return true;
+        return query.StartsWith(@"\\", StringComparison.Ordinal)
+            || query.StartsWith("//", StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// 解析 `>` 前缀（G5）。模式来自输入文本本身而不是环境状态，所以每次请求都就地推导，
     /// 不把它存进 <see cref="_searchContext"/>——存起来就会和输入框脱节。
     ///
@@ -878,8 +894,12 @@ public sealed class SearchViewModel
         // 常规搜索路径也必须取消遗留的 web 联想 Task.Run——从 web mode 切到非 web mode 时，
         // 旧的 Phase B 联想仍在飞行中，不取消它会通过 staleness 守卫后覆盖文件搜索结果。
         CancelSuggestions();
-        // Window results are per-enumeration: their tokens expire on the next publish, so
-        // they must never be served from the prefix cache.
+        // 路径查询（P1，第一轮 bug 修复）不得走前缀缓存：缓存的键是上一次的
+        // 完整查询（如 "E"），路径增长（"E:\foo"）是其前缀，但语义是"换了一个
+        // 路径"，按标题子串过滤缓存必得空集——清缓存，直接发 broker。
+        // 窗口结果按枚举逐次签发，也绝不能从前缀缓存供给。
+        if (!isEmptyQuery && !context.IsWindowMode && IsAbsolutePathQuery(query))
+            _completeCache = null;
         if (!isEmptyQuery && !context.IsWindowMode && TryFilterCompleteCache(query, out var cached))
         {
             ApplySearchResponse(cached, query, max, seq, startPoll: false, updateCache: false);
