@@ -161,6 +161,12 @@ end;
 // 给文件本体，/T 到文件时那些 ACE 在文件上不生效；已存在文件（升级覆盖
 // 前的旧例）断了继承源又没拿到 Users RX ⇒ 装出来 Prism.exe 拒绝访问。
 // 正确顺序：先设目录（含继承标记），再补文件本体 RX。
+//
+// 便携式（2026-08-23，用户要求）：全新装到 Program Files 之外的目录时预建
+// 可写的 {app}\data——Prism 首次启动的 IsWritable 探测成功即把数据留在
+// 安装目录（便携语义），二进制目录本体仍保持 Users 只读执行，安全目标不变。
+// Program Files 内安装不建 data，维持既有「退回 %LocalAppData%\Prism」行为。
+//
 // 失败不吞：ACL 收紧失败 = 服务暴露在用户可写目录（安全隐患）或文件
 // 不可读（等同这次装的机器），都必须中止而不是继续报成功。FAT/exFAT 卷
 // icacls 会报错——那本身就是「此卷无法安全承载 LocalSystem 服务」的信号，
@@ -168,6 +174,7 @@ end;
 procedure HardenInstallDirAcl();
 var
   AppDir: String;
+  DataDir: String;
   ResultCode: Integer;
 begin
   AppDir := ExpandConstant('{app}');
@@ -181,20 +188,38 @@ begin
   if ResultCode <> 0 then
     RaiseException(Format('Unable to tighten install dir ACL (icacls: %d).', [ResultCode]));
 
-  // 2) 文件本体：逐一补 Users RX——继承断掉后 (OI)(CI) 不会流到文件。
+  // 2) 便携 data：仅非 Program Files 目录。预建 + 显式 Users 修改权
+  //    （父目录剥了继承，不给就不会有）。升级路径 data 已存在时同样补权。
+  if not PathUnderProgramFiles(AppDir) then
+  begin
+    DataDir := AppDir + '\data';
+    if not DirExists(DataDir) then
+    begin
+      if not CreateDir(DataDir) then
+        RaiseException('Unable to create data directory: ' + DataDir);
+    end;
+    ResultCode := RunIcacls('"' + DataDir + '" /grant *S-1-5-32-545:(OI)(CI)M');
+    if ResultCode <> 0 then
+      RaiseException(Format('Unable to grant user write on data dir (icacls: %d).', [ResultCode]));
+  end;
+
+  // 3) 文件本体：逐一补 Users RX——继承断掉后 (OI)(CI) 不会流到文件。
   ResultCode := RunIcacls('"' + AppDir + '\*" /grant *S-1-5-32-545:RX');
   if ResultCode <> 0 then
     RaiseException(Format('Unable to set file ACLs in install dir (icacls: %d).', [ResultCode]));
+end;
 
-  // 既有便携安装的 {app}\data 保留用户写权限（升级前已存在的数据目录）；
-  // 新装没有 data 目录，Prism 首次自检发现目录不可写会退回 LocalAppData——
-  // 恰是安全的方向。
-  if DirExists(AppDir + '\data') then
-  begin
-    ResultCode := RunIcacls('"' + AppDir + '\data" /grant *S-1-5-32-545:(OI)(CI)M /T');
-    if ResultCode <> 0 then
-      RaiseException(Format('Unable to grant user write on legacy data dir (icacls: %d).', [ResultCode]));
-  end;
+/// 判定某路径是否位于 Program Files 之下（含其本身）。
+/// 数据目录策略的分界：Program Files 内装 → 数据退 LocalAppData；
+/// 之外的目录 → 预建可写 {app}\data（便携）。{pf} 在 x64 安装下即
+/// C:\Program Files（ArchitecturesInstallIn64BitMode=x64compatible）。
+function PathUnderProgramFiles(const Dir: String): Boolean;
+var
+  D, P: String;
+begin
+  D := LowerCase(TrimRight(Dir));
+  P := LowerCase(TrimRight(ExpandConstant('{pf}')));
+  Result := (D = P) or (Copy(D, 1, Length(P) + 1) = P + '\');
 end;
 
 const
