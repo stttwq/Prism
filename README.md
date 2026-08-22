@@ -37,3 +37,13 @@
 - **系统**：只在 Windows 11 x64 上跑，需要 .NET 8 运行时。Windows 10、ARM 机器、老 x86 不在承诺范围内。
 - **能联动的文件管理器**：Windows 资源管理器、Directory Opus 13.23。两个都默认关着，算实验功能，要在设置里手动开。系统的打开/保存对话框暂时不联动，会回退到全局。
 - **语言**：界面、安装向导、动作菜单全是简体中文，拼音搜索是内建的本事不是后加的。英文文件名和软件名照样能搜。
+
+## 开发
+
+克隆下来之后，跑一次 `sh scripts/setup.sh`（在 Git Bash 里），它会替你把 git 的 pre-commit 钩子指到仓库里的 `scripts/hooks/pre-commit`，并顺带检查 Rust 工具链在不在。这个钩子只拦一件事：你 `git add` 进去的 `.rs` 文件要是没跑过 `rustfmt`，提交会被挡下来，让你格式化完再提交——但历史代码漂移不株连，只查你这次改的那几个文件。急用时 `git commit --no-verify` 能绕过。钩子靠 `core.hooksPath` 生效，这是本地 git 配置，不随仓库传播，所以每台新克隆的机器都要跑一次 setup。
+
+代码格式统一靠 `rustfmt.toml`（锁 `edition = "2021"`）+ pre-commit 钩子守门。历史上格式漂移过四次，每次都因无强制机制复发；2026-08-22 这次一次性清洗（纯空白/换行/import 顺序，零功能改动）后配了守门，此后不再漂移。用 `git blame` 查功能历史时，建议跳过那次纯格式提交：
+
+```
+git blame --ignore-rev 73f1676 -- src/prism-core/src/ipc.rs
+```

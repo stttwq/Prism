@@ -1,0 +1,65 @@
+#!/bin/sh
+# pre-commit hook: block commits that stage unformatted Rust files.
+#
+# Strategy: run `cargo fmt -- -l --check` in every crate dir to get the list
+# of files rustfmt would reformat, intersect with `git diff --cached` staged
+# .rs files. If any staged file is in the dirty list, reject the commit.
+#
+# Old unformatted code does NOT block: only staged files are checked.
+# Bypass: `git commit --no-verify` (emergencies only).
+#
+# Requires: cargo + rustfmt on PATH (git for Windows sh inherits user PATH).
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+
+# Collect staged .rs files (added/modified/renamed), relative to root, forward slashes.
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+# Find every crate (dir containing Cargo.toml) and run cargo fmt --check there.
+# Collect dirty files as relative paths with forward slashes.
+dirty=""
+for toml in $(git ls-files '*/Cargo.toml' ':!**/target/**'); do
+  crate_dir=$(dirname "$toml")
+  abs_crate="$root/$crate_dir"
+  if [ ! -d "$abs_crate" ]; then
+    continue
+  fi
+  # cargo fmt -l --check lists files needing formatting (absolute UNC paths).
+  raw=$(cd "$abs_crate" && cargo fmt -- -l --check 2>/dev/null || true)
+  for line in $raw; do
+    # Normalize \\?\E:\path\to\file.rs -> relative path from root
+    # Strip the \\?\ prefix and the root, convert backslashes.
+    rel=$(echo "$line" | sed 's|^\\\\?\\||' | tr '\\' '/')
+    case "$rel" in
+      "$root"/*) rel=${rel#"$root"/} ;;
+    esac
+    dirty="$dirty
+$rel"
+  done
+done
+
+# Intersect: is any staged file in the dirty list?
+blocked=""
+for f in $staged; do
+  case "$dirty" in
+    *"$f"*) blocked="$blocked
+  $f" ;;
+  esac
+done
+
+if [ -n "$blocked" ]; then
+  echo "pre-commit: staged Rust file(s) not rustfmt-clean:" 1>&2
+  echo "$blocked" 1>&2
+  echo "" 1>&2
+  echo "Fix: cargo fmt in the relevant crate, re-stage, retry." 1>&2
+  echo "Bypass: git commit --no-verify (emergencies only)." 1>&2
+  exit 1
+fi
+
+exit 0
