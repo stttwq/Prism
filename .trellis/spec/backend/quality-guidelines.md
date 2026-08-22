@@ -147,8 +147,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\bench\Invoke-RebuildMe
 ```
 
 The installed `PrismIndexer` service binary must have the same SHA-256 as
-`<three-binary-release-directory>\prism-indexer-service.exe` (both gates;
-the rebuild gate checks it before touching the service).
+`<three-binary-release-directory>\prism-indexer-service.exe` (the idle gate
+and the rebuild gate in active mode; `-Passive` skips service control and
+so cannot verify the installed hash — it samples a naturally occurring
+window against whatever is installed). The active rebuild gate checks the
+hash before touching the service.
 
 ### 3. Contracts
 
@@ -192,7 +195,7 @@ input, not a profile change or a new target.
 | Condition | Required result |
 | --- | --- |
 | Missing, duplicate, exited, or changed PID | Fail the run; publish no success summary. |
-| Service PID differs from `PrismIndexer` SCM PID | Fail the run (both gates; rebuild gate re-resolves after restart). |
+| Service PID differs from `PrismIndexer` SCM PID | Fail the run (idle gate; rebuild gate in active mode re-resolves the indexer PID after restart). `-Passive` resolves no SCM PID and does not apply this check. |
 | Frontend/broker path or installed service hash differs from the Release set | Fail the run. |
 | Idle gate: indexer not ready, building/degraded, or generation zero | Fail the run. |
 | Rebuild gate: no rebuild window observed within the timeout, or zero samples captured | Fail the run. |

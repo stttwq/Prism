@@ -42,6 +42,8 @@ MFT 临时结构，之后堆碎片维持高位。前端高位（14.7 → 50MB）
 
 ## T5 实机结果（2026-08-22 复核）
 
+### 初版（USN 批次计入 touch_activity）
+
 | 测量点 | Prism | prism-core | indexer | 合计 | 达标 |
 |---|---|---|---|---|---|
 | 单次搜索后立即（typed） | 52.9MB | 2.7MB | 64.6MB | 120.3MB | ✗（瞬态） |
@@ -49,18 +51,38 @@ MFT 临时结构，之后堆碎片维持高位。前端高位（14.7 → 50MB）
 | 隐藏后 3 分 20 秒采样 | 46.9MB | 2.5MB | 64.7MB | 114.1MB | ✗（修剪未达） |
 | 进一步空闲后稳态 | 25.6MB | 20.6MB | 45.2MB | **91.5MB** | ✓ |
 
-- **前端单次 `K32EmptyWorkingSet`**：Prism 从 54.5MB 降到 25.6MB（降 29MB）。
-  早期"带验证重试+Thread.Sleep+trace"版本与 OS 自发修剪冲突、反而只降到 46MB；
-  改单次调用后稳态降到 25.6MB，证实重试是反作用。
-- **indexer `SetProcessWorkingSetSizeEx(-1,-1)`**：indexer 从 64.6MB 降到 45.2MB（降 19MB）。
-- **3 分钟修剪点未在 3 分 20 秒采样时生效**：USN 批次（`changed>0`）经
-  `touch_activity` 刷新 `last_activity_ms`，持续文件系统活动（Windows 更新、
-  浏览器缓存等）使空闲计时器达不到 3 分钟；待系统安静后修剪才触发。这是
-  刻意行为：活跃 USN 期不修剪（会立刻被新批次重新分页），静默后才修。
-  相比旧口径「约 1 小时 OS 自发修剪」已提前到「静默 3 分钟」。
-- **瞬态 120MB**：单次搜索瞬间三进程合计 120MB 是搜索把整卷 MFT 随机节点
-  + WPF 框架本体拉进工作集的固有成本，非泄漏——Phase 2（流式建卷/MftRecord
-  瘦身/节点表分页）才能压这一峰值。本轮目标「使用后稳态 ≤100MB」达成（91.5MB）。
-- **重建窗口门 B 侧**：133.2MiB（与 A 侧 134.1MiB 一致），合法重建峰值破线，
-  属 Phase 2 领域，据实报告不谎报达标。
+### T7 复审修正（仅搜索计入 touch_activity）
+
+USN 批次计入 `touch_activity` 使空闲计时器在正常文件活动下几乎永不达 3 分钟，
+修剪延迟到系统完全静默。T7 复审据此改为**仅搜索请求**刷新计时——USN 后台活动
+（浏览器缓存、Windows Update 等）不再阻塞修剪。
+
+| 测量点 | Prism | prism-core | indexer | 合计 | 达标 |
+|---|---|---|---|---|---|
+| 单次搜索后立即（typed） | 64.4MB | 2.7MB | 64.4MB | 131.5MB | ✗（瞬态） |
+| 展开 1000 后 | 51.6MB | 2.7MB | 64.4MB | 118.7MB | ✗（瞬态） |
+| 隐藏后 3 分钟 trim | 45.4MB | 2.6MB | 0.79MB | **48.8MB** | ✓ |
+| 进一步空闲后稳态 | 22.4MB | 20.7MB | 2.0MB | **45.1MB** | ✓ |
+
+- **indexer 工作集修剪生效**：64MB → 0.79MB（降 63MB），不再被 USN 活动阻塞。
+- **前端 `K32EmptyWorkingSet`**：Prism 64MB → 22.4MB（降 42MB）。
+- **瞬态 131MB**：单次搜索瞬间三进程合计 131MB 是搜索把整卷 MFT 随机节点 +
+  WPF 框架本体拉进工作集的固有成本，非泄漏——Phase 2 才能压这一峰值。
+- **稳态 45.1MB ≤ 100MB ✓**：用户「单次搜索后内存 110+」诉求达成。
+
+## T7 复审结论
+
+- **前端 trim**：单次 `K32EmptyWorkingSet` 正确——P/Invoke 入口 K32（Win11 24H2
+  实测）、本进程伪句柄无泄漏、Tick 内窗口已隐藏不卡交互、catch{} 吞异常合理。
+- **indexer trim**：`SetProcessWorkingSetSizeEx(-1,-1)` 惯用法正确、伪句柄无泄漏、
+  `!building && first_build_complete` 守卫重建窗口、`touch_activity` 改仅搜索后
+  空闲 3 分钟可达。新增时钟回跳测试（last > now → saturating_sub 归零 → 不修剪）。
+- **重建风暴修复**：`tolerate_unreachable=true` 跳孤儿、合法记录正常 apply、
+  `next_usn` 越过跳过记录、`RebuildRequired`（排除目录边界变化）仍立即升级、
+  无悬空引用/panic。4096 阈值是未校准启发式（慢性高孤儿率可能变慢速循环重建），
+  非正确性缺陷，留遥测后调参。
+- **门禁脚本**：`WorkingSetPrivate`/`IDProcess` 采样正确、同轮 PID 稳定、
+  G9 恢复语义对齐、`-Passive` 免服务控制。spec 已修正「两道门」身份校验口径
+  为「空闲门 + 重建门主动模式」，`-Passive` 不做哈希/SCM-PID 校验（免提权无安装侧访问）。
+- **无高危**。3 个中危已修：USN touch_activity、时钟回跳测试、spec 身份校验口径。
 

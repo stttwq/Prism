@@ -1,0 +1,3 @@
+{"tag":"after-typed-search","captured_at_utc":"2026-08-22T05:44:48.6614369Z","processes":{"prism-core":2740224,"prism-indexer-service":64368640,"Prism":64409600},"total":131518464}
+{"tag":"after-expand-1000","captured_at_utc":"2026-08-22T05:44:52.8672316Z","processes":{"prism-core":2740224,"prism-indexer-service":64393216,"Prism":51572736},"total":118706176}
+{"tag":"after-hide-3min-trim","captured_at_utc":"2026-08-22T05:48:13.5740213Z","processes":{"prism-core":2564096,"prism-indexer-service":827392,"Prism":45379584},"total":48771072}

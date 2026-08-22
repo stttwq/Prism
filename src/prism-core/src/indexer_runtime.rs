@@ -2163,7 +2163,12 @@ fn watch_volume(
         if changed > 0 {
             service.apply_pinyin_records(volume_number, &records);
             service.generation_notify.notify_waiters();
-            service.touch_activity();
+            // 不在此 touch_activity：USN 批次是 OS 后台文件活动（浏览器缓存、
+            // Windows Update、杀软等）的常态，若计入空闲计时器，正常机器上
+            // 3 分钟静默几乎永不达、工作集 trim 永不触发，用户「用完即降」诉求
+            // 落空。只有用户主动搜索才真正把整卷 MFT 随机节点拉进工作集——
+            // 那才是该刷新计时、延后修剪的活动。修剪后若有 USN 批次到达，
+            // 软缺页重分页是已知的可接受代价（见 trim_working_set 注释）。
         }
         if let Some(reason) = rebuild_reason {
             return Err(reason);
@@ -2818,11 +2823,12 @@ mod tests {
     }
 
     /// 2026-08-22 内存收口：touch_activity 推进 last_activity_ms，idle_for_at_least
-    /// 据此判定是否到达空闲阈值（>= 语义：恰达阈值即 true）。锚定三件事：
+    /// 据此判定是否到达空闲阈值（>= 语义：恰达阈值即 true）。锚定四件事：
     /// (1) 构造即记当前时刻，立即判定未达 3 分钟；(2) touch_activity 后再次立即
     /// 判定仍未达（证明推进而非回拨）；(3) 手动把 last_activity_ms 回拨到阈值前
-    /// 1ms 判定 false、回拨到阈值即判定 true。这锁住「搜索/USN 批次刷新计时、
-    /// maintenance tick 据此决定是否修剪」的契约。
+    /// 1ms 判定 false、回拨到恰好阈值判定 true；(4) last > now 的时钟回跳
+    /// （NTP 向后校正）应判定未达——saturating_sub 归零，保守不修剪。
+    /// 这锁住「搜索刷新计时、maintenance tick 据此决定是否修剪」的契约。
     #[test]
     fn touch_activity_drives_idle_threshold() {
         let state = ServiceState::new();
@@ -2843,7 +2849,12 @@ mod tests {
             Ordering::Release,
         );
         assert!(state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
+        // 时钟回跳：last_activity_ms 比当前还新。saturating_sub 归零，
+        // 判定未达——修剪被保守推迟，不产生误修剪。防回归到 wrapping_sub。
+        state.last_activity_ms.store(now.saturating_add(60_000), Ordering::Release);
+        assert!(!state.idle_for_at_least(IDLE_TRIM_THRESHOLD_MS));
     }
+
 
     /// M1（FRESH-AUDIT-3-2026-08-20）: 首次到达立即准入；退避窗口内拒绝且不动
     /// 计数；到点再次准入且 attempt 递增。
