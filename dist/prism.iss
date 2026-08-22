@@ -171,6 +171,21 @@ end;
 // 不可读（等同这次装的机器），都必须中止而不是继续报成功。FAT/exFAT 卷
 // icacls 会报错——那本身就是「此卷无法安全承载 LocalSystem 服务」的信号，
 // 中止让用户知情,而不是静默装出提权漏洞。
+
+/// 判定某路径是否位于 Program Files 之下（含其本身）。
+/// 数据目录策略的分界：Program Files 内装 → 数据退 LocalAppData；
+/// 之外的目录 → 预建可写 {app}\data（便携）。{pf} 在 x64 安装下即
+/// C:\Program Files（ArchitecturesInstallIn64BitMode=x64compatible）。
+/// 定义在 HardenInstallDirAcl 之前：Inno 是单趟编译，引用必须后置。
+function PathUnderProgramFiles(const Dir: String): Boolean;
+var
+  D, P: String;
+begin
+  D := LowerCase(TrimRight(Dir));
+  P := LowerCase(TrimRight(ExpandConstant('{pf}')));
+  Result := (D = P) or (Copy(D, 1, Length(P) + 1) = P + '\');
+end;
+
 procedure HardenInstallDirAcl();
 var
   AppDir: String;
@@ -207,19 +222,6 @@ begin
   ResultCode := RunIcacls('"' + AppDir + '\*" /grant *S-1-5-32-545:RX');
   if ResultCode <> 0 then
     RaiseException(Format('Unable to set file ACLs in install dir (icacls: %d).', [ResultCode]));
-end;
-
-/// 判定某路径是否位于 Program Files 之下（含其本身）。
-/// 数据目录策略的分界：Program Files 内装 → 数据退 LocalAppData；
-/// 之外的目录 → 预建可写 {app}\data（便携）。{pf} 在 x64 安装下即
-/// C:\Program Files（ArchitecturesInstallIn64BitMode=x64compatible）。
-function PathUnderProgramFiles(const Dir: String): Boolean;
-var
-  D, P: String;
-begin
-  D := LowerCase(TrimRight(Dir));
-  P := LowerCase(TrimRight(ExpandConstant('{pf}')));
-  Result := (D = P) or (Copy(D, 1, Length(P) + 1) = P + '\');
 end;
 
 const
