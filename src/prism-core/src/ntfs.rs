@@ -148,12 +148,23 @@ pub fn parse_usn_buffer(buffer: &[u8]) -> Result<(i64, Vec<UsnRecord>), String> 
     Ok((next_usn, records))
 }
 
+/// Apply a live USN batch to the volume index.
+///
+/// 2026-08-22 rebuild-storm fix: the live path now tolerates records whose
+/// parent never became reachable (the same semantics the replay path always
+/// had) and returns how many were skipped. Bailing with `Err` killed the
+/// watcher, which escalated every poisoned batch into a whole-volume MFT
+/// rescan — and a rebuild re-drops the same parents, so the next batch under
+/// them poisoned again (21+ rebuilds in 1.5h, `broken parent chain at record N`
+/// with N advancing). Legitimate records in the same batch are no longer
+/// rolled back and `next_usn` advances; the caller counts skips and asks for
+/// a resync only past a threshold (see `usn_drop_exceeds_resync_threshold`).
 pub fn apply_records(
     volume: &mut VolumeIndex,
     records: &[UsnRecord],
     next_usn: i64,
-) -> Result<ApplyOutcome, String> {
-    apply_records_inner(volume, records, next_usn, false).map(|(outcome, _)| outcome)
+) -> Result<(ApplyOutcome, usize), String> {
+    apply_records_inner(volume, records, next_usn, true)
 }
 
 fn apply_replay_records(
@@ -864,7 +875,7 @@ mod tests {
         volume.upsert(10, 5, "visible", true).unwrap();
         volume.upsert(11, 10, "child.txt", false).unwrap();
 
-        let outcome = apply_records(
+        let (outcome, _) = apply_records(
             &mut volume,
             &[UsnRecord {
                 frn: 10,
@@ -917,12 +928,15 @@ mod tests {
         };
         assert_eq!(
             apply_records(&mut volume, &[create.clone(), boundary], 12).unwrap(),
-            ApplyOutcome::RebuildRequired
+            (ApplyOutcome::RebuildRequired, 0)
         );
         assert!(volume.search("transient", 10).is_empty());
         assert_eq!(volume.path_for(11).unwrap(), r"C:\visible\child.txt");
         assert_eq!(volume.next_usn, 10);
 
+        // 2026-08-22 rebuild-storm fix: an unreachable parent in a live batch is
+        // skipped and counted, no longer an Err that kills the watcher. The
+        // sibling create in the same batch applies and next_usn advances.
         let broken = UsnRecord {
             frn: 13,
             parent_frn: 99,
@@ -931,7 +945,97 @@ mod tests {
             is_directory: false,
             name: "broken.txt".into(),
         };
-        assert!(apply_records(&mut volume, &[create, broken], 12).is_err());
+        assert_eq!(
+            apply_records(&mut volume, &[create, broken], 12).unwrap(),
+            (ApplyOutcome::Applied, 1)
+        );
+        assert_eq!(volume.search("transient", 10).len(), 1);
+        assert!(volume.search("broken", 10).is_empty());
+        assert_eq!(volume.next_usn, 12);
+    }
+
+    #[test]
+    fn live_path_resolves_child_before_parent_and_skips_orphans() {
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "test".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            10,
+            5,
+        )
+        .unwrap();
+        let records = [
+            UsnRecord {
+                frn: 12,
+                parent_frn: 11,
+                usn: 10,
+                reason: USN_REASON_FILE_CREATE,
+                is_directory: false,
+                name: "child.txt".into(),
+            },
+            UsnRecord {
+                frn: 11,
+                parent_frn: 5,
+                usn: 11,
+                reason: USN_REASON_FILE_CREATE,
+                is_directory: true,
+                name: "parent".into(),
+            },
+            UsnRecord {
+                frn: 13,
+                parent_frn: 99,
+                usn: 12,
+                reason: USN_REASON_FILE_CREATE,
+                is_directory: false,
+                name: "stale.txt".into(),
+            },
+        ];
+
+        let (outcome, skipped) = apply_records(&mut volume, &records, 13).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(skipped, 1);
+        assert_eq!(volume.path_for(12).unwrap(), r"C:\parent\child.txt");
+        assert!(volume.search("stale", 10).is_empty());
+        assert_eq!(volume.next_usn, 13);
+    }
+
+    #[test]
+    fn intolerant_inner_still_bails_and_rolls_back() {
+        // The tolerate=false branch has no production caller since the
+        // rebuild-storm fix, but stays as the strict contract for future
+        // callers — anchored here so it cannot silently rot.
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "test".into(),
+                serial: 1,
+            },
+            "C:\\".into(),
+            7,
+            10,
+            5,
+        )
+        .unwrap();
+        volume.upsert(10, 5, "visible", true).unwrap();
+        let create = UsnRecord {
+            frn: 12,
+            parent_frn: 5,
+            usn: 10,
+            reason: USN_REASON_FILE_CREATE,
+            is_directory: false,
+            name: "transient.txt".into(),
+        };
+        let broken = UsnRecord {
+            frn: 13,
+            parent_frn: 99,
+            usn: 11,
+            reason: USN_REASON_FILE_CREATE,
+            is_directory: false,
+            name: "broken.txt".into(),
+        };
+        assert!(apply_records_inner(&mut volume, &[create, broken], 12, false).is_err());
         assert!(volume.search("transient", 10).is_empty());
         assert_eq!(volume.next_usn, 10);
     }

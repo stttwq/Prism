@@ -1998,6 +1998,12 @@ fn watch_volume(
 ) -> Result<(), String> {
     let handle = ntfs::open_volume(descriptor, false)?;
     let mut output = Vec::with_capacity(ntfs::USN_READ_CHUNK);
+    // 2026-08-22 rebuild-storm fix: cumulative count of USN records skipped
+    // because their parent never became reachable. Local to this watcher —
+    // a rebuild replaces the watcher, so the counter naturally resets. The
+    // per-batch `usn_records_dropped` log lines carry the cumulative number,
+    // which is what the hourly trend would replay anyway.
+    let mut dropped_unreachable: u64 = 0;
     while !stop.is_requested() && epoch.load(Ordering::Acquire) == watcher_epoch {
         let (journal_id, start_usn) = {
             let guard = service.index.read().map_err(|_| "index lock is poisoned")?;
@@ -2028,7 +2034,7 @@ fn watch_volume(
             continue;
         }
         let changed = records.len() as u64;
-        let (rebuild_required, volume_number) = {
+        let (rebuild_reason, volume_number) = {
             let mut guard = service
                 .index
                 .write()
@@ -2043,8 +2049,31 @@ fn watch_volume(
                 .position(|volume| volume.volume_id == descriptor.id)
                 .ok_or("volume disappeared from live index")?;
             let volume = &mut index.volumes[volume_number];
-            let rebuild_required =
-                ntfs::apply_records(volume, &records, next_usn)? == ApplyOutcome::RebuildRequired;
+            let (outcome, skipped) = ntfs::apply_records(volume, &records, next_usn)?;
+            if skipped > 0 {
+                dropped_unreachable = dropped_unreachable.saturating_add(skipped as u64);
+                logging::event_detail(
+                    "info",
+                    "usn_records_dropped",
+                    &format!(
+                        "volume={} batch_skipped={skipped} cumulative={dropped_unreachable}",
+                        descriptor.mount_path,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            // The two escalation causes need distinct reasons in the rebuild log:
+            // a real exclusion-boundary change vs. an unreachable-parent flood.
+            let rebuild_reason = if outcome == ApplyOutcome::RebuildRequired {
+                Some("excluded-directory boundary changed".to_string())
+            } else if usn_drop_exceeds_resync_threshold(dropped_unreachable) {
+                Some(format!(
+                    "skipped unreachable-parent USN records exceeded the resync threshold ({USN_UNREACHABLE_RESYNC_THRESHOLD})"
+                ))
+            } else {
+                None
+            };
             index.events_since_checkpoint = index.events_since_checkpoint.saturating_add(changed);
             // AUDIT-4 B2（2026-08-21）: 压缩触发不再立标志——maintenance tick 每 5s
             // 直接驱动 compact_volumes_off_lock，内部按 dead_name_bytes/池尺寸
@@ -2052,17 +2081,30 @@ fn watch_volume(
             if changed > 0 {
                 index.generation = index.generation.saturating_add(1);
             }
-            (rebuild_required, volume_number)
+            (rebuild_reason, volume_number)
         };
         if changed > 0 {
             service.apply_pinyin_records(volume_number, &records);
             service.generation_notify.notify_waiters();
         }
-        if rebuild_required {
-            return Err("excluded-directory boundary changed".into());
+        if let Some(reason) = rebuild_reason {
+            return Err(reason);
         }
     }
     Ok(())
+}
+
+/// Cumulative skipped-unreachable threshold that still justifies a whole-volume
+/// resync after the 2026-08-22 rebuild-storm fix. Below it, dropping the
+///残留-orphan records is strictly better than a rebuild (a rebuild re-drops
+/// the same parents, so it cannot converge); past it something structural
+/// changed (e.g. the journal lost a chunk of history) and a resync is the
+/// only recovery. Kept as a pure predicate for unit testing, same rationale
+/// as `rank_window_list`.
+const USN_UNREACHABLE_RESYNC_THRESHOLD: u64 = 4096;
+
+fn usn_drop_exceeds_resync_threshold(dropped_unreachable: u64) -> bool {
+    dropped_unreachable > USN_UNREACHABLE_RESYNC_THRESHOLD
 }
 
 fn checkpoint(state: &ServiceState, data_dir: &std::path::Path, flush_pinyin: bool) -> Result<(), String> {
@@ -2684,6 +2726,16 @@ mod tests {
             descriptor: descriptor(letter),
             reason: reason.to_owned(),
         }
+    }
+
+    /// 2026-08-22 rebuild-storm fix: the resync threshold is a pure boundary —
+    /// at-or-below keeps tolerating (a rebuild cannot converge on residual
+    /// orphans), strictly above escalates to a single-volume resync.
+    #[test]
+    fn unreachable_resync_threshold_boundary() {
+        assert!(!usn_drop_exceeds_resync_threshold(0));
+        assert!(!usn_drop_exceeds_resync_threshold(4096));
+        assert!(usn_drop_exceeds_resync_threshold(4097));
     }
 
     /// M1（FRESH-AUDIT-3-2026-08-20）: 首次到达立即准入；退避窗口内拒绝且不动
