@@ -4,7 +4,7 @@
 param(
     [string]$Query = 'wub',
     [int]$Down = 8,
-    [string]$Out = 'E:\LS\DM\listary\artifacts\ui-shot.png'
+    [string]$Out = "$PSScriptRoot\..\artifacts\ui-shot.png"
 )
 
 Add-Type -AssemblyName System.Windows.Forms

@@ -2,9 +2,9 @@
 # ASCII-only source (see prism-build.ps1): PS 5.1 under a Chinese locale reads BOM-less
 # UTF-8 as GBK and corrupts non-ASCII literals.
 param(
-    [string]$DirQuery = 'E:\LS\DM\Listary\src\Prism',
-    [string]$FileQuery = 'E:\LS\DM\Listary\src\Prism\Models\Settings.cs',
-    [string]$PartialQuery = 'E:\LS\DM\Listary\src\Prism\Models\Set'
+    [string]$DirQuery = "$PSScriptRoot\..\src\Prism",
+    [string]$FileQuery = "$PSScriptRoot\..\src\Prism\Models\Settings.cs",
+    [string]$PartialQuery = "$PSScriptRoot\..\src\Prism\Models\Set"
 )
 
 $ErrorActionPreference = 'Stop'
