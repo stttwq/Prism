@@ -6,7 +6,7 @@
   "compilationOptions": {},
   "targets": {
     ".NETCoreApp,Version=v8.0": {
-      "Prism/1.0.0": {
+      "Prism/1.1.0": {
         "runtime": {
           "Prism.dll": {}
         }
@@ -14,7 +14,7 @@
     }
   },
   "libraries": {
-    "Prism/1.0.0": {
+    "Prism/1.1.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""
