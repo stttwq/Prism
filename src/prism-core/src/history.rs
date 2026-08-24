@@ -783,7 +783,8 @@ fn read_history_file(path: &Path, now: u64) -> Result<Vec<HistoryEntry>, History
     }
 }
 
-fn isolate(path: &Path, now: u64) {
+/// pub(crate)：alias.rs 的 C1 修复（全仓检验 2026-08-25）复用同一隔离纪律。
+pub(crate) fn isolate(path: &Path, now: u64) {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return;
     };

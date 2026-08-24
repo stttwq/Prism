@@ -20,6 +20,14 @@ public partial class App : Application
     [DllImport("kernel32.dll")]
     private static extern bool AttachConsole(int dwProcessId);
 
+    // WER 崩溃自愈（2026-08-25）：前端在 cs2 全屏 + 微信输入法（WeType）场景
+    // 会被 WPF/TSF 兼容缺陷带崩（coreclr AV，Listary 6 官方论坛同款问题，
+    // .NET 8.0.30 未修）。RegisterApplicationRestart 让 WER 在进程终结后自动
+    // 拉起本进程（要求崩溃前存活 ≥60s，平台原生防崩溃循环）；重启带
+    // --wer-restart 参数，便于留下日志证据。
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern uint RegisterApplicationRestart(string pwzCommandLine, int dwFlags);
+
     private SettingsStore? _store;
     private AutoStartService? _autoStart;
     private HotkeyService? _hotkey;
@@ -51,6 +59,19 @@ public partial class App : Application
     {
         base.OnStartup(e);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        // WER 自愈注册（见字段区注释）。flags=0：崩溃/挂死/补丁/重启全启用。
+        try
+        {
+            if (RegisterApplicationRestart("--wer-restart", 0) != 0)
+                LogToFile("RegisterApplicationRestart 失败（崩溃后不会自动拉起）");
+        }
+        catch
+        {
+            // 注册失败不影响正常功能。
+        }
+        if (Environment.GetCommandLineArgs().Contains("--wer-restart", StringComparer.OrdinalIgnoreCase))
+            LogToFile("崩溃后由 WER 自动重启（上次进程非正常终结，多为 WPF+输入法兼容缺陷）");
 
         // AUDIT-2026-08-18 C-D1: 全局异常兜底。常驻托盘进程没有这三个钩子时，
         // 任何 UI 线程未捕获异常或后台 async void 异常都会让进程无声消失。

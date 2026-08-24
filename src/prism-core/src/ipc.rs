@@ -1287,7 +1287,8 @@ fn alias_search_hits(
 /// 排不到首位，要靠用户手选一次建立查询记忆才置顶）。现在只在别名 metadata
 /// 严格更优（或既有行无 metadata）时替换排序键，行本体（标题/spans/图标）
 /// 保持不动；新目标照旧追加行。
-fn merge_alias_rows(ranked: &mut Vec<SearchResult>, alias_rows: Vec<SearchResult>) {
+fn merge_alias_rows(ranked: &mut Vec<SearchResult>, alias_rows: Vec<SearchResult>) -> Vec<usize> {
+    let mut alias_indices = Vec::new();
     let mut index_by_target: HashMap<String, usize> = ranked
         .iter()
         .enumerate()
@@ -1310,13 +1311,17 @@ fn merge_alias_rows(ranked: &mut Vec<SearchResult>, alias_rows: Vec<SearchResult
                 if upgrade {
                     ranked[index].match_metadata = row.match_metadata;
                 }
+                // 升级与追加都是别名命中：无论走哪条路径都要参与置顶。
+                alias_indices.push(index);
             }
             None => {
                 index_by_target.insert(key, ranked.len());
+                alias_indices.push(ranked.len());
                 ranked.push(row);
             }
         }
     }
+    alias_indices
 }
 
 /// G5：token → 已复核的句柄。窗口目标永远不进 `ShellExecutor`：激活受 Windows 前台规则
@@ -1970,7 +1975,10 @@ async fn search_service(
     } = match service {
         Ok(reply) => process_indexer_reply(
             reply,
-            query,
+            // C2（全仓检验 2026-08-25）：回退 span/元数据按剥掉 ext:/path: 过滤词后
+            // 的名字查询计算——传原始 query 时 NameTerms 会把 "ext:pdf" 当第
+            // 二个词，多词 AND 匹配全败，带过滤词的文件结果一行高亮都没有。
+            &name_query,
             history,
             &injected_history_targets,
             &app_resolved_paths,
@@ -2012,19 +2020,38 @@ async fn search_service(
     } else {
         Vec::new()
     };
+    let mut alias_indices: Vec<usize> = Vec::new();
     if !alias_rows.is_empty() {
-        merge_alias_rows(&mut ranked, alias_rows);
+        // 2026-08-25 修复：别名词与真实文件同名时（如 "cs"），自然行的
+        // class-0/Literal/position/history 全部平手，末位 score 键（升序）
+        // 里别名行的反转时间戳（数亿）输给文件名长度（个位数）——别名行被
+        // Top-N 截断，用户要启动一次目标（history_score 提升）才搜得到，
+        // 与设置对话框「置顶显示」承诺相悖。别名是显式意图，与查询记忆
+        // （picks）同级：命中行无视匹配质量键直接进前排，行内仍按
+        // MatchMetadata::cmp 排（多目标时 usage_tier → 绑定时间倒序）。
+        alias_indices = merge_alias_rows(&mut ranked, alias_rows);
     }
     // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
     // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
     let pick_key = query_pick_key(query);
-    let pick_flags: Option<Vec<bool>> = pick_key.as_ref().map(|key| {
-        ranked
-            .iter()
-            // P8：键已由 query_pick_key 归一化，直传避免逐条重复归一化分配。
-            .map(|item| history.query_pick_by_key(&item.target, key))
-            .collect()
-    });
+    let pick_flags: Option<Vec<bool>> = if pick_key.is_some() || !alias_indices.is_empty() {
+        let key = pick_key.as_deref();
+        Some(
+            ranked
+                .iter()
+                .enumerate()
+                // P8：键已由 query_pick_key 归一化，直传避免逐条重复归一化分配。
+                .map(|(index, item)| {
+                    alias_indices.contains(&index)
+                        || key
+                            .map(|key| history.query_pick_by_key(&item.target, key))
+                            .unwrap_or(false)
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     sort_search_results_with_picks(&mut ranked, pick_flags.as_deref());
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
@@ -3759,6 +3786,83 @@ mod protocol_tests {
         ];
         sort_search_results_with_picks(&mut ordered, None);
         assert_eq!(ordered[0].target.value, lnk, "别名目标必须排首位");
+    }
+
+    /// 2026-08-25 用户报告锚定：给从未启动过的 exe 绑定别名词后，精确查询该词
+    /// 必须立即出现别名行——不依赖历史/启动记录。全链路（search_service）验证，
+    /// 复刻真实场景：kind=file 的 exe + 独立词 + 空历史 + 空 apps。
+    /// 索引器不可达（CI/无服务）时走 Err 分支同样成立：别名通道不碰索引。
+    #[tokio::test]
+    async fn alias_word_row_appears_without_prior_launch() {
+        let dir = std::env::temp_dir().join(format!("prism-alias-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("Panel v1.4.3.exe");
+        std::fs::write(&exe, b"x").unwrap();
+
+        let aliases = Arc::new(crate::alias::AliasStore::load(&dir));
+        aliases
+            .set(
+                &ActionTarget {
+                    kind: "file".into(),
+                    value: exe.to_string_lossy().into_owned(),
+                },
+                &["cs".into()],
+                1_787_578_631,
+            )
+            .unwrap();
+
+        let history_dir =
+            std::env::temp_dir().join(format!("prism-alias-svc-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+        let apps: SharedApps = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let engines: SharedEngines = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let preferences = Arc::new(BrokerPreferences::new(false));
+        let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+
+        let response = search_service(
+            SearchArgs {
+                query: "cs",
+                max: 8,
+                filters: None,
+                root: None,
+                mode: SearchMode::All,
+            },
+            &apps,
+            &engines,
+            &history,
+            &preferences,
+            &windows,
+            &aliases,
+        )
+        .await;
+
+        let Response::Results { items, .. } = response else {
+            panic!("search_service 必须返回 Results");
+        };
+        let titles = items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} [{:?}]",
+                    item.title,
+                    item.match_metadata
+                        .map(|m| (m.class, m.kind, m.score, m.history_score))
+                )
+            })
+            .collect::<Vec<_>>();
+        let exe_path = exe.to_string_lossy().into_owned();
+        assert!(
+            items.iter().any(|item| item.target.value == exe_path),
+            "未启动过的目标必须由别名行召回：{titles:?}"
+        );
+        assert_eq!(
+            items[0].target.value, exe_path,
+            "class-0 别名行必须置顶：{titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// merge 的另一半：无 metadata 的既有行（注入候选等）接受升级；不同目标

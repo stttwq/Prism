@@ -99,6 +99,18 @@ Name: "{commondesktop}\Prism"; Filename: "{app}\Prism.exe"; IconFilename: "{app}
 ; 无自启。与 M23 favicon 同类；单用户装机（管理员=本人）不受影响。正确修法
 ; 是改为应用内首启引导（AutoStartService 按用户写），不在安装器侧展开。
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Prism"; ValueData: """{app}\Prism.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+; WER LocalDumps（2026-08-25）：前端在微信输入法（WeType）+WPF/TSF 兼容缺陷场景
+; 会 AV 崩溃（coreclr 访问违例，Listary 6 官方论坛同款，.NET 8.0.30 未修）。
+; 注册后 WER 自动落全量 dump 到 %LOCALAPPDATA%\Prism\Dumps——下次复发即可拿到
+; 真栈定位（本次仅有 WER 签名：coreclr!+0x1d4660，无栈）。DumpFolder 必须
+; REG_EXPAND_SZ 才能展开 %LOCALAPPDATA%（WER 默认值同款写法）。
+; prism-core.exe 一并注册：IPC 韧性任务里 broker 静默崩溃同样缺现场。
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Prism.exe"; ValueType: expandsz; ValueName: "DumpFolder"; ValueData: "%LOCALAPPDATA%\Prism\Dumps"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Prism.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "2"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Prism.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\prism-core.exe"; ValueType: expandsz; ValueName: "DumpFolder"; ValueData: "%LOCALAPPDATA%\Prism\Dumps"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\prism-core.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "2"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\prism-core.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "3"; Flags: uninsdeletekey
 
 [Run]
 ; 安装完成后可选立即启动。

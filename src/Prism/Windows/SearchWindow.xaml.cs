@@ -355,6 +355,13 @@ public partial class SearchWindow : Window
         PositionWindow(foreground);
         Opacity = 0;
         Show();
+        // 2026-08-25（WeType 崩溃缓解）：Show 后立刻同步把键盘焦点放到输入框。
+        // 此前焦点要等 Input 优先级的 BeginInvoke 回调，这期间窗口已激活但
+        // WPF focused element 为空——TSF/msctf 在这个窗口上收到的首个击键会
+        // 与 TextStore 焦点状态错位（微信输入法在此窗口内注入 wetype_tip_core，
+        // 双击 Ctrl 呼出后立刻输入的崩溃正是这一族）。Input 优先级的二次断言
+        // 保留，兜激活被全屏应用抢回的场景。
+        Header.FocusQuery();
         SyncGenerationPolling();
         ForceActivate();
         Topmost = true;

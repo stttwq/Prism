@@ -22,6 +22,19 @@ use crate::shell::ActionTarget;
 
 const ALIAS_FILE: &str = "aliases-v1.json";
 
+/// 归档副本（不动原件）：归一化丢弃脏词/条目前留档，原件随后被回写覆盖。
+fn archive_copy(path: &Path) {
+    let now = crate::history::now_utc();
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let stem = name.strip_suffix(".json").unwrap_or(name);
+    let _ = std::fs::copy(path, parent.join(format!("{stem}.corrupt-{now}.json")));
+}
+
 pub struct AliasStore {
     path: PathBuf,
     state: RwLock<AliasData>,
@@ -38,26 +51,52 @@ pub type AliasMutationResult = Result<(), String>;
 impl AliasStore {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(ALIAS_FILE);
-        let entries = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| {
-                serde_json::from_slice::<VersionedEnvelope<AliasData>>(&bytes)
-                    .ok()
-                    .and_then(|envelope| envelope.into_compatible().ok())
-            })
-            .map(|data| data.entries)
-            .unwrap_or_default();
+        // C1（全仓检验 2026-08-25）：读不出/解不开/版本不兼容时先隔离原文件
+        // 再回退空表（history.rs isolate 同纪律）——否则下一个 set/delete 会
+        // 用空内存态把半途撕裂或未来版本的原表整份覆盖，静默清零用户全部别名。
+        let loaded = std::fs::read(&path).ok().and_then(|bytes| {
+            serde_json::from_slice::<VersionedEnvelope<AliasData>>(&bytes)
+                .ok()
+                .and_then(|envelope| envelope.into_compatible().ok())
+        });
+        let (mut entries, isolated) = match loaded {
+            Some(data) => (data.entries, false),
+            None if path.exists() => {
+                crate::history::isolate(&path, crate::history::now_utc());
+                (Vec::new(), true)
+            }
+            None => (Vec::new(), false),
+        };
         // 载入侧归一化词（trim + 小写）：存储历史可能有手工编辑的脏数据。
-        let mut entries = entries;
+        // 归一化丢了词/条目时原文件仍在位，下一次 persist 会把被丢内容从盘上
+        // 抹掉——先归档原件再回写归一化快照。
+        let mut reduced = false;
         for entry in &mut entries {
-            entry.words = normalized_words(&entry.words);
+            let normalized = normalized_words(&entry.words);
+            if normalized.len() != entry.words.len() {
+                reduced = true;
+            }
+            entry.words = normalized;
         }
+        let before = entries.len();
         entries.retain(|entry| !entry.words.is_empty());
-        Self {
+        if entries.len() != before {
+            reduced = true;
+        }
+        let store = Self {
             path,
             state: RwLock::new(AliasData { entries }),
             persist_lock: Mutex::new(()),
+        };
+        if isolated {
+            // 隔离分支：原件已改名归档，回写让 aliases-v1.json 立即回到盘上，
+            // 不依赖用户下一次变更才落盘。
+            let _ = store.persist();
+        } else if reduced {
+            archive_copy(&store.path);
+            let _ = store.persist();
         }
+        store
     }
 
     /// 整体替换目标的词表。空词表 = 解绑（删除条目）。同步落盘（调用方在
@@ -287,6 +326,48 @@ mod tests {
         std::fs::write(dir.join(ALIAS_FILE), b"{ not json").unwrap();
         let reloaded = AliasStore::load(&dir);
         assert!(reloaded.list().is_empty(), "损坏 → 空表重来，不 panic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C1（全仓检验 2026-08-25）：损坏/未来版本的存储文件在 load 时必须隔离
+    /// 留档并回写合法空表——否则静默清零的内存态会在下一次 set/delete 时把
+    /// 原表整份覆盖，用户全部别名无痕丢失（history.rs isolate 同纪律）。
+    #[test]
+    fn corrupt_store_isolated_not_silently_overwritten() {
+        let dir = std::env::temp_dir().join(format!("prism-alias-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ALIAS_FILE);
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let store = AliasStore::load(&dir);
+        assert!(store.list().is_empty(), "损坏 → 空表重来");
+
+        let mut isolated = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.starts_with("aliases-v1.corrupt-") {
+                isolated += 1;
+            }
+        }
+        assert_eq!(isolated, 1, "损坏原件必须留档为 .corrupt-*.json");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).is_ok(),
+            "load 后盘上应回到合法 JSON（空表回写），不依赖下次变更"
+        );
+
+        // 之后的变更只写新表；原内容在隔离副本中留档。
+        store
+            .set(
+                &ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\a.exe".into(),
+                },
+                &["a".into()],
+                2,
+            )
+            .unwrap();
+        assert_eq!(store.lookup_word("a").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

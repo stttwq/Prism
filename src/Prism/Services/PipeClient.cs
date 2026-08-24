@@ -102,6 +102,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
     {
         StartWatchdog();
         await ConnectOrReconnectAsync(ct).ConfigureAwait(false);
+        // F1（全仓检验 2026-08-25）：StartWatchdog 预置的 _wasConnected=true 只在
+        // 首连成功时正确。首连失败（本方法抛出，UI 已进"未连接"态）后看门狗在
+        // 后台恢复连接时，NotifyConnection(true) 因 true==true 被吞——托盘永久
+        // 停留"后端未连接"、每次召唤都显示"正在连接后端…"，且 ConnectionChanged
+        // 侧的 NotifyAliasesChanged 被跳过（前缀缓存用旧词集）。按真实连接状态
+        // 对齐：成功保持 true（不产生冗余通知），失败改 false 让恢复路径可见。
+        _wasConnected = _query.IsConnected;
         if (!_query.IsConnected)
             throw new IOException("无法连接到后端");
     }
