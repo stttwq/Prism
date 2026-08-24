@@ -602,7 +602,18 @@ mod platform {
                     // 然后释放 batch 的 String 分配。
                     for record in batch {
                         let name_bytes = record.name.as_bytes();
-                        let offset = name_pool.len() as u32;
+                        // 2026-08-24 全仓检验：池偏移必须检查转换——静默截断会让
+                        // 4GiB 之后的所有记录拿到错误（回绕）的偏移，索引里张冠
+                        // 李戴的文件名不报错不落日志；窄窗口里切片还会 panic，在
+                        // panic="abort" 下直接杀死 SYSTEM 服务。与 hierarchy.rs
+                        // `append_name` 的 NamePoolOverflow 同一纪律：报错走卷级
+                        // 失败，由既有重试/跳过机制兜底。
+                        let offset = u32::try_from(name_pool.len()).map_err(|_| {
+                            format!(
+                                "MFT name pool exceeds u32 offset limit after {} records",
+                                records.len()
+                            )
+                        })?;
                         name_pool.extend_from_slice(name_bytes);
                         let len = name_bytes.len() as u32;
                         records.push(MftRecord {

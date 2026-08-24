@@ -94,6 +94,10 @@ Name: "{commondesktop}\Prism"; Filename: "{app}\Prism.exe"; IconFilename: "{app}
 ; 开机自启：写 HKCU\...\Run\Prism，值名与 AutoStartService.ValueName 完全一致；
 ; 安装路径含空格/中文时用双引号包裹，与前端 SetEnabled 行为一致。
 ; 仅当 autostart 任务勾选才写入。卸载时删除（属于软件自身注册项，非用户数据）。
+; 已知局限（2026-08-24 全仓检验）：PrivilegesRequired=admin 下，标准用户输管理员
+; 凭据过 UAC 时 HKCU 是**管理员的**配置单元——自启写给了提权账户，真实用户
+; 无自启。与 M23 favicon 同类；单用户装机（管理员=本人）不受影响。正确修法
+; 是改为应用内首启引导（AutoStartService 按用户写），不在安装器侧展开。
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Prism"; ValueData: """{app}\Prism.exe"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
@@ -122,8 +126,43 @@ Type: filesandordirs; Name: "{commonappdata}\Prism"
 Type: filesandordirs; Name: "{localappdata}\Prism\favicons"
 
 [Code]
+// 2026-08-24 全仓检验：Prism.exe 是 framework-dependent，缺 .NET 8 桌面运行时
+// （Microsoft.WindowsDesktop.App 8.x）时装出来的应用首次启动即死。机器级/用户级
+// 安装都会在 sharedfx 下按版本记子键，reg query /f "v8." /k 退出码 0=存在。
+// 查不到不硬阻断（Store 渠道的运行时标记位置可能不同，误报会挡住正常安装），
+// 改为警告并让用户选择继续。
+function DotnetDesktop8Present(): Boolean;
+var
+  ResultCode: Integer;
+  Found: Boolean;
+begin
+  Found := False;
+  if Exec(ExpandConstant('{sys}\reg.exe'),
+      'query "HKLM\SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App" /f "v8." /k',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Found := (ResultCode = 0);
+  if not Found then
+  begin
+    if Exec(ExpandConstant('{sys}\reg.exe'),
+        'query "HKCU\SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App" /f "v8." /k',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      Found := (ResultCode = 0);
+  end;
+  Result := Found;
+end;
+
 function InitializeSetup(): Boolean;
 begin
+  if not DotnetDesktop8Present() then
+  begin
+    if MsgBox('未检测到 .NET 8 桌面运行时（Microsoft.WindowsDesktop.App 8.x）。' + #13#10 +
+      'Prism 需要它才能运行，请先从 https://dotnet.microsoft.com/download/dotnet/8.0 安装。' + #13#10#13#10 +
+      '仍要继续安装吗？', mbConfirmation, MB_YESNO) = IDNO then
+    begin
+      Result := False;
+      exit;
+    end;
+  end;
   Result := True;
 end;
 

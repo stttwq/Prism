@@ -276,6 +276,22 @@ pub(crate) fn zip_external(
     }
 }
 
+/// 外部压缩程序等待上限（2026-08-24 全仓检验）。这条路径在连接读循环内联
+/// 执行（S2a 快路径，刻意绕过 STA 队列预算），一个永不退出的自定义压缩程序
+/// （GUI 弹窗等输入、被挂起、机器休眠穿越）会把整条前端连接永久头阻塞。
+/// 取 5 分钟与前端动作通道读超时（F6 ActionReadTimeout）对齐：前端届时已按
+/// "结果未知"收场，后端杀掉子进程恢复连接；超时≠未执行，文案与 F7 同语义。
+const ZIP_EXTERNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 测试注入：try_wait 轮询周期对单测太粗，cfg!(test) 下用更短的等待上限。
+fn zip_external_timeout() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(500)
+    } else {
+        ZIP_EXTERNAL_TIMEOUT
+    }
+}
+
 /// 用外部程序（7-Zip 或自定义）压缩。
 #[cfg(windows)]
 fn zip_with_external(
@@ -295,9 +311,33 @@ fn zip_with_external(
         cmd.arg(source).arg(output);
     }
 
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
+
+    let deadline = std::time::Instant::now() + zip_external_timeout();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ShellError::new(
+                        ShellErrorKind::System,
+                        format!(
+                            "压缩程序超过 {} 秒未退出，已终止（连接恢复，结果未知）",
+                            zip_external_timeout().as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                return Err(ShellError::new(ShellErrorKind::System, e.to_string()));
+            }
+        }
+    };
 
     if status.success() {
         Ok(ShellOutcome::Success)
@@ -561,6 +601,44 @@ mod tests {
         let target = ActionTarget::new(TargetKind::Web, "https://example.com");
         let err = zip(&target, r"C:\out.zip", None).unwrap_err();
         assert_eq!(err.kind, ShellErrorKind::Unsupported);
+    }
+
+    /// 2026-08-24 全仓检验：外部压缩程序永不退出时必须在限定时间内被杀掉——
+    /// 这条路径在连接读循环内联执行（S2a 快路径），无限等待会把整条前端连接
+    /// 永久头阻塞。用"睡了 9 秒的假压缩程序"直测 zip_with_external（绕过
+    /// detect_zip_program 的 .exe 探测规则）：测试等待上限被 zip_external_timeout
+    /// 压到 500ms，必须快速返回超时错误。
+    #[cfg(windows)]
+    #[test]
+    fn zip_external_times_out_hung_program() {
+        let dir = std::env::temp_dir().join(format!("prism-zip-tmo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target_file = dir.join("a.txt");
+        std::fs::write(&target_file, b"x").unwrap();
+        let output = dir.join("out.zip");
+        let fake = dir.join("slow-zip.bat");
+        std::fs::write(&fake, "@echo off\r\nping -n 10 127.0.0.1 > nul\r\n").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = zip_with_external(
+            target_file.to_str().unwrap(),
+            output.to_str().unwrap(),
+            fake.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "挂死的压缩程序必须在限定时间内被终止，实际等了 {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.message.contains("已终止"),
+            "应返回超时终止错误，实际得到：{}",
+            err.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// S2a：zip_external 的目标/输出校验与 zip 完全一致（错误在程序探测之前

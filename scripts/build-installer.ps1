@@ -84,6 +84,20 @@ if (-not $SkipBuild) {
 
 # --- 2. Commit name -------------------------------------------------------
 
+# 2026-08-24 全仓检验（M2）：版本号钉的是 HEAD，但 cargo/dotnet 编的是工作区——
+# 带未提交改动出包会得到「版本指向 A 提交、字节却不存在于任何提交」的不可追溯
+# 产物。src/ 的任何状态变化（含未跟踪新源文件，它们同样参与编译）与 dist/
+# 已跟踪产物的改动都必须先提交。dist/ 的未跟踪文件（上一次的 PrismSetup-*.exe、
+# data/、Output/）不参与编译，不算脏。
+$dirtyTracked = (git -C $RepoRoot status --porcelain --untracked-files=no -- src dist) -join "`n"
+$dirtySrcAll  = (git -C $RepoRoot status --porcelain -- src) -join "`n"
+if ($dirtyTracked -or $dirtySrcAll) {
+    Write-Bad 'Working tree is dirty; the installer would ship bytes that match no commit:'
+    if ($dirtyTracked) { Write-Host $dirtyTracked -ForegroundColor Yellow }
+    if ($dirtySrcAll)  { Write-Host $dirtySrcAll -ForegroundColor Yellow }
+    throw 'commit or stash the changes above first, then rerun'
+}
+
 $shortHash = (git -C $RepoRoot rev-parse --short HEAD).Trim()
 if ([string]::IsNullOrEmpty($shortHash)) { throw 'could not resolve HEAD short hash' }
 $fullVersion = "$VersionBase.$shortHash"
@@ -96,11 +110,14 @@ Write-Step "Installer version = $fullVersion  (from HEAD $shortHash)"
 # real build so the committed .iss never needs a manual edit between builds.
 # The committed version is restored after ISCC finishes so git status stays clean.
 Write-Step "Stamping $IssPath"
-# Ensure a clean starting point: a prior aborted run may have left .iss stamped.
-# L29: a failed restore must abort -- continuing would stack stamps on an old
-# version or leave the working tree dirty.
-& git -C $RepoRoot checkout HEAD -- 'dist/prism.iss' 2>$null
-if ($LASTEXITCODE -ne 0) { throw 'git checkout dist/prism.iss failed (dirty index or no HEAD?)' }
+# 2026-08-24 全仓检验（M3）：盲 checkout 会无警告销毁未提交的 prism.iss 编辑
+#（本文件最常被改的东西）。先确认工作区副本与 HEAD 一致；不一致就中止，
+# 让用户自己决定保留还是丢弃——上一轮 stamp 残留同样会走到这里，按提示
+# `git checkout -- dist/prism.iss` 清掉即可。
+& git -C $RepoRoot diff --quiet HEAD -- 'dist/prism.iss'
+if ($LASTEXITCODE -ne 0) {
+    throw 'dist/prism.iss has uncommitted edits; commit them, or discard with: git checkout -- dist/prism.iss'
+}
 # Read on-disk UTF-8 (NOT `git show | Out-String`, which re-encodes Chinese via
 # the console code page and corrupts quoted values for ISCC).
 $content = Get-Content -LiteralPath $IssPath -Raw -Encoding UTF8
@@ -153,5 +170,16 @@ try {
 $output = Join-Path $DistDir "PrismSetup-$fullVersion.exe"
 if (-not (Test-Path $output)) { throw "installer not produced: $output" }
 $sizeMb = [math]::Round((Get-Item $output).Length / 1MB, 1)
+
+# 2026-08-24 全仓检验（M6）：清掉旧版安装包——dist 里的 PrismSetup-*.exe 会被
+# 整体提交（既有工作流），不清就只能靠人肉记着删（cf. 68d9897 手工清理），
+# 多留一代就多一个「装到旧代码」的入口。每轮构建后 dist 恰好只剩当前版本。
+$stale = @(Get-ChildItem -LiteralPath $DistDir -Filter 'PrismSetup-*.exe' |
+    Where-Object { $_.Name -ne "PrismSetup-$fullVersion.exe" })
+if ($stale.Count -gt 0) {
+    $stale | Remove-Item -Force
+    Write-Ok ("removed {0} stale installer(s): {1}" -f $stale.Count, (($stale | ForEach-Object Name) -join ', '))
+}
+
 Write-Host ''
 Write-Host "Done: $output ($sizeMb MB)" -ForegroundColor Green

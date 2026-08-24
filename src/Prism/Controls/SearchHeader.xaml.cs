@@ -103,6 +103,33 @@ public partial class SearchHeader : UserControl
         UpdatePlaceholder();
     }
 
+    /// <summary>
+    /// 终结输入框上可能挂着的 IME 组合（2026-08-24 崩溃修复）。
+    ///
+    /// WPF 只在元素**失去键盘焦点的瞬间**终结 TSF 组合
+    /// （TextStore.OnLostFocus → CompleteComposition）。隐藏窗口前焦点往往
+    /// 已被启动的外部程序或崩溃的全屏应用夺走（WPF FocusedElement 已为 null，
+    /// ClearFocus 沦为空操作），组合就此悬空；隐藏期间清空查询文本会在组合
+    /// 视角下"改写文档"，下次召唤的首个击键触发 WPF 重放过期组合事件，
+    /// SetFinalDocumentState 的字符数不变量校验失败直接 FailFast 杀进程
+    /// （dotnet/wpf#4984 同类）。所以改写/清空文本前必须先把 WPF 焦点放回
+    /// 输入框（可见窗口上 Focus() 可成功），再整体清焦，强制组合沿正常路径终结。
+    /// 窗口不可见时 Focus() 无效也无害——那条路径本就没有新组合。
+    /// </summary>
+    public void EndImeComposition()
+    {
+        try
+        {
+            QueryBox.Focus(); // 焦点被外部进程夺走时拉回（窗口可见时成功；隐藏态无效也无害）
+            Keyboard.ClearFocus();
+        }
+        catch
+        {
+            // 焦点操作失败不影响隐藏流程；组合悬空的最坏后果已由调用方
+            // 在清文本前调用本方法规避。
+        }
+    }
+
     /// <summary>按面板模式切换"动作"标签与占位文案。</summary>
     public void SetMode(PanelMode mode)
     {

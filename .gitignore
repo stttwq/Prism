@@ -14,6 +14,11 @@
 **/data/broker.jsonl*
 **/debug/data/
 **/release/data/
+# 2026-08-24 全仓检验：dist 既是打包载荷目录也是"就地运行"时的数据根——
+# 从 dist\Prism.exe 启动会往 dist\data\favicons 灌运行时图标缓存；Output
+# 是 Inno 的默认输出目录。两者都是运行时产物，不属于打包输入。
+dist/data/
+dist/Output/
 
 # .NET / NuGet
 *.nupkg

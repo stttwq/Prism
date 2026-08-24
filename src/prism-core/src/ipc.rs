@@ -798,7 +798,7 @@ async fn handle_connection(
     log("前端已连接");
     let (reader, writer) = tokio::io::split(pipe);
     let mut lines = BoundedLineReader::new(reader);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Response)>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<(u64, Response)>(MAX_QUEUED_RESPONSES);
     let writer_task = tokio::spawn(ordered_writer(writer, rx));
     // B5：在途 search 并发上限。超出（本地进程灌请求）立即回错——仍走保序
     // 通道，不破配对。Arc<Semaphore> 的 permit 随任务结束释放。
@@ -819,13 +819,15 @@ async fn handle_connection(
             },
             Err(message) => {
                 // 超长/损坏的入站行（或握手超时）：回一条错误说明后断开连接。
-                let _ = tx.send((
-                    next_seq,
-                    Response::Error {
-                        message,
-                        category: None,
-                    },
-                ));
+                let _ = tx
+                    .send((
+                        next_seq,
+                        Response::Error {
+                            message,
+                            category: None,
+                        },
+                    ))
+                    .await;
                 log("入站请求行异常，断开连接");
                 drop(tx);
                 let _ = writer_task.await;
@@ -851,15 +853,17 @@ async fn handle_connection(
                 mode,
             }) => {
                 let Ok(permit) = search_permits.clone().try_acquire_owned() else {
-                    let _ = tx.send((
-                        seq,
-                        Response::Error {
-                            message: format!(
-                                "too many concurrent searches (limit {MAX_INFLIGHT_SEARCHES})"
-                            ),
-                            category: None,
-                        },
-                    ));
+                    let _ = tx
+                        .send((
+                            seq,
+                            Response::Error {
+                                message: format!(
+                                    "too many concurrent searches (limit {MAX_INFLIGHT_SEARCHES})"
+                                ),
+                                category: None,
+                            },
+                        ))
+                        .await;
                     continue;
                 };
                 // H4（全仓复审 2026-08-22）：seq 由本分支领走后必须回包，否则 ordered_writer
@@ -899,7 +903,7 @@ async fn handle_connection(
                             category: None,
                         },
                     };
-                    let _ = tx.send((seq, response));
+                    let _ = tx.send((seq, response)).await;
                     drop(permit);
                 });
             }
@@ -914,16 +918,20 @@ async fn handle_connection(
                     &aliases,
                 )
                 .await;
-                let _ = tx.send((seq, response));
+                // 背压：通道满（writer 落后 = 客户端不读）时在此等待而非无限排队；
+                // send 失败说明 writer 已随客户端断开退出，整条连接一并收尾。
+                if tx.send((seq, response)).await.is_err() {
+                    break;
+                }
             }
             Err(e) => {
-                let _ = tx.send((
-                    seq,
-                    Response::Error {
-                        message: format!("无法解析请求：{e}"),
-                        category: None,
-                    },
-                ));
+                let response = Response::Error {
+                    message: format!("无法解析请求：{e}"),
+                    category: None,
+                };
+                if tx.send((seq, response)).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -938,14 +946,21 @@ async fn handle_connection(
 /// B5（AUDIT-4 批次D）：单连接在途 search 并发上限。
 const MAX_INFLIGHT_SEARCHES: usize = 16;
 
+/// 单连接待写响应上限（背压，2026-08-24 全仓检验）：响应通道必须有界——
+/// 请求入站无界读 + 响应无界排队的组合下，一个只写不读的本地恶意/故障进程
+/// 可让响应在通道与 writer 缓冲里无限堆积直至 OOM（与 MAX_INFLIGHT_SEARCHES
+/// 防的是同一威胁模型的另一半）。有界后：客户端停止读取 → 管道写阻塞 →
+/// writer 停止消费 → 通道写满 → 读循环停在 send 上不再读新请求，内存封顶；
+/// 客户端断开 → 管道写失败 → writer 退出 → 通道 send 报错 → 连接整体回收。
+/// 正常前端是严格串行的请求-响应，8 个排队额度绰绰有余。
+const MAX_QUEUED_RESPONSES: usize = 8;
+
 /// B5：连接级保序 writer。收 (seq, response)，BTreeMap 缓冲乱序到达者，
 /// 严格按 0,1,2,… 顺序序列化写出。P15 的响应缓冲复用移到这里（唯一消费者）：
 /// 偶发的超大响应（"more" 模式 300 项）不长期占着容量，写完超过
 /// `RESPONSE_BUFFER_KEEP` 就缩回去。写失败（客户端已断）静默返回，残余丢弃。
-async fn ordered_writer<W>(
-    mut writer: W,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Response)>,
-) where
+async fn ordered_writer<W>(mut writer: W, mut rx: tokio::sync::mpsc::Receiver<(u64, Response)>)
+where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
@@ -5003,7 +5018,7 @@ mod pipe_lifecycle_tests {
     #[tokio::test]
     async fn b5_ordered_writer_writes_responses_in_request_order() {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(super::MAX_QUEUED_RESPONSES);
         let writer = tokio::spawn(super::ordered_writer(server, rx));
 
         // 乱序投递：2 先到、0 后到，1 最晚。
@@ -5014,6 +5029,7 @@ mod pipe_lifecycle_tests {
                 category: None,
             },
         ))
+        .await
         .unwrap();
         tx.send((
             0,
@@ -5022,6 +5038,7 @@ mod pipe_lifecycle_tests {
                 category: None,
             },
         ))
+        .await
         .unwrap();
         tx.send((
             1,
@@ -5030,6 +5047,7 @@ mod pipe_lifecycle_tests {
                 category: None,
             },
         ))
+        .await
         .unwrap();
         drop(tx);
 

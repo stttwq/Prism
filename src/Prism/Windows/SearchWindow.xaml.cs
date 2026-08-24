@@ -333,6 +333,11 @@ public partial class SearchWindow : Window
         _idleTrimTimer?.Stop();
         _idleTrimTimer = null;
 
+        // 窗口已可见时被再次呼出（托盘/设置返回等路径）可能带着进行中的
+        // IME 组合——先终结再清文本，与 HideAnimated 同一纪律。
+        if (IsVisible)
+            Header.EndImeComposition();
+
         _vm?.ResetForShow();
         _suppressQueryEvent = true;
         Header.ClearQuery();
@@ -498,9 +503,13 @@ public partial class SearchWindow : Window
         var fadeOut = new DoubleAnimation(Opacity, 0, TimeSpan.FromMilliseconds(FadeOutMs));
         fadeOut.Completed += (_, _) =>
         {
+            // 必须在 Hide() **之前**终结 IME 组合：窗口不可见后 Focus() 拉不回
+            // 焦点，组合悬空下 ResetForShow 清空文本会让下次召唤的首个击键
+            // FailFast（见 SearchHeader.EndImeComposition）。淡出完成时窗口
+            // 仍可见（Opacity=0 不影响可聚焦），此时终结是最后的机会。
+            Header.EndImeComposition();
             Hide();
             _hiding = false;
-            try { Keyboard.ClearFocus(); } catch { /* ignore */ }
             ReleaseIdleMemory();
         };
         BeginAnimation(OpacityProperty, fadeOut);
@@ -1516,6 +1525,9 @@ public partial class SearchWindow : Window
         if (_vm.State.Mode != PanelMode.Actions) return;
 
         _suppressQueryEvent = true;
+        // 清空输入框供动作过滤前终结 IME 组合（→ 键可能带着未上屏的拼音直接
+        // 进面板，悬空组合下改写文本与 HideAnimated 是同一类 FailFast 风险）。
+        Header.EndImeComposition();
         Header.ClearQuery();
         Header.SetMode(PanelMode.Actions);
         _suppressQueryEvent = false;
