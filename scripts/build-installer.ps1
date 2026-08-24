@@ -84,11 +84,12 @@ if (-not $SkipBuild) {
 
 # --- 2. Commit name -------------------------------------------------------
 
-# 2026-08-24 全仓检验（M2）：版本号钉的是 HEAD，但 cargo/dotnet 编的是工作区——
-# 带未提交改动出包会得到「版本指向 A 提交、字节却不存在于任何提交」的不可追溯
-# 产物。src/ 的任何状态变化（含未跟踪新源文件，它们同样参与编译）与 dist/
-# 已跟踪产物的改动都必须先提交。dist/ 的未跟踪文件（上一次的 PrismSetup-*.exe、
-# data/、Output/）不参与编译，不算脏。
+# 2026-08-24 repo-wide audit (M2): the version pins HEAD but cargo/dotnet
+# compile the working tree -- shipping with uncommitted changes produces an
+# installer whose bytes exist at no commit (traceability inversion). Any state
+# change under src/ (including untracked new sources, they compile too) and any
+# change to tracked dist/ artifacts must be committed first. Untracked dist/
+# files (previous PrismSetup-*.exe, data/, Output/) do not compile, not dirty.
 $dirtyTracked = (git -C $RepoRoot status --porcelain --untracked-files=no -- src dist) -join "`n"
 $dirtySrcAll  = (git -C $RepoRoot status --porcelain -- src) -join "`n"
 if ($dirtyTracked -or $dirtySrcAll) {
@@ -110,10 +111,10 @@ Write-Step "Installer version = $fullVersion  (from HEAD $shortHash)"
 # real build so the committed .iss never needs a manual edit between builds.
 # The committed version is restored after ISCC finishes so git status stays clean.
 Write-Step "Stamping $IssPath"
-# 2026-08-24 全仓检验（M3）：盲 checkout 会无警告销毁未提交的 prism.iss 编辑
-#（本文件最常被改的东西）。先确认工作区副本与 HEAD 一致；不一致就中止，
-# 让用户自己决定保留还是丢弃——上一轮 stamp 残留同样会走到这里，按提示
-# `git checkout -- dist/prism.iss` 清掉即可。
+# 2026-08-24 repo-wide audit (M3): the old blind checkout destroyed uncommitted
+# prism.iss edits (the most-edited file in dist/) with zero warning. Verify the
+# working copy matches HEAD first; abort and let the user decide keep-vs-discard.
+# Stamp residue from an aborted run also lands here -- clean it with the hint below.
 & git -C $RepoRoot diff --quiet HEAD -- 'dist/prism.iss'
 if ($LASTEXITCODE -ne 0) {
     throw 'dist/prism.iss has uncommitted edits; commit them, or discard with: git checkout -- dist/prism.iss'
@@ -171,9 +172,10 @@ $output = Join-Path $DistDir "PrismSetup-$fullVersion.exe"
 if (-not (Test-Path $output)) { throw "installer not produced: $output" }
 $sizeMb = [math]::Round((Get-Item $output).Length / 1MB, 1)
 
-# 2026-08-24 全仓检验（M6）：清掉旧版安装包——dist 里的 PrismSetup-*.exe 会被
-# 整体提交（既有工作流），不清就只能靠人肉记着删（cf. 68d9897 手工清理），
-# 多留一代就多一个「装到旧代码」的入口。每轮构建后 dist 恰好只剩当前版本。
+# 2026-08-24 repo-wide audit (M6): prune previous PrismSetup-*.exe after a
+# successful compile -- dist is committed wholesale (established workflow), and
+# without pruning every cycle relies on someone remembering (cf. 68d9897 manual
+# sweep). Each build leaves exactly one installer in dist: the current version.
 $stale = @(Get-ChildItem -LiteralPath $DistDir -Filter 'PrismSetup-*.exe' |
     Where-Object { $_.Name -ne "PrismSetup-$fullVersion.exe" })
 if ($stale.Count -gt 0) {
