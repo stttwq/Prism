@@ -121,6 +121,9 @@ public partial class App : Application
                 _tray?.SetTooltip(connected ? "Prism" : "Prism · 后端未连接");
                 if (!connected)
                     _state.StatusMessage = "正在重连后端…";
+                // 2026-08-24 修复：重连后别名词集可能已变（broker 重启/手工编辑
+                // aliases-v1.json），前缀缓存守卫的词集失效重拉。
+                _vm?.NotifyAliasesChanged();
             }));
         _icons = new IconCache();
         // G5: activation must run in this process — SetForegroundWindow only takes effect
@@ -131,7 +134,8 @@ public partial class App : Application
             _pipe,
             activator: new Win32WindowActivator(),
             suggestions: new SuggestionService(),
-            staging: _staging);
+            staging: _staging,
+            aliasList: ListBackendAliasesAsync);
         ApplySearchExclusions(settings);
         _vm.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
 
@@ -347,6 +351,8 @@ public partial class App : Application
         if (_pipe is null || !_pipe.IsConnected)
             throw new InvalidOperationException("后端未连接");
         await _pipe.AliasDeleteAsync(target).ConfigureAwait(true);
+        // 2026-08-24 修复：设置页删除别名后词集失效（前缀缓存守卫重拉）。
+        _vm?.NotifyAliasesChanged();
     }
 
     /// <summary>

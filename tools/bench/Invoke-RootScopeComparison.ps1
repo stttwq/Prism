@@ -45,11 +45,11 @@ foreach ($path in @($rawPath, $summaryPath)) {
 # Paired fixtures: each root-scoped case has a global twin running the identical
 # query string, so any difference is attributable to `root` alone.
 $pairs = @(
-    @{ pair = 'deep_high_candidate'; query = 'e';     root = 'E:\YX' }
+    @{ pair = 'deep_high_candidate'; query = 'd';     root = 'D:\YX' }
     @{ pair = 'deep_system32';       query = 'win';   root = 'C:\Windows\System32' }
-    @{ pair = 'shallow_small';       query = 'prism'; root = 'E:\LS\DM\listary\src' }
-    @{ pair = 'no_hit';              query = 'prism-g0-no-hit-019fabfb9808'; root = 'E:\YX' }
-    @{ pair = 'drive_root';          query = 'e';     root = 'E:\' }
+    @{ pair = 'shallow_small';       query = 'prism'; root = 'D:\LS\DM\Listary\src' }
+    @{ pair = 'no_hit';              query = 'prism-g0-no-hit-019fabfb9808'; root = 'D:\YX' }
+    @{ pair = 'drive_root';          query = 'd';     root = 'D:\' }
 )
 
 $cases = foreach ($p in $pairs) {

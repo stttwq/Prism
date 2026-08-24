@@ -11,6 +11,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <RootNamespace>Prism</RootNamespace>
+    <!-- 2026-08-24 复审：与安装包 1.1 线、prism-core crate 版本对齐。 -->
+    <Version>1.1.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\prism.ico</ApplicationIcon>
     <!-- 关闭默认 Page 收集；仅显式登记已实现的 XAML。 -->

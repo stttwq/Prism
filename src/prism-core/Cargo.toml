@@ -1,6 +1,8 @@
 [package]
 name = "prism-core"
-version = "0.1.0"
+# 2026-08-24 复审：与安装包 1.1 线对齐（此前 crate 0.1.0 / csproj 1.0.0 /
+# installer 1.1.x 三处互不相干；Hello/Pong 上报的 version 就是 crate 版本）。
+version = "1.1.0"
 edition = "2021"
 description = "Prism 后端：文件索引 / 搜索 / 程序清单 / 网页关键词，命名管道 JSON 服务"
 

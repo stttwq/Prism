@@ -49,6 +49,12 @@ public sealed class SearchViewModel
     /// <summary>暂存区（2026-08-22 计划阶段三）：工作集名字召回注入用。
     /// 为空表示未装配，不注入合成行。</summary>
     private readonly StagingArea? _staging;
+    /// <summary>别名词表来源（2026-08-24 修复）：前缀缓存守卫用。null = 未装配
+    /// （测试/无别名环境），守卫不生效，缓存行为与修复前一致。</summary>
+    private readonly Func<Task<IReadOnlyList<AliasEntry>>>? _onAliasList;
+    /// <summary>已归一化（trim + 小写）的别名词集合。null = 未加载或已失效；
+    /// 装配了来源且为 null 时前缀缓存一律绕过（宁可少缓存，不可漏别名行）。</summary>
+    private HashSet<string>? _aliasWords;
 
     public AppState State => _state;
 
@@ -94,13 +100,15 @@ public sealed class SearchViewModel
         IWindowActivator? activator = null,
         ISuggestionService? suggestions = null,
         IFolderPicker? folderPicker = null,
-        StagingArea? staging = null)
+        StagingArea? staging = null,
+        Func<Task<IReadOnlyList<AliasEntry>>>? aliasList = null)
     {
         _state = state;
         _pipe = pipe;
         _activator = activator;
         _suggestions = suggestions;
         _staging = staging;
+        _onAliasList = aliasList;
         // P4a: 缺省保持 WinForms 对话框（照抄 ISuggestionService 的可选注入先例）。
         _folderPicker = folderPicker ?? new WinFormsFolderPicker();
         // P4c: 联想结果必须回 UI 线程写 Results；无 Application（单元测试）或已在
@@ -129,6 +137,10 @@ public sealed class SearchViewModel
         _webEngines = engines.Count > 0 ? engines : Settings.DefaultEngines();
         _suggestionsEnabled = suggestionsEnabled;
     }
+
+    /// <summary>别名绑定变更后调用（保存/删除/后端重连）：词集失效，下次搜索
+    /// 重新拉取。前缀缓存在词集未知期间一律绕过。</summary>
+    public void NotifyAliasesChanged() => _aliasWords = null;
 
     /// <summary>Schedules one refresh through the existing broker search path.</summary>
     public void OnIndexGenerationChanged()
@@ -772,6 +784,16 @@ public sealed class SearchViewModel
             var completed = await Task.WhenAny(generationTask, timeoutTask).ConfigureAwait(true);
             Interlocked.CompareExchange(ref _mutationGenerationSignal, null, signal);
 
+            // 复审 2026-08-24：等待期间用户已改查询（新搜索在飞或已展示）——本次
+            // 刷新整体让位。否则下方 RunSearchAsync(旧query) 会 bump seq 并取消
+            // 用户在飞的新搜索，而它自己的响应又被查询文本守卫丢弃，列表停在
+            // 空结果 + "正在刷新…"死态。generation debounce 不停：它 fire 时读的
+            // 是最新 _state.Query，搜新查询无害。
+            if (!string.Equals(query, _state.Query, StringComparison.Ordinal))
+            {
+                return;
+            }
+
             if (completed == timeoutTask)
             {
                 // generation 超时：先搜索一次（用当前索引），再提示索引尚未刷新。
@@ -936,6 +958,33 @@ public sealed class SearchViewModel
             && (IsAbsolutePathQuery(query) || HasFilterToken(query)))
         {
             _completeCache = null;
+        }
+        // 2026-08-24 修复：装配了别名词表来源时先拉词集——前缀缓存按标题子串
+        // 过滤，永远变不出别名行（别名通道只在查询与词精确相等时由 broker 出
+        // 行，且缓存响应里根本不会有该词的别名行）。词集未知（拉取失败）时
+        // 缓存守卫按「可能命中别名」处理，绕过缓存直发 broker。
+        // 复审补丁：这里的 await 让出了 UI 线程——等待期间用户可能已击键发起新
+        // 搜索（bump _searchSeq）。恢复后必须与网络路径同款复查（seq + 查询
+        // 文本），否则旧查询的缓存过滤结果会最终态覆盖新查询结果，且下方
+        // _searchCts 赋值会覆盖新搜索的取消句柄。
+        if (!isEmptyQuery && !context.IsWindowMode && _onAliasList is not null && _aliasWords is null)
+        {
+            try
+            {
+                if (_pipe.IsConnected)
+                {
+                    var entries = await _onAliasList().ConfigureAwait(true);
+                    _aliasWords = [.. entries.SelectMany(entry => entry.Words)
+                        .Select(word => word.Trim().ToLowerInvariant())];
+                }
+            }
+            catch
+            {
+                // 词集保持 null：本次绕过缓存，下次搜索重试拉取。
+            }
+            if (seq != _searchSeq
+                || !string.Equals(query, _state.Query, StringComparison.Ordinal))
+                return;
         }
         if (!isEmptyQuery && !context.IsWindowMode && TryFilterCompleteCache(query, out var cached))
         {
@@ -1368,6 +1417,15 @@ public sealed class SearchViewModel
             || !cached.Context.IsEquivalentTo(_searchContext)
             || !query.StartsWith(cached.Response.Query, StringComparison.Ordinal)
             || string.Equals(query, cached.Response.Query, StringComparison.Ordinal))
+        {
+            response = null!;
+            return false;
+        }
+        // 别名守卫（2026-08-24）：装配了词表来源时，查询与某个别名词精确相等
+        // （trim + 小写，与 broker lookup_word 同口径）必须直发 broker——缓存
+        // 过滤拿不到别名行。词表还没拉到（null）同样绕过，宁可少缓存。
+        if (_onAliasList is not null
+            && (_aliasWords is null || _aliasWords.Contains(query.Trim().ToLowerInvariant())))
         {
             response = null!;
             return false;

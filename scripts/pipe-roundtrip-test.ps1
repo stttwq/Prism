@@ -31,7 +31,8 @@ try {
     $resp = $reader.ReadLine()
     Write-Host "PING   -> $resp"
     if ($resp -notmatch '"type":"pong"')    { $ok = $false; Write-Host "  FAIL expected pong" }
-    if ($resp -notmatch '"version":"0\.1\.0"') { $ok = $false; Write-Host "  FAIL expected version 0.1.0" }
+    # 2026-08-24: crate 版本对齐安装包 1.1 线（原 0.1.0）。
+    if ($resp -notmatch '"version":"1\.1\.0"') { $ok = $false; Write-Host "  FAIL expected version 1.1.0" }
 
     # --- search (skeleton returns empty items, must echo the query verbatim) ---
     $writer.WriteLine('{"type":"search","query":"' + $cnQuery + '","max":100}')

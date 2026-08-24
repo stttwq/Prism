@@ -352,7 +352,7 @@ fn decode_token(value: u64) -> (u64, usize) {
 #[cfg(windows)]
 mod platform {
     use super::RawWindow;
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, MAX_PATH, TRUE};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
@@ -522,9 +522,14 @@ mod platform {
             return None;
         }
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-        let mut buffer = vec![0u16; MAX_PATH as usize];
+        // 2026-08-24 修复：映像路径不受 MAX_PATH(260) 约束——长路径（node/
+        // git 深目录）会以 ERROR_INSUFFICIENT_BUFFER 失败，app 身份静默缺失，
+        // 窗口历史键（app_name 前缀）随之冲突。先给 1K，失败按回填长度重试
+        // 一次（QueryFullProcessImageNameW 在缓冲不足时回填所需大小，不含
+        // 终止符）。
+        let mut buffer = vec![0u16; 1024];
         let mut size = buffer.len() as u32;
-        let result = unsafe {
+        let mut result = unsafe {
             QueryFullProcessImageNameW(
                 handle,
                 PROCESS_NAME_FORMAT(0),
@@ -532,6 +537,18 @@ mod platform {
                 &mut size,
             )
         };
+        if result.is_err() {
+            buffer = vec![0u16; size as usize + 1];
+            size = buffer.len() as u32;
+            result = unsafe {
+                QueryFullProcessImageNameW(
+                    handle,
+                    PROCESS_NAME_FORMAT(0),
+                    windows::core::PWSTR(buffer.as_mut_ptr()),
+                    &mut size,
+                )
+            };
+        }
         let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
         result.ok()?;
         Some(String::from_utf16_lossy(&buffer[..size as usize]))

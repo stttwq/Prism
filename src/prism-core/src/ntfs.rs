@@ -405,8 +405,11 @@ mod platform {
                 hresult: 0,
             });
         }
-        // SAFETY: output 恰为 USN_JOURNAL_DATA_V0 大小且已对齐（u8 数组按值读出）。
-        let data = unsafe { std::ptr::read(output.as_ptr() as *const USN_JOURNAL_DATA_V0) };
+        // SAFETY: output 恰为 USN_JOURNAL_DATA_V0 大小；read_unaligned 消除
+        // 「u8 数组（对齐 1）转读含 u64 字段结构体」的未对齐 UB（2026-08-24
+        // 复审——x64 栈槽实际对齐无害，但语义上这是 UB，修复零成本）。
+        let data =
+            unsafe { std::ptr::read_unaligned(output.as_ptr() as *const USN_JOURNAL_DATA_V0) };
         Ok(JournalInfo {
             journal_id: data.UsnJournalID,
             first_usn: data.FirstUsn,

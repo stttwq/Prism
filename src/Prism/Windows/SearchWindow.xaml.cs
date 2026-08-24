@@ -906,6 +906,9 @@ public partial class SearchWindow : Window
             if (!_pipe.IsConnected)
                 await _pipe.StartAsync().ConfigureAwait(true);
             await _pipe.AliasSetAsync(aliasTarget, words).ConfigureAwait(true);
+            // 2026-08-24 修复：词集失效，前缀缓存守卫重新拉取——否则保存后
+            // 第一次搜别名词仍可能被本地前缀缓存拦截（别名行变不出来）。
+            _vm.NotifyAliasesChanged();
             _vm.State.StatusMessage = words.Count > 0
                 ? $"别名已保存：{string.Join("、", words)}"
                 : "别名已删除";

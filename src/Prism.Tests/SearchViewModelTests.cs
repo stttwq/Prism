@@ -186,6 +186,46 @@ public sealed class SearchViewModelTests
         Assert.Equal("微信", state.Results[0].Title);
     }
 
+    /// <summary>
+    /// 2026-08-24 修复：查询与别名词精确相等时必须直发 broker——前缀缓存按
+    /// 标题子串过滤，永远变不出别名行（别名通道只在精确相等时由 broker 出行，
+    /// 缓存响应里也不会有该词的别名行）。词集已加载且包含查询词 → 绕过缓存。
+    /// </summary>
+    [Fact]
+    public async Task AliasWordQueryBypassesPrefixCacheAndGoesToBroker()
+    {
+        var client = new FakeSearchClient();
+        // 三轮真实查询：首击 "wx"、删字 "w"、再回到别名精确词 "wx"。
+        client.Enqueue(Response("wx", false, 7, Result("wxWidgets.h")));
+        client.Enqueue(Response("w", false, 7, Result("wxWidgets.h"), Result("weight.csv")));
+        client.Enqueue(Response("wx", false, 7, Result("微信")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState();
+        IReadOnlyList<AliasEntry> aliases =
+        [
+            new AliasEntry(
+                new ActionTarget("application", @"C:\Program Files\Tencent\WeChat\WeChat.exe"),
+                ["wx"],
+                1000),
+        ];
+        var vm = new SearchViewModel(
+            state, client, timers, new ImmediateScheduler(),
+            aliasList: () => Task.FromResult(aliases));
+
+        vm.OnQueryChanged("wx");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+        vm.OnQueryChanged("w");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 2);
+        // "w" 的完整响应已入缓存；"wx" 是其前缀增长且恰为别名词——必须绕过
+        // 缓存直发 broker（缓存过滤只会给出 wxWidgets.h，别名行变不出来）。
+        vm.OnQueryChanged("wx");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 3 && state.Results.Count == 1);
+        Assert.Equal("微信", state.Results[0].Title);
+    }
+
     [Fact]
     public async Task WebModeSetsIsWebModeAndClearsOnEmptyQuery()
     {

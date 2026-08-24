@@ -35,7 +35,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD_STAMP: &str = env!("PRISM_BUILD_STAMP");
 pub const BUILD_PROFILE: &str = env!("PRISM_BUILD_PROFILE");
 
-/// 形如 `0.1.0+release.1754400000`，用于日志与握手回传。
+/// 形如 `1.1.0+release.1754400000`，用于日志与握手回传。
 pub fn build_id() -> String {
     format!("{VERSION}+{BUILD_PROFILE}.{BUILD_STAMP}")
 }

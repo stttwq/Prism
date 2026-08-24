@@ -312,7 +312,17 @@ fn execute_run_action(
     match id {
         // 无 mutation 文件/文件夹动作：复用已有 Shell 路径。
         ActionId::OpenFolder => reveal(&target),
-        ActionId::Properties | ActionId::AppProperties => shell_execute(&target, "properties"),
+        ActionId::Properties => shell_execute(&target, "properties"),
+        // 2026-08-24 修复：App 目标的 value 是开始菜单 .lnk，属性页要的是真实
+        // 可执行程序的（动作语义：查看真实可执行程序属性）。
+        ActionId::AppProperties => {
+            let resolved = crate::apps::resolve_lnk_target(&target.value);
+            let real = match resolved {
+                Some(path) => ActionTarget::new(TargetKind::Application, path),
+                None => target.clone(),
+            };
+            shell_execute(&real, "properties")
+        }
         ActionId::OpenWith => {
             if kind != TargetKind::File {
                 return Err(ShellError::new(
@@ -339,13 +349,21 @@ fn execute_run_action(
                     "run_as_admin is only available for applications",
                 ));
             }
+            // 仍对 .lnk 本身 runas：ShellExecute 会解析快捷方式并携带其
+            // 参数/工作目录提升真实目标——换成解析后的 exe 反而丢参数。
             shell_execute(&target, "runas")
         }
         // 剪贴板动作（已有实现，无 mutation）。L4：run_action_direct 已返回
         // 类型化 ShellError，不再从中文消息反推类别。
+        // 2026-08-24 修复：copy_app_path 复制的是真实可执行程序路径（.lnk
+        // 解析失败回退快捷方式路径本身）；copy/cut/copy_path 维持原值。
         ActionId::Copy | ActionId::Cut | ActionId::CopyPath | ActionId::CopyAppPath => {
-            crate::actions::run_action_direct(&target.value, id.as_str())
-                .map(|()| ShellOutcome::Success)
+            let value = if matches!(id, ActionId::CopyAppPath) {
+                crate::apps::resolve_lnk_target(&target.value).unwrap_or(target.value.clone())
+            } else {
+                target.value.clone()
+            };
+            crate::actions::run_action_direct(&value, id.as_str()).map(|()| ShellOutcome::Success)
         }
         // mutation 动作：IFileOperation 在 STA worker 上执行。
         ActionId::Recycle => crate::file_ops::recycle(&target),
@@ -624,7 +642,15 @@ fn reveal(target: &ActionTarget) -> Result<ShellOutcome, ShellError> {
             "target cannot be revealed",
         ));
     }
-    let normalized = target.value.replace('/', "\\");
+    // 2026-08-24 修复：Application 目标的 value 是开始菜单 .lnk——「打开所在
+    // 文件夹」要定位的是真实可执行程序（actions.rs 的动作语义如此），解析
+    // 失败回退 .lnk 本身。File/Directory 不解析：用户搜到的就是那个文件。
+    let value = if kind == TargetKind::Application {
+        crate::apps::resolve_lnk_target(&target.value).unwrap_or_else(|| target.value.clone())
+    } else {
+        target.value.clone()
+    };
+    let normalized = value.replace('/', "\\");
     let arg = format!("/select,\"{normalized}\"");
     std::process::Command::new("explorer")
         .raw_arg(arg)

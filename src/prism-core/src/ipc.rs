@@ -10,7 +10,7 @@
 //! 第八步：reload_engines 热替换引擎列表（设置页保存后立即生效）。
 //! 第九步：actions / run_action 接基础动作（打开所在文件夹/复制/剪切/复制路径）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -190,7 +190,7 @@ pub enum Response {
     Hello {
         protocol: u32,
         version: String,
-        /// 构建指纹（`0.1.0+release.<mtime>`），用于确认跑的是刚编出来的那份。
+        /// 构建指纹（`1.1.0+release.<mtime>`），用于确认跑的是刚编出来的那份。
         /// 纯新增字段，旧前端忽略即可。
         build_id: String,
     },
@@ -259,6 +259,10 @@ pub enum Response {
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
+        /// 结构化错误类别（snake_case：access_denied/target_invalid/conflict/
+        /// elevation_required/unsupported/system）。2026-08-24 复审确认：前端
+        /// 目前只读 message，此字段是**预留**——给将来按类别分支的错误处理用
+        ///（L4 的类型化产物），不是遗漏；前端接入前不要在此反推文案。
         #[serde(skip_serializing_if = "Option::is_none")]
         category: Option<crate::shell::ShellErrorKind>,
     },
@@ -1238,7 +1242,13 @@ fn alias_search_hits(
             position: 0,
             // L10（全仓复审 2026-08-22）：min 已保证 ≤ u32::MAX，直接 as 即可；
             // 原 unwrap_or(0) 是死码，反而掩盖饱和语义。
-            score: entry.bound_at_utc.min(u32::MAX as u64) as u32,
+            // 2026-08-24 修复：MatchMetadata::cmp 的 score 键是升序（原名长度，
+            // 短名优先）。直接放绑定时间秒会把「新绑定优先」的仲裁语义反过来
+            // （老绑定时间戳小反而排前）。取反后：同词多目标冷启动时新绑定在前，
+            // 与本函数文档注释一致。取反限制在 i32 域（u32::MAX - epoch 会超出
+            // 前端 PipeClient 的 TryGetInt32 值域，整个 match_metadata 被静默
+            // 丢弃）；2038 年后饱和为平手，由标题兜底排序。
+            score: (i32::MAX as u32) - entry.bound_at_utc.min(i32::MAX as u64) as u32,
             history_score: history.score(&target),
         };
         rows.push(SearchResult {
@@ -1252,6 +1262,46 @@ fn alias_search_hits(
         });
     }
     rows
+}
+
+/// 别名行并入既有结果（2026-08-24 修复）。
+///
+/// 目标已在字面/apps/历史/索引结果里时，此前直接丢弃别名行——「既有行的
+/// class/kind 不会更差」的假设对同目标的拼音行不成立（App 行经拼音通道是
+/// Initials kind，被丢弃后别名绑定的 class-0 Literal 加成凭空消失，首次搜索
+/// 排不到首位，要靠用户手选一次建立查询记忆才置顶）。现在只在别名 metadata
+/// 严格更优（或既有行无 metadata）时替换排序键，行本体（标题/spans/图标）
+/// 保持不动；新目标照旧追加行。
+fn merge_alias_rows(ranked: &mut Vec<SearchResult>, alias_rows: Vec<SearchResult>) {
+    let mut index_by_target: HashMap<String, usize> = ranked
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            (
+                crate::history::target_key(&item.target.kind, &item.target.value),
+                index,
+            )
+        })
+        .collect();
+    for row in alias_rows {
+        let key = crate::history::target_key(&row.target.kind, &row.target.value);
+        match index_by_target.get(&key) {
+            Some(&index) => {
+                let upgrade = match (row.match_metadata, ranked[index].match_metadata) {
+                    (Some(new), Some(existing)) => new < existing,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if upgrade {
+                    ranked[index].match_metadata = row.match_metadata;
+                }
+            }
+            None => {
+                index_by_target.insert(key, ranked.len());
+                ranked.push(row);
+            }
+        }
+    }
 }
 
 /// G5：token → 已复核的句柄。窗口目标永远不进 `ShellExecutor`：激活受 Windows 前台规则
@@ -1948,18 +1998,7 @@ async fn search_service(
         Vec::new()
     };
     if !alias_rows.is_empty() {
-        // 去重：目标已在字面/apps/历史/索引结果里就不再重复出行
-        //（既有行的 class/kind 不会更差，保既有行改动最小）。
-        let existing: HashSet<String> = ranked
-            .iter()
-            .map(|item| crate::history::target_key(&item.target.kind, &item.target.value))
-            .collect();
-        for row in alias_rows {
-            let key = crate::history::target_key(&row.target.kind, &row.target.value);
-            if !existing.contains(&key) {
-                ranked.push(row);
-            }
-        }
+        merge_alias_rows(&mut ranked, alias_rows);
     }
     // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
     // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
@@ -3629,6 +3668,188 @@ mod protocol_tests {
         assert!(alias_search_hits(&aliases, "wxx", &history, 8).is_empty());
         let _ = std::fs::remove_dir_all(&history_dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-08-24 修复锚定：同目标的拼音行不得丢掉别名绑定的 class-0 Literal
+    /// 加成——merge_alias_rows 升级排序键后，全局排序里别名目标压过 Initials
+    /// 行排到首位（首次搜索即置顶，不依赖查询记忆）。
+    #[test]
+    fn alias_merge_upgrades_pinyin_row_to_class_zero_literal() {
+        let lnk = r"C:\Users\x\Start Menu\Programs\微信.lnk";
+        // 既有行：拼音 Initials 命中（apps 通道对 "wx" 的真实产物形态）。
+        let mut ranked = vec![SearchResult {
+            kind: SearchResultKind::App,
+            title: Arc::from("微信"),
+            subtitle: Arc::from(lnk),
+            execute_id: Arc::from(lnk),
+            target: ActionTarget {
+                kind: "application".into(),
+                value: lnk.into(),
+            },
+            match_spans: Vec::new(),
+            match_metadata: Some(MatchMetadata {
+                kind: MatchKind::Initials,
+                class: 0,
+                position: 0,
+                score: 2,
+                history_score: 0,
+            }),
+        }];
+        // 别名行：同目标，class 0 Literal（绑定 "wx"）。
+        let alias_row = SearchResult {
+            kind: SearchResultKind::App,
+            title: Arc::from("微信.lnk"),
+            subtitle: Arc::from(lnk),
+            execute_id: Arc::from(lnk),
+            target: ActionTarget {
+                kind: "application".into(),
+                value: lnk.into(),
+            },
+            match_spans: Vec::new(),
+            match_metadata: Some(MatchMetadata {
+                kind: MatchKind::Literal,
+                class: 0,
+                position: 0,
+                score: (i32::MAX as u32) - 1770000000,
+                history_score: 0,
+            }),
+        };
+        merge_alias_rows(&mut ranked, vec![alias_row]);
+        // 不追加重复行；既有行的 metadata 升级为别名的 class-0 Literal。
+        assert_eq!(ranked.len(), 1);
+        let upgraded = ranked[0].match_metadata.unwrap();
+        assert_eq!(upgraded.kind, MatchKind::Literal);
+        assert_eq!(upgraded.class, 0);
+        // 全局排序：升级后的别名目标压过其他 Initials 行。
+        let mut ordered = vec![
+            SearchResult {
+                kind: SearchResultKind::App,
+                title: Arc::from("网校"),
+                subtitle: Arc::from(r"C:\Apps\wangxiao.lnk"),
+                execute_id: Arc::from(r"C:\Apps\wangxiao.lnk"),
+                target: ActionTarget {
+                    kind: "application".into(),
+                    value: r"C:\Apps\wangxiao.lnk".into(),
+                },
+                match_spans: Vec::new(),
+                match_metadata: Some(MatchMetadata {
+                    kind: MatchKind::Initials,
+                    class: 0,
+                    position: 0,
+                    score: 2,
+                    history_score: 99, // 重度使用
+                }),
+            },
+            ranked[0].clone(),
+        ];
+        sort_search_results_with_picks(&mut ordered, None);
+        assert_eq!(ordered[0].target.value, lnk, "别名目标必须排首位");
+    }
+
+    /// merge 的另一半：无 metadata 的既有行（注入候选等）接受升级；不同目标
+    /// 的别名行照旧追加；别名 metadata 更差时不降级既有行。
+    #[test]
+    fn alias_merge_appends_new_targets_and_never_downgrades() {
+        let mut ranked = vec![
+            SearchResult {
+                kind: SearchResultKind::File,
+                title: Arc::from("a.txt"),
+                subtitle: Arc::from(r"C:\a.txt"),
+                execute_id: Arc::from(r"C:\a.txt"),
+                target: ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\a.txt".into(),
+                },
+                match_spans: Vec::new(),
+                match_metadata: None,
+            },
+            SearchResult {
+                kind: SearchResultKind::File,
+                title: Arc::from("b.txt"),
+                subtitle: Arc::from(r"C:\b.txt"),
+                execute_id: Arc::from(r"C:\b.txt"),
+                target: ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\b.txt".into(),
+                },
+                match_spans: Vec::new(),
+                match_metadata: Some(MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: 5,
+                    history_score: 7,
+                }),
+            },
+        ];
+        let rows = vec![
+            // 无 metadata 的既有行 → 升级。
+            SearchResult {
+                kind: SearchResultKind::File,
+                title: Arc::from("a.txt"),
+                subtitle: Arc::from(r"C:\a.txt"),
+                execute_id: Arc::from(r"C:\a.txt"),
+                target: ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\a.txt".into(),
+                },
+                match_spans: Vec::new(),
+                match_metadata: Some(MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: 1,
+                    history_score: 0,
+                }),
+            },
+            // 既有行 metadata 更优（history_score 7 > 0）→ 不降级。
+            SearchResult {
+                kind: SearchResultKind::File,
+                title: Arc::from("b.txt"),
+                subtitle: Arc::from(r"C:\b.txt"),
+                execute_id: Arc::from(r"C:\b.txt"),
+                target: ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\b.txt".into(),
+                },
+                match_spans: Vec::new(),
+                match_metadata: Some(MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: 1,
+                    history_score: 0,
+                }),
+            },
+            // 新目标 → 追加。
+            SearchResult {
+                kind: SearchResultKind::File,
+                title: Arc::from("c.txt"),
+                subtitle: Arc::from(r"C:\c.txt"),
+                execute_id: Arc::from(r"C:\c.txt"),
+                target: ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\c.txt".into(),
+                },
+                match_spans: Vec::new(),
+                match_metadata: Some(MatchMetadata {
+                    kind: MatchKind::Literal,
+                    class: 0,
+                    position: 0,
+                    score: 1,
+                    history_score: 0,
+                }),
+            },
+        ];
+        merge_alias_rows(&mut ranked, rows);
+        assert_eq!(ranked.len(), 3, "无重复行，新目标追加");
+        assert!(ranked[0].match_metadata.is_some(), "None 行接受升级");
+        assert_eq!(
+            ranked[1].match_metadata.unwrap().history_score,
+            7,
+            "更优既有行不降级"
+        );
+        assert_eq!(ranked[2].target.value, r"C:\c.txt");
     }
 
     /// 别名协议三命令的解码形状。

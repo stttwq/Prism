@@ -47,10 +47,10 @@
 
     {
       "id": "root_deep_high_candidate",
-      "query": "e",
-      "root": "E:\\YX",
+      "query": "d",
+      "root": "D:\\YX",
       "categories": ["root_scope", "high_candidate", "deep_directory"],
-      "volume_scope": ["E:\\"],
+      "volume_scope": ["D:\\"],
       "notes": "~132k entries under root; single-letter query maximises candidates so ancestor validation dominates."
     },
     {
@@ -64,25 +64,25 @@
     {
       "id": "root_shallow_small",
       "query": "prism",
-      "root": "E:\\LS\\DM\\listary\\src",
+      "root": "D:\\LS\\DM\\Listary\\src",
       "categories": ["root_scope", "small_subtree"],
-      "volume_scope": ["E:\\"],
+      "volume_scope": ["D:\\"],
       "notes": "~2k entries; lower bound for root overhead when filtering saves little."
     },
     {
       "id": "root_no_hit",
       "query": "prism-g0-no-hit-019fabfb9808",
-      "root": "E:\\YX",
+      "root": "D:\\YX",
       "categories": ["root_scope", "no_hit"],
-      "volume_scope": ["E:\\"],
+      "volume_scope": ["D:\\"],
       "notes": "Root set but nothing matches: isolates root rejection/validation cost from result assembly."
     },
     {
       "id": "root_drive_root",
-      "query": "e",
-      "root": "E:\\",
+      "query": "d",
+      "root": "D:\\",
       "categories": ["root_scope", "drive_root", "high_candidate"],
-      "volume_scope": ["E:\\"],
+      "volume_scope": ["D:\\"],
       "notes": "Drive-root scope normalises to a 2-char prefix; guards the boundary case in path_is_under_root."
     }
   ]

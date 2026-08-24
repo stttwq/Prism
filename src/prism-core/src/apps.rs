@@ -270,6 +270,26 @@ impl LnkResolver {
     }
 }
 
+/// 解析单个 `.lnk` 的目标路径（Application 动作用：reveal/copy_app_path 等
+/// 应指向真实可执行程序而非开始菜单快捷方式）。非 .lnk 路径直接返回 None，
+/// 调用方回退原值。COM 必须已由调用方线程初始化（Shell STA worker）；
+/// 解析失败同样返回 None，行为退回修复前（对 .lnk 本身操作）。
+pub(crate) fn resolve_lnk_target(path: &str) -> Option<String> {
+    if !path.to_ascii_lowercase().ends_with(".lnk") {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        let mut resolver = LnkResolver::new(false);
+        resolver.resolve(Path::new(path))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Windows：整次扫描共用一次 CoInitialize + 一个 IShellLinkW。
 #[cfg(windows)]
 struct LnkResolver {
@@ -489,6 +509,19 @@ mod tests {
             prev = secs;
         }
         assert_eq!(prev, 3600);
+    }
+
+    /// 2026-08-24 修复锚定：非 .lnk 路径与磁盘上不存在的 .lnk 都返回 None
+    /// （调用方回退原值），绝不 panic。
+    #[test]
+    fn resolve_lnk_target_rejects_non_lnk_and_missing() {
+        assert_eq!(resolve_lnk_target(r"C:\Tools\weixin.exe"), None);
+        assert_eq!(resolve_lnk_target(r"C:\Tools\app.EXE"), None);
+        assert_eq!(
+            resolve_lnk_target(r"C:\Nonexistent\ghost.lnk"),
+            None,
+            "磁盘上不存在的 .lnk：COM Load 失败 → None"
+        );
     }
 
     #[test]

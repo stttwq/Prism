@@ -50,4 +50,23 @@ public sealed class AliasTests
         Assert.Empty(row.MatchSpans);
         Assert.Equal(SearchResultKind.App, row.ResultKind);
     }
+
+    /// <summary>
+    /// 2026-08-24 修复锚定：broker 别名行的 score 是「i32::MAX - 绑定秒」（升序
+    /// 排序键取反，见 ipc.rs alias_search_hits），上界恰为 int.MaxValue——前端
+    /// TryGetInt32 必须能整段解析 match_metadata（曾因 u32 取反越界被静默丢弃）。
+    /// </summary>
+    [Fact]
+    public void AliasRowScoreStaysWithinInt32ParseDomain()
+    {
+        using var doc = JsonDocument.Parse("""
+            {"kind":"app","title":"weixin.exe","subtitle":"C:\\Tools\\weixin.exe",
+             "execute_id":"C:\\Tools\\weixin.exe","match_spans":[],
+             "match_metadata":{"kind":"literal","class":0,"position":0,"score":2147483647}}
+            """);
+        var row = PipeClient.ParseResult(doc.RootElement);
+        Assert.NotNull(row.MatchMetadata);
+        Assert.Equal(0, row.MatchMetadata!.Class);
+        Assert.Equal(int.MaxValue, row.MatchMetadata.Score);
+    }
 }
