@@ -327,6 +327,72 @@ public sealed class SearchViewModelTests
         Assert.Contains("动作失败", state.StatusMessage);
     }
 
+    // ── 2026-08-25 修复：delete_permanent 的 DestructiveDialog 协同 ──
+
+    /// <summary>永久删除发起前后触发 Started/Ended；未固定成功后不走「保留窗口刷新」
+    /// 路径（窗口已为本动作隐藏，刷新无意义），也不触发 Failed。</summary>
+    [Fact]
+    public async Task PermanentDeleteRaisesDialogEventsAndSkipsRefreshWhenUnpinned()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+        var order = new List<string>();
+        vm.DestructiveDialogStarted += () => order.Add("started");
+        vm.DestructiveDialogEnded += () => order.Add("ended");
+        vm.DestructiveDialogFailed += _ => order.Add("failed");
+
+        var target = new SearchResult("file", "x.txt", @"C:\x.txt", @"C:\x.txt", []);
+        await vm.RunActionOnAsync(target, new ActionItem("delete_permanent", "永久删除", "", false, false));
+
+        Assert.Equal(new[] { "started", "ended" }, order);
+        Assert.Equal(0, client.SearchCount); // 未触发刷新重搜
+    }
+
+    /// <summary>永久删除失败走 DestructiveDialogFailed（窗口侧保证错误可见），
+    /// 超时文案与其他 mutation 一致报「结果未知」。</summary>
+    [Fact]
+    public async Task PermanentDeleteFailureRaisesFailedEventWithTimeoutWording()
+    {
+        var client = new FakeSearchClient
+        {
+            RunActionException = new IOException("后端响应超时（300 秒）"),
+        };
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+        string? failed = null;
+        vm.DestructiveDialogFailed += m => failed = m;
+
+        var target = new SearchResult("file", "x.txt", @"C:\x.txt", @"C:\x.txt", []);
+        await vm.RunActionOnAsync(target, new ActionItem("delete_permanent", "永久删除", "", false, false));
+
+        Assert.NotNull(failed);
+        Assert.Contains("结果未知", failed);
+        // 超时异常不再落 StatusMessage（窗口可能已隐藏，由 Failed 事件的订阅方展示）。
+        Assert.DoesNotContain("结果未知", state.StatusMessage);
+    }
+
+    /// <summary>钉住窗口不隐藏，成功后照旧刷新结果（与 recycle 等一致）。</summary>
+    [Fact]
+    public async Task PermanentDeletePinnedStillRefreshesResults()
+    {
+        var client = new FakeSearchClient();
+        client.Enqueue(Response("x", false, 1, Result("x")));
+        client.Enqueue(Response("x", false, 2, Result("x")));
+        var timers = new ManualTimerFactory();
+        var state = new AppState { IsPinned = true };
+        var vm = new SearchViewModel(state, client, timers, new ImmediateScheduler());
+        vm.OnQueryChanged("x");
+        timers.Input.Fire();
+        await Eventually(() => client.SearchCount == 1);
+
+        var target = new SearchResult("file", "x.txt", @"C:\x.txt", @"C:\x.txt", []);
+        await vm.RunActionOnAsync(target, new ActionItem("delete_permanent", "永久删除", "", false, false));
+
+        // RefreshAsync 的 3 秒 generation 超时在 ImmediateScheduler 下立即到期并重搜。
+        await Eventually(() => client.SearchCount == 2);
+    }
+
     [Fact]
     public async Task GenerationInvalidatesCacheAndLateResponseCannotOverwriteNewQuery()
     {

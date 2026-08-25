@@ -12,6 +12,7 @@
 //! - 路径失效：命中时 `Path::exists()` 复验（history stale paths 教训），
 //!   失效静默跳过。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -227,7 +228,17 @@ impl AliasStore {
         let temporary = self.path.with_extension("json.tmp");
         std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))
             .map_err(|error| format!("create alias directory: {error}"))?;
-        std::fs::write(&temporary, &bytes).map_err(|error| format!("write aliases: {error}"))?;
+        // 审计 2026-08-25（中）：补齐 fsync——history/index_cache/pinyin_sidecar
+        // 三层持久化都在 replace 前 sync_all，唯独别名表缺：ReplaceFileW 是元数据
+        // 操作，掉电窗口内新数据块可能未落盘，目标文件呈零填充/半写，下次启动
+        // 走 C1 隔离把用户全部别名静默清零。
+        {
+            let mut file = std::fs::File::create(&temporary)
+                .map_err(|error| format!("write aliases: {error}"))?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("write aliases: {error}"))?;
+        }
         crate::fs_util::atomic_replace(&temporary, &self.path, "aliases")
     }
 }

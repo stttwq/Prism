@@ -168,11 +168,24 @@ struct CacheEnvelopeLegacy<T> {
     state: T,
 }
 
+/// 审计 2026-08-25（中）：v5 缓存写盘互斥（见 save 内注释）。
+static CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn save(state: &IndexState, data_dir: &Path) -> Result<(), String> {
     // AUDIT-2026-08-18 R-C2: save 前只做抽样 validate——全量 validate 对每节点跑
     // path_for（O(n·depth)），大索引下可能超 SCM Stop 30s wait_hint。
     // load 侧保留全量 validate 作为缓存文件损坏的安全网。
     validate_before_save(state)?;
+    // 审计 2026-08-25（中）：v5 写盘互斥。maintenance checkpoint 被 stop 打断后，
+    // 其 spawn_blocking 仍在写 .tmp；停机 checkpoint 在另一线程并发
+    // File::create 同名 tmp——两把句柄交错写，先完成者的 atomic_replace 可把
+    // 混合内容装上，下次启动 checksum 失败触发全卷 MFT 重建。照抄 history/
+    // alias 的 persist 纪律把写盘段（含 atomic_replace）串行化。锁序恒为
+    // cache_write_lock → index.read（流式回调）；反向不存在——所有调用方都在
+    // 释放索引锁后以 owned snapshot 调用 save（见 checkpoint_sync 回落路径）。
+    let _write_guard = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::fs::create_dir_all(data_dir)
         .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
     let path = cache_path(data_dir);
@@ -222,6 +235,11 @@ pub fn save_streaming<F>(
 where
     F: FnMut(usize, &mut std::io::BufWriter<std::fs::File>) -> Result<u64, String>,
 {
+    // 审计 2026-08-25（中）：同 save 的写盘互斥——maintenance/停机/重建三条
+    // checkpoint 路径共享同一个 .tmp 文件名，必须串行写。
+    let _write_guard = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::fs::create_dir_all(data_dir)
         .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
     let path = cache_path(data_dir);

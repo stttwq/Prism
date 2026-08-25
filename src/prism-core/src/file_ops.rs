@@ -172,6 +172,20 @@ pub(crate) fn delete_permanent(target: &ActionTarget) -> Result<ShellOutcome, Sh
 
     let kind = validate_file_target(target)?;
     verify_target_on_disk(target, kind)?;
+    // H3 补强（审计 2026-08-25）：属主窗口创建失败（桌面堆/USER 对象耗尽的
+    // 极端场景）时，FOF_WANTNUKEWARNING 的确认对话框可能被抑制——文件会在
+    // 无任何确认的情况下被不可恢复删除。宁可不删：拒绝执行并给出可读错误，
+    // 用户改走资源管理器。回收站路径不受此守卫（可恢复，对话框本就非强制）。
+    OWNER_WINDOW.with(|hwnd| {
+        if hwnd.0.is_null() {
+            Err(ShellError::new(
+                ShellErrorKind::System,
+                "无法创建确认对话框的属主窗口，已拒绝永久删除（请改用资源管理器）",
+            ))
+        } else {
+            Ok(())
+        }
+    })?;
     let item = shell_item_from_path(&target.value)?;
     let op = create_file_operation()?;
 

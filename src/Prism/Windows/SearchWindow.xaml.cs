@@ -299,6 +299,11 @@ public partial class SearchWindow : Window
             if (!_contextMenuOpen)
                 ReleaseDeactivateGuardAfterDelay();
         };
+        // 永久删除协同（2026-08-25 修复）：系统确认对话框在后台 broker 里弹出，
+        // 窗口先让位（隐藏/撤 Topmost）+ 放行前台权限，失败时保证错误可见。
+        vm.DestructiveDialogStarted += OnDestructiveDialogStarted;
+        vm.DestructiveDialogEnded += OnDestructiveDialogEnded;
+        vm.DestructiveDialogFailed += OnDestructiveDialogFailed;
         vm.RootRejected += rejection =>
         {
             // BeginInvoke 而非 Invoke：后台线程触发的 Invalidate 不能阻塞等待 UI，
@@ -955,11 +960,83 @@ public partial class SearchWindow : Window
         timer.Tick += (_, _) =>
         {
             timer.Stop();
-            if (!_contextMenuOpen && !_contextMenuActionPending && !_hiding)
-                _ignoreDeactivate = false;
+            if (_contextMenuOpen || _contextMenuActionPending || _hiding)
+                return;
+            _ignoreDeactivate = false;
+            // 审计 2026-08-25（中）：守卫期间用户可能已把焦点切到别处（Alt-Tab /
+            // 点击其他程序）——Deactivated 与前台 WinEvent 回调都被守卫挡下，
+            // 守卫释放后不再有任何失焦事件来补刀，置顶窗口悬浮在新前台应用
+            // 之上。复刻 OnDragOutFinished 的补判：释放时复核激活态，该隐藏
+            // 就隐藏（焦点仍在 Prism 时 IsActive 为真，不受影响）。
+            if (!IsActive && SearchWindowFocusPolicy.ShouldHide(
+                    _ignoreDeactivate,
+                    _contextMenuOpen,
+                    _contextMenuActionPending,
+                    IsPinned,
+                    _hiding,
+                    _isDragging))
+                HideAnimated();
         };
         _releaseGuardTimer = timer;
         timer.Start();
+    }
+
+    // ── 永久删除协同（2026-08-25 修复）──────────────────────────────────
+    // delete_permanent 的系统确认对话框由后台 broker（prism-core STA 线程、
+    // message-only 属主窗口）创建：后台进程拿不到前台、对话框无任务栏按钮，
+    // 而本窗口 Topmost——对话框被整个挡住（结果多时窗口更高更必然），用户
+    // 看不到弹窗，IPC 拖到超时按失败报；确认后窗口也不按失焦语义隐藏。
+    // 对策：发起前放行前台权限（对话框可激活）+ 窗口让位（未固定隐藏、
+    // 固定撤 Topmost），结束后按钉住态收尾。
+
+    /// <summary>钉住窗口为对话框让位时撤下的 Topmost，动作结束后恢复。</summary>
+    private bool _topmostDroppedForDialog;
+
+    private void OnDestructiveDialogStarted()
+    {
+        // 必须在 Prism 仍持前台时调用：放行 broker 的对话框激活（一次性令牌）。
+        ForegroundInterop.AllowAnyProcessToTakeForeground();
+        if (IsPinned)
+        {
+            // 钉住 = 用户要求窗口保持可见：不能隐藏，改为临时撤 Topmost，
+            // 让激活后的对话框浮在窗口之上。
+            _topmostDroppedForDialog = true;
+            Topmost = false;
+        }
+        else
+        {
+            HideAnimated();
+        }
+    }
+
+    private void OnDestructiveDialogEnded()
+    {
+        if (_topmostDroppedForDialog)
+        {
+            _topmostDroppedForDialog = false;
+            Topmost = true;
+        }
+    }
+
+    private void OnDestructiveDialogFailed(string message)
+    {
+        // 失败必须可见：钉住路径窗口仍可见，就地报错；未固定路径窗口已为本
+        // 动作隐藏（ReleaseIdleMemory 清空了旧查询/结果，无处就地显示），
+        // 重新呼出空窗展示错误文案。
+        if (IsVisible && !_hiding)
+        {
+            if (_vm is not null)
+            {
+                _vm.State.StatusMessage = message;
+            }
+            Header.FocusQuery();
+            return;
+        }
+        ShowAndFocus();
+        if (_vm is not null)
+        {
+            _vm.State.StatusMessage = message;
+        }
     }
 
     /// <summary>当前目录 / 全局 范围状态机，供 App 同步设置里的总开关。</summary>
@@ -1291,6 +1368,12 @@ public partial class SearchWindow : Window
     private async Task OnHeaderKeyDownCore(KeyEventArgs e)
     {
         if (_vm is null) return;
+
+        // 审计 2026-08-25（高）：动作触发键的 OS 自动重复（按住 Enter 约 30Hz）会
+        // 逐个发起 execute IPC——首个完成隐藏窗口后，已排队的重复请求仍会执行
+        // （文件被打开 N 次）。仅导航键保留重复语义（按住上下键连续移动属预期）。
+        if (e.IsRepeat && e.Key is not (Key.Up or Key.Down or Key.PageUp or Key.PageDown))
+            return;
 
         // 动作快捷键（2026-08-21 设想）：先于输入/导航查用户表；保留键（导航/
         // Ctrl+Enter/Ctrl+G/Ctrl+数字）永远进不去用户表，原有按键行为零改动。

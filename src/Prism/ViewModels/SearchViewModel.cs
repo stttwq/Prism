@@ -71,6 +71,19 @@ public sealed class SearchViewModel
     public event Action? ModalPickEnded;
 
     /// <summary>
+    /// 永久删除（delete_permanent）的前后台协同三事件（2026-08-25 修复）。
+    /// 系统确认对话框由后台 broker 弹出：后台进程受 Windows 前台锁定压制，
+    /// 对话框拿不到前台也没有任务栏按钮，会被置顶的搜索窗整个挡住——用户
+    /// 看不到弹窗（症状：无确认直接超时失败），确认后窗口也不按失焦隐藏。
+    /// Started 在发起 IPC 前触发（窗口隐藏或撤 Topmost + 放行前台权限）；
+    /// Ended 在动作结束后触发（恢复钉住窗口的 Topmost）；Failed 携带错误
+    /// 文案（窗口已隐藏时需要重新呼出展示）。
+    /// </summary>
+    public event Action? DestructiveDialogStarted;
+    public event Action? DestructiveDialogEnded;
+    public event Action<string>? DestructiveDialogFailed;
+
+    /// <summary>
     /// 查询从非空变为空时请求释放空闲内存（由 SearchWindow 订阅）。
     /// 清空查询会丢弃结果引用，但 GC 只在窗口隐藏时跑——这里让窗口在 idle 时
     /// 额外做一次轻量回收，避免反复搜索后工作集只涨不降。
@@ -445,14 +458,36 @@ public sealed class SearchViewModel
         _state.SelectedIndex = n;
     }
 
+    /// <summary>
+    /// 审计 2026-08-25（高）：动作执行在飞守卫。IPC 慢（杀软扫描/属性页对话框）
+    /// 期间第二次 Enter/动作触发会重复执行（文件开两次、剪切执行两次）。
+    /// 键盘自动重复由窗口侧 IsRepeat 守卫拦，这里兜人为的快速双击/双按。
+    /// UI 线程调用（面板 Enter/快捷键/右键菜单），普通字段即可。
+    /// </summary>
+    private bool _actionInFlight;
+
     public async Task ExecuteSelectedAsync()
     {
         if (_state.Mode == PanelMode.Actions)
         {
+            // RunActionOnAsync 自带在飞守卫，这里不叠（叠加会把面板路径误吞）。
             await ExecuteActionAsync().ConfigureAwait(true);
             return;
         }
+        if (_actionInFlight) return;
+        _actionInFlight = true;
+        try
+        {
+            await ExecuteSelectedCoreAsync().ConfigureAwait(true);
+        }
+        finally
+        {
+            _actionInFlight = false;
+        }
+    }
 
+    private async Task ExecuteSelectedCoreAsync()
+    {
         var item = _state.SelectedResult;
         if (item is null) return;
 
@@ -655,7 +690,9 @@ public sealed class SearchViewModel
 
     /// <summary>
     /// 动作成功后隐藏窗口的动作集合。不在集合中的动作（rename/move_to/
-    /// recycle/delete_permanent/zip）保留窗口，等待 generation 更新或有界超时后重搜。
+    /// recycle/zip）保留窗口，等待 generation 更新或有界超时后重搜。
+    /// delete_permanent 不在此集合——它走 DestructiveDialog* 协同路径（发起前
+    /// 先隐藏，见 RunActionOnAsync），2026-08-25 修复后不再走到这里。
     /// </summary>
     private static readonly HashSet<string> HideAfterSuccessActions = new()
     {
@@ -665,6 +702,20 @@ public sealed class SearchViewModel
 
     /// <summary>执行指定目标上的动作，保持所有入口的成功隐藏和错误提示一致。</summary>
     public async Task RunActionOnAsync(SearchResult target, ActionItem action)
+    {
+        if (_actionInFlight) return;
+        _actionInFlight = true;
+        try
+        {
+            await RunActionOnCoreAsync(target, action).ConfigureAwait(true);
+        }
+        finally
+        {
+            _actionInFlight = false;
+        }
+    }
+
+    private async Task RunActionOnCoreAsync(SearchResult target, ActionItem action)
     {
         if (action.IsSectionHeader || string.IsNullOrEmpty(action.Id)) return;
         if (target.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(target.ExecuteId))
@@ -715,11 +766,40 @@ public sealed class SearchViewModel
             return;
         }
 
+        // 永久删除：FOF_WANTNUKEWARNING 强制弹出的系统确认对话框在后台 broker
+        // 进程里创建——先让窗口让位（未固定隐藏/固定撤 Topmost，订阅方决定），
+        // 再发 IPC。成功与用户取消都以完成收场：未固定时窗口已隐藏，无需刷新
+        // （隐藏即 ReleaseIdleMemory 清空状态，下次呼出全新；索引由 USN watcher
+        // 自行更新）；固定钉住时窗口仍可见，照旧走刷新。失败走
+        // DestructiveDialogFailed 由窗口保证错误可见（隐藏后需重新呼出）。
+        if (action.Id == "delete_permanent")
+        {
+            DestructiveDialogStarted?.Invoke();
+            try
+            {
+                await _pipe.RunActionAsync(target.ExecutionTarget, action.Id, _state.Query).ConfigureAwait(true);
+                if (_state.IsPinned)
+                {
+                    _state.StatusMessage = "操作完成，正在刷新…";
+                    await RefreshAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                DestructiveDialogFailed?.Invoke(ActionErrorMessage(ex, action.Id));
+            }
+            finally
+            {
+                DestructiveDialogEnded?.Invoke();
+            }
+            return;
+        }
+
         try
         {
             await _pipe.RunActionAsync(target.ExecutionTarget, action.Id, _state.Query).ConfigureAwait(true);
-            // mutation 动作（recycle/delete_permanent/zip）保留窗口等待 generation 刷新；
-            // 其余成功动作隐藏 Prism。
+            // mutation 动作（recycle/zip）保留窗口等待 generation 刷新；
+            // 其余成功动作隐藏 Prism。delete_permanent 已在上面的专属分支处理。
             if (HideAfterSuccessActions.Contains(action.Id))
             {
                 HideRequested?.Invoke();

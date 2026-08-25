@@ -107,8 +107,13 @@ public sealed class PipeClient : ISearchClient, IDisposable
         // 后台恢复连接时，NotifyConnection(true) 因 true==true 被吞——托盘永久
         // 停留"后端未连接"、每次召唤都显示"正在连接后端…"，且 ConnectionChanged
         // 侧的 NotifyAliasesChanged 被跳过（前缀缓存用旧词集）。按真实连接状态
-        // 对齐：成功保持 true（不产生冗余通知），失败改 false 让恢复路径可见。
-        _wasConnected = _query.IsConnected;
+        // 对齐：成功走 NotifyConnection（已连接时内部吞掉、无冗余事件；曾报过
+        // 失败则发出恢复通知——审计 2026-08-25 补：静默赋值会吞掉恢复路径），
+        // 失败改 false 让恢复路径可见。
+        if (_query.IsConnected)
+            NotifyConnection(true);
+        else
+            _wasConnected = false;
         if (!_query.IsConnected)
             throw new IOException("无法连接到后端");
     }
@@ -168,7 +173,15 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 // 没有任何机制会带走它）。只杀本体不杀树（Bug 3：用户应用是子进程）。
                 if (_backend is { HasExited: false } previous && previous.Id != pid)
                 {
-                    try { previous.Kill(); } catch { /* 已退出 */ }
+                    // 审计 2026-08-25（中）：动作通道有在途交互请求（属性页/复制
+                    // 确认/删除确认对话框挂在旧 broker 的 STA worker 上）时不能杀
+                    // ——用户眼前的系统对话框会随之消失、在途动作误报失败。留它
+                    // 活着：已在 Job Object 里随本进程退出统一回收，对话完成后
+                    // 动作通道的响应照常送达；无在途请求时照旧立即杀。
+                    if (!_action.HasPendingSlowRead)
+                    {
+                        try { previous.Kill(); } catch { /* 已退出 */ }
+                    }
                 }
                 try { _backend?.Dispose(); } catch { /* 已退出 */ }
                 _backend = proc; // 收编成功：接管生命周期（Dispose 时随 Job 一起回收），不得提前 Dispose
@@ -264,7 +277,12 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
         catch
         {
-            NotifyConnection(false);
+            // 审计 2026-08-25（中）：这里的失败可能只是 10s CTS 到期——_ioLock 被
+            // 用户路径的慢重连（最长约 13s）占着，连接本身可能已被那条路径修好。
+            // 不核实就 NotifyConnection(false) 会让 UI 停在"正在重连"，随后
+            // StartAsync 成功路径的赋值又吞掉恢复通知（F1 同症状的新复发路径）。
+            // 按实际连接状态汇报；真断连仍是 false。
+            NotifyConnection(_query.IsConnected);
         }
     }
 

@@ -22,6 +22,20 @@ internal static class ForegroundInterop
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 
+    /// <summary>AllowSetForegroundWindow 的 ASFW_ANY：放行任意进程的下一次前台请求。</summary>
+    private const uint ASFW_ANY = unchecked((uint)-1);
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(uint dwProcessId);
+
+    /// <summary>
+    /// Prism 持前台时放行后台进程（broker 的 IFileOperation 确认对话框）激活：
+    /// 不放行时对话框压在前台锁定下——无焦点、无任务栏按钮（属主窗口拥有），
+    /// 藏在所有窗口后面。放行令牌一次性消费，窗口本来也要随即隐藏/让位。
+    /// </summary>
+    public static void AllowAnyProcessToTakeForeground() =>
+        _ = AllowSetForegroundWindow(ASFW_ANY);
+
     // ── 多显示器定位（B4）──────────────────────────────────────────────
     private const uint MONITOR_DEFAULTTONEAREST = 2;
 
