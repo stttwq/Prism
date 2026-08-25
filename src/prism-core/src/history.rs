@@ -289,13 +289,6 @@ impl HistoryStore {
         if let Ok(mut cache) = self.weights_cache.lock() {
             *cache = None;
         }
-        for file in [&self.path, &self.legacy_path] {
-            match std::fs::remove_file(file) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("clear history: {error}")),
-            }
-        }
         if let Ok(mut diagnostic) = self.diagnostic.write() {
             *diagnostic = None;
         }
@@ -305,8 +298,29 @@ impl HistoryStore {
         }
         // M2：代际 +1——所有在飞（已快照代际、尚未落盘）的 persist 就此作废，
         // 不把 clear 前的旧快照写回磁盘复活已清空的历史。
+        // R1（全仓检验 2026-08-25 第二轮）：推进必须先于文件删除——此前删除失败
+        // 走提前 return，epoch 未动，clear 前在飞、尚未拿到 persist_lock 的旧快照
+        // 稍后代际检查照旧通过，把已清空的历史整份写回磁盘复活。代际语义只关心
+        // 「内存态已被替换」，不应依赖文件删除成败。
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        // 文件删除放最后且互不掩盖：v2 删除成功不因 v1 失败而回滚，失败仅收集为
+        // 告警（内存已清空是事实，向用户报"整体失败"反而背离真实状态）。
+        let mut failure = None;
+        for file in [&self.path, &self.legacy_path] {
+            match std::fs::remove_file(file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(format!("clear history: {error}"));
+                    }
+                }
+            }
+        }
+        match failure {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
     }
 
     pub fn record(&self, target: &ActionTarget, usage: HistoryUse) -> Result<(), String> {
@@ -846,6 +860,40 @@ mod tests {
             !store.path.exists(),
             "clear 后在飞 persist 必须放弃，不得复活历史文件"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// R1（全仓检验 2026-08-25 第二轮）：clear 时文件删除失败（杀软锁文件、权限抖动）
+    /// 不得绕过代际保护——旧快照的在飞 persist 仍必须作废；且失败只作告警，
+    /// 内存态保持已清空。用「legacy 路径被同名目录占住」模拟 remove_file 失败。
+    #[test]
+    fn clear_failure_still_aborts_in_flight_persist() {
+        let dir = test_dir("clear-fail-epoch");
+        // 预放 legacy 文件形态的目录：remove_file 对目录必然失败。
+        std::fs::create_dir_all(dir.join("history-v1.json")).unwrap();
+        let store = HistoryStore::load_at(&dir, true, 1_000_000);
+        store
+            .record_at(
+                &target("C:\\gone.txt"),
+                HistoryUse::Execute,
+                None,
+                1_000_000,
+            )
+            .unwrap();
+        assert!(store.path.exists(), "首条 record 立即落盘");
+        let captured = store.epoch.load(Ordering::Acquire);
+        // clear 报删除失败（legacy 目录删不掉），但内存清空与代际推进必须已完成。
+        assert!(store.clear().is_err(), "legacy 删除失败必须上报");
+        assert!(
+            !store.path.exists(),
+            "v2 文件照常删除，不被 legacy 失败掩盖"
+        );
+        store.persist_snapshot(captured).unwrap();
+        assert!(
+            !store.path.exists(),
+            "删除失败分支同样作废在飞 persist，不得复活历史"
+        );
+        assert!(store.weights().is_empty(), "内存态保持已清空");
         let _ = std::fs::remove_dir_all(dir);
     }
 

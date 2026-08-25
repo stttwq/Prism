@@ -1161,6 +1161,10 @@ public sealed class SearchViewModel
         var recall = BuildWorksetRecallRow(query);
         if (recall is not null)
             list.Insert(0, recall);
+        // 全仓检验 2026-08-25 第二轮（F2）：State.Results 与 ResultList 显示集合必须
+        // 同源去重——此前只在显示层去重，一旦 broker（或旧版本 broker）产出同键
+        // 重复行，两列表索引错一位：选中/Enter 执行/Ctrl+N 全部偏移到错误的行。
+        list = SearchResult.DeduplicateRows(list);
 
         if (updateCache
             && !string.IsNullOrWhiteSpace(query)

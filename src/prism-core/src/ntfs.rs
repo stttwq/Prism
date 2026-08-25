@@ -306,6 +306,14 @@ mod platform {
         }
     }
 
+    /// R3（全仓检验 2026-08-25 第二轮）：纯 API 探测当前逻辑驱动器位掩码，零磁盘
+    /// I/O。maintenance tick 据此廉价发现"运行期新挂载的固定 NTFS 卷"——此前卷
+    /// 发现只在启动路径执行一次，服务运行期间新挂载/新格式化的固定卷永远搜不到，
+    /// 只能重启服务。失败返回 0（调用方视作无变化，下拍重试）。
+    pub fn logical_drive_mask() -> u32 {
+        unsafe { GetLogicalDrives() }
+    }
+
     pub fn discover_volumes() -> Result<Vec<VolumeDescriptor>, String> {
         let mask = unsafe { GetLogicalDrives() };
         if mask == 0 {

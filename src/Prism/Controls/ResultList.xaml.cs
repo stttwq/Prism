@@ -31,6 +31,13 @@ public partial class ResultList : UserControl
     private Brush? _normalBrush;
     private ImageSource? _moreIcon;
 
+    // 全仓检验 2026-08-25 第二轮（F1）：图标重试的节流簿记。Source 空重试让失败
+    // 可自愈，但裸重试会按"装饰遍数 × 行数"叠加 shell I/O（滚动逐帧触发装饰）。
+    // 在途去抖挡并发；同一身份连续失败达上限后停止重试，直到 DPI 变更换新身份。
+    private readonly HashSet<string> _iconLoadsInFlight = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _iconFailedAttempts = new(StringComparer.Ordinal);
+    private const int MaxIconAttempts = 3;
+
     public ResultList()
     {
         InitializeComponent();
@@ -75,12 +82,16 @@ public partial class ResultList : UserControl
             var next = value ?? Array.Empty<SearchResult>();
             if (ReferenceEquals(_items, next)) return;
 
-            var countChanged = _items.Count != next.Count;
-            _items = next;
+            // 去重后的列表才是显示/索引的单一事实源：装饰与 ItemAt 都按 _items[i] 取行，
+            // 若 _items 保留原始列表而 display 按去重列表同步，中段丢弃重复行后两边索引错位。
+            // VM 组装时已去过重（SearchResult.DeduplicateRows），这里是最后防线。
+            var unique = SearchResult.DeduplicateRows(next);
+            var countChanged = _items.Count != unique.Count;
+            _items = unique;
             _syncing = true;
             try
             {
-                SynchronizeDisplayItems(next);
+                SynchronizeDisplayItems(unique);
             }
             finally
             {
@@ -154,11 +165,20 @@ public partial class ResultList : UserControl
         set
         {
             if (List.SelectedIndex == value) return;
+            // F5（全仓检验 2026-08-25 第二轮）：Selector 内部抛异常（如历史上的
+            // ItemInfo 重复键类）不得把 _syncing 永久留在 true——否则选择回调与
+            // 装饰从此在入口静默 return，列表变僵尸。
             _syncing = true;
-            List.SelectedIndex = value;
-            if (value >= 0 && value < List.Items.Count)
-                List.ScrollIntoView(List.Items[value]);
-            _syncing = false;
+            try
+            {
+                List.SelectedIndex = value;
+                if (value >= 0 && value < List.Items.Count)
+                    List.ScrollIntoView(List.Items[value]);
+            }
+            finally
+            {
+                _syncing = false;
+            }
         }
     }
 
@@ -311,6 +331,8 @@ public partial class ResultList : UserControl
         base.OnDpiChanged(oldDpi, newDpi);
         UpdateListHeight();
         // DPI 变化后图标身份键带新尺寸，重装饰会触发按新尺寸重载。
+        // 失败计数随新尺寸身份一并清零（F1）：换显示器/缩放是重试的合理时机。
+        _iconFailedAttempts.Clear();
         DecorateVisibleItems();
     }
 
@@ -486,7 +508,14 @@ public partial class ResultList : UserControl
             {
                 var path = item.ExecuteId;
                 var identity = path + "@" + IconPixelSize();
-                if (!Equals(icon.Tag as string, identity))
+                // Source 为空即重试：Tag 已等于 identity 但图标从未到位的行（加载失败、
+                // 或异常风暴期间装饰中断留下的半初始化容器）不会再有任何事件触发重载，
+                // 图标就永久空着（2026-08-25 用户报告：文件夹行只剩文本）。失败不进
+                // IconCache 缓存，瞬时失败下一个装饰周期自愈；同一身份连续失败达上限
+                // 即止（断网网络盘等持续失败不再按装饰遍数反复探盘），DPI 变更换新
+                // 身份重新计。成功后 Source 非空 + 引用比较短路，零额外开销。
+                if ((!Equals(icon.Tag as string, identity) || icon.Source is null)
+                    && _iconFailedAttempts.GetValueOrDefault(identity) < MaxIconAttempts)
                 {
                     icon.Tag = identity;
                     icon.Source = null;
@@ -556,15 +585,27 @@ public partial class ResultList : UserControl
     private async Task LoadIconAsync(string path, int pixelSize, string identity, Image target)
     {
         if (_icons is null) return;
+        // F1：在途去抖——装饰周期可能比加载快（滚动逐帧触发），同身份并发加载
+        // 只会让首个完成者胜出，其余白做 shell I/O。
+        if (!_iconLoadsInFlight.Add(identity)) return;
         try
         {
             var src = await _icons.GetAsync(path, pixelSize).ConfigureAwait(true);
             if (!Equals(target.Tag as string, identity)) return;
             target.Source = src;
+            if (src is not null)
+                _iconFailedAttempts.Remove(identity);
+            else
+                _iconFailedAttempts[identity] = _iconFailedAttempts.GetValueOrDefault(identity) + 1;
         }
         catch
         {
-            // 图标失败不影响搜索。
+            // 图标失败不影响搜索；计入失败上限。
+            _iconFailedAttempts[identity] = _iconFailedAttempts.GetValueOrDefault(identity) + 1;
+        }
+        finally
+        {
+            _iconLoadsInFlight.Remove(identity);
         }
     }
 

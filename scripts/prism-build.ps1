@@ -493,10 +493,14 @@ function Invoke-Verify {
     # L36（全仓复审 2026-08-22）：dist/ 的追踪二进制也纳入比对——它们是安装包
     # 的直接来源，且 git 里追踪（曾让一份陈旧副本盖住新构建好几天）。
     # Invoke-Verify 从来只比 target/release 与安装目录，dist/ 无人看守。
+    # X1 addendum (audit 2026-08-25 round 2): also compare deps.json / runtimeconfig.json
+    # (M21 fixed a stale deps.json shipping, but the hash gate never covered them).
     $distDir = Join-Path $RepoRoot 'dist'
-    foreach ($name in @('prism-core.exe', 'prism-indexer-service.exe', 'Prism.exe', 'Prism.dll')) {
+    foreach ($name in @('prism-core.exe', 'prism-indexer-service.exe', 'Prism.exe', 'Prism.dll',
+                        'Prism.deps.json', 'Prism.runtimeconfig.json')) {
         $distPath = Join-Path $distDir $name
         $builtPath = if ($name -eq 'Prism.dll') { Join-Path $AppOut 'Prism.dll' }
+                     elseif ($name -like 'Prism.*.json') { Join-Path $AppOut $name }
                      else { $Artifacts[$name].Built }
         $builtHash = Get-Sha $builtPath
         if ($null -eq $builtHash) { continue }

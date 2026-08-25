@@ -1263,6 +1263,13 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
     let mut deferred_rebuilds: Vec<DeferredVolumeRebuild> = Vec::new();
     // M3（FRESH-AUDIT-3-2026-08-20）：拼音重建退避——None 表示启动后首轮立即可做。
     let mut last_pinyin_rebuild: Option<Instant> = None;
+    // R3（全仓检验 2026-08-25 第二轮）：卷发现此前只在启动路径执行一次，服务运行期
+    // 间新挂载/新格式化的固定 NTFS 卷永远不入索引（RebuildRequest::Full 曾无生产
+    // 发送点）。maintenance tick 用零 I/O 的盘符位掩码探测变化，出现新盘符才做一次
+    // 完整探测；seen 掩码只增不减——U 盘反复插拔不重复触发探测。
+    let mut indexed_letters: Vec<char> =
+        initial.descriptors.iter().map(|d| d.drive_letter).collect();
+    let mut seen_drive_mask = ntfs::logical_drive_mask();
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     'run: loop {
         tokio::select! {
@@ -1311,6 +1318,8 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                             Ok((index, descriptors)) => {
                                 epoch.fetch_add(1, Ordering::AcqRel);
                                 state.building.store(true, Ordering::Release);
+                                // R3：全量重建后的卷集合是新的事实源。
+                                indexed_letters = descriptors.iter().map(|d| d.drive_letter).collect();
                                 // 缓存写失败按可降级故障处理：新索引已在内存，先发布继续服务；
                                 // 旧缓存 + USN 前滚保证重启安全。退出会丢弃热索引并触发
                                 // SCM 重启循环，代价远大于一次降级提示。
@@ -1383,6 +1392,10 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                         match rebuilt {
                             Ok(Ok(volume)) => {
                                 state.merge_and_publish(volume);
+                                // R3：该卷已入索引，避免新卷探测把它当新增重复触发 Full。
+                                if !indexed_letters.contains(&descriptor.drive_letter) {
+                                    indexed_letters.push(descriptor.drive_letter);
+                                }
                                 // M1：成功即撤销该卷的挂起重试。
                                 remove_deferred_rebuild(&mut deferred_rebuilds, &descriptor.id);
                                 // AUDIT-4-2026-08-20 修 2：单卷重建后必须失效拼音
@@ -1428,6 +1441,34 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                 }
             }
             _ = maintenance.tick() => {
+                // R3（全仓检验 2026-08-25 第二轮）：运行期新挂载固定 NTFS 卷的探测。
+                // 先做零 I/O 的位掩码比对（GetLogicalDrives），出现新盘符才 spend 一次
+                // 完整探测（spawn_blocking：含 GetDriveType/FS 查询与卷 GUID 获取，
+                // 与启动发现完全同口径——只认 DRIVE_FIXED + NTFS，U 盘/网络盘不触发）。
+                // 新卷不在索引集合即发送 Full 重建（沿用 H1 的积压合并与退避路径）；
+                // 探测失败也推进 seen 掩码，避免坏盘符让 5s tick 连续做完整探测。
+                let mask = ntfs::logical_drive_mask();
+                if mask != 0 && mask & !seen_drive_mask != 0 {
+                    let probe = tokio::task::spawn_blocking(discover_ordered_volumes).await;
+                    if let Ok(Ok(descriptors)) = probe {
+                        let new_fixed: Vec<char> = descriptors
+                            .iter()
+                            .map(|d| d.drive_letter)
+                            .filter(|letter| !indexed_letters.contains(letter))
+                            .collect();
+                        if !new_fixed.is_empty() {
+                            let letters = new_fixed
+                                .iter()
+                                .map(|letter| format!("{letter}:"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let _ = rebuild_tx.send(RebuildRequest::Full(format!(
+                                "new fixed NTFS volume appeared: {letters}"
+                            )));
+                        }
+                    }
+                    seen_drive_mask |= mask;
+                }
                 // 2026-08-22 内存收口：空闲 ≥3 分钟且未在重建时修剪 indexer 工作集。
                 // 单次搜索把整卷 MFT 随机节点拉进工作集（~64MB 常驻），OS 自发修剪
                 // 要约 1 小时；这里与前端 3 分钟 trim 同节奏主动释放。重建窗口
@@ -2542,8 +2583,21 @@ async fn serve(state: Arc<ServiceState>, first_pipe: NamedPipeServer) -> Result<
 /// 瞬时失败（资源不足、ACL 临时不可用）退避重试（100ms 起指数、上限 5s），
 /// 连续失败超 60s 才升级为致命——与 SCM Stop 的 wait_hint 对齐。
 async fn accept_loop(state: Arc<ServiceState>, mut server: NamedPipeServer) -> Result<(), String> {
+    // R4（全仓检验 2026-08-25 第二轮）：R-B3 只覆盖了 create_pipe 失败，connect 失败
+    // 仍是一条瞬时错误就丢掉全部热索引、SCM 重启 + 全卷 MFT 重扫。失败实例不可
+    // 复用：丢弃后与 rearm 同款退避重建（100ms 起指数、上限 5s），只有 rearm 的
+    // 60s 升级条件保留致命语义。
+    let mut connect_backoff = Duration::from_millis(100);
     loop {
-        server.connect().await.map_err(|error| error.to_string())?;
+        if let Err(error) = server.connect().await {
+            log(format!("pipe connect failed, re-arming listener: {error}"));
+            drop(server);
+            tokio::time::sleep(connect_backoff).await;
+            connect_backoff = (connect_backoff * 2).min(Duration::from_secs(5));
+            server = rearm_with_backoff().await?;
+            continue;
+        }
+        connect_backoff = Duration::from_millis(100);
         let connected = server;
         server = rearm_with_backoff().await?;
         // R-A3：超限连接握手前直接关闭，不产生任务与行缓冲。

@@ -569,17 +569,24 @@ fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, Shel
         .chain(std::iter::once(0))
         .collect();
     let verb_wide: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
-    // 传父目录作为工作目录。
-    let dir: Vec<u16> = std::path::Path::new(&target.value)
-        .parent()
-        .and_then(|p| p.to_str())
-        .map(|s| {
-            std::ffi::OsStr::new(s)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect::<Vec<u16>>()
-        })
-        .unwrap_or_default();
+    // 传父目录作为工作目录。R2（全仓检验 2026-08-25 第二轮）：web 目标跳过——
+    // 对 URL 取 parent() 会产出 "https://host/" 这类不存在的"目录"，传入
+    // lpDirectory 后部分协议激活链路（视默认浏览器注册形态）直接激活失败，
+    // 表现为网页行回车无反应。URL 激活不需要工作目录，显式传 null。
+    let dir: Vec<u16> = if kind == TargetKind::Web {
+        Vec::new()
+    } else {
+        std::path::Path::new(&target.value)
+            .parent()
+            .and_then(|p| p.to_str())
+            .map(|s| {
+                std::ffi::OsStr::new(s)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect::<Vec<u16>>()
+            })
+            .unwrap_or_default()
+    };
 
     // SEE_MASK_INVOKEIDLIST: 让 ShellExecuteEx 通过 IContextMenu 路由 verb，
     // 解决后台进程调用 "properties" 等 verb 时返回 code 31 (SE_ERR_NOASSOC) 的问题。

@@ -21,7 +21,11 @@ public sealed class IndexerGenerationClient : IIndexGenerationClient
     private const string PipeName = "prism-indexer-v1";
     /// <summary>
     /// 与 prism-core 的 <c>INDEXER_PROTOCOL</c>（<c>src/prism-core/src/lib.rs</c>，当前为 2）
-    /// 保持一致。这是"单一真源"的镜像——Rust 侧是源头，C# 侧手动同步并在测试中锚定。
+    /// 保持一致。Rust 侧是源头，C# 侧**手动镜像、无编译期联动、也没有自动化锚定测试**
+    ///（X1，全仓检验 2026-08-25 第二轮更正：旧注释声称"在测试中锚定"不实）。
+    /// 升 Rust 侧协议号时必须同改这里，否则 generation 长轮询握手永久 mismatch，
+    /// 文件变更通知静默失效（RunAsync 只 1s 退避重连、无 UI 提示）。改动任一侧的
+    /// 协议号后跑 scripts\pipe-roundtrip-test.ps1 做端到端复核。
     /// </summary>
     private const int ProtocolVersion = 2;
 

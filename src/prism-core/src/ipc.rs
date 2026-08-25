@@ -296,6 +296,19 @@ pub enum SearchResultKind {
     Window,
 }
 
+impl SearchResultKind {
+    /// 序列化后的 kind 字符串（serde snake_case 的手写镜像，供去重键使用）。
+    fn wire_str(self) -> &'static str {
+        match self {
+            SearchResultKind::App => "app",
+            SearchResultKind::File => "file",
+            SearchResultKind::Folder => "folder",
+            SearchResultKind::Web => "web",
+            SearchResultKind::Window => "window",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     /// "app" | "file" | "folder" | "web"（"more" 行由前端生成）。
@@ -576,12 +589,23 @@ async fn accept_loop(
     shared: Arc<BrokerShared>,
     ownership: Arc<PipeOwnership>,
 ) -> std::io::Result<()> {
+    // R4（全仓检验 2026-08-25 第二轮）：单次 connect 错误不再让整个 accept 循环退出
+    // ——旧路径丢掉其余健康 listener，broker exit(1)，与诱因（瞬时管道状态竞争）
+    // 完全不成比例。失败实例不可复用：计数减掉、退避一小段后走 rearm 重建。
+    // rearm 返回 Err 仅剩"管道名被第三方抢注"一种致命语义，照旧上抛让位。
+    let mut connect_retry_delay = std::time::Duration::from_millis(100);
     loop {
         if let Err(error) = server.connect().await {
             // armed 实例被本错误路径丢弃，计数必须同步减掉，否则抢注探测永远看不到 0。
             ownership.instances.fetch_sub(1, Ordering::Relaxed);
-            return Err(error);
+            log(format!("管道 connect 失败，重建 listener 重试：{error}"));
+            drop(server);
+            tokio::time::sleep(connect_retry_delay).await;
+            connect_retry_delay = (connect_retry_delay * 2).min(std::time::Duration::from_secs(5));
+            server = rearm_listener(&pipe_name, &ownership).await?;
+            continue;
         }
+        connect_retry_delay = std::time::Duration::from_millis(100);
         let connected = server;
         // 实例从 armed 转为 connected，仍归本进程持有，计数不变；
         // 连接任务结束时由其减 1。
@@ -1324,6 +1348,27 @@ fn merge_alias_rows(ranked: &mut Vec<SearchResult>, alias_rows: Vec<SearchResult
     alias_indices
 }
 
+/// 2026-08-25 修复：多通道（字面/拼音/apps/历史注入/别名）汇入 ranked 后的最终去重。
+/// 键与前端 ResultList 的 ContainerKey 同构（kind+execute_id+title）：同键两行会把
+/// 同一实例两次插进前端显示集合，ListBox 出现重复行，WPF Selector 的选中簿记随即抛
+/// "An item with the same key has already been added. Key: …ItemInfo"，且中毒行跨查询
+/// 存活——此后每次按键都报"搜索失败"直至重启（用户报告：搜索 B 后输入什么都失败）。
+/// 保序保留首次出现（排序已定优劣）；窗口行单一通道且 token 天然唯一，不走此去重。
+fn dedupe_row_identities(ranked: &mut Vec<SearchResult>) {
+    if ranked.len() <= 1 {
+        return;
+    }
+    let mut seen = HashSet::with_capacity(ranked.len());
+    ranked.retain(|row| {
+        seen.insert(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            row.kind.wire_str(),
+            row.execute_id,
+            row.title
+        ))
+    });
+}
+
 /// G5：token → 已复核的句柄。窗口目标永远不进 `ShellExecutor`：激活受 Windows 前台规则
 /// 约束，只能由前台进程（WPF）完成，broker 这里只负责复核并交出句柄。
 fn resolve_window(
@@ -2053,6 +2098,7 @@ async fn search_service(
         None
     };
     sort_search_results_with_picks(&mut ranked, pick_flags.as_deref());
+    dedupe_row_identities(&mut ranked);
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
     items.extend(ranked);
@@ -2324,6 +2370,7 @@ async fn path_query_results(
         let fields = process_indexer_reply(reply, "", history, &empty, &empty, &mut ranked);
         // 浏览项里也含 root 自身（未跌出 top-K 的情形）——去掉首行之后的重复。
         dedupe_after_self_row(&mut ranked, path.as_str());
+        dedupe_row_identities(&mut ranked);
         ranked.truncate(max);
         return Some(path_response(raw_query, fields, ranked));
     }
@@ -2353,6 +2400,7 @@ async fn path_query_results(
             // 的 is_truncated 按放宽口径判定；截回 max 后必须像全局路径一样
             // 重算（ipc.rs search_service 的 is_truncated 同式），否则命中数
             // 落在 (max, 3×max] 的结果既显示不全又没有"更多"行可展开。
+            dedupe_row_identities(&mut ranked);
             let truncated = fields.is_truncated || ranked.len() > max;
             ranked.truncate(max);
             let fields = IndexerReplyFields {
@@ -3969,6 +4017,42 @@ mod protocol_tests {
             "更优既有行不降级"
         );
         assert_eq!(ranked[2].target.value, r"C:\c.txt");
+    }
+
+    /// 2026-08-25 用户报告锚定：同键行（kind+execute_id+title 相同，spans 可不同）
+    /// 绝不能进最终结果——前端 ResultList 的同步算法与 WPF Selector 的选中簿记
+    /// 都假定行键唯一，同键两行让前端把同一实例插两次并抛
+    /// "An item with the same key has already been added. Key: …ItemInfo"，
+    /// 且此后每次按键都复发直至重启。
+    #[test]
+    fn dedupe_row_identities_keeps_first_occurrence() {
+        let mk = |title: &str, exec: &str, spans: Vec<i32>| SearchResult {
+            kind: SearchResultKind::Folder,
+            title: Arc::from(title),
+            subtitle: Arc::from(exec),
+            execute_id: Arc::from(exec),
+            target: crate::shell::ActionTarget::new(crate::shell::TargetKind::Directory, exec),
+            match_spans: spans,
+            match_metadata: None,
+        };
+        let mut ranked = vec![
+            mk("B", r"C:\B", vec![0, 1]),
+            mk("other", r"C:\x", vec![]),
+            // 同键不同 spans（字面通道 + 拼音通道对同一路径各出一条的形态）。
+            mk("B", r"C:\B", vec![2, 3]),
+            // 同名不同路径：不是重复，必须保留。
+            mk("B", r"C:\B2", vec![]),
+        ];
+        dedupe_row_identities(&mut ranked);
+        assert_eq!(ranked.len(), 3, "同键行只留首行，同名异径保留");
+        assert_eq!(ranked[0].execute_id.as_ref(), r"C:\B");
+        assert_eq!(
+            ranked[0].match_spans,
+            vec![0, 1],
+            "保留首行（排序已定优劣）"
+        );
+        assert_eq!(ranked[1].execute_id.as_ref(), r"C:\x");
+        assert_eq!(ranked[2].execute_id.as_ref(), r"C:\B2");
     }
 
     /// 别名协议三命令的解码形状。

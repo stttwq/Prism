@@ -89,6 +89,11 @@ public sealed class IconCache
     {
         ct.ThrowIfCancellationRequested();
         var icon = LoadIcon(path, pixelSize);
+        // 失败不进缓存：dir:/ext: 这类共享键一旦缓存 null，同类型全部行（如所有文件夹）
+        // 在本会话内永久无图标（ClearPathKeys 还特意保留这些键）。装饰层的 Source 空重试
+        // 依赖"失败可重试"——shell 瞬时失败下一个装饰周期自愈，持续失败也只是一次轻探。
+        if (icon is null)
+            return null;
         lock (_lock)
         {
             // 复查：加载期间可能有别的线程插了同一 key——复用已有条目、丢弃本次结果，

@@ -101,19 +101,23 @@ public sealed class PipeClient : ISearchClient, IDisposable
     public async Task StartAsync(CancellationToken ct = default)
     {
         StartWatchdog();
-        await ConnectOrReconnectAsync(ct).ConfigureAwait(false);
-        // F1（全仓检验 2026-08-25）：StartWatchdog 预置的 _wasConnected=true 只在
-        // 首连成功时正确。首连失败（本方法抛出，UI 已进"未连接"态）后看门狗在
-        // 后台恢复连接时，NotifyConnection(true) 因 true==true 被吞——托盘永久
-        // 停留"后端未连接"、每次召唤都显示"正在连接后端…"，且 ConnectionChanged
-        // 侧的 NotifyAliasesChanged 被跳过（前缀缓存用旧词集）。按真实连接状态
-        // 对齐：成功走 NotifyConnection（已连接时内部吞掉、无冗余事件；曾报过
-        // 失败则发出恢复通知——审计 2026-08-25 补：静默赋值会吞掉恢复路径），
-        // 失败改 false 让恢复路径可见。
-        if (_query.IsConnected)
-            NotifyConnection(true);
-        else
+        try
+        {
+            await ConnectOrReconnectAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // F3（全仓检验 2026-08-25 第二轮）：连接失败以异常上抛，控制流到不了
+            // 上一版补丁的 else 分支——_wasConnected 停留预置的 true，watchdog
+            // 后台恢复连接时 NotifyConnection(true) 被 true==true 吞掉（托盘
+            // 永久"后端未连接"、别名词集不重拉）。异常路径先把状态对齐再抛。
             _wasConnected = false;
+            NotifyConnection(false);
+            throw;
+        }
+        // 成功走 NotifyConnection（已连接时内部吞掉、无冗余事件；曾报过失败则
+        // 发出恢复通知）。
+        NotifyConnection(true);
         if (!_query.IsConnected)
             throw new IOException("无法连接到后端");
     }
@@ -128,6 +132,31 @@ public sealed class PipeClient : ISearchClient, IDisposable
 
     /// <summary>broker 进程名（与 <see cref="LocateBackend"/> 搜索的 exe 名一致）。</summary>
     private const string BrokerProcessName = "prism-core";
+
+    /// <summary>
+    /// X2：管道服务端进程的可执行文件目录是否与本进程期望的安装目录不一致。
+    /// 任一路径探测失败返回 false（保守视作一致，复用现状）。
+    /// </summary>
+    private static bool ServerDirectoryDiffers(Process proc)
+    {
+        try
+        {
+            var expected = LocateBackend();
+            if (string.IsNullOrEmpty(expected))
+                return false;
+            var actual = proc.MainModule?.FileName;
+            if (string.IsNullOrEmpty(actual))
+                return false;
+            return !string.Equals(
+                System.IO.Path.GetFullPath(expected),
+                System.IO.Path.GetFullPath(actual),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// AUDIT-2026-08-18 R-A8: 连上已有管道后收编服务端进程。此前孤儿 broker 被复用时
@@ -162,6 +191,24 @@ public sealed class PipeClient : ISearchClient, IDisposable
             {
                 proc.Dispose(); // AUDIT-4 B10：同上，复用返回前释放句柄。
                 return true;
+            }
+
+            // X2（全仓检验 2026-08-25 第二轮）：换目录覆盖安装——旧目录的 broker 还
+            // 活着并占着管道名时，直接收编会让新前端继续跑旧二进制 + 旧目录数据
+            //（settings/history/aliases 与新目录分裂两套，直到重启）。服务端 exe
+            // 目录与本进程期望的安装目录不一致时杀旧拉新；在途对话框守卫与 M1 同款
+            //（动作通道有在途交互请求时先留着，下轮重连再收）。路径探测失败
+            //（权限/已退出/平台不符）保守复用，维持修复前行为。
+            if (ServerDirectoryDiffers(proc))
+            {
+                if (_action.HasPendingSlowRead)
+                {
+                    proc.Dispose();
+                    return true;
+                }
+                try { proc.Kill(); } catch { /* 已退出 */ }
+                proc.Dispose();
+                return false;
             }
 
             _jobGuard ??= new JobObjectGuard();
@@ -1323,9 +1370,14 @@ public sealed class PipeClient : ISearchClient, IDisposable
                     await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
                     await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
 
-                    // watchdog 判活（审计 C2）：记录"查询已发出"时刻；无超时的动作类
-                    // 请求（属性页/复制确认）单独计数——它们合法等待任意久，判活必须放行。
-                    var slowRead = readTimeout is null;
+                    // watchdog 判活（审计 C2）：记录"查询已发出"时刻；动作类长超时
+                    // 请求（属性页/复制确认可合法等待用户数分钟）单独计数——判活与
+                    // AdoptExistingServer 的"在途对话框不杀旧 broker"守卫都依赖它。
+                    // F4（全仓检验 2026-08-25 第二轮）：F6 之后所有调用都带超时
+                    //（动作通道 5 分钟、退化 60 秒），`readTimeout is null` 恒假，
+                    // 计数成死码、守卫失效。改为按"读超时 ≥30 秒即可能在等用户面前
+                    // 的系统对话框"计数（查询 500ms/握手 3s 不计，语义不变）。
+                    var slowRead = readTimeout is null || readTimeout >= TimeSpan.FromSeconds(30);
                     if (slowRead)
                         Interlocked.Increment(ref _pendingSlowActionReads);
                     if (readTimeout is not null)

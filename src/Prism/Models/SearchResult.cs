@@ -82,4 +82,33 @@ public sealed record SearchResult(
         Subtitle: "热键: 双击 Ctrl",
         ExecuteId: "",
         MatchSpans: []);
+
+    /// <summary>
+    /// 进结果列表前的双重去重（2026-08-25 用户报告修复）：
+    /// 1) 按 ContainerKey 去重——ResultList 的同步算法（FindBy 只查 i 之后）假定
+    ///    键唯一，同键两行会把上一轮已显示的同键实例再次插入，ListBox 出现同一
+    ///    实例两份；WPF Selector 的选中簿记以 Object.Equals 键控 ItemInfo 字典，
+    ///    重复实例让 Dictionary.Add 抛 "An item with the same key has already been
+    ///    added. Key: …ItemInfo"，选中存储从此带毒，此后每次按键都报"搜索失败"
+    ///    直至重启。VM 组装 list 时先去重（保证 State.Results 与显示集合同源，
+    ///    选中/执行索引一致），ResultList 再兜一层防御。
+    /// 2) 按值去重（record 相等性）——等值记录必然同键（相等性含 RowKey），与键
+    ///    去重语义重叠，纯防御：防将来 ContainerKey 取键逻辑与相等性脱钩。
+    /// 同键/等值行对用户是同一行，丢弃无信息损失。
+    /// </summary>
+    public static List<SearchResult> DeduplicateRows(IReadOnlyList<SearchResult> rows)
+    {
+        if (rows.Count <= 1) return new List<SearchResult>(rows);
+
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        var values = new HashSet<SearchResult>();
+        var unique = new List<SearchResult>(rows.Count);
+        foreach (var row in rows)
+        {
+            if (!keys.Add(row.ContainerKey) || !values.Add(row))
+                continue;
+            unique.Add(row);
+        }
+        return unique;
+    }
 }
