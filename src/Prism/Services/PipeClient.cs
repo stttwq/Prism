@@ -75,6 +75,22 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// <summary>AUDIT-2026-08-18 R-A8: 测试用——是否已接管某个后端进程对象。</summary>
     internal bool HasBackendProcess => _backend is not null;
 
+    // K0 T9：命令能力总开关。internal static 既是测试注入点也是紧急关闭手段
+    //（与 ActionReadTimeout 同款先例）。设计 P7 明确 K0 不往 settings.json 加命令字段。
+    // K1 陷阱：SendActionAsync 在动作通道未连接时回退到查询通道，ExecuteCommand 因此
+    // 可能落在任一通道上，能力/PID/build_id/generation 的一致性检查必须针对实际承载
+    // 通道做。K0 让两个通道各自回答 HasCommands，把这个检查在 K1 变成可行的。
+    internal static bool AdvertiseCommandCapability { get; set; } = true;
+
+    /// <summary>查询通道是否协商了 commands_v1 能力（命令功能整体开关）。</summary>
+    public bool CommandsAvailable => _query.HasCommands;
+
+    /// <summary>查询通道的命令目录代际（测试用；0 = 未拉取或未协商）。</summary>
+    internal ulong? PipeCommandCatalogGeneration => _query.CommandCatalogGeneration;
+
+    /// <summary>查询通道的 broker build_id（测试用；null = 未发送）。</summary>
+    internal string? PipeBuildId => _query.BuildId;
+
     public PipeClient() : this(PipeName)
     {
     }
@@ -498,7 +514,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
         SearchContext context,
         CancellationToken ct = default)
     {
-        var resp = await SendAsync(SearchPayload(query, max, context), ct, QueryReadTimeout).ConfigureAwait(false);
+        var resp = await SendAsync(
+            SearchPayload(query, max, context, CommandsAvailable), ct, QueryReadTimeout).ConfigureAwait(false);
         return ParseSearchResponse(resp, query);
     }
 
@@ -506,7 +523,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
     /// 组装 search 请求。`root` 只在真正限定当前目录时出现：范围为全局时字段整体缺失，
     /// 与加入 root 之前的线上格式逐字节一致，也保证「UI 说全局」与「后端搜全局」不会背离。
     /// </summary>
-    internal static Dictionary<string, object?> SearchPayload(string query, int max, SearchContext context)
+    internal static Dictionary<string, object?> SearchPayload(
+        string query, int max, SearchContext context, bool commandsAvailable = false)
     {
         var payload = new Dictionary<string, object?>
         {
@@ -529,6 +547,21 @@ public sealed class PipeClient : ISearchClient, IDisposable
         // never learned `mode` behaves exactly as before.
         if (!string.Equals(context.Mode, SearchContext.AllMode, StringComparison.Ordinal))
             payload["mode"] = context.Mode;
+        // K0 T10.5：仅在通道已协商 commands_v1 且 CommandContext 非 null 时加 command_context。
+        // 其余情况 payload 逐字节等于旧格式（P2 字节级锚点）。
+        if (commandsAvailable && context.CommandContext is { } cmdCtx)
+        {
+            var cmd = new Dictionary<string, object?>();
+            if (!string.IsNullOrWhiteSpace(cmdCtx.CurrentFolder))
+                cmd["current_folder"] = cmdCtx.CurrentFolder;
+            if (!string.IsNullOrWhiteSpace(cmdCtx.HostKind))
+                cmd["host_kind"] = cmdCtx.HostKind;
+            if (cmdCtx.HostCapabilities.Count > 0)
+                cmd["host_capabilities"] = cmdCtx.HostCapabilities.ToArray();
+            // 只有有内容时才加 command_context（空对象不如不加——逐字节对齐旧格式）。
+            if (cmd.Count > 0)
+                payload["command_context"] = cmd;
+        }
         return payload;
     }
 
@@ -552,6 +585,15 @@ public sealed class PipeClient : ISearchClient, IDisposable
             foreach (var el in arr.EnumerateArray())
                 items.Add(ParseResult(el));
         }
+        // K0 T10.8：cacheable 字段缺失 → true（与 broker skip_serializing_if=is_true 配对）。
+        var cacheable = resp.TryGetProperty("cacheable", out var cacheableValue)
+            ? cacheableValue.ValueKind != JsonValueKind.False
+            : true;
+        ulong? commandCatalogGeneration =
+            resp.TryGetProperty("command_catalog_generation", out var cmdGenValue)
+            && cmdGenValue.TryGetUInt64(out var parsedCmdGen)
+                ? parsedCmdGen
+                : null;
         return new SearchResponse(
             echo,
             items,
@@ -563,7 +605,9 @@ public sealed class PipeClient : ISearchClient, IDisposable
             ReadOptionalString(resp, "pinyin_status"),
             ReadOptionalString(resp, "history_status"),
             RootRejectionCodes.Parse(ReadOptionalString(resp, "root_rejection")),
-            ReadOptionalString(resp, "root_message"));
+            ReadOptionalString(resp, "root_message"),
+            cacheable,
+            commandCatalogGeneration);
     }
 
     private static string? ReadOptionalString(JsonElement owner, string name) =>
@@ -789,6 +833,45 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
     }
 
+    /// <summary>
+    /// K0 T9：拉取命令目录（查询通道，已协商连接）。收到 error 时不抛致命异常，
+    /// 返回 null 表示「命令功能整体不可用」——调用方据此标记降级。
+    /// </summary>
+    internal async Task<(ulong Generation, IReadOnlyList<CommandDescriptor> Items)?>
+        CommandListAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var resp = await SendAsync(
+                new { type = "command_list" }, ct, QueryReadTimeout).ConfigureAwait(false);
+            if (resp.TryGetProperty("type", out var type)
+                && type.GetString() == "error")
+            {
+                return null;
+            }
+            var generation = resp.TryGetProperty("generation", out var gen)
+                && gen.TryGetUInt64(out var parsedGen)
+                    ? parsedGen
+                    : 0u;
+            var items = new List<CommandDescriptor>();
+            if (resp.TryGetProperty("items", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in arr.EnumerateArray())
+                {
+                    var descriptor = CommandDescriptor.Parse(el);
+                    if (descriptor is not null)
+                        items.Add(descriptor);
+                }
+            }
+            return (generation, items);
+        }
+        catch
+        {
+            // 传输层失败/超时/断连：命令功能整体不可用。
+            return null;
+        }
+    }
+
     internal static IReadOnlyList<AliasEntry> ParseAliasList(JsonElement resp)
     {
         var items = new List<AliasEntry>();
@@ -953,6 +1036,10 @@ public sealed class PipeClient : ISearchClient, IDisposable
         {
             MatchMetadata = metadata,
             Target = target,
+            // K0 T10.3：命令行用 "command:" 前缀 + execute_id（命令 id）作 RowKey。
+            // 默认 ContainerKey 含 Title，描述变更会让容器删旧插新，重演网页行
+            // 图标闪烁缺陷。命令 id 是唯一稳定身份。
+            RowKey = kind == "command" ? $"command:{id}" : null,
         };
     }
 
@@ -1165,6 +1252,14 @@ public sealed class PipeClient : ISearchClient, IDisposable
         /// </summary>
         public int? ServerProcessId { get; private set; }
 
+        // K0 T9：能力协商结果——Hello 回包解析后写入，断开清空（与 ServerProcessId 同处理）。
+        /// <summary>本通道是否协商了 commands_v1 能力（Hello 回包 features 含之）。</summary>
+        public bool HasCommands { get; private set; }
+        /// <summary>broker 构建指纹（Hello 回包 build_id，目前被忽略）。</summary>
+        public string? BuildId { get; private set; }
+        /// <summary>命令目录代际（Hello 回包 command_catalog_generation）。</summary>
+        public ulong? CommandCatalogGeneration { get; private set; }
+
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetNamedPipeServerProcessId(
             Microsoft.Win32.SafeHandles.SafePipeHandle handle, out uint serverProcessId);
@@ -1304,7 +1399,17 @@ public sealed class PipeClient : ISearchClient, IDisposable
         /// </summary>
         internal async Task HandshakeAsync()
         {
-            var json = JsonSerializer.Serialize(new { type = "hello", protocol = ProtocolVersion });
+            // K0 T9：hello 发 capabilities。受 AdvertiseCommandCapability 静态开关控制——
+            // 测试注入点兼紧急关闭手段（与 ActionReadTimeout 同款先例）。设计 P7 明确
+            // K0 不往 settings.json 加命令字段（旧 WPF 全量保存会丢弃未知字段）。
+            var helloPayload = new Dictionary<string, object?>
+            {
+                ["type"] = "hello",
+                ["protocol"] = ProtocolVersion,
+            };
+            if (AdvertiseCommandCapability)
+                helloPayload["capabilities"] = new[] { "commands_v1" };
+            var json = JsonSerializer.Serialize(helloPayload);
             await _writer!.WriteLineAsync(json.AsMemory(), CancellationToken.None).ConfigureAwait(false);
             await _writer.FlushAsync(CancellationToken.None).ConfigureAwait(false);
 
@@ -1346,6 +1451,24 @@ public sealed class PipeClient : ISearchClient, IDisposable
             {
                 throw new IOException("Broker protocol version mismatch");
             }
+
+            // K0 T9：解析 features / command_catalog_generation / build_id。
+            // 旧 broker 回包不含这些 key → HasCommands=false（逐字节兼容）。
+            HasCommands = root.TryGetProperty("features", out var features)
+                && features.ValueKind == JsonValueKind.Array
+                && features.EnumerateArray()
+                    .Any(f => f.ValueKind == JsonValueKind.String
+                              && f.GetString() == "commands_v1");
+            if (root.TryGetProperty("command_catalog_generation", out var cmdGen)
+                && cmdGen.TryGetUInt64(out var parsedGen))
+                CommandCatalogGeneration = parsedGen;
+            else
+                CommandCatalogGeneration = null;
+            if (root.TryGetProperty("build_id", out var buildId)
+                && buildId.ValueKind == JsonValueKind.String)
+                BuildId = buildId.GetString();
+            else
+                BuildId = null;
 
             // 握手成功即最近一次有效响应（watchdog 判活参考）。
             Interlocked.Exchange(ref _lastResponseTicks, DateTime.UtcNow.Ticks);
@@ -1487,6 +1610,10 @@ public sealed class PipeClient : ISearchClient, IDisposable
             _lineReader = null;
             _writer = null;
             ServerProcessId = null;
+            // K0 T9：能力协商结果随连接清空（与 ServerProcessId 同处理）。
+            HasCommands = false;
+            BuildId = null;
+            CommandCatalogGeneration = null;
             // 先关闭 stream（CancelIoEx），再关闭 reader/writer——顺序在 ThreadPool
             // 上执行不受调用线程影响。stream 先关让 reader 的 pending read 先被取消。
             ThreadPool.QueueUserWorkItem(_ =>
@@ -1568,4 +1695,8 @@ public sealed record SearchResponse(
     string? PinyinStatus = null,
     string? HistoryStatus = null,
     RootRejection? RootRejection = null,
-    string? RootMessage = null);
+    string? RootMessage = null,
+    // K0 T10.7：末位带默认值 → 全部现有构造点（含测试）零改动。
+    // Cacheable 与 broker 的 skip_serializing_if=is_true 配对：字段缺失 → true。
+    bool Cacheable = true,
+    ulong? CommandCatalogGeneration = null);

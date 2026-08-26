@@ -8,7 +8,10 @@ public sealed record SearchContext(
     string Mode,
     string? Root,
     IReadOnlyList<SearchFilterOption> Filters,
-    int SortVersion)
+    int SortVersion,
+    // K0 T10.5：末位带默认值 → 现有全部构造点（含 HostScopeController.Apply 的
+    // with { Root = ... }）零改动。K0 不纳入 IsEquivalentTo（D7 注释见下方）。
+    CommandSearchContext? CommandContext = null)
 {
     /// <summary>默认模式：文件/程序/网页混排。线路上省略该值。</summary>
     public const string AllMode = "all";
@@ -21,12 +24,27 @@ public sealed record SearchContext(
     public bool IsWindowMode =>
         string.Equals(Mode, WindowMode, StringComparison.Ordinal);
 
+    // D7（K1 必做）：K0 不纳入 CommandContext——根搜索命令 lane 上线时，
+    // IsEquivalentTo 必须纳入它，否则目录切换时前缀缓存会把旧命令上下文的
+    // 结果当新查询的缓存命中返回。K0 无生产者，此刻纳入反而让缓存逻辑变复杂。
     public bool IsEquivalentTo(SearchContext other) =>
         string.Equals(Mode, other.Mode, StringComparison.Ordinal)
         && string.Equals(Root, other.Root, StringComparison.Ordinal)
         && SortVersion == other.SortVersion
         && Filters.SequenceEqual(other.Filters);
 }
+
+/// <summary>
+/// K0 T10.5：命令搜索上下文（current_folder / host_kind / host_capabilities）。
+/// 通道已协商且非 null 时随 SearchPayload 下发；否则 payload 逐字节等于旧格式。
+/// current_folder 必须取 HostScopeController.Host.Root（条件 Host.HasUsableRoot），
+/// 不是 HostScopeController.Root（后者 Ctrl+G 切回全局后返回 null，命令上下文会消失）。
+/// </summary>
+public sealed record CommandSearchContext(
+    string? CurrentFolder,
+    string? HostKind,
+    IReadOnlyList<string> HostCapabilities);
+
 
 /// <summary>
 /// broker 复核通过的窗口句柄（G5）。句柄只在这一步离开 broker，WPF 必须在真正激活前

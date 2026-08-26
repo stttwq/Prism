@@ -512,6 +512,14 @@ public sealed class SearchViewModel
             return;
         }
 
+        // K0 T10.4：命令行在通用 ExecuteAsync 之前截获——否则命令 id 被当路径执行。
+        // K0 分支体是「命令不可用」，K1 替换为按 owner 分派。
+        if (item.Kind == "command")
+        {
+            _state.StatusMessage = "命令不可用";
+            return;
+        }
+
         try
         {
             await _pipe.ExecuteAsync(item.ExecutionTarget, _state.Query).ConfigureAwait(true);
@@ -576,7 +584,9 @@ public sealed class SearchViewModel
         if (_state.Mode == PanelMode.Actions) return;
         var item = _state.SelectedResult;
         // workset 是前端合成行，没有可定位的文件系统对象。
-        if (item is null || item.Kind is "more" or "web" or "workset") return;
+        // K0 T10.5：命令行禁用 Reveal——命令没有「所在文件夹」，
+        // 不禁用则命令 id 被送进 reveal 的 explorer /select 路径。
+        if (item is null || item.Kind is "more" or "web" or "workset" or "command") return;
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
         try
@@ -1190,7 +1200,10 @@ public sealed class SearchViewModel
             && resp.IndexGeneration.HasValue
             && resp.RootRejection is null
             && (resp.PinyinStatus is null or "disabled")
-            && resp.Items.All(item => item.ResultKind != SearchResultKind.Web))
+            && resp.Items.All(item => item.ResultKind != SearchResultKind.Web)
+            // K0 T10.9：命令态响应不可回填本地前缀缓存。命令目录由 broker 广播，
+            // 其时效与索引快照无关——混入缓存会让命中过期的命令项。
+            && resp.Cacheable)
         {
             _completeCache = new SearchCacheEntry(resp, _searchContext);
         }
@@ -1497,6 +1510,10 @@ public sealed class SearchViewModel
     private bool TryFilterCompleteCache(string query, out SearchResponse response)
     {
         var cached = _completeCache;
+        // D7：K0 下 SearchContext.IsEquivalentTo 不纳入 CommandContext，因为 K0
+        // 不路由命令、命令目录恒空，缓存命中与否只看索引/根/模式。K1 一旦真正
+        // 下发 command_context，此处必须把 CommandContext 纳入等价判断——否则
+        // 切换命令态时旧缓存会被当命中复用，漏掉 broker 新广播的命令项。
         if (cached is null
             || !cached.Context.IsEquivalentTo(_searchContext)
             || !query.StartsWith(cached.Response.Query, StringComparison.Ordinal)

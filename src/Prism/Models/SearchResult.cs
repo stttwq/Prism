@@ -9,6 +9,8 @@ public enum SearchResultKind
     Web,
     /// <summary>可切换的顶层窗口（G5）。</summary>
     Window,
+    /// <summary>K0：命令行（统一命令系统）。K0 无生产者，K1 接入。</summary>
+    Command,
     More,
 }
 
@@ -25,6 +27,10 @@ public sealed record ActionTarget(string Kind, string Value)
             // Window results always arrive with a typed target; this keeps the legacy
             // fallback from mis-labelling an enumeration token as a file path.
             "window" => "window",
+            // K0 T10.2：命令行映射成 command 而非 file——现状 _ => "file" 会让命令 id
+            // 退化成以 id 为路径的 file target，走 broker Shell 链路只剩绝对路径检查兜底。
+            // 映射成 command 后，broker 每条路径都显式拒绝（T2 守卫）。
+            "command" => "command",
             _ => "file",
         },
         executeId);
@@ -71,6 +77,7 @@ public sealed record SearchResult(
         "folder" => SearchResultKind.Folder,
         "web" => SearchResultKind.Web,
         "window" => SearchResultKind.Window,
+        "command" => SearchResultKind.Command,
         "more" => SearchResultKind.More,
         _ => SearchResultKind.Unknown,
     };
