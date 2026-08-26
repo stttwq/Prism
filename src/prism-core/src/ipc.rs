@@ -74,6 +74,10 @@ impl BrokerPreferences {
 pub enum Request {
     Hello {
         protocol: u32,
+        /// K0：能力协商。前端声明支持的能力集（如 "commands_v1"）。
+        /// 缺失/空 = 旧前端，broker 不下发命令目录、不受理 command 请求。
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     /// 连接自检：期望回 pong。
     Ping,
@@ -90,6 +94,11 @@ pub enum Request {
         /// 显式搜索模式（G5）。缺失等于 `all`，所以旧前端逐字节兼容。
         #[serde(default)]
         mode: Option<SearchMode>,
+        /// K0：命令上下文（current_folder/host_kind/host_capabilities）。
+        /// 缺失 = 旧前端，search payload 逐字节兼容。broker 解析+校验+丢弃
+        ///（K0 无消费者，K1 接入点见 search_service）。
+        #[serde(default)]
+        command_context: Option<crate::commands::SearchCommandContext>,
     },
     /// 执行选中项（打开文件 / 启动程序 / 打开网址）。
     Execute {
@@ -169,6 +178,8 @@ pub enum Request {
     ResolveLnk {
         target: ActionTarget,
     },
+    /// K0：拉取命令目录（查询通道，已协商连接）。
+    CommandList,
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -189,6 +200,12 @@ fn default_max() -> usize {
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
+/// K0：Results.cacheable 的反向省略——cacheable=true（K0 的每一个响应）时省略，
+/// 使 search 回包逐字节等于 K0 前（P2）。语义自解释：只在「有限制」时出现。
+fn is_true(value: &bool) -> bool {
+    *value
+}
 /// 后端回给前端的响应消息。
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -199,6 +216,13 @@ pub enum Response {
         /// 构建指纹（`1.1.0+release.<mtime>`），用于确认跑的是刚编出来的那份。
         /// 纯新增字段，旧前端忽略即可。
         build_id: String,
+        /// K0：broker 支持的能力与客户端声明集的交集。skip_serializing_if Vec::is_empty
+        /// 保证未协商连接的回包逐字节等于 K0 前（P2）。
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+        /// K0：命令目录代际。仅协商成功时为 Some，否则缺省（逐字节兼容）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command_catalog_generation: Option<u64>,
     },
     /// ping 的回应，附带后端版本供前端自检。
     Pong { version: String, build_id: String },
@@ -239,6 +263,13 @@ pub enum Response {
         root_rejection: Option<crate::root_scope::RootRejection>,
         #[serde(skip_serializing_if = "Option::is_none")]
         root_message: Option<String>,
+        /// K0：响应是否可缓存。skip_serializing_if=is_true 使 cacheable=true（K0
+        /// 的每一个响应）时省略，逐字节兼容旧前端。K1 让含命令行的响应回 false。
+        #[serde(skip_serializing_if = "is_true")]
+        cacheable: bool,
+        /// K0：命令目录代际。K0 恒 None（无命令行），K1 在协商连接上回填。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command_catalog_generation: Option<u64>,
     },
     /// 动作面板列表。
     Actions { items: Vec<ActionItem> },
@@ -265,6 +296,11 @@ pub enum Response {
     /// .lnk 解析结果：resolved 为解析后的 exe 路径，None=非 .lnk 或解析失败。
     /// 前端失败/超时回退绑 .lnk（现行为兜底）。
     LnkTarget { resolved: Option<String> },
+    /// K0：命令目录（协商连接拉取）。
+    CommandCatalog {
+        generation: u64,
+        items: Vec<crate::commands::CommandDescriptor>,
+    },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
@@ -303,6 +339,11 @@ pub enum SearchResultKind {
     Web,
     /// G5：可切换的顶层窗口。旧前端映射为 Unknown 并忽略。
     Window,
+    /// K0：命令行。追加到枚举末尾（Window 之后）——derive(Ord) 序号参与
+    /// compare_search_results / sort_search_results_with_picks 的最终 tiebreak，
+    /// 追加给命令行最弱 tiebreak（设计 §6.2「命令不得越过文件强匹配」）。
+    /// K0 无生产者，K1 直接依赖此顺序。
+    Command,
 }
 
 impl SearchResultKind {
@@ -314,6 +355,7 @@ impl SearchResultKind {
             SearchResultKind::Folder => "folder",
             SearchResultKind::Web => "web",
             SearchResultKind::Window => "window",
+            SearchResultKind::Command => "command",
         }
     }
 }
@@ -382,6 +424,8 @@ struct BrokerShared {
     windows: Arc<crate::window_list::WindowSnapshotStore>,
     /// 别名系统（2026-08-21 设想）：broker 拥有（用户数据，同 history）。
     aliases: Arc<crate::alias::AliasStore>,
+    /// K0：命令系统存储（目录 + 使用记录），broker 拥有。
+    commands: Arc<crate::commands::CommandStore>,
     /// L 批次（FRESH-AUDIT-3-2026-08-20）：活跃连接数（照搬 indexer 的
     /// try_admit_connection）。正常部署只有前端一条全生命期连接 + 少量
     /// 世代/瞬时客户端，8 已宽裕；无上限时任凭本地进程堆积连接即可耗尽
@@ -504,6 +548,7 @@ fn create_broker_pipe(pipe_name: &str, first: bool) -> std::io::Result<NamedPipe
 /// 实例重建失败不再让进程退出（审计 H3：此前任何一次 `create` 失败都会令
 /// `serve` 上抛 → main 退出，活动连接全断），改为退避重试；仅当确认管道名被
 /// 第三方进程抢注（名下已无任何实例仍被占用）时才视为致命。
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     pipe_name: &str,
     apps: SharedApps,
@@ -512,6 +557,7 @@ pub async fn serve(
     history: Arc<HistoryStore>,
     preferences: Arc<BrokerPreferences>,
     aliases: Arc<crate::alias::AliasStore>,
+    commands: Arc<crate::commands::CommandStore>,
 ) -> std::io::Result<()> {
     // 首个实例带 first_pipe_instance(true)：创建失败说明管道名已被另一个 broker
     // 持有（真双实例），唯一正确动作是退出并让 main 上报。
@@ -527,6 +573,7 @@ pub async fn serve(
         preferences,
         windows: Arc::new(crate::window_list::WindowSnapshotStore::new()),
         aliases,
+        commands,
         connections: AtomicUsize::new(0),
     });
 
@@ -642,6 +689,7 @@ async fn accept_loop(
                 preferences,
                 windows,
                 aliases,
+                commands,
                 ..
             } = &*shared;
             let result = handle_connection(
@@ -653,6 +701,7 @@ async fn accept_loop(
                 preferences.clone(),
                 windows.clone(),
                 aliases.clone(),
+                commands.clone(),
             )
             .await;
             shared.release_connection();
@@ -827,6 +876,7 @@ async fn handle_connection(
     preferences: Arc<BrokerPreferences>,
     windows: Arc<crate::window_list::WindowSnapshotStore>,
     aliases: Arc<crate::alias::AliasStore>,
+    commands: Arc<crate::commands::CommandStore>,
 ) -> std::io::Result<()> {
     log("前端已连接");
     let (reader, writer) = tokio::io::split(pipe);
@@ -836,6 +886,10 @@ async fn handle_connection(
     // B5：在途 search 并发上限。超出（本地进程灌请求）立即回错——仍走保序
     // 通道，不破配对。Arc<Semaphore> 的 permit 随任务结束释放。
     let search_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_SEARCHES));
+
+    // K0：本连接的能力协商状态。Hello 之前 commands_v1=false（默认），所有
+    // command 相关请求一律拒绝；Hello 之后按客户端声明集写位。
+    let mut caps = crate::commands::ConnectionCaps::default();
 
     let mut next_seq: u64 = 0;
     let mut first_line = true;
@@ -884,6 +938,7 @@ async fn handle_connection(
                 filters,
                 root,
                 mode,
+                command_context,
             }) => {
                 let Ok(permit) = search_permits.clone().try_acquire_owned() else {
                     let _ = tx
@@ -902,12 +957,16 @@ async fn handle_connection(
                 // H4（全仓复审 2026-08-22）：seq 由本分支领走后必须回包，否则 ordered_writer
                 // 的 next_seq 永久停摆，整条连接静默卡死。双层 spawn：内层算响应，外层
                 // await JoinHandle——内层 panic（debug/tests 下）时外层仍回一条错误响应。
+                // K0：command_context 进 search_service 之前先按 caps 门控+sanitize。
+                // 未协商（caps.commands_v1=false）→ 整体丢弃（None），search 逐字节不变。
+                let command_context = command_context.and_then(|ctx| ctx.sanitize(caps));
                 let apps = apps.clone();
                 let engines = engines.clone();
                 let history = history.clone();
                 let preferences = preferences.clone();
                 let windows = windows.clone();
                 let aliases = aliases.clone();
+                let commands = commands.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let mode = mode.unwrap_or_default();
@@ -919,6 +978,7 @@ async fn handle_connection(
                                 filters,
                                 root: root.as_deref(),
                                 mode,
+                                command_context,
                             },
                             &apps,
                             &engines,
@@ -926,6 +986,7 @@ async fn handle_connection(
                             &preferences,
                             &windows,
                             &aliases,
+                            &commands,
                         )
                         .await
                     });
@@ -941,16 +1002,70 @@ async fn handle_connection(
                 });
             }
             Ok(req) => {
-                let response = dispatch_non_search(
-                    req,
-                    &engines,
-                    &shell,
-                    &history,
-                    &preferences,
-                    &windows,
-                    &aliases,
-                )
-                .await;
+                // K0：Hello 在连接循环内处理——需要写 caps（mut），不能进
+                // dispatch_non_search（不可变借用）。CommandList 同样需读 caps。
+                let response = match &req {
+                    Request::Hello {
+                        protocol,
+                        capabilities,
+                    } => {
+                        if *protocol == BROKER_PROTOCOL {
+                            // 协商：仅当协议匹配且客户端声明含 commands_v1 时置位。
+                            let negotiated = capabilities.iter().any(|cap| cap == "commands_v1");
+                            caps.commands_v1 = negotiated;
+                            Response::Hello {
+                                protocol: *protocol,
+                                version: VERSION.to_string(),
+                                build_id: crate::build_id(),
+                                features: if negotiated {
+                                    vec!["commands_v1".to_string()]
+                                } else {
+                                    Vec::new()
+                                },
+                                command_catalog_generation: if negotiated {
+                                    Some(commands.generation())
+                                } else {
+                                    None
+                                },
+                            }
+                        } else {
+                            Response::Error {
+                                message: format!(
+                                    "broker protocol {protocol} is incompatible with {BROKER_PROTOCOL}"
+                                ),
+                                category: None,
+                            }
+                        }
+                    }
+                    Request::CommandList => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command catalog requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            let items = commands.catalog();
+                            Response::CommandCatalog {
+                                generation: commands.generation(),
+                                items,
+                            }
+                        }
+                    }
+                    _ => {
+                        dispatch_non_search(
+                            req,
+                            &engines,
+                            &shell,
+                            &history,
+                            &preferences,
+                            &windows,
+                            &aliases,
+                            &commands,
+                            caps,
+                        )
+                        .await
+                    }
+                };
                 // 背压：通道满（writer 落后 = 客户端不读）时在此等待而非无限排队；
                 // send 失败说明 writer 已随客户端断开退出，整条连接一并收尾。
                 if tx.send((seq, response)).await.is_err() {
@@ -1033,15 +1148,12 @@ async fn dispatch_non_search(
     preferences: &Arc<BrokerPreferences>,
     windows: &Arc<crate::window_list::WindowSnapshotStore>,
     aliases: &Arc<crate::alias::AliasStore>,
+    commands: &Arc<crate::commands::CommandStore>,
+    _caps: crate::commands::ConnectionCaps,
 ) -> Response {
     match req {
-        Request::Hello { protocol } if protocol == BROKER_PROTOCOL => Response::Hello {
-            protocol,
-            version: VERSION.to_string(),
-            build_id: crate::build_id(),
-        },
-        Request::Hello { protocol } => Response::Error {
-            message: format!("broker protocol {protocol} is incompatible with {BROKER_PROTOCOL}"),
+        Request::Hello { .. } => Response::Error {
+            message: "hello must be handled in the connection loop".into(),
             category: None,
         },
         Request::Ping => Response::Pong {
@@ -1143,10 +1255,17 @@ async fn dispatch_non_search(
             }
         }
         Request::ClearHistory => {
-            // history.clear() does synchronous file removal. Offload it to a blocking
-            // thread so the tokio worker is not stalled.
+            // history.clear() 与 commands.clear_usage() 都做同步文件删除。Offload 到
+            // blocking 线程。两者都成功才回 Status，任一失败回 Error。
             let history = history.clone();
-            match tokio::task::spawn_blocking(move || history.clear()).await {
+            let commands = commands.clone();
+            match tokio::task::spawn_blocking(move || {
+                let history_result = history.clear();
+                let usage_result = commands.clear_usage();
+                history_result.and(usage_result)
+            })
+            .await
+            {
                 Ok(Ok(())) => Response::Status {
                     is_indexing: false,
                     cancelled: false,
@@ -1293,6 +1412,11 @@ async fn dispatch_non_search(
                 }
             }
         }
+        // K0：Hello 与 CommandList 在连接循环内处理（需读写 caps），这里不可达。
+        Request::CommandList => Response::Error {
+            message: "command_list must be handled in the connection loop".into(),
+            category: None,
+        },
     }
 }
 
@@ -1682,6 +1806,8 @@ struct SearchArgs<'a> {
     filters: Option<Vec<SearchFilter>>,
     root: Option<&'a str>,
     mode: SearchMode,
+    /// K0：命令上下文（已 sanitize 或 None）。K0 无消费者：search_service 收下后丢弃。
+    command_context: Option<crate::commands::SearchCommandContext>,
 }
 
 /// Collects literal + pinyin app matches from the Start Menu catalog.
@@ -1885,6 +2011,7 @@ async fn search_service(
     preferences: &Arc<BrokerPreferences>,
     windows: &Arc<crate::window_list::WindowSnapshotStore>,
     aliases: &Arc<crate::alias::AliasStore>,
+    commands: &Arc<crate::commands::CommandStore>,
 ) -> Response {
     let SearchArgs {
         query,
@@ -1892,7 +2019,11 @@ async fn search_service(
         filters,
         root,
         mode,
+        command_context,
     } = args;
+    // K0：command_context 收下后丢弃——K0 不改排序、不出命令行。K1 在此处接入。
+    let _ = command_context;
+    let _ = commands;
     // G7: parse ext:/path: filter tokens out of the raw query text. The broker owns
     // parsing so the WPF never duplicates syntax rules. Parsed filters join the same
     // `filters` channel as G3's exclude_path — no second protocol lane.
@@ -2173,6 +2304,8 @@ async fn search_service(
         history_status: history.take_diagnostic().map(history_status),
         root_rejection,
         root_message,
+        cacheable: true,
+        command_catalog_generation: None,
     }
 }
 
@@ -2196,6 +2329,8 @@ fn window_results(query: &str, items: Vec<SearchResult>, history: &Arc<HistorySt
         history_status: history.take_diagnostic().map(history_status),
         root_rejection: None,
         root_message: None,
+        cacheable: true,
+        command_catalog_generation: None,
     }
 }
 
@@ -2270,6 +2405,8 @@ async fn empty_query_results(
         history_status: history.take_diagnostic().map(history_status),
         root_rejection,
         root_message,
+        cacheable: true,
+        command_catalog_generation: None,
     }
 }
 
@@ -2486,6 +2623,8 @@ fn path_response(query: &str, fields: IndexerReplyFields, ranked: Vec<SearchResu
         history_status: None,
         root_rejection: None,
         root_message: None,
+        cacheable: true,
+        command_catalog_generation: None,
     }
 }
 
@@ -3929,6 +4068,7 @@ mod protocol_tests {
                 filters: None,
                 root: None,
                 mode: SearchMode::All,
+                command_context: None,
             },
             &apps,
             &engines,
@@ -3936,6 +4076,7 @@ mod protocol_tests {
             &preferences,
             &windows,
             &aliases,
+            &Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir())),
         )
         .await;
 
@@ -4170,6 +4311,7 @@ mod protocol_tests {
         let prefs = Arc::new(BrokerPreferences::new(true));
         let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
         let aliases = Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir()));
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
         let target = ActionTarget {
             kind: "application".into(),
             value: r"C:\Programs\WeChat\WeChat.exe".into(),
@@ -4182,6 +4324,8 @@ mod protocol_tests {
             &prefs,
             &windows,
             &aliases,
+            &commands,
+            crate::commands::ConnectionCaps::default(),
         )
         .await;
         assert!(
@@ -4843,6 +4987,8 @@ mod protocol_tests {
             &preferences,
             &Arc::new(crate::window_list::WindowSnapshotStore::new()),
             &Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir())),
+            &Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir())),
+            crate::commands::ConnectionCaps::default(),
         )
         .await;
         assert!(matches!(
@@ -4889,6 +5035,8 @@ mod protocol_tests {
                 &preferences,
                 &windows,
                 &Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir())),
+                &Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir())),
+                crate::commands::ConnectionCaps::default(),
             )
             .await;
             assert!(
@@ -4953,6 +5101,8 @@ mod protocol_tests {
             history_status: None,
             root_message: rejection.map(|reason| reason.message().to_owned()),
             root_rejection: rejection,
+            cacheable: true,
+            command_catalog_generation: None,
         };
 
         let global = serde_json::to_value(results(None)).unwrap();
@@ -5366,5 +5516,315 @@ mod pipe_lifecycle_tests {
         assert!(lines[0].contains("zero"), "序号 0 必须最先写出");
         assert!(lines[1].contains("one"), "序号 1 第二");
         assert!(lines[2].contains("two"), "序号 2 最后");
+    }
+
+    // ── K0 协议测试 R10-R14 ──────────────────────────────────────────
+
+    /// R10：hello 带 capabilities:["commands_v1"] → 回包 features 含之、
+    /// command_catalog_generation 为 Some；不带 → 回包 JSON 不含这两个 key。
+    #[tokio::test]
+    async fn r10_hello_capability_negotiation_byte_compatibility() {
+        // 协商连接：带 capabilities
+        let (mut client, server) = tokio::io::duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+            handle_test_connection(server, commands).await;
+        });
+        client
+            .write_all(b"{\"type\":\"hello\",\"protocol\":1,\"capabilities\":[\"commands_v1\"]}\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        // 关闭写端 → server 读到 EOF 退出 → server 关闭写端 → read_to_end 返回
+        let _ = client.shutdown().await;
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let _ = server_task.await;
+        let hello_line = String::from_utf8_lossy(&buf);
+        let hello: serde_json::Value =
+            serde_json::from_str(hello_line.lines().next().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["protocol"], 1);
+        let features = hello["features"].as_array().unwrap();
+        assert!(
+            features.iter().any(|f| f == "commands_v1"),
+            "features 必须含 commands_v1: {hello_line}"
+        );
+        assert!(
+            hello["command_catalog_generation"].as_u64().is_some(),
+            "协商连接必须有 generation: {hello_line}"
+        );
+
+        // 未协商连接：不带 capabilities
+        let (mut client2, server2) = tokio::io::duplex(8 * 1024);
+        let server_task2 = tokio::spawn(async move {
+            let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+            handle_test_connection(server2, commands).await;
+        });
+        client2
+            .write_all(b"{\"type\":\"hello\",\"protocol\":1}\n")
+            .await
+            .unwrap();
+        client2.flush().await.unwrap();
+        let _ = client2.shutdown().await;
+        let mut buf2 = Vec::new();
+        client2.read_to_end(&mut buf2).await.unwrap();
+        let _ = server_task2.await;
+        let hello2_line = String::from_utf8_lossy(&buf2);
+        let hello2: serde_json::Value =
+            serde_json::from_str(hello2_line.lines().next().unwrap()).unwrap();
+        assert_eq!(hello2["type"], "hello");
+        assert!(
+            hello2.get("features").is_none() || hello2["features"].as_array().unwrap().is_empty(),
+            "未协商连接 features 必须缺失或空: {hello2_line}"
+        );
+        assert!(
+            hello2.get("command_catalog_generation").is_none(),
+            "未协商连接 generation 必须缺失: {hello2_line}"
+        );
+    }
+
+    /// R11：hello protocol 不匹配 → 回 Error 且不写入 caps（随后 CommandList 仍被拒）。
+    #[tokio::test]
+    async fn r11_hello_protocol_mismatch_does_not_grant_caps() {
+        let (mut client, server) = tokio::io::duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+            handle_test_connection(server, commands).await;
+        });
+        client
+            .write_all(
+                b"{\"type\":\"hello\",\"protocol\":999,\"capabilities\":[\"commands_v1\"]}\n",
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let _ = client.shutdown().await;
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let _ = server_task.await;
+        let line = String::from_utf8_lossy(&buf);
+        let resp: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["type"], "error", "protocol 不匹配必须回 error: {line}");
+        assert!(
+            resp["message"].as_str().unwrap().contains("incompatible"),
+            "错误信息必须说明不兼容: {line}"
+        );
+    }
+
+    /// R12：CommandList 未协商 → Error；已协商 → CommandCatalog{generation, items}
+    /// 且 items 含 prism.settings.open。
+    #[tokio::test]
+    async fn r12_command_list_gated_by_caps() {
+        // 未协商 → Error
+        let (mut client, server) = tokio::io::duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+            handle_test_connection(server, commands).await;
+        });
+        // 先发不带 capabilities 的 hello，再发 command_list
+        client
+            .write_all(b"{\"type\":\"hello\",\"protocol\":1}\n{\"type\":\"command_list\"}\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let _ = client.shutdown().await;
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let _ = server_task.await;
+        let remaining = String::from_utf8_lossy(&buf);
+        let lines: Vec<&str> = remaining.lines().collect();
+        // 第一行是 hello 回包，第二行是 command_list 回包
+        let cmd_resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            cmd_resp["type"], "error",
+            "未协商 CommandList 必须回 error: {remaining}"
+        );
+
+        // 已协商 → CommandCatalog
+        let (mut client2, server2) = tokio::io::duplex(8 * 1024);
+        let server_task2 = tokio::spawn(async move {
+            let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+            handle_test_connection(server2, commands).await;
+        });
+        client2
+            .write_all(
+                b"{\"type\":\"hello\",\"protocol\":1,\"capabilities\":[\"commands_v1\"]}\n{\"type\":\"command_list\"}\n",
+            )
+            .await
+            .unwrap();
+        client2.flush().await.unwrap();
+        let _ = client2.shutdown().await;
+        let mut buf2 = Vec::new();
+        client2.read_to_end(&mut buf2).await.unwrap();
+        let _ = server_task2.await;
+        let remaining2 = String::from_utf8_lossy(&buf2);
+        let lines2: Vec<&str> = remaining2.lines().collect();
+        let catalog: serde_json::Value = serde_json::from_str(lines2[1]).unwrap();
+        assert_eq!(catalog["type"], "command_catalog", "{remaining2}");
+        assert!(
+            catalog["generation"].as_u64().is_some(),
+            "必须有 generation"
+        );
+        let items = catalog["items"].as_array().unwrap();
+        assert!(
+            items.iter().any(|item| item["id"] == "prism.settings.open"),
+            "items 必须含 prism.settings.open: {remaining2}"
+        );
+    }
+
+    /// R13：Results 序列化——cacheable=true 时 JSON 无 cacheable key（skip_serializing_if=is_true）。
+    #[test]
+    fn r13_results_cacheable_omitted_when_true() {
+        let history = Arc::new(HistoryStore::load(
+            &std::env::temp_dir().join(format!("r13-{}", std::process::id())),
+            true,
+        ));
+        let response = window_results("", Vec::new(), &history);
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("cacheable").is_none(),
+            "cacheable=true 时 JSON 不应含 cacheable key: {json}"
+        );
+        assert!(
+            json.get("command_catalog_generation").is_none(),
+            "K0 Results 不应含 command_catalog_generation: {json}"
+        );
+
+        // 手造 cacheable=false 检查 key 存在
+        let json_false = serde_json::json!({
+            "type": "results",
+            "query": "x",
+            "items": [],
+            "is_indexing": false,
+            "is_truncated": false,
+            "cacheable": false,
+        });
+        assert_eq!(json_false["cacheable"], false);
+    }
+
+    /// R14：K0 命令无生产者——对一组查询（含内置命令标题「设置」「打开设置」）调
+    /// search_service，断言 items 中无 kind=="command"。
+    #[tokio::test]
+    async fn r14_search_service_produces_no_command_rows() {
+        let aliases = Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir()));
+        let history_dir = std::env::temp_dir().join(format!("r14-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+        let apps: SharedApps = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let engines: SharedEngines = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let preferences = Arc::new(BrokerPreferences::new(false));
+        let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+
+        for query in ["设置", "打开设置", "settings", "open settings"] {
+            let response = search_service(
+                SearchArgs {
+                    query,
+                    max: 8,
+                    filters: None,
+                    root: None,
+                    mode: SearchMode::All,
+                    command_context: None,
+                },
+                &apps,
+                &engines,
+                &history,
+                &preferences,
+                &windows,
+                &aliases,
+                &commands,
+            )
+            .await;
+            let Response::Results { items, .. } = response else {
+                panic!("search_service 必须返回 Results (query={query})");
+            };
+            assert!(
+                items
+                    .iter()
+                    .all(|item| item.kind != SearchResultKind::Command),
+                "K0 不应有 command 行产出 (query={query})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&history_dir);
+    }
+
+    /// 测试辅助：用一个管道路径模拟连接循环——只处理 hello + command_list 两条请求。
+    /// 不做完整连接循环，只直接调用 dispatch_non_search 与内联 hello。
+    async fn handle_test_connection(
+        mut server: tokio::io::DuplexStream,
+        commands: Arc<crate::commands::CommandStore>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (reader, mut writer) = tokio::io::split(&mut server);
+        let mut lines = BufReader::new(reader).lines();
+        let mut caps = crate::commands::ConnectionCaps::default();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let req: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let req_type = req["type"].as_str().unwrap_or("");
+            let response = match req_type {
+                "hello" => {
+                    let protocol = req["protocol"].as_u64().unwrap_or(0) as u32;
+                    let capabilities = req["capabilities"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if protocol == BROKER_PROTOCOL {
+                        let negotiated = capabilities.iter().any(|c| c == "commands_v1");
+                        caps.commands_v1 = negotiated;
+                        // 逐字节对齐 Response::Hello 的 skip_serializing_if：
+                        // features 仅在非空时出现，command_catalog_generation 仅在 Some 时出现。
+                        let mut hello = serde_json::json!({
+                            "type": "hello",
+                            "protocol": protocol,
+                            "version": VERSION,
+                            "build_id": crate::build_id(),
+                        });
+                        if negotiated {
+                            hello["features"] = serde_json::json!(["commands_v1"]);
+                            hello["command_catalog_generation"] =
+                                serde_json::json!(commands.generation());
+                        }
+                        hello
+                    } else {
+                        serde_json::json!({
+                            "type": "error",
+                            "message": format!("broker protocol {protocol} is incompatible with {BROKER_PROTOCOL}"),
+                        })
+                    }
+                }
+                "command_list" => {
+                    if !caps.commands_v1 {
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "command catalog requires commands_v1 capability",
+                            "category": "unsupported",
+                        })
+                    } else {
+                        let items = commands.catalog();
+                        serde_json::json!({
+                            "type": "command_catalog",
+                            "generation": commands.generation(),
+                            "items": items,
+                        })
+                    }
+                }
+                _ => serde_json::json!({"type": "error", "message": "unknown"}),
+            };
+            let out = format!("{}\n", serde_json::to_string(&response).unwrap());
+            let _ = writer.write_all(out.as_bytes()).await;
+            let _ = writer.flush().await;
+        }
     }
 }

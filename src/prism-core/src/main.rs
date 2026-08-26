@@ -24,6 +24,8 @@ async fn main() {
     ));
     // 别名系统（2026-08-21 设想）：用户数据，同 history 放数据目录。
     let aliases = std::sync::Arc::new(prism_core::alias::AliasStore::load(&data_dir));
+    // K0：命令系统存储（目录 + 使用记录），用户数据，同 history/aliases 放数据目录。
+    let commands = std::sync::Arc::new(prism_core::commands::CommandStore::load(&data_dir));
 
     let shell = match shell::ShellExecutor::start() {
         Ok(shell) => shell,
@@ -94,6 +96,7 @@ async fn main() {
         history,
         preferences,
         aliases,
+        commands,
     )
     .await
     {
