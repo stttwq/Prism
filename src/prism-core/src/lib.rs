@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod alias;
 pub mod apps;
+pub mod commands;
 pub mod config;
 pub mod file_ops;
 pub mod fs_util;

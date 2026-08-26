@@ -6,6 +6,8 @@ pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub const HISTORY_SCHEMA_VERSION: u32 = 2;
 pub const FAVICON_METADATA_SCHEMA_VERSION: u32 = 1;
 pub const ALIAS_SCHEMA_VERSION: u32 = 1;
+pub const COMMANDS_SCHEMA_VERSION: u32 = 1;
+pub const COMMAND_USAGE_SCHEMA_VERSION: u32 = 1;
 
 pub trait VersionedData {
     const SCHEMA_VERSION: u32;
@@ -195,6 +197,212 @@ impl VersionedData for FaviconMetadata {
     }
 }
 
+// ── 命令系统持久化（K0） ───────────────────────────────────────────
+//
+// 独立命名上限常量，不复用 ALIAS_*：别名词是用户词表（≤32 字符/≤8 个、精确整词
+// 匹配），命令关键字进与网页引擎共享的独占路由命名空间（≤16 字符/≤4 个）。
+// 共享常量会让一侧调参波及另一侧路由语义。title/subtitle 按 chars().count()：
+// 中文为主的展示文本，字节上限会让正常标题在 UTF-8 下提前触顶。
+
+pub const COMMAND_MAX_ENTRIES: usize = 512;
+pub const COMMAND_ID_MAX_BYTES: usize = 128;
+pub const COMMAND_MAX_KEYWORDS: usize = 4;
+pub const COMMAND_KEYWORD_MAX_CHARS: usize = 16;
+pub const COMMAND_TITLE_MAX_CHARS: usize = 64;
+pub const COMMAND_SUBTITLE_MAX_CHARS: usize = 128;
+pub const COMMAND_USAGE_MAX_ENTRIES: usize = 2000;
+
+/// 用户命令目录。`UserCommandDefinition` 刻意不含 `owner`：用户命令的 owner 恒为
+/// broker、trust 恒为 user，由代码赋值，不从 JSON 读。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandData {
+    #[serde(default)]
+    pub commands: Vec<UserCommandDefinition>,
+}
+
+/// 持久化形态的用户命令定义（Deserialize 端）。与 broker 下发的 `CommandDescriptor`
+/// （Serialize 端）是两个类型——类型收口保证导入 JSON 无法获得内置特权 handler
+/// （owner 字段不在用户侧类型上）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserCommandDefinition {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: String,
+    #[serde(default)]
+    pub icon_glyph: String,
+    /// 关键字：独占路由命名空间。trim 后非空、≤16 字符、无空白、≤4 个。
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// 输入要求。
+    #[serde(default)]
+    pub input: CommandInputSpec,
+    /// 各 surface 的绑定。K0 用户表为空，字段保留供 K1+。
+    #[serde(default)]
+    pub bindings: CommandBindings,
+    /// normal | elevated | destructive。
+    #[serde(default)]
+    pub danger: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandInputSpec {
+    /// none | text | destination | output_path。
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// 各 surface 的绑定集合。K0 用户命令无绑定，字段保留。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandBindings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_search: Option<CommandBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyword: Option<CommandBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_panel: Option<CommandBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging: Option<CommandBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut: Option<CommandBinding>,
+}
+
+/// 单条 binding（K0 不细化内部，保留为占位结构）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandBinding {
+    #[serde(default)]
+    pub priority: i32,
+}
+
+/// 命令使用记录。不存参数、不存 query（设计 §14 R14）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandUsageData {
+    #[serde(default)]
+    pub entries: Vec<CommandUsageEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandUsageEntry {
+    pub id: String,
+    #[serde(default)]
+    pub success_count: u32,
+    #[serde(default)]
+    pub last_success_utc: u64,
+    #[serde(default)]
+    pub frecency_milli: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl VersionedData for CommandData {
+    const SCHEMA_VERSION: u32 = COMMANDS_SCHEMA_VERSION;
+
+    fn validate(&self) -> Result<(), String> {
+        if self.commands.len() > COMMAND_MAX_ENTRIES {
+            return Err("command store contains more than 512 entries".into());
+        }
+        for command in &self.commands {
+            validate_command_id(&command.id)?;
+            if command.title.chars().count() > COMMAND_TITLE_MAX_CHARS {
+                return Err("command title exceeds 64 chars".into());
+            }
+            if command.subtitle.chars().count() > COMMAND_SUBTITLE_MAX_CHARS {
+                return Err("command subtitle exceeds 128 chars".into());
+            }
+            if command.icon_glyph.chars().count() > 16 {
+                return Err("command icon_glyph exceeds 16 chars".into());
+            }
+            if command.keywords.len() > COMMAND_MAX_KEYWORDS {
+                return Err("command has more than 4 keywords".into());
+            }
+            for keyword in &command.keywords {
+                if keyword.trim().is_empty()
+                    || keyword.chars().count() > COMMAND_KEYWORD_MAX_CHARS
+                    || keyword.chars().any(char::is_whitespace)
+                {
+                    return Err("command keyword is invalid".into());
+                }
+            }
+            if command.input.kind.is_empty() {
+                // 缺省视为 none
+            } else if !matches!(
+                command.input.kind.as_str(),
+                "none" | "text" | "destination" | "output_path"
+            ) {
+                return Err("command input has an unsupported kind".into());
+            }
+            if command.input.prompt.chars().count() > 128 {
+                return Err("command input prompt exceeds 128 chars".into());
+            }
+            if !matches!(
+                command.danger.as_str(),
+                "" | "normal" | "elevated" | "destructive"
+            ) {
+                return Err("command has an unsupported danger level".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl VersionedData for CommandUsageData {
+    const SCHEMA_VERSION: u32 = COMMAND_USAGE_SCHEMA_VERSION;
+
+    fn validate(&self) -> Result<(), String> {
+        if self.entries.len() > COMMAND_USAGE_MAX_ENTRIES {
+            return Err("command usage contains more than 2000 entries".into());
+        }
+        for entry in &self.entries {
+            validate_command_id(&entry.id)?;
+            if entry.id.len() > COMMAND_ID_MAX_BYTES {
+                return Err("command usage id exceeds 128 bytes".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 命令 id 语法校验：`prism.` 或 `user.` 前缀，其余字符仅 [a-z0-9._-]，无空白。
+/// 复用于 CommandStore 与 Shell 校验，保证存储与执行面同一把尺。
+pub fn validate_command_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > COMMAND_ID_MAX_BYTES {
+        return Err("command id is empty or exceeds 128 bytes".into());
+    }
+    if id.contains('\0') {
+        return Err("command id contains NUL".into());
+    }
+    // "prism." = 6 bytes, "user." = 5 bytes. 两种前缀长度不同，分开判定。
+    let rest = if let Some(rest) = id.strip_prefix("prism.") {
+        rest
+    } else if let Some(rest) = id.strip_prefix("user.") {
+        rest
+    } else {
+        return Err("command id must start with 'prism.' or 'user.'".into());
+    };
+    if rest.is_empty() {
+        return Err("command id has no name after prefix".into());
+    }
+    for byte in rest.bytes() {
+        let ok = byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || byte == b'.'
+            || byte == b'_'
+            || byte == b'-';
+        if !ok {
+            return Err("command id contains invalid characters".into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +477,168 @@ mod tests {
         assert_eq!(data.entries[0].frecency_milli, 0);
         assert!(data.entries[0].queries.is_empty());
         assert_eq!(data.entries[0].first_used_utc, 0);
+    }
+
+    // ── K0 命令 schema ───────────────────────────────────────────────
+
+    #[test]
+    fn command_id_syntax_accepts_valid_and_rejects_invalid() {
+        assert!(validate_command_id("prism.settings.open").is_ok());
+        assert!(validate_command_id("user.my_cmd.v2").is_ok());
+        assert!(validate_command_id("user.copy").is_ok());
+        // 无前缀
+        assert!(validate_command_id("settings.open").is_err());
+        // 大写
+        assert!(validate_command_id("prism.Settings").is_err());
+        // 含斜杠
+        assert!(validate_command_id("prism.settings/open").is_err());
+        // 含空白
+        assert!(validate_command_id("prism.set tings").is_err());
+        // 仅前缀
+        assert!(validate_command_id("prism.").is_err());
+        // 超长
+        assert!(validate_command_id(&format!("user.{}", "a".repeat(130))).is_err());
+        // NUL
+        assert!(validate_command_id("prism.set\u{0}tings").is_err());
+        // 空串
+        assert!(validate_command_id("").is_err());
+    }
+
+    #[test]
+    fn command_data_future_schema_rejected() {
+        let envelope: VersionedEnvelope<CommandData> =
+            serde_json::from_str(r#"{"schema_version":999,"data":{"commands":[]}}"#).unwrap();
+        assert!(envelope.into_compatible().is_err());
+    }
+
+    #[test]
+    fn command_data_validates_bounds() {
+        // 超 512 条
+        let over = CommandData {
+            commands: vec![
+                UserCommandDefinition {
+                    id: "user.x".into(),
+                    title: "t".into(),
+                    ..Default::default()
+                };
+                513
+            ],
+        };
+        assert!(VersionedEnvelope::new(over).is_err());
+
+        // 中文标题按 chars 计，64 字符合法
+        let title64: String = "设".repeat(64);
+        let ok = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.title64".into(),
+                title: title64,
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(ok).is_ok());
+
+        // 65 字符拒绝
+        let title65: String = "设".repeat(65);
+        let over_title = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.title65".into(),
+                title: title65,
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(over_title).is_err());
+
+        // 5 个关键字拒绝
+        let five_kw: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+        let over_kw = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.kw".into(),
+                title: "t".into(),
+                keywords: five_kw,
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(over_kw).is_err());
+
+        // 关键字含空白拒绝
+        let space_kw = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.space".into(),
+                title: "t".into(),
+                keywords: vec!["has space".into()],
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(space_kw).is_err());
+
+        // 未知 input kind 拒绝
+        let bad_input = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.input".into(),
+                title: "t".into(),
+                input: CommandInputSpec {
+                    kind: "magic".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(bad_input).is_err());
+
+        // 未知 danger 拒绝
+        let bad_danger = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.danger".into(),
+                title: "t".into(),
+                danger: "apocalypse".into(),
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(bad_danger).is_err());
+
+        // 无效 id 拒绝
+        let bad_id = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "badprefix.x".into(),
+                title: "t".into(),
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(bad_id).is_err());
+    }
+
+    #[test]
+    fn command_usage_data_validates_bounds() {
+        // 超 2000 条
+        let over = CommandUsageData {
+            entries: vec![
+                CommandUsageEntry {
+                    id: "user.x".into(),
+                    ..Default::default()
+                };
+                2001
+            ],
+        };
+        assert!(VersionedEnvelope::new(over).is_err());
+
+        // 无效 id
+        let bad = CommandUsageData {
+            entries: vec![CommandUsageEntry {
+                id: "nope".into(),
+                ..Default::default()
+            }],
+        };
+        assert!(VersionedEnvelope::new(bad).is_err());
+
+        // 合法
+        let ok = CommandUsageData {
+            entries: vec![CommandUsageEntry {
+                id: "user.x".into(),
+                success_count: 3,
+                last_success_utc: 100,
+                frecency_milli: 500,
+            }],
+        };
+        assert!(VersionedEnvelope::new(ok).is_ok());
     }
 }
