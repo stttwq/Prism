@@ -163,6 +163,11 @@ pub enum Request {
     },
     /// 设置页列表。
     AliasList,
+    /// 解析 .lnk 的目标路径（别名身份指向真实 exe）。非 .lnk 或失败返回 None。
+    /// 复用 STA worker 的 COM 单元（禁裸 spawn_blocking——CoCreateInstance 会失败）。
+    ResolveLnk {
+        target: ActionTarget,
+    },
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -256,6 +261,9 @@ pub enum Response {
     AliasItems { items: Vec<AliasItemDto> },
     /// 别名设置/解绑回执：`Ok` 空串表示成功，否则为用户可读错误。
     AliasApplied { message: String },
+    /// .lnk 解析结果：resolved 为解析后的 exe 路径，None=非 .lnk 或解析失败。
+    /// 前端失败/超时回退绑 .lnk（现行为兜底）。
+    LnkTarget { resolved: Option<String> },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
@@ -1239,6 +1247,20 @@ async fn dispatch_non_search(
                 })
                 .collect();
             Response::AliasItems { items }
+        }
+        Request::ResolveLnk { target } => {
+            // 非 .lnk 快速路径：免 STA 往返。
+            if !target.value.to_ascii_lowercase().ends_with(".lnk") {
+                return Response::LnkTarget { resolved: None };
+            }
+            match shell.resolve_lnk(target.value.clone()).await {
+                Ok(resolved) => Response::LnkTarget { resolved },
+                Err(error) => {
+                    log(format!("resolve_lnk failed: {error:?}"));
+                    // 失败回退 None（调用方绑 .lnk），与 STA 忙/超时语义一致。
+                    Response::LnkTarget { resolved: None }
+                }
+            }
         }
     }
 }
@@ -4078,6 +4100,63 @@ mod protocol_tests {
         })
         .unwrap();
         assert!(json.contains(r#""type":"alias_applied""#), "{json}");
+    }
+
+    /// resolve_lnk 请求解码 + lnk_target 响应序列化形状（对齐 alias_requests_decode）。
+    #[test]
+    fn resolve_lnk_request_decodes_and_response_serializes() {
+        let req: Request = serde_json::from_str(
+            r#"{"type":"resolve_lnk","target":{"kind":"application","value":"C:\\Programs\\WeChat.lnk"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(req, Request::ResolveLnk { ref target } if target.kind == "application"
+                && target.value.ends_with("WeChat.lnk"))
+        );
+
+        let json_some = serde_json::to_string(&Response::LnkTarget {
+            resolved: Some(r"C:\Programs\WeChat\WeChat.exe".into()),
+        })
+        .unwrap();
+        assert!(json_some.contains(r#""type":"lnk_target""#), "{json_some}");
+        assert!(json_some.contains(r#"resolved"#), "{json_some}");
+
+        let json_none = serde_json::to_string(&Response::LnkTarget { resolved: None }).unwrap();
+        assert!(json_none.contains(r#""type":"lnk_target""#), "{json_none}");
+        // None 经 skip？不——resolved 非 skip 字段，需显式 null。
+        assert!(json_none.contains(r#""resolved":null"#), "{json_none}");
+    }
+
+    /// dispatch_non_search 对非 .lnk target 返回 None，免 STA 往返（纯逻辑不依赖 COM）。
+    #[tokio::test]
+    async fn dispatch_resolve_lnk_non_lnk_returns_none_without_sta() {
+        let engines = default_engines();
+        let shell = ShellExecutor::start().expect("shell worker starts");
+        let history = Arc::new(HistoryStore::load(
+            &std::env::temp_dir().join(format!("prism-ipc-lnk-{}", std::process::id())),
+            true,
+        ));
+        let prefs = Arc::new(BrokerPreferences::new(true));
+        let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+        let aliases = Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir()));
+        let target = ActionTarget {
+            kind: "application".into(),
+            value: r"C:\Programs\WeChat\WeChat.exe".into(),
+        };
+        let resp = dispatch_non_search(
+            Request::ResolveLnk { target },
+            &engines,
+            &shell,
+            &history,
+            &prefs,
+            &windows,
+            &aliases,
+        )
+        .await;
+        assert!(
+            matches!(resp, Response::LnkTarget { resolved: None }),
+            "non-.lnk must short-circuit to None"
+        );
     }
 
     #[test]

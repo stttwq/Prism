@@ -831,6 +831,29 @@ public partial class SearchWindow : Window
     {
         if (_pipe is null || _vm is null) return;
         var aliasTarget = target.ExecutionTarget;
+        var originalValue = aliasTarget.Value; // resolve 前的值（存量 .lnk 换绑清理用）
+
+        // 问题1（方案A）：app 且 Value 是 .lnk 时先 resolve 成 exe，身份指真实程序。
+        // resolve 失败/超时回退绑 .lnk（现状兜底）。执行仍走 .lnk（ShellExecute 自解）。
+        if (aliasTarget.Kind == "application"
+            && aliasTarget.Value.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                if (!_pipe.IsConnected)
+                    await _pipe.StartAsync().ConfigureAwait(true);
+                var resolved = await _pipe.ResolveLnkAsync(aliasTarget).ConfigureAwait(true);
+                if (!string.IsNullOrEmpty(resolved)
+                    && System.IO.Path.IsPathRooted(resolved))
+                {
+                    aliasTarget = new ActionTarget(aliasTarget.Kind, resolved);
+                }
+            }
+            catch
+            {
+                // resolve 异常回退绑 .lnk（现行为）。
+            }
+        }
 
         // M18（全仓复审 2026-08-22）：_modalDialogs 占位提前到第一个 await 之前。
         // AliasListAsync 在飞时 App.ToggleSearchWindow（热键/托盘）可直达
@@ -841,16 +864,30 @@ public partial class SearchWindow : Window
         try
         {
         // 预填：拉取现有词表（失败静默按空处理）。
+        // 存量 .lnk 别名换绑：先按 resolve 后 exe 匹配；未中则回退匹配原 .lnk 值，
+        // 记住旧条目，保存成功后 best-effort 清理（防双条目）。
         var existing = Array.Empty<string>();
+        AliasEntry? staleLnkEntry = null;
         try
         {
             if (!_pipe.IsConnected)
                 await _pipe.StartAsync().ConfigureAwait(true);
             var entries = await _pipe.AliasListAsync().ConfigureAwait(true);
-            existing = entries
+            var matched = entries
                 .FirstOrDefault(entry => entry.Target.Kind == aliasTarget.Kind
-                    && string.Equals(entry.Target.Value, aliasTarget.Value, StringComparison.OrdinalIgnoreCase))
-                ?.Words.ToArray() ?? Array.Empty<string>();
+                    && string.Equals(entry.Target.Value, aliasTarget.Value, StringComparison.OrdinalIgnoreCase));
+            if (matched is not null)
+            {
+                existing = matched.Words.ToArray();
+            }
+            else if (aliasTarget.Value != originalValue)
+            {
+                // resolve 改了值：回退匹配旧 .lnk 值的同 kind 条目，预填其词表。
+                staleLnkEntry = entries
+                    .FirstOrDefault(entry => entry.Target.Kind == aliasTarget.Kind
+                        && string.Equals(entry.Target.Value, originalValue, StringComparison.OrdinalIgnoreCase));
+                existing = staleLnkEntry?.Words.ToArray() ?? Array.Empty<string>();
+            }
         }
         catch
         {
@@ -879,7 +916,7 @@ public partial class SearchWindow : Window
         var panel = new StackPanel { Margin = new Thickness(16) };
         panel.Children.Add(new TextBlock
         {
-            Text = System.IO.Path.GetFileName(target.ExecuteId),
+            Text = System.IO.Path.GetFileName(aliasTarget.Value),
             FontSize = 13,
             FontWeight = FontWeights.SemiBold,
             Margin = new Thickness(0, 0, 0, 4),
@@ -927,6 +964,19 @@ public partial class SearchWindow : Window
             if (!_pipe.IsConnected)
                 await _pipe.StartAsync().ConfigureAwait(true);
             await _pipe.AliasSetAsync(aliasTarget, words).ConfigureAwait(true);
+            // 存量 .lnk 别名换绑清理：resolve 改了值且旧 .lnk 条目存在时，
+            // best-effort 删除旧条目（失败忽略——不影响新绑定，用户重开一次即迁移）。
+            if (staleLnkEntry is not null && aliasTarget.Value != originalValue && words.Count > 0)
+            {
+                try
+                {
+                    await _pipe.AliasDeleteAsync(staleLnkEntry.Target).ConfigureAwait(true);
+                }
+                catch
+                {
+                    // 清理失败忽略：新 exe 绑定已生效，旧 .lnk 条目留存不影响功能。
+                }
+            }
             // 2026-08-24 修复：词集失效，前缀缓存守卫重新拉取——否则保存后
             // 第一次搜别名词仍可能被本地前缀缓存拦截（别名行变不出来）。
             _vm.NotifyAliasesChanged();

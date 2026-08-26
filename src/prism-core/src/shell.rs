@@ -79,6 +79,11 @@ struct WorkItem {
 enum WorkerMessage {
     Execute(WorkItem),
     ScanApps(mpsc::Sender<Vec<crate::apps::AppEntry>>),
+    /// 解析单个 .lnk 的目标路径（别名身份用）。复用 STA worker 的 COM 单元。
+    ResolveLnk {
+        path: String,
+        reply: mpsc::Sender<Option<String>>,
+    },
     Shutdown,
 }
 
@@ -144,6 +149,37 @@ impl ShellExecutor {
             // M4：清单扫描解析数百个 .lnk 可合法耗时，给满慢预算防挂死。
             receiver
                 .recv_timeout(std::time::Duration::from_secs(300))
+                .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker did not reply"))
+        })
+        .await
+        .map_err(|error| ShellError::new(ShellErrorKind::System, error.to_string()))?
+    }
+
+    /// 解析 .lnk 的目标路径（别名身份指向真实 exe）。复用 STA worker 的 COM 单元；
+    /// 非 .lnk 或解析失败返回 None（调用方回退原值）。超时取快档 60s。
+    pub async fn resolve_lnk(self: &Arc<Self>, path: String) -> Result<Option<String>, ShellError> {
+        let worker = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let (result, receiver) = mpsc::channel();
+            worker
+                .sender
+                .try_send(WorkerMessage::ResolveLnk {
+                    path: path.clone(),
+                    reply: result,
+                })
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => ShellError::new(
+                        ShellErrorKind::System,
+                        "shell worker queue is saturated (worker stuck on a modal operation?)",
+                    ),
+                    mpsc::TrySendError::Disconnected(_) => {
+                        ShellError::new(ShellErrorKind::System, "Shell worker is closed")
+                    }
+                })?;
+            // 与 execute_blocking 的 FAST 同档：解析单个 .lnk 通常瞬时，
+            // 给 60s 足以越过死网络路径的内核超时而不拖死队列。
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(60))
                 .map_err(|_| ShellError::new(ShellErrorKind::System, "Shell worker did not reply"))
         })
         .await
@@ -259,6 +295,9 @@ fn worker_loop(receiver: mpsc::Receiver<WorkerMessage>, ready: SyncSender<Result
             }
             WorkerMessage::ScanApps(result) => {
                 let _ = result.send(crate::apps::scan_start_menu_on_sta());
+            }
+            WorkerMessage::ResolveLnk { path, reply } => {
+                let _ = reply.send(crate::apps::resolve_lnk_target(&path));
             }
             WorkerMessage::Shutdown => break,
         }

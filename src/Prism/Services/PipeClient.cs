@@ -752,6 +752,32 @@ public sealed class PipeClient : ISearchClient, IDisposable
         return ParseAliasList(resp);
     }
 
+    /// <summary>
+    /// 解析 .lnk 的目标路径（别名身份指向真实 exe）。失败/超时返回 null（调用方回退绑 .lnk）。
+    /// 走 query 通道 + 8s 超时（与 AliasSetAsync 同档）；resolved 非 .lnk 或解析失败为 null。
+    /// </summary>
+    public async Task<string?> ResolveLnkAsync(ActionTarget target, CancellationToken ct = default)
+    {
+        try
+        {
+            var resp = await SendAsync(
+                new { type = "resolve_lnk", target = TargetPayload(target) },
+                ct,
+                QueryReadTimeout).ConfigureAwait(false);
+            if (resp.TryGetProperty("resolved", out var resolved)
+                && resolved.ValueKind == JsonValueKind.String)
+            {
+                return resolved.GetString();
+            }
+            return null;
+        }
+        catch
+        {
+            // 失败/超时/断连：回退绑 .lnk（现状行为兜底）。
+            return null;
+        }
+    }
+
     /// <summary>alias_applied 回执：非空 message 是业务失败（连接仍可用）。</summary>
     private static void ThrowIfAliasRejected(JsonElement resp)
     {
