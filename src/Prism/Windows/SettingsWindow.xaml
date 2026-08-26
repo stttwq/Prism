@@ -167,6 +167,9 @@
             <Setter Property="FontSize" Value="13"/>
             <Setter Property="Padding" Value="8,5"/>
             <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="MinHeight" Value="32"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="ItemContainerStyle" Value="{StaticResource SettingsComboBoxItemStyle}"/>
             <Setter Property="Template">
                 <Setter.Value>
@@ -195,6 +198,9 @@
                             </ToggleButton>
                             <ContentPresenter Grid.Column="0"
                                               Margin="{TemplateBinding Padding}"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}"
                                               HorizontalAlignment="Left"
                                               VerticalAlignment="Center"
                                               IsHitTestVisible="False"
@@ -399,6 +405,7 @@
                         <StackPanel>
                             <ToggleButton x:Name="HeaderSite"
                                           IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          Foreground="{TemplateBinding Foreground}"
                                           Background="Transparent"
                                           BorderThickness="0"
                                           HorizontalContentAlignment="Left"
@@ -491,6 +498,7 @@
 
             <!-- 常规 -->
             <ScrollViewer Grid.Row="0"
+                          Style="{StaticResource PrismScrollViewer}"
                           VerticalScrollBarVisibility="Auto"
                           Visibility="{Binding IsGeneralTab, Converter={StaticResource BoolToVis}}">
                 <StackPanel>
@@ -560,6 +568,7 @@
 
             <!-- 快速访问（2026-08-21 设想）：呼出键（全局）+ 动作快捷键（窗口级）+ 文件别名。 -->
             <ScrollViewer Grid.Row="0"
+                          Style="{StaticResource PrismScrollViewer}"
                           VerticalScrollBarVisibility="Auto"
                           Visibility="{Binding IsQuickAccessTab, Converter={StaticResource BoolToVis}}">
                 <StackPanel>
@@ -744,13 +753,14 @@
                                                 <Setter Property="Template">
                                                     <Setter.Value>
                                                         <ControlTemplate TargetType="GroupItem">
-                                                            <Expander IsExpanded="True" Margin="0,0,0,4">
+                                                            <Expander Style="{StaticResource SettingsExpanderStyle}"
+                                                                      IsExpanded="True" Margin="0,0,0,4">
                                                                 <Expander.Header>
                                                                     <TextBlock FontSize="12" FontWeight="SemiBold"
                                                                                Foreground="{DynamicResource TextTitle}">
-                                                                        <Run Text="{Binding Name}"/>
+                                                                        <Run Text="{Binding Name, Mode=OneWay}"/>
                                                                         <Run Text=" (" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
-                                                                        <Run Text="{Binding ItemCount}" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
+                                                                        <Run Text="{Binding ItemCount, Mode=OneWay}" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
                                                                         <Run Text=")" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
                                                                     </TextBlock>
                                                                 </Expander.Header>

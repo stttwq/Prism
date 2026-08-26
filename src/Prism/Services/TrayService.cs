@@ -5,6 +5,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Threading;
 using System.Windows.Forms;
+using System.Windows.Interop;
 // NotifyIcon 在 WinForms 命名空间；WPF Application 由 GlobalUsings 统一别名。
 
 namespace Prism.Services;
@@ -77,7 +78,10 @@ public sealed class TrayService : IDisposable
     {
         if (e.Button == MouseButtons.Left)
         {
-            Raise(ShowSearchRequested);
+            // 同线程直调分支绕过 WPF Dispatcher 兜底：包一层 try/catch 兜底（5.4），
+            // 否则异常沿 WinForms NotifyIcon.WndProc 原生回调栈上抛直接杀进程。
+            try { Raise(ShowSearchRequested); }
+            catch (Exception ex) { Prism.App.LogException("TrayService.OnMouseClick", ex); }
         }
         else if (e.Button == MouseButtons.Right)
         {
@@ -90,7 +94,7 @@ public sealed class TrayService : IDisposable
     {
         if (_disposed) return;
         if (_dispatcher.CheckAccess())
-            ShowContextMenuOnDispatcher();
+            ShowContextMenuOnDispatcher();   // 方法体内已有 5.4 兜底
         else
             _dispatcher.BeginInvoke(ShowContextMenuOnDispatcher);
     }
@@ -99,45 +103,75 @@ public sealed class TrayService : IDisposable
     {
         if (_disposed) return;
 
-        _menu ??= BuildMenu();
-
-        // 锚点窗：0 尺寸、无任务栏、离屏。首次需 Show 一次让 HWND 就绪，
-        // 之后 SetForegroundWindow 让它获得激活态——这是托盘弹窗菜单
-        // 点击外部正常收起的标准条件。
-        _anchor ??= new Window
+        try
         {
-            Width = 0,
-            Height = 0,
-            WindowStyle = WindowStyle.None,
-            ShowInTaskbar = false,
-            AllowsTransparency = true,
-            Visibility = Visibility.Hidden,
-            Left = -32000,
-            Top = -32000,
-        };
+            _menu ??= BuildMenu();
 
-        if (!_anchorShown)
-        {
+            // 锚点窗：0 尺寸、无任务栏、离屏、透明。首次需 Show 一次让 HWND 就绪，
+            // 之后 SetForegroundWindow 让它获得激活态——这是托盘弹窗菜单
+            // 点击外部正常收起的标准条件。
+            // 5.3：透明背景（否则系统默认白），并加扩展样式让它不进 Alt+Tab / Win+Tab。
+            if (_anchor is null)
+            {
+                _anchor = new Window
+                {
+                    Width = 0,
+                    Height = 0,
+                    WindowStyle = WindowStyle.None,
+                    ShowInTaskbar = false,
+                    AllowsTransparency = true,
+                    Background = System.Windows.Media.Brushes.Transparent,
+                    Visibility = Visibility.Hidden,
+                    Left = -32000,
+                    Top = -32000,
+                };
+                // 5.2：锚点窗被外部关闭后清空状态，下次重建，避免复用死对象（崩溃根治点）。
+                _anchor.Closed += (_, _) => { _anchor = null; _anchorShown = false; };
+                // 5.3：WS_EX_TOOLWINDOW 去 Alt+Tab/任务视图条目；WS_EX_NOACTIVATE 防抢焦点。
+                _anchor.SourceInitialized += (s, _) =>
+                {
+                    var hwnd = new WindowInteropHelper((Window)s!).Handle;
+                    if (hwnd == IntPtr.Zero) return;
+                    var ex = GetWindowLongPtr(hwnd, GwlExStyle);
+                    SetWindowLongPtr(hwnd, GwlExStyle, ex | WsExToolWindow | WsExNoActivate);
+                };
+            }
+
+            if (!_anchorShown)
+            {
+                _anchor.Show();
+                _anchor.Hide();
+                _anchorShown = true;
+            }
+
             _anchor.Show();
-            _anchor.Hide();
-            _anchorShown = true;
+            _anchor.Activate();
+            var hwnd = new WindowInteropHelper(_anchor).Handle;
+            if (hwnd != IntPtr.Zero)
+                SetForegroundWindow(hwnd);
+
+            // 问题3：PlacementTarget 挂锚点窗，让 ContextMenu 进应用资源树，
+            // DynamicResource 令牌解析走应用主题字典（深色下不再退回系统浅色）。
+            // 必须在 _anchor 非空之后赋值。
+            _menu.PlacementTarget = _anchor;
+            _menu.Placement = PlacementMode.MousePoint;
+            _menu.StaysOpen = false;
+            _menu.IsOpen = true;
         }
-
-        _anchor.Show();
-        _anchor.Activate();
-        var hwnd = new System.Windows.Interop.WindowInteropHelper(_anchor).Handle;
-        if (hwnd != IntPtr.Zero)
-            SetForegroundWindow(hwnd);
-
-        _menu.Placement = PlacementMode.MousePoint;
-        _menu.StaysOpen = false;
-        _menu.IsOpen = true;
+        catch (Exception ex)
+        {
+            // 5.4：兜底（额外第二层防线）。根治在 5.2（不复用关闭的窗口），
+            // 这里只拦剩余异常，不让它沿 WinForms 回调栈杀进程。
+            Prism.App.LogException("TrayService.ShowContextMenu", ex);
+        }
     }
 
     private ContextMenu BuildMenu()
     {
         var menu = new ContextMenu();
         menu.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuStyle");
+        // 5.1：菜单关闭即隐藏锚点窗，避免它在菜单关闭后仍 Visible 被窗口切换器看见。
+        menu.Closed += (_, _) => _anchor?.Hide();
 
         var openSettings = new MenuItem { Header = "打开设置" };
         openSettings.SetResourceReference(FrameworkElement.StyleProperty, "PrismContextMenuItemStyle");
@@ -199,6 +233,18 @@ public sealed class TrayService : IDisposable
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    // 5.3：扩展样式常量。用 GetWindowLongW/SetWindowLongW（两架构都导出；
+    // GWL_EXSTYLE 是 32 位值，64 位下经符号扩展仍正确）。
+    private const int GwlExStyle = -20;
+    private const int WsExToolWindow = 0x00000080;
+    private const int WsExNoActivate = 0x08000000;
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
+    private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
     public void Dispose()
     {
