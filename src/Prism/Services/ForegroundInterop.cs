@@ -22,6 +22,21 @@ internal static class ForegroundInterop
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 
+    // 合成输入解锁前台锁：沉浸式/UWP 前台（Win+I 的 SystemSettings.exe 等）会
+    // 静默拒绝外部进程的 SetForegroundWindow。注入一次按键让 Windows 认为调用
+    // 线程刚收到用户输入，放行前台切换。VK_SHIFT 不触发任何菜单/热键。
+    private const byte VK_SHIFT = 0x10;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, IntPtr dwExtraInfo);
+
+    private static void InjectSyntheticInput()
+    {
+        keybd_event(VK_SHIFT, 0, 0, IntPtr.Zero);
+        keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, IntPtr.Zero);
+    }
+
     /// <summary>AllowSetForegroundWindow 的 ASFW_ANY：放行任意进程的下一次前台请求。</summary>
     private const uint ASFW_ANY = unchecked((uint)-1);
 
@@ -123,7 +138,16 @@ internal static class ForegroundInterop
             return true;
 
         // Windows refuses cross-thread foreground changes unless the calling thread is
-        // attached to the current foreground thread.
+        // attached to the current foreground thread. For immersive/UWP foregrounds
+        // (Win+I SystemSettings.exe) even AttachThreadInput leaves the request
+        // silently denied. Injecting a synthetic keystroke marks the calling thread
+        // as having received user input, which unlocks the foreground lock.
+        InjectSyntheticInput();
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if (GetForegroundWindow() == hwnd)
+            return true;
+
         var foreground = GetForegroundWindow();
         var foreThread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
         var currentThread = GetCurrentThreadId();
