@@ -731,7 +731,8 @@ impl Drop for HistoryStore {
     }
 }
 
-fn is_recordable(target: &ActionTarget) -> bool {
+/// pub(crate)：K0 commands 测试锚定 history-v2.json 不被命令污染的唯一防线。
+pub(crate) fn is_recordable(target: &ActionTarget) -> bool {
     matches!(
         target.kind.as_str(),
         "file" | "directory" | "application" | "window"

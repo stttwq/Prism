@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 const SHELL_QUEUE_CAPACITY: usize = 32;
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_WEB_BYTES: usize = 8 * 1024;
+/// K0：命令 id 的字节上限（对齐 persistence::COMMAND_ID_MAX_BYTES）。
+const MAX_COMMAND_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionTarget {
@@ -22,6 +24,10 @@ pub enum TargetKind {
     Application,
     Window,
     Web,
+    /// K0：命令身份。不是文件系统资源——是调用身份。broker 每条既有执行路径
+    /// 都显式拒绝它（见 allowed_actions / execute_run_action / shell_execute）。
+    /// IPC 入口另有单点守卫（dispatch_non_search），纵深防御。
+    Command,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,7 +331,7 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
 ///
 /// 无 mutation 动作直接路由到 Shell 函数；mutation 动作由 `file_ops` 在
 /// `IFileOperation` 上执行。
-fn execute_run_action(
+pub(crate) fn execute_run_action(
     target: ActionTarget,
     action: String,
     args: crate::ipc::ActionArgs,
@@ -341,7 +347,10 @@ fn execute_run_action(
     })?;
 
     let kind = target.validate()?;
-    if matches!(kind, TargetKind::Window | TargetKind::Web) {
+    if matches!(
+        kind,
+        TargetKind::Window | TargetKind::Web | TargetKind::Command
+    ) {
         return Err(ShellError::new(
             ShellErrorKind::Unsupported,
             "the action does not support this target kind",
@@ -500,10 +509,12 @@ impl ActionTarget {
         // 放行——reveal 的 explorer /select,"{path}" 用 raw_arg 刻意绕开转义，
         // 值里带引号即可塑形 explorer 命令行。真实磁盘路径永不包含引号，
         // 这里拒绝只会拦下构造载荷。
-        let maximum = if kind == TargetKind::Web {
-            MAX_WEB_BYTES
-        } else {
-            MAX_PATH_BYTES
+        // K0：Command 用 128 字节上限——它不是文件系统资源，是调用身份。
+        // 沿用 32 KiB 会让一条超长「命令 id」通过校验后流进日志和错误文案。
+        let maximum = match kind {
+            TargetKind::Web => MAX_WEB_BYTES,
+            TargetKind::Command => MAX_COMMAND_ID_BYTES,
+            _ => MAX_PATH_BYTES,
         };
         if self.value.len() > maximum {
             return Err(ShellError::new(
@@ -528,6 +539,11 @@ impl ActionTarget {
                 ShellErrorKind::TargetInvalid,
                 "window targets must contain a numeric handle",
             )),
+            TargetKind::Command => {
+                crate::persistence::validate_command_id(&self.value)
+                    .map_err(|message| ShellError::new(ShellErrorKind::TargetInvalid, message))?;
+                Ok(kind)
+            }
             _ => Ok(kind),
         }
     }
@@ -541,16 +557,19 @@ impl TargetKind {
             Self::Application => "application",
             Self::Window => "window",
             Self::Web => "web",
+            Self::Command => "command",
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    /// pub(crate)：IPC 层单点守卫需要按 kind 字符串判定是否命令身份。
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "file" => Some(Self::File),
             "directory" => Some(Self::Directory),
             "application" => Some(Self::Application),
             "window" => Some(Self::Window),
             "web" => Some(Self::Web),
+            "command" => Some(Self::Command),
             _ => None,
         }
     }
@@ -597,10 +616,14 @@ fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, Shel
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let kind = target.validate()?;
-    if kind == TargetKind::Window {
+    if matches!(kind, TargetKind::Window | TargetKind::Command) {
         return Err(ShellError::new(
             ShellErrorKind::Unsupported,
-            "window activation is not implemented",
+            if kind == TargetKind::Window {
+                "window activation is not implemented"
+            } else {
+                "command targets cannot be executed via Shell"
+            },
         ));
     }
     let value: Vec<u16> = std::ffi::OsStr::new(&target.value)

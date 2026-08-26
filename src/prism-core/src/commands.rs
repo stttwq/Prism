@@ -307,7 +307,7 @@ impl CommandStore {
                         // 容量 LRU：按 last_success 降序截断
                         usage
                             .entries
-                            .sort_by(|a, b| b.last_success_utc.cmp(&a.last_success_utc));
+                            .sort_by_key(|a| std::cmp::Reverse(a.last_success_utc));
                         usage.entries.truncate(COMMAND_USAGE_MAX_ENTRIES - 1);
                     }
                     usage.entries.push(crate::persistence::CommandUsageEntry {
@@ -615,27 +615,18 @@ impl SearchCommandContext {
         if !caps.commands_v1 {
             return None;
         }
-        let current_folder = self.current_folder.and_then(|folder| {
-            if folder.is_empty()
-                || folder.contains('\0')
-                || folder.contains('"')
-                || folder.chars().any(char::is_control)
-                || folder.len() > CURRENT_FOLDER_MAX_BYTES
-                || folder.starts_with(r"\\")
-                || !Path::new(&folder).is_absolute()
-            {
-                None
-            } else {
-                Some(folder)
-            }
+        let current_folder = self.current_folder.filter(|folder| {
+            !folder.is_empty()
+                && !folder.contains('\0')
+                && !folder.contains('"')
+                && !folder.chars().any(char::is_control)
+                && folder.len() <= CURRENT_FOLDER_MAX_BYTES
+                && !folder.starts_with(r"\\")
+                && Path::new(folder).is_absolute()
         });
-        let host_kind = self.host_kind.and_then(|kind| {
-            if HOST_KIND_WHITELIST.contains(&kind.as_str()) {
-                Some(kind)
-            } else {
-                None
-            }
-        });
+        let host_kind = self
+            .host_kind
+            .filter(|kind| HOST_KIND_WHITELIST.contains(&kind.as_str()));
         let host_capabilities = self
             .host_capabilities
             .into_iter()
@@ -953,5 +944,113 @@ mod tests {
         // K0 全 binding null
         assert!(settings.bindings.root_search.is_none());
         assert!(settings.bindings.keyword.is_none());
+    }
+
+    // R7: ActionTarget{kind:"command"} validate
+    #[test]
+    fn command_target_validate_accepts_and_rejects() {
+        use crate::shell::{ActionTarget, ShellErrorKind, TargetKind};
+
+        // 合法 id 通过
+        let t = ActionTarget {
+            kind: "command".into(),
+            value: "prism.settings.open".into(),
+        };
+        assert_eq!(t.validate().unwrap(), TargetKind::Command);
+
+        // 129 字节拒绝
+        let long = format!("user.{}", "a".repeat(130));
+        let t = ActionTarget {
+            kind: "command".into(),
+            value: long,
+        };
+        assert_eq!(
+            t.validate().unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+
+        // 大写拒绝
+        let t = ActionTarget {
+            kind: "command".into(),
+            value: "prism.Settings".into(),
+        };
+        assert_eq!(
+            t.validate().unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+
+        // 含 / 拒绝
+        let t = ActionTarget {
+            kind: "command".into(),
+            value: "prism.settings/open".into(),
+        };
+        assert_eq!(
+            t.validate().unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+
+        // 含空白拒绝
+        let t = ActionTarget {
+            kind: "command".into(),
+            value: "prism.set tings".into(),
+        };
+        assert_eq!(
+            t.validate().unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+
+        // 无前缀拒绝
+        let t = ActionTarget {
+            kind: "command".into(),
+            value: "settings.open".into(),
+        };
+        assert_eq!(
+            t.validate().unwrap_err().kind,
+            ShellErrorKind::TargetInvalid
+        );
+    }
+
+    // R8: 命令 target 被逐一拒绝（五处拒绝点）
+    #[test]
+    fn command_target_rejected_everywhere() {
+        use crate::shell::{ActionTarget, ShellErrorKind};
+
+        let cmd = ActionTarget {
+            kind: "command".into(),
+            value: "prism.exit".into(),
+        };
+
+        // actions::list_actions → Err(Unsupported)
+        let err = crate::actions::list_actions(&cmd).unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+
+        // shell::execute_run_action 拒绝（pub(crate) 纯函数）
+        let err =
+            crate::shell::execute_run_action(cmd.clone(), "copy".into(), Default::default(), None)
+                .unwrap_err();
+        assert_eq!(err.kind, ShellErrorKind::Unsupported);
+
+        // history::is_recordable == false（history-v2.json 不被污染的唯一防线）
+        assert!(!crate::history::is_recordable(&cmd));
+    }
+
+    // R9: IPC 守卫验证 TargetKind::parse 识别 command
+    #[test]
+    fn ipc_guard_recognizes_command_target() {
+        // 验证 TargetKind::parse 对 "command" 返回 Command
+        assert_eq!(
+            crate::shell::TargetKind::parse("command"),
+            Some(crate::shell::TargetKind::Command)
+        );
+        // 验证 resolve_target 不回退 command kind 为 File（target 已显式提供）
+        let target = crate::ipc::resolve_target(
+            Some(crate::shell::ActionTarget {
+                kind: "command".into(),
+                value: "prism.exit".into(),
+            }),
+            None,
+            None,
+        );
+        assert_eq!(target.kind, "command");
     }
 }

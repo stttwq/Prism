@@ -27,7 +27,8 @@ use crate::indexer_ipc::{
 };
 use crate::root_scope::RootRejection;
 use crate::shell::{
-    ActionTarget, ShellError, ShellExecutor, ShellOperation, ShellOutcome, TargetKind,
+    ActionTarget, ShellError, ShellErrorKind, ShellExecutor, ShellOperation, ShellOutcome,
+    TargetKind,
 };
 use crate::websearch::{self, WebEngine};
 use crate::{log, VERSION};
@@ -1048,25 +1049,48 @@ async fn dispatch_non_search(
             build_id: crate::build_id(),
         },
         Request::Execute { id, target, query } => {
+            // K0：命令身份只能经 execute_command 调用（K1）。这里显式拒绝，不依赖
+            // 下游 Shell 层的类型守卫——新增操作忘记加守卫不应等于开一个洞。
+            let resolved = resolve_target(target, id, None);
+            if TargetKind::parse(&resolved.kind) == Some(TargetKind::Command) {
+                return Response::Error {
+                    message: "命令不能通过该请求执行".into(),
+                    category: Some(ShellErrorKind::Unsupported),
+                };
+            }
             run_shell(
                 shell,
-                ShellOperation::Open(resolve_target(target, id, None)),
+                ShellOperation::Open(resolved),
                 history,
                 query.as_deref().and_then(query_pick_key),
             )
             .await
         }
         Request::Reveal { id, target, query } => {
+            let resolved = resolve_target(target, id, Some(TargetKind::File));
+            if TargetKind::parse(&resolved.kind) == Some(TargetKind::Command) {
+                return Response::Error {
+                    message: "命令不能通过该请求执行".into(),
+                    category: Some(ShellErrorKind::Unsupported),
+                };
+            }
             run_shell(
                 shell,
-                ShellOperation::Reveal(resolve_target(target, id, Some(TargetKind::File))),
+                ShellOperation::Reveal(resolved),
                 history,
                 query.as_deref().and_then(query_pick_key),
             )
             .await
         }
         Request::Actions { id, target } => {
-            list_actions(resolve_target(target, id, Some(TargetKind::File)))
+            let resolved = resolve_target(target, id, Some(TargetKind::File));
+            if TargetKind::parse(&resolved.kind) == Some(TargetKind::Command) {
+                return Response::Error {
+                    message: "命令不能通过该请求执行".into(),
+                    category: Some(ShellErrorKind::Unsupported),
+                };
+            }
+            list_actions(resolved)
         }
         Request::RunAction {
             id,
@@ -1075,10 +1099,17 @@ async fn dispatch_non_search(
             args,
             query,
         } => {
+            let resolved = resolve_target(target, id, Some(TargetKind::File));
+            if TargetKind::parse(&resolved.kind) == Some(TargetKind::Command) {
+                return Response::Error {
+                    message: "命令不能通过该请求执行".into(),
+                    category: Some(ShellErrorKind::Unsupported),
+                };
+            }
             run_shell(
                 shell,
                 ShellOperation::RunAction {
-                    target: resolve_target(target, id, Some(TargetKind::File)),
+                    target: resolved,
                     action,
                     args: args.unwrap_or_default(),
                     zip_program: preferences.zip_program(),
@@ -3121,7 +3152,7 @@ async fn finish_shell_response(
     }
 }
 
-fn resolve_target(
+pub(crate) fn resolve_target(
     target: Option<ActionTarget>,
     legacy_id: Option<String>,
     expected: Option<TargetKind>,

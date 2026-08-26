@@ -224,6 +224,8 @@ fn allowed_actions(kind: TargetKind) -> Vec<ActionId> {
         ],
         // Window / Web 不进入文件动作面板
         TargetKind::Window | TargetKind::Web => Vec::new(),
+        // K0：命令身份不能进文件动作面板——list_actions 因 allowed.is_empty() 返 Unsupported
+        TargetKind::Command => Vec::new(),
     }
 }
 
