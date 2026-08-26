@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Windows.Data;
 using System.Windows.Input;
 using Prism.Models;
 using Prism.Services;
@@ -358,8 +359,16 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         {
             var entries = await _onAliasList().ConfigureAwait(true);
             AliasEntries.Clear();
-            foreach (var entry in entries)
+            // 按 kind 序（应用→文件夹→文件）填充，分组内也按此序。
+            foreach (var entry in entries.OrderBy(e => KindOrder(e.Target.Kind)))
                 AliasEntries.Add(entry);
+            // 一次性挂分组视图（防重复添加）；删除经 ObservableCollection 通知自动更新组。
+            var view = CollectionViewSource.GetDefaultView(AliasEntries);
+            if (view is not null && view.GroupDescriptions.OfType<PropertyGroupDescription>()
+                .All(g => g.PropertyName != "KindLabel"))
+            {
+                view.GroupDescriptions.Add(new PropertyGroupDescription("KindLabel"));
+            }
         }
         catch
         {
@@ -367,6 +376,14 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
         OnPropertyChanged(nameof(HasNoAliases));
     }
+
+    /// <summary>别名分组排序键：应用 0、文件夹 1、文件 2。</summary>
+    private static int KindOrder(string kind) => kind switch
+    {
+        "application" => 0,
+        "directory" => 1,
+        _ => 2,
+    };
 
     private async Task RemoveAliasAsync(AliasEntry? entry)
     {

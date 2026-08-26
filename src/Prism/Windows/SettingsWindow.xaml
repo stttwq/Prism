@@ -385,6 +385,72 @@
                BasedOn="{StaticResource SettingsTextBoxStyle}">
             <Setter Property="Padding" Value="4,2"/>
         </Style>
+
+        <!-- 设置页分节折叠器（问题4B 整页折叠）：字形箭头旋转 + SemiBold 标题。 -->
+        <Style x:Key="SettingsExpanderStyle" TargetType="Expander">
+            <Setter Property="Foreground" Value="{DynamicResource TextTitle}"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="0,0,0,4"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Expander">
+                        <StackPanel>
+                            <ToggleButton x:Name="HeaderSite"
+                                          IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          Background="Transparent"
+                                          BorderThickness="0"
+                                          HorizontalContentAlignment="Left"
+                                          Padding="0,4"
+                                          Cursor="Hand">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="{TemplateBinding Background}"
+                                                Padding="{TemplateBinding Padding}">
+                                            <ContentPresenter/>
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="Arrow"
+                                               Text="&#xE76C;"
+                                               FontFamily="{DynamicResource IconFontFamily}"
+                                               FontSize="12"
+                                               Foreground="{DynamicResource TextSubtitle}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,8,0"
+                                               RenderTransformOrigin="0.5,0.5">
+                                        <TextBlock.RenderTransform>
+                                            <RotateTransform Angle="0"/>
+                                        </TextBlock.RenderTransform>
+                                    </TextBlock>
+                                    <ContentPresenter Grid.Column="1"
+                                                      ContentSource="Header"
+                                                      VerticalAlignment="Center"/>
+                                </Grid>
+                            </ToggleButton>
+                            <ContentPresenter x:Name="ExpandSite"
+                                              Visibility="Collapsed"/>
+                        </StackPanel>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsExpanded" Value="True">
+                                <Setter TargetName="ExpandSite" Property="Visibility" Value="Visible"/>
+                                <Setter TargetName="Arrow" Property="RenderTransform">
+                                    <Setter.Value>
+                                        <RotateTransform Angle="90"/>
+                                    </Setter.Value>
+                                </Setter>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
 
     <Grid>
@@ -527,125 +593,236 @@
 
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
-                    <TextBlock Text="动作快捷键（搜索窗口内生效）" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
-                    <TextBlock Text="默认不绑定任何动作。点「添加动作」逐个添加：先选动作，再点右侧框录制组合键，搜索窗口打开时按下即对当前选中项执行。方向键、Enter、Esc、Ctrl+G、Ctrl+数字保留给导航，不可绑定。"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               TextWrapping="Wrap" Margin="0,0,0,10"/>
-                    <ItemsControl ItemsSource="{Binding ActionHotkeys}" Margin="0,0,0,8">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Grid Margin="0,0,0,6">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <ComboBox Style="{StaticResource SettingsComboBoxStyle}"
-                                              ItemsSource="{Binding AvailableActions}"
-                                              SelectedValuePath="Id"
-                                              SelectedValue="{Binding Id, Mode=TwoWay}"
-                                              DisplayMemberPath="Label"
-                                              Width="170"
-                                              VerticalAlignment="Center"/>
-                                    <TextBlock Text="{Binding ScopeText}"
-                                               FontSize="11" Foreground="{DynamicResource TextSubtitle}"
-                                               Grid.Column="1" VerticalAlignment="Center"
-                                               Margin="10,1,0,0"/>
-                                    <controls:HotkeyRecorderBox Value="{Binding Value, Mode=TwoWay}"
-                                                                Width="200"
-                                                                Grid.Column="3"/>
-                                    <Button Content="删除"
-                                            Command="{Binding DataContext.RemoveActionHotkeyCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
-                                            CommandParameter="{Binding}"
-                                            Style="{StaticResource SettingsActionButton}"
-                                            Padding="10,2,10,2"
-                                            Grid.Column="4" Margin="8,0,0,0"/>
-                                </Grid>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                    <Button Content="＋ 添加动作"
-                            Command="{Binding AddActionHotkeyCommand}"
-                            Style="{StaticResource SettingsActionButton}"
-                            HorizontalAlignment="Left"
-                            Margin="0,0,0,16"/>
-
-                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
-
-                    <!-- 暂存区（2026-08-22 计划）：容量 + 加入快捷键。 -->
-                    <TextBlock Text="暂存区" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
-                    <TextBlock Text="搜索窗口内按下方快捷键把选中文件扔进暂存区（搜索框下方的文件架），随时拖出到任意应用。满了自动挤掉最早加入的未标记文件。"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               TextWrapping="Wrap" Margin="0,0,0,10"/>
-                    <Grid Margin="0,0,0,6">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Text="加入暂存区"
-                                   FontSize="13" Foreground="{DynamicResource TextQuery}"
-                                   VerticalAlignment="Center" Margin="0,0,12,0"/>
-                        <controls:HotkeyRecorderBox Value="{Binding StagingAddHotkey, Mode=TwoWay}"
-                                                    Width="200"
-                                                    Grid.Column="1"/>
-                        <StackPanel Grid.Column="2" Orientation="Horizontal"
-                                    HorizontalAlignment="Right" VerticalAlignment="Center">
-                            <TextBlock Text="容量（1–32）"
-                                       FontSize="13" Foreground="{DynamicResource TextQuery}"
-                                       VerticalAlignment="Center" Margin="0,0,8,0"/>
-                            <TextBox Text="{Binding StagingCapacityText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                     Style="{StaticResource SettingsTextBoxStyle}"
-                                     Width="64" Padding="8,4,8,4"/>
+                    <Expander Style="{StaticResource SettingsExpanderStyle}"
+                              IsExpanded="True"
+                              Header="动作快捷键（搜索窗口内生效）"
+                              Margin="0,0,0,10">
+                        <StackPanel>
+                            <TextBlock Text="默认不绑定任何动作。点「添加动作」逐个添加：先选动作，再点右侧框录制组合键，搜索窗口打开时按下即对当前选中项执行。方向键、Enter、Esc、Ctrl+G、Ctrl+数字保留给导航，不可绑定。"
+                                       FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                       TextWrapping="Wrap" Margin="0,0,0,10"/>
+                            <ItemsControl ItemsSource="{Binding ActionHotkeys}" Margin="0,0,0,8">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,0,0,6">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <ComboBox Style="{StaticResource SettingsComboBoxStyle}"
+                                                      ItemsSource="{Binding AvailableActionsView}"
+                                                      SelectedValuePath="Id"
+                                                      SelectedValue="{Binding Id, Mode=TwoWay}"
+                                                      Width="170"
+                                                      VerticalAlignment="Center">
+                                                <ComboBox.GroupStyle>
+                                                    <GroupStyle>
+                                                        <GroupStyle.HeaderTemplate>
+                                                            <DataTemplate>
+                                                                <TextBlock Text="{Binding Name}"
+                                                                           FontSize="11" FontWeight="SemiBold"
+                                                                           Foreground="{DynamicResource TextSubtitle}"
+                                                                           Padding="8,4,0,2"/>
+                                                            </DataTemplate>
+                                                        </GroupStyle.HeaderTemplate>
+                                                    </GroupStyle>
+                                                </ComboBox.GroupStyle>
+                                                <ComboBox.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <TextBlock Text="{Binding IconGlyph}"
+                                                                       FontFamily="{DynamicResource IconFontFamily}"
+                                                                       FontSize="13"
+                                                                       Foreground="{DynamicResource TextSubtitle}"
+                                                                       VerticalAlignment="Center"
+                                                                       Width="16" TextAlignment="Center"
+                                                                       Margin="0,0,6,0"/>
+                                                            <TextBlock Text="{Binding Label}"
+                                                                       FontSize="13"
+                                                                       Foreground="{DynamicResource TextQuery}"
+                                                                       VerticalAlignment="Center"/>
+                                                            <TextBlock Text="{Binding Description}"
+                                                                       FontSize="11"
+                                                                       Foreground="{DynamicResource TextSubtitle}"
+                                                                       VerticalAlignment="Center"
+                                                                       Margin="8,0,0,0"
+                                                                       TextTrimming="CharacterEllipsis"
+                                                                       MaxWidth="120"/>
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ComboBox.ItemTemplate>
+                                            </ComboBox>
+                                            <TextBlock Text="{Binding ScopeText}"
+                                                       FontSize="11" Foreground="{DynamicResource TextSubtitle}"
+                                                       Grid.Column="1" VerticalAlignment="Center"
+                                                       Margin="10,1,0,0"/>
+                                            <controls:HotkeyRecorderBox Value="{Binding Value, Mode=TwoWay}"
+                                                                        Width="200"
+                                                                        Grid.Column="3"/>
+                                            <Button Content="删除"
+                                                    Command="{Binding DataContext.RemoveActionHotkeyCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                    CommandParameter="{Binding}"
+                                                    Style="{StaticResource SettingsActionButton}"
+                                                    Padding="10,2,10,2"
+                                                    Grid.Column="4" Margin="8,0,0,0"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <Button Content="＋ 添加动作"
+                                    Command="{Binding AddActionHotkeyCommand}"
+                                    Style="{StaticResource SettingsActionButton}"
+                                    HorizontalAlignment="Left"
+                                    Margin="0,0,0,16"/>
                         </StackPanel>
-                    </Grid>
-                    <TextBlock Text="清空录键框 = 禁用该快捷键。"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               Margin="0,0,0,16"/>
+                    </Expander>
 
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
 
-                    <!-- 别名系统（2026-08-21 设想）：可见资产——统一看、逐条删。 -->
-                    <TextBlock Text="文件别名" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,6"/>
-                    <TextBlock Text="在搜索结果上右键「设置别名…」绑定快捷词；输入词与查询完全一致时对应文件置顶显示。"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               TextWrapping="Wrap" Margin="0,0,0,8"/>
-                    <ItemsControl ItemsSource="{Binding AliasEntries}" Margin="0,0,0,4">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Grid Margin="0,0,0,6">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{Binding WordsText}"
-                                               FontSize="13" FontWeight="SemiBold"
-                                               Foreground="{DynamicResource TextMatch}"
-                                               Margin="0,0,12,0" VerticalAlignment="Center"/>
-                                    <TextBlock Text="{Binding Target.Value}"
-                                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                                               TextTrimming="CharacterEllipsis"
-                                               Grid.Column="1" VerticalAlignment="Center"/>
-                                    <Button Content="删除"
-                                            Command="{Binding DataContext.RemoveAliasCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
-                                            CommandParameter="{Binding}"
-                                            Style="{StaticResource SettingsActionButton}"
-                                            Padding="10,2,10,2"
-                                            Grid.Column="2" Margin="12,0,0,0"/>
-                                </Grid>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                    <TextBlock Text="（暂无别名。在搜索结果上右键即可添加。）"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}"
-                               Visibility="{Binding HasNoAliases, Converter={StaticResource BoolToVis}}"
-                               Margin="0,0,0,16"/>
+                    <Expander Style="{StaticResource SettingsExpanderStyle}"
+                              IsExpanded="False"
+                              Header="暂存区"
+                              Margin="0,0,0,10">
+                        <StackPanel>
+                            <TextBlock Text="搜索窗口内按下方快捷键把选中文件扔进暂存区（搜索框下方的文件架），随时拖出到任意应用。满了自动挤掉最早加入的未标记文件。"
+                                       FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                       TextWrapping="Wrap" Margin="0,0,0,10"/>
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="加入暂存区"
+                                           FontSize="13" Foreground="{DynamicResource TextQuery}"
+                                           VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                <controls:HotkeyRecorderBox Value="{Binding StagingAddHotkey, Mode=TwoWay}"
+                                                            Width="200"
+                                                            Grid.Column="1"/>
+                                <StackPanel Grid.Column="2" Orientation="Horizontal"
+                                            HorizontalAlignment="Right" VerticalAlignment="Center">
+                                    <TextBlock Text="容量（1–32）"
+                                               FontSize="13" Foreground="{DynamicResource TextQuery}"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <TextBox Text="{Binding StagingCapacityText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource SettingsTextBoxStyle}"
+                                             Width="64" Padding="8,4,8,4"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="清空录键框 = 禁用该快捷键。"
+                                       FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                       Margin="0,0,0,16"/>
+                        </StackPanel>
+                    </Expander>
+
+                    <Border Height="1" Background="{DynamicResource Divider}" Margin="0,4,0,16"/>
+
+                    <Expander Style="{StaticResource SettingsExpanderStyle}"
+                              IsExpanded="False"
+                              Header="文件别名"
+                              Margin="0,0,0,10">
+                        <StackPanel>
+                            <TextBlock Text="在搜索结果上右键「设置别名…」绑定快捷词；输入词与查询完全一致时对应文件置顶显示。"
+                                       FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                       TextWrapping="Wrap" Margin="0,0,0,8"/>
+                            <ListBox ItemsSource="{Binding AliasEntries}"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     MaxHeight="320"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                     VirtualizingPanel.IsVirtualizing="True"
+                                     VirtualizingPanel.VirtualizationMode="Recycling"
+                                     Margin="0,0,0,4">
+                                <ListBox.GroupStyle>
+                                    <GroupStyle>
+                                        <GroupStyle.ContainerStyle>
+                                            <Style TargetType="GroupItem">
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="GroupItem">
+                                                            <Expander IsExpanded="True" Margin="0,0,0,4">
+                                                                <Expander.Header>
+                                                                    <TextBlock FontSize="12" FontWeight="SemiBold"
+                                                                               Foreground="{DynamicResource TextTitle}">
+                                                                        <Run Text="{Binding Name}"/>
+                                                                        <Run Text=" (" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
+                                                                        <Run Text="{Binding ItemCount}" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
+                                                                        <Run Text=")" FontWeight="Normal" Foreground="{DynamicResource TextSubtitle}"/>
+                                                                    </TextBlock>
+                                                                </Expander.Header>
+                                                                <ItemsPresenter/>
+                                                            </Expander>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </GroupStyle.ContainerStyle>
+                                    </GroupStyle>
+                                </ListBox.GroupStyle>
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="Background" Value="Transparent"/>
+                                        <Setter Property="Padding" Value="0,2"/>
+                                        <Setter Property="Margin" Value="0"/>
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="ListBoxItem">
+                                                    <Border Background="{TemplateBinding Background}"
+                                                            Padding="{TemplateBinding Padding}"
+                                                            SnapsToDevicePixels="True">
+                                                        <ContentPresenter/>
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                                                        </Trigger>
+                                                        <Trigger Property="IsSelected" Value="True">
+                                                            <Setter Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,0,0,6">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding WordsText}"
+                                                       FontSize="13" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource TextMatch}"
+                                                       Margin="0,0,12,0" VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding TargetFileName}"
+                                                       FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                                       TextTrimming="CharacterEllipsis"
+                                                       ToolTip="{Binding Target.Value}"
+                                                       Grid.Column="1" VerticalAlignment="Center"/>
+                                            <Button Content="删除"
+                                                    Command="{Binding DataContext.RemoveAliasCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                                    CommandParameter="{Binding}"
+                                                    Style="{StaticResource SettingsActionButton}"
+                                                    Padding="10,2,10,2"
+                                                    Grid.Column="2" Margin="12,0,0,0"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <TextBlock Text="（暂无别名。在搜索结果上右键即可添加。）"
+                                       FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                       Visibility="{Binding HasNoAliases, Converter={StaticResource BoolToVis}}"
+                                       Margin="0,0,0,16"/>
+                        </StackPanel>
+                    </Expander>
                 </StackPanel>
             </ScrollViewer>
 

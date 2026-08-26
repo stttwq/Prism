@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Windows.Data;
 
 namespace Prism.Models;
 
@@ -38,6 +39,7 @@ public sealed class ActionHotkeyEditItem : INotifyPropertyChanged
         ActionHotkeyCatalog.ScopeText(ActionHotkeyCatalog.Find(_id)?.Kinds ?? ActionHotkeyKinds.None);
 
     /// <summary>本行 ComboBox 可选动作（设置页刷新：目录减去其他行已占用的）。</summary>
+    /// <remarks>返回按 Category 分组的 ListCollectionView，供下拉 GroupStyle 出 section header。</remarks>
     public IReadOnlyList<ActionHotkeyCatalog.Entry> AvailableActions
     {
         get => _availableActions;
@@ -46,8 +48,26 @@ public sealed class ActionHotkeyEditItem : INotifyPropertyChanged
             if (ReferenceEquals(_availableActions, value)) return;
             _availableActions = value;
             OnPropertyChanged();
+            // 同步刷新分组视图（ComboBox ItemsSource 绑它）。
+            var view = CollectionViewSource.GetDefaultView(_availableActions);
+            if (view is ListCollectionView lcv)
+            {
+                lcv.GroupDescriptions.Clear();
+                lcv.GroupDescriptions.Add(new PropertyGroupDescription("Category"));
+            }
+            else if (value is not null)
+            {
+                // 非 ListCollectionView 情况（罕见）回退新建一个，保证分组生效。
+                var grouped = new ListCollectionView((System.Collections.IList)value);
+                grouped.GroupDescriptions.Add(new PropertyGroupDescription("Category"));
+            }
+            OnPropertyChanged(nameof(AvailableActionsView));
         }
     }
+
+    /// <summary>ComboBox 实际绑定的分组视图（AvailableActions 的分组包装）。</summary>
+public System.Collections.IEnumerable AvailableActionsView
+        => CollectionViewSource.GetDefaultView(_availableActions);
 
     public string Value
     {
