@@ -61,7 +61,7 @@
             <Setter Property="MinWidth" Value="80"/>
         </Style>
 
-        <!-- 引擎管理大按钮：标题 + 说明两行，占满分配宽度（小问题 Q1） -->
+        <!-- 引擎管理大按钮：单行紧凑（图标 + 标题），描述移入 ToolTip（问题3） -->
         <Style x:Key="SettingsEngineCardButton" TargetType="Button">
             <Setter Property="Background" Value="{DynamicResource BgSettingsInput}"/>
             <Setter Property="BorderBrush" Value="{DynamicResource BorderSettingsInput}"/>
@@ -70,8 +70,8 @@
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="HorizontalContentAlignment" Value="Left"/>
             <Setter Property="VerticalContentAlignment" Value="Center"/>
-            <Setter Property="Padding" Value="12,8"/>
-            <Setter Property="Height" Value="52"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="Height" Value="36"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
@@ -336,6 +336,34 @@
             <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource Divider}"/>
             <Setter Property="VerticalGridLinesBrush" Value="{DynamicResource Divider}"/>
             <Setter Property="ColumnHeaderStyle" Value="{StaticResource SettingsDataGridColumnHeaderStyle}"/>
+            <Setter Property="CellStyle">
+                <Setter.Value>
+                    <Style TargetType="DataGridCell">
+                        <Setter Property="Background" Value="Transparent"/>
+                        <Setter Property="BorderBrush" Value="Transparent"/>
+                        <Setter Property="BorderThickness" Value="0"/>
+                        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="DataGridCell">
+                                    <Border Background="{TemplateBinding Background}"
+                                            BorderBrush="{TemplateBinding BorderBrush}"
+                                            BorderThickness="{TemplateBinding BorderThickness}"
+                                            SnapsToDevicePixels="True">
+                                        <ContentPresenter VerticalAlignment="Center"
+                                                          Margin="4,0"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                        <Style.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Setter.Value>
+            </Setter>
             <Setter Property="RowStyle">
                 <Setter.Value>
                     <Style TargetType="DataGridRow">
@@ -348,6 +376,14 @@
                     </Style>
                 </Setter.Value>
             </Setter>
+        </Style>
+
+        <!-- DataGrid 编辑态 TextBox：基于 SettingsTextBoxStyle，仅调紧凑 Padding，
+             双击编辑格生成的内部 TextBox 拿到主题色，深色下不再露系统白底。 -->
+        <Style x:Key="SettingsDataGridEditTextBoxStyle"
+               TargetType="TextBox"
+               BasedOn="{StaticResource SettingsTextBoxStyle}">
+            <Setter Property="Padding" Value="4,2"/>
         </Style>
     </Window.Resources>
 
@@ -643,60 +679,94 @@
                           BorderThickness="1"
                           SelectionMode="Single"
                           SelectionUnit="FullRow"
-                          FontSize="13">
+                          FontSize="13"
+                          MinHeight="150">
                     <DataGrid.Columns>
                         <DataGridTextColumn Header="关键词"
                                             Binding="{Binding Keyword, UpdateSourceTrigger=PropertyChanged}"
-                                            Width="80"/>
+                                            Width="80"
+                                            EditingElementStyle="{StaticResource SettingsDataGridEditTextBoxStyle}"/>
                         <DataGridTextColumn Header="名称"
                                             Binding="{Binding Name, UpdateSourceTrigger=PropertyChanged}"
-                                            Width="100"/>
+                                            Width="100"
+                                            EditingElementStyle="{StaticResource SettingsDataGridEditTextBoxStyle}"/>
                         <DataGridTextColumn Header="URL 模板（含 {q}）"
                                             Binding="{Binding UrlTemplate, UpdateSourceTrigger=PropertyChanged}"
-                                            Width="*"/>
+                                            Width="*"
+                                            EditingElementStyle="{StaticResource SettingsDataGridEditTextBoxStyle}"/>
                     </DataGrid.Columns>
                 </DataGrid>
 
                 <UniformGrid Grid.Row="2" Columns="3" Margin="0,12,0,12">
                     <Button Command="{Binding AddEngineCommand}"
-                            Style="{StaticResource SettingsEngineCardButton}" Margin="0,0,8,0">
-                        <StackPanel>
-                            <TextBlock Text="添加引擎" FontSize="13" FontWeight="SemiBold"/>
-                            <TextBlock Text="新增一行空白引擎" FontSize="11"
-                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                            Style="{StaticResource SettingsEngineCardButton}"
+                            ToolTip="新增一行空白引擎"
+                            Margin="0,0,8,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE710;"
+                                       FontFamily="{DynamicResource IconFontFamily}"
+                                       FontSize="14"
+                                       Foreground="{DynamicResource TextSubtitle}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       TextAlignment="Center"
+                                       Width="16"/>
+                            <TextBlock Text="添加引擎" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Button>
                     <Button Command="{Binding RemoveEngineCommand}"
-                            Style="{StaticResource SettingsEngineCardButton}" Margin="0,0,8,0">
-                        <StackPanel>
-                            <TextBlock Text="删除选中" FontSize="13" FontWeight="SemiBold"/>
-                            <TextBlock Text="移除列表中选中的引擎" FontSize="11"
-                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                            Style="{StaticResource SettingsEngineCardButton}"
+                            ToolTip="移除列表中选中的引擎"
+                            Margin="0,0,8,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE74D;"
+                                       FontFamily="{DynamicResource IconFontFamily}"
+                                       FontSize="14"
+                                       Foreground="{DynamicResource TextSubtitle}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       TextAlignment="Center"
+                                       Width="16"/>
+                            <TextBlock Text="删除选中" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Button>
                     <Button Command="{Binding ResetEnginesCommand}"
-                            Style="{StaticResource SettingsEngineCardButton}">
-                        <StackPanel>
-                            <TextBlock Text="恢复预设" FontSize="13" FontWeight="SemiBold"/>
-                            <TextBlock Text="还原全部内置引擎" FontSize="11"
-                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                            Style="{StaticResource SettingsEngineCardButton}"
+                            ToolTip="还原全部内置引擎">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE72C;"
+                                       FontFamily="{DynamicResource IconFontFamily}"
+                                       FontSize="14"
+                                       Foreground="{DynamicResource TextSubtitle}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       TextAlignment="Center"
+                                       Width="16"/>
+                            <TextBlock Text="恢复预设" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Button>
                 </UniformGrid>
 
                 <StackPanel Grid.Row="3">
                     <Border Height="1" Background="{DynamicResource Divider}" Margin="0,0,0,12"/>
-                    <TextBlock Text="在线联想" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
-                    <CheckBox Content="启用在线联想（仅内置 Bing / 百度 / Google，默认关闭）"
-                              IsChecked="{Binding SuggestionsEnabled, Mode=TwoWay}"
-                              Style="{StaticResource SettingsCheckBoxStyle}"
-                              Margin="0,0,0,8"/>
-                    <TextBlock Text="开启后，输入网页关键词时会向对应引擎发送查询词以获取联想建议。查询词和联想结果不写入历史或日志。单次请求 800ms 超时，断网或失败时静默回退直接搜索。"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"
-                               Margin="0,0,0,8"/>
-                    <TextBlock Text="自定义引擎不支持联想。favicon 图标联网获取需在保存引擎时单独授权，与联想开关相互独立。"
-                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                        <TextBlock Text="在线联想" FontSize="13" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextTitle}"
+                                   VerticalAlignment="Center" Margin="0,0,12,0"/>
+                        <CheckBox Content="启用在线联想（仅内置 Bing / 百度 / Google，默认关闭）"
+                                  IsChecked="{Binding SuggestionsEnabled, Mode=TwoWay}"
+                                  Style="{StaticResource SettingsCheckBoxStyle}"
+                                  VerticalAlignment="Center"/>
+                        <TextBlock Text="&#xE7B3;"
+                                   FontFamily="{DynamicResource IconFontFamily}"
+                                   FontSize="14"
+                                   Foreground="{DynamicResource TextSubtitle}"
+                                   VerticalAlignment="Center"
+                                   Margin="10,0,0,0"
+                                   Width="18" Height="18"
+                                   TextAlignment="Center"
+                                   ToolTip="查询词和联想结果不写入历史或日志。单次请求 800ms 超时，断网或失败时静默回退直接搜索。自定义引擎不支持联想。favicon 图标联网获取需在保存引擎时单独授权，与联想开关相互独立。"/>
+                    </StackPanel>
                 </StackPanel>
             </Grid>
 
