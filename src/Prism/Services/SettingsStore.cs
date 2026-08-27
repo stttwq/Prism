@@ -88,6 +88,7 @@ public sealed class SettingsStore
         {
             ComboHotkey = settings.ComboHotkey ?? Settings.Default.ComboHotkey,
             WebEngines = settings.WebEngines ?? [],
+            FilterTriggers = settings.FilterTriggers ?? [],
             ExcludedPaths = settings.ExcludedPaths ?? [],
             ZipProgram = string.IsNullOrWhiteSpace(settings.ZipProgram) ? null : settings.ZipProgram,
             ActionHotkeys = actionHotkeys,
@@ -116,6 +117,8 @@ public sealed class SettingsStore
     {
         if (settings.ExcludedPaths.Count > 32)
             throw new InvalidDataException("ExcludedPaths may contain at most 32 entries.");
+        if (settings.FilterTriggers.Count > 16)
+            throw new InvalidDataException("FilterTriggers may contain at most 16 entries.");
         foreach (var path in settings.ExcludedPaths)
         {
             if (string.IsNullOrWhiteSpace(path)

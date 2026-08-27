@@ -23,6 +23,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly Func<Task>? _onClearHistory;
     /// <summary>G8：保存设置后通知 App 更新联想开关和引擎列表。</summary>
     private readonly Action<IReadOnlyList<WebEngine>, bool>? _onWebSettingsChanged;
+    /// <summary>保存设置后通知 App 更新过滤触发词列表。</summary>
+    private readonly Action<IReadOnlyList<FilterTrigger>>? _onFilterTriggersChanged;
     /// <summary>G8：自定义引擎 origin 变化时弹出 favicon 授权对话框。返回 true=授权。</summary>
     private readonly Func<string, bool>? _onRequestFaviconGrant;
     /// <summary>G8：授权成功后触发 favicon 下载（App 持有 FaviconCache，完成后刷新图标缓存）。</summary>
@@ -37,12 +39,14 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private string _comboHotkey;
     private string _statusMessage = "";
     private WebEngineEditItem? _selectedEngine;
+    private FilterTriggerEditItem? _selectedFilterTrigger;
     private sealed class TabIndex
     {
         public const int General = 0;
         public const int QuickAccess = 1;
         public const int Web = 2;
-        public const int About = 3;
+        public const int Filters = 3;
+        public const int About = 4;
     }
 
     private int _selectedTab; // 0=常规 1=快速访问 2=网页搜索 3=关于
@@ -68,6 +72,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Func<bool, bool, Task>? onPreferencesChanged = null,
         Func<Task>? onClearHistory = null,
         Action<IReadOnlyList<WebEngine>, bool>? onWebSettingsChanged = null,
+        Action<IReadOnlyList<FilterTrigger>>? onFilterTriggersChanged = null,
         Func<string, bool>? onRequestFaviconGrant = null,
         Action<string>? onFaviconGranted = null,
         Func<Task<IReadOnlyList<AliasEntry>>>? onAliasList = null,
@@ -80,6 +85,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onPreferencesChanged = onPreferencesChanged;
         _onClearHistory = onClearHistory;
         _onWebSettingsChanged = onWebSettingsChanged;
+        _onFilterTriggersChanged = onFilterTriggersChanged;
         _onRequestFaviconGrant = onRequestFaviconGrant;
         _onFaviconGranted = onFaviconGranted;
         _onAliasList = onAliasList;
@@ -117,6 +123,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             (settings.WebEngines.Count > 0 ? settings.WebEngines : Settings.DefaultEngines())
             .Select(e => new WebEngineEditItem(e)));
 
+        FilterTriggers = new ObservableCollection<FilterTriggerEditItem>(
+            (settings.FilterTriggers.Count > 0 ? settings.FilterTriggers : Settings.DefaultFilterTriggers())
+            .Select(t => new FilterTriggerEditItem(t)));
+
         // 第一轮 bug 修复：默认没有任何行——用户点「添加动作」逐个加、自选动作
         // 与组合键；不再预列全部 15 个动作。已有绑定（旧设置）按行恢复。
         ActionHotkeys = new ObservableCollection<ActionHotkeyEditItem>(
@@ -132,6 +142,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         AddEngineCommand = new RelayCommand(_ => AddEngine());
         RemoveEngineCommand = new RelayCommand(_ => RemoveSelectedEngine(), _ => SelectedEngine is not null);
         ResetEnginesCommand = new RelayCommand(_ => ResetEngines());
+        AddFilterTriggerCommand = new RelayCommand(_ => AddFilterTrigger());
+        RemoveFilterTriggerCommand = new RelayCommand(_ => RemoveSelectedFilterTrigger(), _ => SelectedFilterTrigger is not null);
+        ResetFilterTriggersCommand = new RelayCommand(_ => ResetFilterTriggers());
         SaveCommand = new RelayCommand(_ => Save());
         ClearHistoryCommand = new RelayCommand(_ => _ = ClearHistoryAsync());
         RemoveAliasCommand = new RelayCommand(p => _ = RemoveAliasAsync(p as AliasEntry), _ => AliasEntries.Count > 0);
@@ -164,6 +177,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(IsGeneralTab));
             OnPropertyChanged(nameof(IsQuickAccessTab));
             OnPropertyChanged(nameof(IsWebTab));
+            OnPropertyChanged(nameof(IsFiltersTab));
             OnPropertyChanged(nameof(IsAboutTab));
         }
     }
@@ -171,6 +185,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public bool IsGeneralTab => SelectedTab == TabIndex.General;
     public bool IsQuickAccessTab => SelectedTab == TabIndex.QuickAccess;
     public bool IsWebTab => SelectedTab == TabIndex.Web;
+    public bool IsFiltersTab => SelectedTab == TabIndex.Filters;
     public bool IsAboutTab => SelectedTab == TabIndex.About;
 
     /// <summary>是否使用双击 Ctrl 呼出（与 IsComboMode 互斥）。</summary>
@@ -253,6 +268,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public ObservableCollection<WebEngineEditItem> Engines { get; }
 
+    public ObservableCollection<FilterTriggerEditItem> FilterTriggers { get; }
+
     /// <summary>动作快捷键行集合：默认空，用户逐个添加（第一轮 bug 修复）。</summary>
     public ObservableCollection<ActionHotkeyEditItem> ActionHotkeys { get; }
 
@@ -321,6 +338,18 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    public FilterTriggerEditItem? SelectedFilterTrigger
+    {
+        get => _selectedFilterTrigger;
+        set
+        {
+            if (ReferenceEquals(_selectedFilterTrigger, value)) return;
+            _selectedFilterTrigger = value;
+            OnPropertyChanged();
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
     public string StatusMessage
     {
         get => _statusMessage;
@@ -335,6 +364,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public ICommand AddEngineCommand { get; }
     public ICommand RemoveEngineCommand { get; }
     public ICommand ResetEnginesCommand { get; }
+    public ICommand AddFilterTriggerCommand { get; }
+    public ICommand RemoveFilterTriggerCommand { get; }
+    public ICommand ResetFilterTriggersCommand { get; }
     public ICommand SaveCommand { get; }
     public ICommand SelectTabCommand { get; }
     public ICommand ClearHistoryCommand { get; }
@@ -548,6 +580,39 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         StatusMessage = "已恢复预设（bi / b / g），点保存后生效";
     }
 
+    private void AddFilterTrigger()
+    {
+        var item = new FilterTriggerEditItem
+        {
+            Keyword = "",
+            FilterType = "ext",
+            Description = "新触发词",
+        };
+        FilterTriggers.Add(item);
+        SelectedFilterTrigger = item;
+        StatusMessage = "已添加一行，请填写关键词后点保存";
+    }
+
+    private void RemoveSelectedFilterTrigger()
+    {
+        if (SelectedFilterTrigger is null) return;
+        var idx = FilterTriggers.IndexOf(SelectedFilterTrigger);
+        FilterTriggers.Remove(SelectedFilterTrigger);
+        SelectedFilterTrigger = FilterTriggers.Count == 0
+            ? null
+            : FilterTriggers[Math.Clamp(idx, 0, FilterTriggers.Count - 1)];
+        StatusMessage = "已移除，点保存后生效";
+    }
+
+    private void ResetFilterTriggers()
+    {
+        FilterTriggers.Clear();
+        foreach (var t in Settings.DefaultFilterTriggers())
+            FilterTriggers.Add(new FilterTriggerEditItem(t));
+        SelectedFilterTrigger = FilterTriggers.FirstOrDefault();
+        StatusMessage = "已恢复预设（tz / pp），点保存后生效";
+    }
+
     private void Save()
     {
         if (_hotkeyMode == HotkeyMode.Combo && string.IsNullOrWhiteSpace(ComboHotkey))
@@ -680,6 +745,42 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             return;
         }
 
+        var filterTriggers = new List<FilterTrigger>();
+        var seenTriggers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in FilterTriggers)
+        {
+            var trig = row.ToTrigger();
+            if (string.IsNullOrEmpty(trig.Keyword))
+            {
+                StatusMessage = "过滤触发词关键词不能为空";
+                SelectedTab = TabIndex.Filters;
+                SelectedFilterTrigger = row;
+                return;
+            }
+            if (trig.Keyword.Any(char.IsWhiteSpace))
+            {
+                StatusMessage = $"关键词「{trig.Keyword}」不能含空格";
+                SelectedTab = TabIndex.Filters;
+                SelectedFilterTrigger = row;
+                return;
+            }
+            if (trig.FilterType is not ("ext" or "path"))
+            {
+                StatusMessage = $"触发词「{trig.Keyword}」的类型必须是 ext 或 path";
+                SelectedTab = TabIndex.Filters;
+                SelectedFilterTrigger = row;
+                return;
+            }
+            if (!seenTriggers.Add(trig.Keyword))
+            {
+                StatusMessage = $"关键词「{trig.Keyword}」重复";
+                SelectedTab = TabIndex.Filters;
+                SelectedFilterTrigger = row;
+                return;
+            }
+            filterTriggers.Add(trig);
+        }
+
         var next = new Settings
         {
             SchemaVersion = Settings.CurrentSchemaVersion,
@@ -687,6 +788,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             ComboHotkey = ComboHotkey.Trim(),
             AutoStart = _autoStartEnabled,
             WebEngines = engines,
+            FilterTriggers = filterTriggers,
             ExcludedPaths = _excludedPaths,
             HistoryEnabled = HistoryEnabled,
             PinyinEnabled = PinyinEnabled,
@@ -728,6 +830,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
         // G8: 同步联想开关和引擎列表给 SearchViewModel（无论后端是否连接）。
         _onWebSettingsChanged?.Invoke(engines, _suggestionsEnabled);
+
+        // 同步过滤触发词给 SearchViewModel（纯前端消费，无后端热重载）。
+        _onFilterTriggersChanged?.Invoke(filterTriggers);
 
         // G8: 检查自定义引擎的新 origin，弹出 favicon 联网授权。
         if (_onRequestFaviconGrant is not null)

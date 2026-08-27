@@ -17,6 +17,15 @@ public enum HotkeyMode
 public sealed record WebEngine(string Keyword, string Name, string UrlTemplate);
 
 /// <summary>
+/// 自定义过滤触发词：关键词+空格触发后把查询重写为 ext:/path: 过滤语法。
+/// 纯前端重写，broker 的 parse_query 自动拆分。
+/// </summary>
+/// <param name="Keyword">触发关键词（如 "tz"）。</param>
+/// <param name="FilterType">过滤类型："ext" 或 "path"。</param>
+/// <param name="Description">显示名（如 "扩展名过滤"）。</param>
+public sealed record FilterTrigger(string Keyword, string FilterType, string Description);
+
+/// <summary>
 /// favicon 联网许可（G8）。用户对某个 origin 授权后，favicon 缓存可下载该 origin 的图标。
 /// </summary>
 /// <param name="Origin">规范化 origin（scheme://host[:port]）。</param>
@@ -45,6 +54,9 @@ public sealed record Settings
 
     /// <summary>网页快捷搜索引擎列表。</summary>
     public List<WebEngine> WebEngines { get; init; } = [];
+
+    /// <summary>自定义过滤触发词列表（关键词+空格 → ext:/path: 过滤）。</summary>
+    public List<FilterTrigger> FilterTriggers { get; init; } = [];
 
     /// <summary>User-owned absolute directory exclusions sent as bounded search filters.</summary>
     public List<string> ExcludedPaths { get; init; } = [];
@@ -112,6 +124,7 @@ public sealed record Settings
         ComboHotkey = "Alt+Space",
         AutoStart = false,
         WebEngines = DefaultEngines(),
+        FilterTriggers = DefaultFilterTriggers(),
         ExcludedPaths = [],
         HistoryEnabled = true,
         PinyinEnabled = true,
@@ -132,5 +145,12 @@ public sealed record Settings
         new("bi", "Bing", "https://www.bing.com/search?q={q}"),
         new("b", "百度", "https://www.baidu.com/s?wd={q}"),
         new("g", "Google", "https://www.google.com/search?q={q}"),
+    ];
+
+    /// <summary>预设过滤触发词：tz→扩展名过滤，pp→路径过滤。</summary>
+    public static List<FilterTrigger> DefaultFilterTriggers() =>
+    [
+        new("tz", "ext", "扩展名过滤"),
+        new("pp", "path", "路径过滤"),
     ];
 }

@@ -29,6 +29,8 @@ public sealed class SearchViewModel
     private readonly IFolderPicker _folderPicker;
     /// <summary>当前引擎列表（G8 网页模式检测用），由设置更新时刷新。</summary>
     private IReadOnlyList<WebEngine> _webEngines = Settings.DefaultEngines();
+    /// <summary>自定义过滤触发词列表，由设置更新时刷新。</summary>
+    private IReadOnlyList<FilterTrigger> _filterTriggers = Settings.DefaultFilterTriggers();
     /// <summary>在线联想开关（G8），默认关闭。</summary>
     private bool _suggestionsEnabled;
     private CancellationTokenSource? _searchCts;
@@ -156,6 +158,10 @@ public sealed class SearchViewModel
         _suggestionsEnabled = suggestionsEnabled;
     }
 
+    /// <summary>更新自定义过滤触发词列表。设置保存后由 App 调用。</summary>
+    public void UpdateFilterTriggers(IReadOnlyList<FilterTrigger> triggers) =>
+        _filterTriggers = triggers.Count > 0 ? triggers : Settings.DefaultFilterTriggers();
+
     /// <summary>别名绑定变更后调用（保存/删除/后端重连）：词集失效，下次搜索
     /// 重新拉取。前缀缓存在词集未知期间一律绕过。</summary>
     public void NotifyAliasesChanged() => _aliasWords = null;
@@ -266,6 +272,10 @@ public sealed class SearchViewModel
         }
         return false;
     }
+
+    /// <summary>查询是否命中自定义过滤触发词（关键词+空格）。</summary>
+    internal bool IsCustomFilterTrigger(string query) =>
+        FilterTriggerDetector.TryDetect(query, _filterTriggers) is not null;
 
     /// <summary>
     /// 解析 `>` 前缀（G5）。模式来自输入文本本身而不是环境状态，所以每次请求都就地推导，
@@ -1075,9 +1085,14 @@ public sealed class SearchViewModel
         // G8: web mode — detect web keyword before pipe search. The broker still produces
         // web results in AllMode, but the dedicated web mode isolates them: only 1 direct
         // result + up to 5 suggestions, no file/app/window mixing.
+        // 自定义过滤触发词：关键词+空格 → 重写 wireQuery 为 ext:/path: 语法。
+        // 优先级高于网页关键词——用户自定义意图优先于内置网页引擎。
+        // 纯前端重写，broker 的 parse_query 自动拆分 ext:/path: token。
+        var filterRewrite = FilterTriggerDetector.TryRewrite(query, _filterTriggers);
+
         var webMode = WebModeDetector.TryDetect(query, _webEngines);
         _state.IsWebMode = webMode is not null;
-        if (webMode is not null)
+        if (webMode is not null && filterRewrite is null)
         {
             // 同步方法（G1：原 async 无 await，CS1998 伪装）：直接结果本就同步产生，
             // 联想是 coordinator 内部的 fire-and-forget。
@@ -1089,6 +1104,9 @@ public sealed class SearchViewModel
         // The broker never sees the `>`; it echoes back the stripped query, so every
         // comparison against the echo below has to use this form too.
         var wireQuery = StripWindowPrefix(query);
+        // 过滤触发词命中时重写 wire 形式，不动 query（盒内文本保持原样供 staleness 校验）。
+        if (filterRewrite is not null)
+            wireQuery = filterRewrite;
         // Empty query is only meaningful with a host root (recent under root) or in window
         // mode (recent windows). Otherwise the UI stays Idle and never reaches here; still
         // guard for context changes.
@@ -1113,7 +1131,7 @@ public sealed class SearchViewModel
         // 原文，Title.Contains("ext:pdf") 永远为假，下一击键整页滤空。
         if (!isEmptyQuery
             && !context.IsWindowMode
-            && (IsAbsolutePathQuery(query) || HasFilterToken(query)))
+            && (IsAbsolutePathQuery(query) || HasFilterToken(query) || IsCustomFilterTrigger(query)))
         {
             _completeCache = null;
         }
@@ -1261,7 +1279,10 @@ public sealed class SearchViewModel
             // cannot isolate it for exactly that reason.
             && !IsWindowQuery(query)
             // H7：过滤词查询不入缓存（TryFilterCompleteCache 的子串过滤对它们必然失真）。
+            // 自定义过滤触发词同理——wireQuery 被重写为 ext:/path: 但 query 保持原样，
+            // 缓存键对不上。
             && !HasFilterToken(query)
+            && !IsCustomFilterTrigger(query)
             && !resp.IsIndexing
             && string.IsNullOrWhiteSpace(resp.IndexError)
             && !resp.IsTruncated

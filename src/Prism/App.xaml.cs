@@ -176,6 +176,7 @@ public partial class App : Application
             commandCatalog: _commandCatalog);
         ApplySearchExclusions(settings);
         _vm.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
+        _vm.UpdateFilterTriggers(settings.FilterTriggers);
 
         // 深浅色跟随系统（替换 App.xaml 中的 Tokens 字典）。
         _theme = new ThemeWatcher(_state);
@@ -266,6 +267,8 @@ public partial class App : Application
             onClearHistory: ClearBackendHistoryAsync,
             onWebSettingsChanged: (engines, suggestionsEnabled) =>
                 _vm?.UpdateWebSettings(engines, suggestionsEnabled),
+            onFilterTriggersChanged: triggers =>
+                _vm?.UpdateFilterTriggers(triggers),
             onRequestFaviconGrant: RequestFaviconGrant,
             onFaviconGranted: DownloadFavicon,
             onAliasList: ListBackendAliasesAsync,
@@ -324,6 +327,7 @@ public partial class App : Application
             _hotkey?.Apply(settings);
             ApplySearchExclusions(settings);
             _vm?.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
+            _vm?.UpdateFilterTriggers(settings.FilterTriggers);
             _actionHotkeyBindings = settings.ActionHotkeys;
             _searchWindow?.SetActionHotkeys(settings.ActionHotkeys);
             // 暂存区容量/快捷键热更新（2026-08-22 计划）。

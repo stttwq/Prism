@@ -482,8 +482,11 @@
                 <Button Content="网页搜索"
                         Command="{Binding SelectTabCommand}" CommandParameter="2"
                         Style="{StaticResource SettingsNavButton}"/>
-                <Button Content="关于"
+                <Button Content="过滤触发"
                         Command="{Binding SelectTabCommand}" CommandParameter="3"
+                        Style="{StaticResource SettingsNavButton}"/>
+                <Button Content="关于"
+                        Command="{Binding SelectTabCommand}" CommandParameter="4"
                         Style="{StaticResource SettingsNavButton}"/>
             </StackPanel>
         </Border>
@@ -955,6 +958,104 @@
                                    ToolTip="查询词和联想结果不写入历史或日志。单次请求 800ms 超时，断网或失败时静默回退直接搜索。自定义引擎不支持联想。favicon 图标联网获取需在保存引擎时单独授权，与联想开关相互独立。"/>
                     </StackPanel>
                 </StackPanel>
+            </Grid>
+
+            <!-- 过滤触发词 -->
+            <Grid Grid.Row="0"
+                  Visibility="{Binding IsFiltersTab, Converter={StaticResource BoolToVis}}">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" Margin="0,0,0,12">
+                    <TextBlock Text="过滤触发词" FontSize="20" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
+                    <TextBlock Text="在搜索框输入「关键词 + 空格 + 内容」即可按扩展名或路径过滤文件。类型选 ext 按扩展名过滤，选 path 按路径过滤。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <DataGrid Grid.Row="1"
+                          Style="{StaticResource SettingsDataGridStyle}"
+                          ItemsSource="{Binding FilterTriggers}"
+                          SelectedItem="{Binding SelectedFilterTrigger, Mode=TwoWay}"
+                          AutoGenerateColumns="False"
+                          CanUserAddRows="False"
+                          CanUserDeleteRows="False"
+                          CanUserResizeRows="False"
+                          HeadersVisibility="Column"
+                          GridLinesVisibility="Horizontal"
+                          BorderThickness="1"
+                          SelectionMode="Single"
+                          SelectionUnit="FullRow"
+                          FontSize="13"
+                          MinHeight="150">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="关键词"
+                                            Binding="{Binding Keyword, UpdateSourceTrigger=PropertyChanged}"
+                                            Width="80"
+                                            EditingElementStyle="{StaticResource SettingsDataGridEditTextBoxStyle}"/>
+                        <DataGridTextColumn Header="类型"
+                                            Binding="{Binding FilterType, UpdateSourceTrigger=PropertyChanged}"
+                                            Width="80"
+                                            EditingElementStyle="{StaticResource SettingsDataGridEditTextBoxStyle}"/>
+                        <DataGridTextColumn Header="说明"
+                                            Binding="{Binding Description, UpdateSourceTrigger=PropertyChanged}"
+                                            Width="*"
+                                            EditingElementStyle="{StaticResource SettingsDataGridEditTextBoxStyle}"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+
+                <UniformGrid Grid.Row="2" Columns="3" Margin="0,12,0,12">
+                    <Button Command="{Binding AddFilterTriggerCommand}"
+                            Style="{StaticResource SettingsEngineCardButton}"
+                            ToolTip="新增一行空白触发词"
+                            Margin="0,0,8,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE710;"
+                                       FontFamily="{DynamicResource IconFontFamily}"
+                                       FontSize="14"
+                                       Foreground="{DynamicResource TextSubtitle}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       TextAlignment="Center"
+                                       Width="16"/>
+                            <TextBlock Text="添加触发词" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+                    <Button Command="{Binding RemoveFilterTriggerCommand}"
+                            Style="{StaticResource SettingsEngineCardButton}"
+                            ToolTip="移除列表中选中的触发词"
+                            Margin="0,0,8,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE74D;"
+                                       FontFamily="{DynamicResource IconFontFamily}"
+                                       FontSize="14"
+                                       Foreground="{DynamicResource TextSubtitle}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       TextAlignment="Center"
+                                       Width="16"/>
+                            <TextBlock Text="删除选中" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+                    <Button Command="{Binding ResetFilterTriggersCommand}"
+                            Style="{StaticResource SettingsEngineCardButton}"
+                            ToolTip="还原全部预设触发词">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE72C;"
+                                       FontFamily="{DynamicResource IconFontFamily}"
+                                       FontSize="14"
+                                       Foreground="{DynamicResource TextSubtitle}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       TextAlignment="Center"
+                                       Width="16"/>
+                            <TextBlock Text="恢复预设" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+                </UniformGrid>
             </Grid>
 
             <!-- 关于 -->
