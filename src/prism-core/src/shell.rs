@@ -737,6 +737,40 @@ fn reveal(target: &ActionTarget) -> Result<ShellOutcome, ShellError> {
     ))
 }
 
+/// K1：在指定目录打开终端。优先 Windows Terminal (wt.exe)，未安装时回退 cmd.exe。
+/// 工作目录设为 folder。
+#[cfg(windows)]
+pub fn open_terminal_at(folder: &str) -> Result<(), ShellError> {
+    use std::os::windows::process::CommandExt;
+
+    // 优先 wt.exe（Windows Terminal）。`wt -d <folder>` 设工作目录。
+    // wt.exe 在 PATH 中（Windows Terminal 安装后）；spawn 失败 = 未安装 → 回退 cmd。
+    let wt_result = std::process::Command::new("wt.exe")
+        .arg("-d")
+        .arg(folder)
+        .creation_flags(0x00000008) // DETACHED_PROCESS
+        .spawn();
+    if wt_result.is_ok() {
+        return Ok(());
+    }
+
+    // 回退 cmd.exe，工作目录设为 folder。
+    std::process::Command::new("cmd.exe")
+        .current_dir(folder)
+        .creation_flags(0x00000008) // DETACHED_PROCESS
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| ShellError::new(classify_io_error(&error), error.to_string()))
+}
+
+#[cfg(not(windows))]
+pub fn open_terminal_at(_folder: &str) -> Result<(), ShellError> {
+    Err(ShellError::new(
+        ShellErrorKind::Unsupported,
+        "terminal is only available on Windows",
+    ))
+}
+
 fn classify_io_error(error: &std::io::Error) -> ShellErrorKind {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => ShellErrorKind::AccessDenied,

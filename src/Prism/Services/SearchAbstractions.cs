@@ -24,14 +24,24 @@ public sealed record SearchContext(
     public bool IsWindowMode =>
         string.Equals(Mode, WindowMode, StringComparison.Ordinal);
 
-    // D7（K1 必做）：K0 不纳入 CommandContext——根搜索命令 lane 上线时，
-    // IsEquivalentTo 必须纳入它，否则目录切换时前缀缓存会把旧命令上下文的
-    // 结果当新查询的缓存命中返回。K0 无生产者，此刻纳入反而让缓存逻辑变复杂。
+    // D7（K1 已纳入）：K1 根搜索命令 lane 上线，IsEquivalentTo 必须纳入
+    // CommandContext，否则目录切换时前缀缓存会把旧命令上下文的结果当新查询
+    // 的缓存命中返回。
     public bool IsEquivalentTo(SearchContext other) =>
         string.Equals(Mode, other.Mode, StringComparison.Ordinal)
         && string.Equals(Root, other.Root, StringComparison.Ordinal)
         && SortVersion == other.SortVersion
-        && Filters.SequenceEqual(other.Filters);
+        && Filters.SequenceEqual(other.Filters)
+        && CommandContextEquals(CommandContext, other.CommandContext);
+
+    private static bool CommandContextEquals(CommandSearchContext? a, CommandSearchContext? b)
+    {
+        if (a is null && b is null) return true;
+        if (a is null || b is null) return false;
+        return string.Equals(a.CurrentFolder, b.CurrentFolder, StringComparison.Ordinal)
+            && string.Equals(a.HostKind, b.HostKind, StringComparison.Ordinal)
+            && a.HostCapabilities.SequenceEqual(b.HostCapabilities);
+    }
 }
 
 /// <summary>

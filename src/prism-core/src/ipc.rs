@@ -180,6 +180,11 @@ pub enum Request {
     },
     /// K0：拉取命令目录（查询通道，已协商连接）。
     CommandList,
+    /// K1：执行命令。context 携带 command_id 与调用上下文（目录/选中项等）。
+    /// 仅在协商 commands_v1 的连接上受理，否则回 Unsupported。
+    ExecuteCommand {
+        context: crate::commands::CommandInvocationContext,
+    },
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -300,6 +305,12 @@ pub enum Response {
     CommandCatalog {
         generation: u64,
         items: Vec<crate::commands::CommandDescriptor>,
+    },
+    /// K1：broker 把 UI-owned 命令回传给前端执行。id = 命令 id，
+    /// context = 原始调用上下文（前端据此决定是否隐藏窗口等）。
+    UiCommand {
+        id: String,
+        context: crate::commands::CommandInvocationContext,
     },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
@@ -1051,6 +1062,16 @@ async fn handle_connection(
                             }
                         }
                     }
+                    Request::ExecuteCommand { context } => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command execution requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            execute_command(context.clone(), &commands, &shell, &history).await
+                        }
+                    }
                     _ => {
                         dispatch_non_search(
                             req,
@@ -1415,6 +1436,11 @@ async fn dispatch_non_search(
         // K0：Hello 与 CommandList 在连接循环内处理（需读写 caps），这里不可达。
         Request::CommandList => Response::Error {
             message: "command_list must be handled in the connection loop".into(),
+            category: None,
+        },
+        // K1：ExecuteCommand 在连接循环内处理（需读 caps），这里不可达。
+        Request::ExecuteCommand { .. } => Response::Error {
+            message: "execute_command must be handled in the connection loop".into(),
             category: None,
         },
     }
@@ -2001,6 +2027,84 @@ fn process_indexer_reply(
     }
 }
 
+/// K1：命令执行分派。验证上下文 → 查目录 → 按 owner 路由。
+/// broker-owned：调用内置 handler（在此执行）。
+/// ui-owned：返回 `UiCommand` 交给前端执行。
+async fn execute_command(
+    context: crate::commands::CommandInvocationContext,
+    commands: &Arc<crate::commands::CommandStore>,
+    _shell: &Arc<ShellExecutor>,
+    history: &Arc<HistoryStore>,
+) -> Response {
+    if let Err(message) = context.validate() {
+        return Response::Error {
+            message,
+            category: Some(ShellErrorKind::TargetInvalid),
+        };
+    }
+    let catalog = commands.catalog();
+    let Some(desc) = catalog.iter().find(|d| d.id == context.command_id) else {
+        return Response::Error {
+            message: format!("命令不存在：{}", context.command_id),
+            category: Some(ShellErrorKind::TargetInvalid),
+        };
+    };
+    if !desc.enabled {
+        return Response::Error {
+            message: format!("命令已禁用：{}", context.command_id),
+            category: Some(ShellErrorKind::TargetInvalid),
+        };
+    }
+    match desc.owner {
+        "broker" => {
+            let Some(handler) = crate::commands::broker_handler(&desc.id) else {
+                return Response::Error {
+                    message: format!("命令无 handler：{}", context.command_id),
+                    category: Some(ShellErrorKind::Unsupported),
+                };
+            };
+            match handler {
+                crate::commands::BrokerHandlerId::OpenTerminalHere => {
+                    let folder = context.current_folder.clone().unwrap_or_else(|| {
+                        std::env::current_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    });
+                    match crate::shell::open_terminal_at(&folder) {
+                        Ok(()) => {
+                            let _ = commands.record_success(
+                                &desc.id,
+                                crate::history::now_utc(),
+                                history.is_enabled(),
+                            );
+                            Response::Status {
+                                is_indexing: false,
+                                cancelled: false,
+                            }
+                        }
+                        Err(error) => Response::Error {
+                            message: format!("打开终端失败：{}", error.message),
+                            category: Some(error.kind),
+                        },
+                    }
+                }
+                crate::commands::BrokerHandlerId::SystemLock => Response::Error {
+                    message: "SystemLock 尚未实现".into(),
+                    category: Some(ShellErrorKind::Unsupported),
+                },
+            }
+        }
+        "ui" => Response::UiCommand {
+            id: desc.id.clone(),
+            context,
+        },
+        _ => Response::Error {
+            message: format!("未知的命令 owner：{}", desc.owner),
+            category: Some(ShellErrorKind::Unsupported),
+        },
+    }
+}
+
 // clippy: 搜索服务的既有参数形状（连接处理器逐 Arc 传入）。
 #[allow(clippy::too_many_arguments)]
 async fn search_service(
@@ -2021,9 +2125,9 @@ async fn search_service(
         mode,
         command_context,
     } = args;
-    // K0：command_context 收下后丢弃——K0 不改排序、不出命令行。K1 在此处接入。
-    let _ = command_context;
-    let _ = commands;
+    // K1：command_context 非 None（已协商 commands_v1）时接入命令搜索。
+    // 命令仅在无 root、无过滤、非窗口模式下产出——与 apps/alias 同一批条件守卫。
+    let has_command_context = command_context.is_some();
     // G7: parse ext:/path: filter tokens out of the raw query text. The broker owns
     // parsing so the WPF never duplicates syntax rules. Parsed filters join the same
     // `filters` channel as G3's exclude_path — no second protocol lane.
@@ -2260,6 +2364,13 @@ async fn search_service(
         // MatchMetadata::cmp 排（多目标时 usage_tier → 绑定时间倒序）。
         alias_indices = merge_alias_rows(&mut ranked, alias_rows);
     }
+    // K1：命令结果在别名合并之后、排序之前注入。命令只在无 root、无过滤、
+    // 非窗口模式且已协商 commands_v1 时产出。命令 ID 与文件路径键空间不重叠，
+    // 不需与别名/历史去重；享受统一的 picks 置顶机制。
+    if has_command_context && root.is_none() && !has_filters {
+        let command_results = command_search(&name_query, result_slots, commands);
+        ranked.extend(command_results);
+    }
     // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
     // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
     let pick_key = query_pick_key(query);
@@ -2287,6 +2398,12 @@ async fn search_service(
     ranked.truncate(result_slots);
     items.extend(ranked);
     let matched_count = index_matched_count.map(|count| count.saturating_add(app_match_count));
+    // K1：含命令行的响应不可缓存——命令目录代际变化（增删/启停命令）后
+    // 旧缓存会让命令行消失/出现错位。回填 command_catalog_generation 让前端
+    // 在收到含命令行但代际过期的响应时主动刷新目录。
+    let has_command_rows = items
+        .iter()
+        .any(|item| item.kind == SearchResultKind::Command);
     Response::Results {
         query: query.to_owned(),
         items,
@@ -2304,8 +2421,12 @@ async fn search_service(
         history_status: history.take_diagnostic().map(history_status),
         root_rejection,
         root_message,
-        cacheable: true,
-        command_catalog_generation: None,
+        cacheable: !has_command_rows,
+        command_catalog_generation: if has_command_context {
+            Some(commands.generation())
+        } else {
+            None
+        },
     }
 }
 
@@ -3152,6 +3273,48 @@ fn literal_match_lowered(title: &str, terms: &NameTerms) -> Option<(MatchMetadat
         history_score: 0,
     };
     Some((metadata, spans))
+}
+
+/// K1：命令目录搜索。复用 `literal_match_lowered` 做标题匹配，命令行
+/// `match_metadata` 参与统一排序（`sort_search_results_with_picks`）。
+///
+/// 仅匹配 `enabled` 且有 `root_search` binding 的命令。命令 ID 与文件路径
+/// 键空间不重叠，无需与别名/历史去重。
+fn command_search(
+    query: &str,
+    max_results: usize,
+    commands: &Arc<crate::commands::CommandStore>,
+) -> Vec<SearchResult> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let terms = NameTerms::parse(query);
+    let catalog = commands.catalog();
+    let mut results = Vec::new();
+    for desc in catalog {
+        if !desc.enabled || desc.bindings.root_search.is_none() {
+            continue;
+        }
+        if let Some((metadata, spans)) = literal_match_lowered(&desc.title, &terms) {
+            results.push(SearchResult {
+                kind: SearchResultKind::Command,
+                title: Arc::from(desc.title.as_str()),
+                subtitle: Arc::from(desc.subtitle.as_str()),
+                execute_id: Arc::from(desc.id.as_str()),
+                target: ActionTarget::new(TargetKind::Command, desc.id.clone()),
+                match_spans: spans,
+                match_metadata: Some(metadata),
+            });
+        }
+    }
+    // 命令行内按 MatchMetadata 排序，随后参与统一排序。
+    results.sort_by(|a, b| {
+        a.match_metadata
+            .cmp(&b.match_metadata)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    results.truncate(max_results);
+    results
 }
 
 /// 只要 metadata 的旧签名（测试沿用；生产路径一律走 `literal_match_lowered`）。
@@ -5746,6 +5909,139 @@ mod pipe_lifecycle_tests {
                 "K0 不应有 command 行产出 (query={query})"
             );
         }
+        let _ = std::fs::remove_dir_all(&history_dir);
+    }
+
+    // K1: command_search 匹配标题
+    #[test]
+    fn command_search_matches_title() {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        // 内置"打开设置"匹配"设置"
+        let results = command_search("设置", 10, &commands);
+        assert!(results
+            .iter()
+            .any(|r| r.execute_id.as_ref() == "prism.settings.open"));
+        // 内置"在此处打开终端"匹配"终端"
+        let results = command_search("终端", 10, &commands);
+        assert!(results
+            .iter()
+            .any(|r| r.execute_id.as_ref() == "prism.terminal.open"));
+    }
+
+    // K1: 空查询不返回命令
+    #[test]
+    fn command_search_empty_query_returns_empty() {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        assert!(command_search("", 10, &commands).is_empty());
+        assert!(command_search("   ", 10, &commands).is_empty());
+    }
+
+    // K1: 无 root_search binding 的命令不出现在结果中
+    #[test]
+    fn command_search_only_returns_root_search_bound() {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        let results = command_search("打开", 10, &commands);
+        // 两条内置命令都有 root_search binding，都应出现
+        assert!(results.len() >= 1);
+        for r in &results {
+            assert_eq!(r.kind, SearchResultKind::Command);
+            assert!(r.target.kind == "command");
+        }
+    }
+
+    // K1: 命令执行——ui-owned 命令返回 UiCommand
+    #[tokio::test]
+    async fn execute_command_ui_owned_returns_ui_command() {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        let shell = ShellExecutor::start().unwrap();
+        let history_dir = std::env::temp_dir().join(format!("k1-exec-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "prism.settings.open".into(),
+            ..Default::default()
+        };
+        let response = execute_command(context, &commands, &shell, &history).await;
+        match response {
+            Response::UiCommand { id, .. } => assert_eq!(id, "prism.settings.open"),
+            other => panic!("expected UiCommand, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&history_dir);
+    }
+
+    // K1: 命令执行——无效 command_id 返回 Error
+    #[tokio::test]
+    async fn execute_command_unknown_id_returns_error() {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        let shell = ShellExecutor::start().unwrap();
+        let history_dir = std::env::temp_dir().join(format!("k1-exec-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "user.nonexistent".into(),
+            ..Default::default()
+        };
+        let response = execute_command(context, &commands, &shell, &history).await;
+        match response {
+            Response::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&history_dir);
+    }
+
+    // K1: 命令搜索集成——协商连接下命令行出现在搜索结果中
+    #[tokio::test]
+    async fn search_service_produces_command_rows_when_negotiated() {
+        let aliases = Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir()));
+        // 独立目录 + 清理，避免 temp 里的残留历史污染
+        let history_dir =
+            std::env::temp_dir().join(format!("k1-search-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+        let apps: SharedApps = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let engines: SharedEngines = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let preferences = Arc::new(BrokerPreferences::new(false));
+        let windows = Arc::new(crate::window_list::WindowSnapshotStore::new());
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+
+        let response = search_service(
+            SearchArgs {
+                query: "设置",
+                max: 1000,
+                filters: None,
+                root: None,
+                mode: SearchMode::All,
+                command_context: Some(crate::commands::SearchCommandContext::default()),
+            },
+            &apps,
+            &engines,
+            &history,
+            &preferences,
+            &windows,
+            &aliases,
+            &commands,
+        )
+        .await;
+        let Response::Results {
+            items, cacheable, ..
+        } = response
+        else {
+            panic!("search_service 必须返回 Results");
+        };
+        assert!(
+            items
+                .iter()
+                .any(|item| item.kind == SearchResultKind::Command),
+            "协商连接下应产出 command 行，items: {:?}",
+            items
+                .iter()
+                .map(|i| (i.kind, i.title.as_ref()))
+                .collect::<Vec<_>>()
+        );
+        assert!(!cacheable, "含命令行的响应不可缓存");
         let _ = std::fs::remove_dir_all(&history_dir);
     }
 

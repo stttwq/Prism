@@ -55,6 +55,9 @@ public sealed class SearchViewModel
     /// <summary>已归一化（trim + 小写）的别名词集合。null = 未加载或已失效；
     /// 装配了来源且为 null 时前缀缓存一律绕过（宁可少缓存，不可漏别名行）。</summary>
     private HashSet<string>? _aliasWords;
+    /// <summary>K1：命令目录快照缓存。null = 未装配（测试/无命令环境），
+    /// 命令执行分支据此判定是否可用 ExecuteCommand。</summary>
+    private readonly CommandCatalog? _commandCatalog;
 
     public AppState State => _state;
 
@@ -114,7 +117,8 @@ public sealed class SearchViewModel
         ISuggestionService? suggestions = null,
         IFolderPicker? folderPicker = null,
         StagingArea? staging = null,
-        Func<Task<IReadOnlyList<AliasEntry>>>? aliasList = null)
+        Func<Task<IReadOnlyList<AliasEntry>>>? aliasList = null,
+        CommandCatalog? commandCatalog = null)
     {
         _state = state;
         _pipe = pipe;
@@ -122,6 +126,7 @@ public sealed class SearchViewModel
         _suggestions = suggestions;
         _staging = staging;
         _onAliasList = aliasList;
+        _commandCatalog = commandCatalog;
         // P4a: 缺省保持 WinForms 对话框（照抄 ISuggestionService 的可选注入先例）。
         _folderPicker = folderPicker ?? new WinFormsFolderPicker();
         // P4c: 联想结果必须回 UI 线程写 Results；无 Application（单元测试）或已在
@@ -292,6 +297,17 @@ public sealed class SearchViewModel
     /// </summary>
     public void SetScopeRoot(string? root) =>
         SetSearchContext(_searchContext with { Root = root });
+
+    /// <summary>
+    /// K1：同时更新 root 与命令上下文。命令上下文取自 HostScopeController.Host
+    /// （Host.HasUsableRoot 时 Host.Root / Host.Kind），全局时为 null。
+    /// </summary>
+    public void SetScopeContext(string? root, CommandSearchContext? commandContext) =>
+        SetSearchContext(_searchContext with
+        {
+            Root = root,
+            CommandContext = commandContext,
+        });
 
     private async Task OnGenerationDebounceTickAsync()
     {
@@ -512,11 +528,12 @@ public sealed class SearchViewModel
             return;
         }
 
-        // K0 T10.4：命令行在通用 ExecuteAsync 之前截获——否则命令 id 被当路径执行。
-        // K0 分支体是「命令不可用」，K1 替换为按 owner 分派。
+        // K1：命令行在通用 ExecuteAsync 之前截获——否则命令 id 被当路径执行。
+        // 按 owner 分派：broker-owned → broker 直接执行；ui-owned → broker 回
+        // UiCommand 交给前端 handler 执行。
         if (item.Kind == "command")
         {
-            _state.StatusMessage = "命令不可用";
+            await ExecuteCommandAsync(item).ConfigureAwait(true);
             return;
         }
 
@@ -577,6 +594,57 @@ public sealed class SearchViewModel
             // The switch already succeeded; a failed history write must not be reported as
             // a failed switch.
         }
+    }
+
+    /// <summary>
+    /// K1：命令执行。发 ExecuteCommand 请求给 broker，broker 按 owner 分派：
+    /// broker-owned → broker 直接执行（打开终端等），返回 null；
+    /// ui-owned → broker 回 UiCommand（command id），前端据此调用本地 handler。
+    /// 两种情况成功后都隐藏窗口。
+    /// </summary>
+    private async Task ExecuteCommandAsync(SearchResult item)
+    {
+        if (_pipe is not PipeClient realPipe)
+        {
+            _state.StatusMessage = "命令执行不可用";
+            return;
+        }
+        var context = BuildCommandInvocationContext(item);
+        try
+        {
+            var uiCommandId = await realPipe.ExecuteCommandAsync(context).ConfigureAwait(true);
+            if (uiCommandId is not null)
+            {
+                // ui-owned 命令：前端执行本地 handler。
+                if (!CommandHandlers.TryExecute(uiCommandId, context))
+                {
+                    _state.StatusMessage = "命令未注册：" + uiCommandId;
+                    return;
+                }
+            }
+            HideRequested?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "命令执行失败：" + ShortMsg(ex);
+        }
+    }
+
+    /// <summary>
+    /// 组装命令调用上下文。current_folder 取当前搜索上下文里的 CommandContext
+    /// （已从 HostScopeController.Host.Root 填充）。
+    /// </summary>
+    private CommandInvocationContext BuildCommandInvocationContext(SearchResult item)
+    {
+        var cmdCtx = _searchContext.CommandContext;
+        return new CommandInvocationContext
+        {
+            CommandId = item.ExecuteId,
+            Source = "root",
+            CurrentFolder = cmdCtx?.CurrentFolder,
+            HostKind = cmdCtx?.HostKind,
+            HostCapabilities = cmdCtx?.HostCapabilities ?? Array.Empty<string>(),
+        };
     }
 
     public async Task RevealSelectedAsync()
@@ -1510,10 +1578,8 @@ public sealed class SearchViewModel
     private bool TryFilterCompleteCache(string query, out SearchResponse response)
     {
         var cached = _completeCache;
-        // D7：K0 下 SearchContext.IsEquivalentTo 不纳入 CommandContext，因为 K0
-        // 不路由命令、命令目录恒空，缓存命中与否只看索引/根/模式。K1 一旦真正
-        // 下发 command_context，此处必须把 CommandContext 纳入等价判断——否则
-        // 切换命令态时旧缓存会被当命中复用，漏掉 broker 新广播的命令项。
+        // D7：K1 已把 CommandContext 纳入 IsEquivalentTo——切换命令态时旧缓存
+        // 不再被当命中复用，避免漏掉 broker 新广播的命令项。
         if (cached is null
             || !cached.Context.IsEquivalentTo(_searchContext)
             || !query.StartsWith(cached.Response.Query, StringComparison.Ordinal)

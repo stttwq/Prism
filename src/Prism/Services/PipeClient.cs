@@ -872,6 +872,55 @@ public sealed class PipeClient : ISearchClient, IDisposable
         }
     }
 
+    /// <summary>
+    /// K1：执行命令。发 execute_command 请求，broker 按 owner 分派：
+    /// broker-owned → broker 直接执行（返回 status）；
+    /// ui-owned → broker 回 ui_command，本方法据此回传 command id 供前端执行。
+    /// 返回值：ui_command 时为 command id；否则 null（broker 已自行执行）。
+    /// </summary>
+    internal async Task<string?> ExecuteCommandAsync(
+        CommandInvocationContext context,
+        CancellationToken ct = default)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["type"] = "execute_command",
+            ["context"] = new Dictionary<string, object?>
+            {
+                ["command_id"] = context.CommandId,
+                ["source"] = context.Source,
+                ["arguments"] = context.Arguments is { } args
+                    ? new Dictionary<string, object?>
+                    {
+                        ["text"] = args.Text,
+                        ["destination"] = args.Destination,
+                        ["output_path"] = args.OutputPath,
+                    }
+                    : new Dictionary<string, object?>(),
+                ["current_folder"] = context.CurrentFolder,
+                ["host_kind"] = context.HostKind,
+                ["host_capabilities"] = context.HostCapabilities.ToArray(),
+            },
+        };
+
+        var resp = await SendAsync(payload, ct, QueryReadTimeout).ConfigureAwait(false);
+        if (resp.TryGetProperty("type", out var type))
+        {
+            var typeStr = type.GetString();
+            if (typeStr == "error")
+            {
+                var msg = resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+                throw new InvalidOperationException(msg);
+            }
+            if (typeStr == "ui_command"
+                && resp.TryGetProperty("id", out var idEl))
+            {
+                return idEl.GetString();
+            }
+        }
+        return null;
+    }
+
     internal static IReadOnlyList<AliasEntry> ParseAliasList(JsonElement resp)
     {
         var items = new List<AliasEntry>();

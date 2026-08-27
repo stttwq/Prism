@@ -10,7 +10,7 @@ namespace Prism.Services;
 /// 且绝不复用 _generationDebounce（它服务索引代际，复用会混淆两套 generation）。
 /// 命令目录的唯一写者是本进程（单实例强制），K0 没有写者，握手后拉一次足够。
 /// </summary>
-internal sealed class CommandCatalog
+public sealed class CommandCatalog
 {
     private readonly object _lock = new();
     private readonly PipeClient _pipe;

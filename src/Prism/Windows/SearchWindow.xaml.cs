@@ -1378,9 +1378,29 @@ public partial class SearchWindow : Window
         ScopeNotice.Visibility = string.IsNullOrEmpty(_scope.Notice)
             ? Visibility.Collapsed
             : Visibility.Visible;
-        _vm?.SetScopeRoot(_scope.Root);
+        // K1：命令上下文取 Host.Root（HasUsableRoot 时），不是 _scope.Root
+        //（后者 Ctrl+G 切回全局后返回 null，命令上下文会消失）。
+        var commandContext = _scope.Host.HasUsableRoot
+            ? new CommandSearchContext(
+                _scope.Host.Root,
+                HostKindToWireString(_scope.Host.Kind),
+                Array.Empty<string>())
+            : null;
+        _vm?.SetScopeContext(_scope.Root, commandContext);
         UpdateCardClip();
     }
+
+    /// <summary>
+    /// K1：HostKind → 线路字符串（对齐 Rust HOST_KIND_WHITELIST 的 snake_case）。
+    /// </summary>
+    private static string HostKindToWireString(HostKind kind) => kind switch
+    {
+        HostKind.None => "none",
+        HostKind.Explorer => "explorer",
+        HostKind.SystemFileDialog => "system_file_dialog",
+        HostKind.DirectoryOpus => "directory_opus",
+        _ => "none",
+    };
 
     /// <summary>
     /// 在呼出前的前台窗口所在显示器居中、顶部 25%——副屏工作时不再跳回主屏。

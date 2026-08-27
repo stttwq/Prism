@@ -473,6 +473,19 @@ public partial class ResultList : UserControl
                 continue;
             }
 
+            // K1：命令行——ExecuteId 是命令 id 不是路径，用内置矢量图标。
+            if (item.Kind == "command")
+            {
+                var cmdKey = "cmd:" + item.ExecuteId;
+                var next = CommandIcon(item.ExecuteId);
+                if (!Equals(icon.Tag as string, cmdKey) || !ReferenceEquals(icon.Source, next))
+                {
+                    icon.Tag = cmdKey;
+                    icon.Source = next;
+                }
+                continue;
+            }
+
             // "window" carries an enumeration token, not a path — asking the shell for an
             // icon from it would just fail per row.
             if (item.Kind == "web")
@@ -579,6 +592,117 @@ public partial class ResultList : UserControl
         var img = new DrawingImage(group);
         if (img.CanFreeze) img.Freeze();
         _worksetIcon = img;
+        return img;
+    }
+
+    /// <summary>K1：命令行图标。设置页用蓝底齿轮，终端用深色终端方块，其余默认。</summary>
+    private static ImageSource? _settingsCmdIcon;
+    private static ImageSource? _terminalCmdIcon;
+    private static ImageSource? _defaultCmdIcon;
+
+    private static ImageSource CommandIcon(string commandId) => commandId switch
+    {
+        "prism.settings.open" => SettingsCommandIcon(),
+        "prism.terminal.open" => TerminalCommandIcon(),
+        _ => DefaultCommandIcon(),
+    };
+
+    private static ImageSource SettingsCommandIcon()
+    {
+        if (_settingsCmdIcon is not null) return _settingsCmdIcon;
+        var blue = Freeze(new SolidColorBrush(Color.FromRgb(0x1E, 0x7A, 0xD4)));
+        var white = Freeze(new SolidColorBrush(Colors.White));
+        var group = new DrawingGroup();
+        using (var ctx = group.Open())
+        {
+            ctx.DrawRoundedRectangle(blue, null, new Rect(0, 0, 32, 32), 6, 6);
+            // 简易齿轮：中心圆 + 8 个齿
+            var pen = new Pen(white, 2.2) { StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round };
+            if (pen.CanFreeze) pen.Freeze();
+            ctx.DrawEllipse(null, pen, new Point(16, 16), 5, 5);
+            for (var i = 0; i < 8; i++)
+            {
+                var angle = i * 45.0 * Math.PI / 180.0;
+                var x1 = 16 + 7 * Math.Cos(angle);
+                var y1 = 16 + 7 * Math.Sin(angle);
+                var x2 = 16 + 11 * Math.Cos(angle);
+                var y2 = 16 + 11 * Math.Sin(angle);
+                ctx.DrawGeometry(null, pen, new LineGeometry(new Point(x1, y1), new Point(x2, y2)));
+            }
+        }
+        if (group.CanFreeze) group.Freeze();
+        var img = new DrawingImage(group);
+        if (img.CanFreeze) img.Freeze();
+        _settingsCmdIcon = img;
+        return img;
+    }
+
+    private static ImageSource TerminalCommandIcon()
+    {
+        if (_terminalCmdIcon is not null) return _terminalCmdIcon;
+        var dark = Freeze(new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)));
+        var green = Freeze(new SolidColorBrush(Color.FromRgb(0x00, 0xCC, 0x66)));
+        var group = new DrawingGroup();
+        using (var ctx = group.Open())
+        {
+            ctx.DrawRoundedRectangle(dark, null, new Rect(0, 0, 32, 32), 6, 6);
+            var pen = new Pen(green, 2.5)
+            {
+                StartLineCap = PenLineCap.Round,
+                EndLineCap = PenLineCap.Round,
+                LineJoin = PenLineJoin.Round,
+            };
+            if (pen.CanFreeze) pen.Freeze();
+            // 终端提示符 > 与下划线
+            ctx.DrawGeometry(null, pen, new PathGeometry(new[]
+            {
+                new PathFigure(new Point(9, 11), new[] { new LineSegment(new Point(14, 16), true) }, false),
+            }));
+            ctx.DrawGeometry(null, pen, new PathGeometry(new[]
+            {
+                new PathFigure(new Point(14, 16), new[] { new LineSegment(new Point(9, 21), true) }, false),
+            }));
+            ctx.DrawGeometry(null, pen, new PathGeometry(new[]
+            {
+                new PathFigure(new Point(18, 21), new[] { new LineSegment(new Point(24, 21), true) }, false),
+            }));
+        }
+        if (group.CanFreeze) group.Freeze();
+        var img = new DrawingImage(group);
+        if (img.CanFreeze) img.Freeze();
+        _terminalCmdIcon = img;
+        return img;
+    }
+
+    private static ImageSource DefaultCommandIcon()
+    {
+        if (_defaultCmdIcon is not null) return _defaultCmdIcon;
+        var gray = Freeze(new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66)));
+        var white = Freeze(new SolidColorBrush(Colors.White));
+        var group = new DrawingGroup();
+        using (var ctx = group.Open())
+        {
+            ctx.DrawRoundedRectangle(gray, null, new Rect(0, 0, 32, 32), 6, 6);
+            var pen = new Pen(white, 2.5)
+            {
+                StartLineCap = PenLineCap.Round,
+                EndLineCap = PenLineCap.Round,
+            };
+            if (pen.CanFreeze) pen.Freeze();
+            // 默认命令：> 提示符
+            ctx.DrawGeometry(null, pen, new PathGeometry(new[]
+            {
+                new PathFigure(new Point(11, 11), new[] { new LineSegment(new Point(16, 16), true), new LineSegment(new Point(11, 21), true) }, false),
+            }));
+            ctx.DrawGeometry(null, pen, new PathGeometry(new[]
+            {
+                new PathFigure(new Point(19, 21), new[] { new LineSegment(new Point(24, 21), true) }, false),
+            }));
+        }
+        if (group.CanFreeze) group.Freeze();
+        var img = new DrawingImage(group);
+        if (img.CanFreeze) img.Freeze();
+        _defaultCmdIcon = img;
         return img;
     }
 

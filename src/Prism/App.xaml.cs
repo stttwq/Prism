@@ -40,6 +40,8 @@ public partial class App : Application
     private TrayService? _tray;
     private ThemeWatcher? _theme;
     private SingleInstance? _singleInstance;
+    /// <summary>K1：命令目录快照缓存。</summary>
+    private CommandCatalog? _commandCatalog;
     /// <summary>G8：favicon 磁盘缓存（含联网下载），数据目录与 settings.json 同级。</summary>
     private FaviconCache? _favicons;
     /// <summary>G8：搜索结果的网页图标提供器（授权门控走 _hostSettings）。</summary>
@@ -133,6 +135,7 @@ public partial class App : Application
 
         _state = new AppState();
         _pipe = new PipeClient();
+        _commandCatalog = new CommandCatalog(_pipe);
         // watchdog 连接状态变化时更新 UI（在后台线程触发，需回到 UI 线程写 AppState）。
         _pipe.ConnectionChanged += connected =>
             Dispatcher.BeginInvoke(new Action(() =>
@@ -145,6 +148,19 @@ public partial class App : Application
                 // 2026-08-24 修复：重连后别名词集可能已变（broker 重启/手工编辑
                 // aliases-v1.json），前缀缓存守卫的词集失效重拉。
                 _vm?.NotifyAliasesChanged();
+                // K1：连接成功刷新命令目录，断开则清空。
+                if (connected)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try { await _commandCatalog!.RefreshAsync().ConfigureAwait(false); }
+                        catch { /* 目录拉取失败不影响其他功能 */ }
+                    });
+                }
+                else
+                {
+                    _commandCatalog?.Clear();
+                }
             }));
         _icons = new IconCache();
         // G5: activation must run in this process — SetForegroundWindow only takes effect
@@ -156,7 +172,8 @@ public partial class App : Application
             activator: new Win32WindowActivator(),
             suggestions: new SuggestionService(),
             staging: _staging,
-            aliasList: ListBackendAliasesAsync);
+            aliasList: ListBackendAliasesAsync,
+            commandCatalog: _commandCatalog);
         ApplySearchExclusions(settings);
         _vm.UpdateWebSettings(settings.WebEngines, settings.SuggestionsEnabled);
 
@@ -229,7 +246,8 @@ public partial class App : Application
         _hotkey?.RefreshHook();
     }
 
-    private void OpenSettings()
+    /// <summary>K1：public 供 CommandHandlers 调用（UI-owned 命令执行）。</summary>
+    public void OpenSettings()
     {
         if (_store is null || _autoStart is null) return;
 

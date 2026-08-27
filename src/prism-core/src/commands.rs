@@ -27,7 +27,7 @@ const COMMAND_USAGE_FILE: &str = "command-usage-v1.json";
 //
 // K0 放 1 条 `prism.settings.open`：owner=ui、danger=normal、所有 binding 为
 // null（结构上不可达）。全 binding 为 null 使它在 K0 不可达，同时给测试提供
-// 真实数据。K1 再填 root_search/keyword binding。
+// 真实数据。K1 填 root_search binding，使两条命令在根搜索可见、可执行。
 
 /// broker 下发的命令描述（Serialize-only）。与持久化用的 `UserCommandDefinition`
 /// （Deserialize）是两个类型——类型收口保证导入 JSON 无法获得内置特权 handler。
@@ -79,42 +79,70 @@ pub struct CommandBindingDto {
     pub priority: i32,
 }
 
-/// K0 唯一内置命令。binding 全 null = 结构上不可达。
+/// K1 两条内置命令，均带 root_search binding（在根搜索中可见、可执行）。
+/// `prism.settings.open` owner=ui → broker 返回 UiCommand 交给前端执行。
+/// `prism.terminal.open` owner=broker → broker 直接打开终端。
 fn builtin_catalog() -> Vec<CommandDescriptor> {
-    vec![CommandDescriptor {
-        id: "prism.settings.open".into(),
-        title: "打开设置".into(),
-        subtitle: String::new(),
-        icon_glyph: String::new(),
-        owner: "ui",
-        trust: "builtin",
-        keywords: Vec::new(),
-        input: CommandInputDto {
-            kind: "none",
-            required: false,
-            prompt: String::new(),
+    vec![
+        CommandDescriptor {
+            id: "prism.settings.open".into(),
+            title: "打开设置".into(),
+            subtitle: String::new(),
+            icon_glyph: String::new(),
+            owner: "ui",
+            trust: "builtin",
+            keywords: Vec::new(),
+            input: CommandInputDto {
+                kind: "none",
+                required: false,
+                prompt: String::new(),
+            },
+            bindings: CommandBindingsDto {
+                root_search: Some(CommandBindingDto { priority: 0 }),
+                ..Default::default()
+            },
+            danger: "normal",
+            enabled: true,
         },
-        bindings: CommandBindingsDto::default(),
-        danger: "normal",
-        enabled: true,
-    }]
+        CommandDescriptor {
+            id: "prism.terminal.open".into(),
+            title: "在此处打开终端".into(),
+            subtitle: String::new(),
+            icon_glyph: String::new(),
+            owner: "broker",
+            trust: "builtin",
+            keywords: Vec::new(),
+            input: CommandInputDto {
+                kind: "none",
+                required: false,
+                prompt: String::new(),
+            },
+            bindings: CommandBindingsDto {
+                root_search: Some(CommandBindingDto { priority: 0 }),
+                ..Default::default()
+            },
+            danger: "normal",
+            enabled: true,
+        },
+    ]
 }
 
-// ── T8: handler registry 骨架 ──────────────────────────────────────
+// ── T8: handler registry ──────────────────────────────────────────
 //
-// K0 空表。用静态表 + find 而非 `match id { _ => None }`——后者触发 clippy
-// `match_single_binding`（D1 基线对比会变红）。K1 填 OpenTerminalHere/SystemLock。
+// K1 填入 prism.terminal.open → OpenTerminalHere。prism.settings.open owner=ui，
+// 不经 broker handler（broker 返回 UiCommand 交给前端）。
 
-/// K1 起使用的内置 handler 标识。K0 定义但不消费。
+/// K1 起使用的内置 handler 标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerHandlerId {
     OpenTerminalHere,
     SystemLock,
 }
 
-const BROKER_HANDLERS: &[(&str, BrokerHandlerId)] = &[];
+const BROKER_HANDLERS: &[(&str, BrokerHandlerId)] =
+    &[("prism.terminal.open", BrokerHandlerId::OpenTerminalHere)];
 
-/// 查 broker-owned 命令是否有对应 handler。K0 空表，恒返回 None。
+/// 查 broker-owned 命令是否有对应 handler。
 pub fn broker_handler(id: &str) -> Option<BrokerHandlerId> {
     BROKER_HANDLERS
         .iter()
@@ -452,7 +480,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
 // K0 交付 validate() + 全部边界单测。512 KiB 的线路级检查随 K1 的
 // ExecuteCommand 请求一起落地（K1-3）。
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandInvocationContext {
     pub command_id: String,
     pub source: InvocationSource,
@@ -468,7 +496,7 @@ pub struct CommandInvocationContext {
     pub host_kind: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationSource {
     #[default]
@@ -481,7 +509,7 @@ pub enum InvocationSource {
 
 /// 严格解析：deny_unknown_fields 只加在这一层（K1→K2 新 WPF 加外层字段时
 /// 旧 broker 不会整体拒绝），防「把 ZIP 输出路径塞进自由文本」这类越权。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandArguments {
     #[serde(default)]
@@ -492,7 +520,7 @@ pub struct CommandArguments {
     pub output_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandSelection {
     #[serde(default)]
     pub title: String,
@@ -517,6 +545,9 @@ impl CommandInvocationContext {
         }
         for path in &self.staged_paths {
             validate_path_field(path)?;
+        }
+        if let Some(folder) = &self.current_folder {
+            validate_path_field(folder)?;
         }
         if let Some(text) = &self.arguments.text {
             if text.len() > TEXT_MAX_BYTES {
@@ -671,9 +702,9 @@ mod tests {
     fn set_persist_load_roundtrip() {
         let (store, dir) = store("roundtrip");
         store.set(user_cmd("user.test")).unwrap();
-        assert_eq!(store.catalog().len(), 2, "builtin + 1 user");
+        assert_eq!(store.catalog().len(), 3, "2 builtin + 1 user");
         let reloaded = CommandStore::load(&dir);
-        assert_eq!(reloaded.catalog().len(), 2);
+        assert_eq!(reloaded.catalog().len(), 3);
         assert_eq!(reloaded.generation(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -691,8 +722,8 @@ mod tests {
         .unwrap();
         let store = CommandStore::load(&dir);
         assert!(
-            store.catalog().len() == 1,
-            "future version → 空用户表 + builtin"
+            store.catalog().len() == 2,
+            "future version → 空用户表 + 2 builtin"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -707,7 +738,7 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
 
         let store = CommandStore::load(&dir);
-        assert_eq!(store.catalog().len(), 1, "损坏 → 空用户表 + builtin");
+        assert_eq!(store.catalog().len(), 2, "损坏 → 空用户表 + 2 builtin");
 
         let mut isolated = 0;
         for entry in std::fs::read_dir(&dir).unwrap() {
@@ -754,7 +785,7 @@ mod tests {
         store.set_enabled("user.b", false).unwrap();
         assert_eq!(store.generation(), 5);
         // enabled=false 不进 catalog，只剩 builtin
-        assert_eq!(store.catalog().len(), 1, "builtin only (user.b disabled)");
+        assert_eq!(store.catalog().len(), 2, "2 builtin only (user.b disabled)");
     }
 
     // R6: 并发 mutation 不撕裂
@@ -921,19 +952,23 @@ mod tests {
         assert!(store.usage.read().unwrap().entries.is_empty());
     }
 
-    // T8: handler registry 空表
+    // T8: handler registry —— K1 填入 terminal handler
     #[test]
-    fn broker_handler_returns_none_in_k0() {
+    fn broker_handler_resolves_terminal() {
+        assert_eq!(
+            broker_handler("prism.terminal.open"),
+            Some(BrokerHandlerId::OpenTerminalHere)
+        );
+        // ui-owned 命令无 broker handler
         assert!(broker_handler("prism.settings.open").is_none());
-        assert!(broker_handler("anything").is_none());
+        assert!(broker_handler("unknown").is_none());
     }
 
-    // D5: 内置目录含 prism.settings.open
+    // D5: 内置目录含 prism.settings.open + prism.terminal.open
     #[test]
-    fn builtin_catalog_has_settings_open() {
+    fn builtin_catalog_has_both_commands() {
         let (store, _dir) = store("builtin");
         let catalog = store.catalog();
-        assert!(catalog.iter().any(|d| d.id == "prism.settings.open"));
         let settings = catalog
             .iter()
             .find(|d| d.id == "prism.settings.open")
@@ -941,9 +976,17 @@ mod tests {
         assert_eq!(settings.owner, "ui");
         assert_eq!(settings.trust, "builtin");
         assert!(settings.enabled);
-        // K0 全 binding null
-        assert!(settings.bindings.root_search.is_none());
-        assert!(settings.bindings.keyword.is_none());
+        // K1 root_search binding 已填
+        assert!(settings.bindings.root_search.is_some());
+
+        let terminal = catalog
+            .iter()
+            .find(|d| d.id == "prism.terminal.open")
+            .unwrap();
+        assert_eq!(terminal.owner, "broker");
+        assert_eq!(terminal.trust, "builtin");
+        assert!(terminal.enabled);
+        assert!(terminal.bindings.root_search.is_some());
     }
 
     // R7: ActionTarget{kind:"command"} validate
