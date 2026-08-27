@@ -2364,10 +2364,11 @@ async fn search_service(
         // MatchMetadata::cmp 排（多目标时 usage_tier → 绑定时间倒序）。
         alias_indices = merge_alias_rows(&mut ranked, alias_rows);
     }
-    // K1：命令结果在别名合并之后、排序之前注入。命令只在无 root、无过滤、
-    // 非窗口模式且已协商 commands_v1 时产出。命令 ID 与文件路径键空间不重叠，
-    // 不需与别名/历史去重；享受统一的 picks 置顶机制。
-    if has_command_context && root.is_none() && !has_filters {
+    // K1：命令结果在别名合并之后、排序之前注入。命令在已协商 commands_v1 且
+    // 无过滤时产出——有 root（目录范围模式）时也显示，因为命令的 current_folder
+    // 取自 command_context 而非 root（设计 §6.2：文件搜索 root 不能替代 command
+    // context）。窗口模式已提前返回，此处不会命中。
+    if has_command_context && !has_filters {
         let command_results = command_search(&name_query, result_slots, commands);
         ranked.extend(command_results);
     }
