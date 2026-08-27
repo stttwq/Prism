@@ -1378,14 +1378,15 @@ public partial class SearchWindow : Window
         ScopeNotice.Visibility = string.IsNullOrEmpty(_scope.Notice)
             ? Visibility.Collapsed
             : Visibility.Visible;
-        // K1：命令上下文取 Host.Root（HasUsableRoot 时），不是 _scope.Root
-        //（后者 Ctrl+G 切回全局后返回 null，命令上下文会消失）。
-        var commandContext = _scope.Host.HasUsableRoot
-            ? new CommandSearchContext(
-                _scope.Host.Root,
-                HostKindToWireString(_scope.Host.Kind),
-                Array.Empty<string>())
-            : null;
+        // K1 命令 lane：只要已协商 commands_v1 就必须发 command_context，否则
+        // broker 侧 has_command_context=false，命令行（设置/终端）永远不出现。
+        // 无宿主文件夹时仍发 host_kind="none" 的上下文——broker sanitize 在
+        // commands_v1=true 时恒返回 Some（current_folder/host_kind 可空），命令
+        // 搜索 gate 即通过。终端命令执行时 current_folder 缺失回退进程工作目录。
+        var commandContext = new CommandSearchContext(
+            _scope.Host.HasUsableRoot ? _scope.Host.Root : null,
+            _scope.Host.HasUsableRoot ? HostKindToWireString(_scope.Host.Kind) : "none",
+            Array.Empty<string>());
         _vm?.SetScopeContext(_scope.Root, commandContext);
         UpdateCardClip();
     }
