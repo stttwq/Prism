@@ -897,6 +897,17 @@ public sealed class PipeClient : ISearchClient, IDisposable
                         ["output_path"] = args.OutputPath,
                     }
                     : new Dictionary<string, object?>(),
+                ["selection"] = context.Selection is { } sel
+                    ? new Dictionary<string, object?>
+                    {
+                        ["target"] = sel.Target is { } t
+                            ? new Dictionary<string, object?> { ["kind"] = t.Kind, ["value"] = t.Value }
+                            : null,
+                        ["title"] = sel.Title,
+                        ["subtitle"] = sel.Subtitle,
+                    }
+                    : null,
+                ["staged_paths"] = context.StagedPaths.ToArray(),
                 ["current_folder"] = context.CurrentFolder,
                 ["host_kind"] = context.HostKind,
                 ["host_capabilities"] = context.HostCapabilities.ToArray(),

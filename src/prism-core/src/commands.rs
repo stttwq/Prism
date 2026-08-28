@@ -19,6 +19,7 @@ use crate::persistence::{
     validate_command_id, CommandData, CommandUsageData, UserCommandDefinition, VersionedEnvelope,
     COMMAND_MAX_ENTRIES, COMMAND_USAGE_MAX_ENTRIES,
 };
+use crate::shell::ActionTarget;
 
 const COMMANDS_FILE: &str = "commands-v1.json";
 const COMMAND_USAGE_FILE: &str = "command-usage-v1.json";
@@ -520,8 +521,13 @@ pub struct CommandArguments {
     pub output_path: Option<String>,
 }
 
+// K2 §4.1：CommandSelection 带 typed target——动作面板命令段的语义是「对当前
+// 选中项执行命令」，broker 收到调用后需据此复核操作对象。设计 §5.3-2：
+// title/subtitle 只是有界 UI 快照，不可作为路径或权限依据。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandSelection {
+    #[serde(default)]
+    pub target: Option<ActionTarget>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -567,6 +573,13 @@ impl CommandInvocationContext {
             if selection.subtitle.chars().count() > SELECTION_TITLE_MAX_CHARS {
                 return Err("selection subtitle exceeds 256 chars".into());
             }
+            // K2 §4.1：typed target 复核。选中项不可能是命令自身——防命令递归调用命令。
+            if let Some(target) = &selection.target {
+                let kind = target.validate().map_err(|e| e.message)?;
+                if matches!(kind, crate::shell::TargetKind::Command) {
+                    return Err("selection target cannot be a command".into());
+                }
+            }
         }
         if self.approximate_json_len() > APPROX_MAX_JSON {
             return Err("command invocation exceeds 512 KiB".into());
@@ -592,6 +605,9 @@ impl CommandInvocationContext {
         }
         if let Some(selection) = &self.selection {
             total += selection.title.len() + selection.subtitle.len();
+            if let Some(target) = &selection.target {
+                total += target.kind.len() + target.value.len() + 32;
+            }
         }
         total
     }
@@ -863,6 +879,113 @@ mod tests {
         ctx.arguments.text = Some("x".repeat(500 * 1024));
         ctx.staged_paths = vec!["y".repeat(20 * 1024)];
         assert!(ctx.validate().is_err());
+    }
+
+    // K2 §4.1：CommandSelection 带 typed target 的校验。
+    // command kind 的 selection.target 必须被拒绝——防命令递归调用命令。
+    #[test]
+    fn selection_target_validates_typed_target() {
+        use crate::shell::{ActionTarget, TargetKind};
+
+        let base = || CommandInvocationContext {
+            command_id: "user.test".into(),
+            source: InvocationSource::Root,
+            ..Default::default()
+        };
+
+        // selection 为 None（root 来源）→ 通过
+        assert!(base().validate().is_ok());
+
+        // 合法 file target → 通过
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            target: Some(ActionTarget::new(TargetKind::File, r"C:\x.txt")),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_ok());
+
+        // 合法 directory target → 通过
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            target: Some(ActionTarget::new(TargetKind::Directory, r"C:\Windows")),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_ok());
+
+        // 合法 application target → 通过
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            target: Some(ActionTarget::new(
+                TargetKind::Application,
+                r"C:\Windows\notepad.exe",
+            )),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_ok());
+
+        // command kind target → 拒绝（防命令递归）
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            target: Some(ActionTarget::new(
+                TargetKind::Command,
+                "prism.settings.open",
+            )),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_err());
+
+        // 非法路径（相对）→ 拒绝
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            target: Some(ActionTarget::new(TargetKind::File, "relative")),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_err());
+
+        // 超长 title（>256 chars）→ 拒绝
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            title: "设".repeat(257),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_err());
+
+        // 256 chars title → 通过（边界）
+        let mut ctx = base();
+        ctx.selection = Some(CommandSelection {
+            title: "设".repeat(256),
+            ..Default::default()
+        });
+        assert!(ctx.validate().is_ok());
+    }
+
+    // K2 §4.1：CommandSelection 含 target 字段的 serde 往返。
+    #[test]
+    fn selection_target_serde_roundtrip() {
+        let ctx = CommandInvocationContext {
+            command_id: "user.test".into(),
+            source: InvocationSource::Root,
+            selection: Some(CommandSelection {
+                target: Some(crate::shell::ActionTarget {
+                    kind: "file".into(),
+                    value: r"C:\x.txt".into(),
+                }),
+                title: "x.txt".into(),
+                subtitle: String::new(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        // 缺 target 的旧 JSON 仍可反序列化（default None）
+        let legacy =
+            r#"{"command_id":"user.test","source":"root","selection":{"title":"a","subtitle":""}}"#;
+        let parsed: CommandInvocationContext = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.selection.unwrap().target.is_none());
+
+        // 含 target 的 JSON 往返
+        let reparsed: CommandInvocationContext = serde_json::from_str(&json).unwrap();
+        let sel = reparsed.selection.unwrap();
+        assert_eq!(sel.target.unwrap().value, r"C:\x.txt");
     }
 
     // R15: SearchCommandContext::sanitize

@@ -92,6 +92,9 @@ pub struct JournalInfo {
     pub next_usn: i64,
 }
 
+// chunks_exact(2) 的 chunk size 恒为 2，clippy 1.98 新 lint 建议用 array_chunks，
+// 但 array_chunks 在 stable 上是 nightly slice API。保留写法，待 API 稳定再换。
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn parse_usn_buffer(buffer: &[u8]) -> Result<(i64, Vec<UsnRecord>), String> {
     if buffer.len() < 8 {
         return Err("USN buffer is shorter than its cursor".into());

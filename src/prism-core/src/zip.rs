@@ -93,6 +93,7 @@ fn detect_zip_program(custom_path: Option<&str>) -> ZipProgram {
 
 /// 通过注册表探测已安装的 7-Zip，返回 `7z.exe` 完整路径。
 #[cfg(windows)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn detect_seven_zip() -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
