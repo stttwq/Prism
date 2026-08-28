@@ -195,7 +195,7 @@ pub enum Request {
     ///（路径存在性、协议白名单、关键字命名空间冲突）。拒绝而非静默修正。
     /// 仅协商 commands_v1 的连接受理。
     CommandSet {
-        command: crate::persistence::UserCommandDefinition,
+        command: Box<crate::persistence::UserCommandDefinition>,
     },
     /// K3 §4.5：删除用户命令。幂等。
     /// 仅协商 commands_v1 的连接受理。
@@ -1203,7 +1203,8 @@ async fn handle_connection(
                                 category: Some(ShellErrorKind::Unsupported),
                             }
                         } else {
-                            handle_command_set(command.clone(), &commands, &engines, &aliases).await
+                            handle_command_set(*command.clone(), &commands, &engines, &aliases)
+                                .await
                         }
                     }
                     Request::CommandDelete { command_id } => {
@@ -3905,6 +3906,13 @@ fn command_search(
     for desc in catalog {
         if !desc.enabled || desc.bindings.root_search.is_none() {
             continue;
+        }
+        // K3 §4.4：show_in_root_search=false 的命令不进根搜索 lane，
+        // 只能经关键字/快捷键/动作面板到达。
+        if let Some(ref root_search) = desc.bindings.root_search {
+            if !root_search.show_in_root_search {
+                continue;
+            }
         }
         if let Some((metadata, spans)) = literal_match_lowered(&desc.title, &terms) {
             results.push(SearchResult {
@@ -6620,6 +6628,45 @@ mod pipe_lifecycle_tests {
             assert_eq!(r.kind, SearchResultKind::Command);
             assert!(r.target.kind == "command");
         }
+    }
+
+    // K3 §4.4：show_in_root_search=false 的命令不进根搜索 lane
+    #[test]
+    fn command_search_filters_show_in_root_search_false() {
+        let dir =
+            std::env::temp_dir().join(format!("prism-cmd-root-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let commands = Arc::new(crate::commands::CommandStore::load(&dir));
+
+        // 普通命令：show_in_root_search=true（默认）
+        let mut cmd_visible = crate::persistence::UserCommandDefinition::default();
+        cmd_visible.id = "user.visible_cmd".into();
+        cmd_visible.title = "Visible Command".into();
+        cmd_visible.enabled = true;
+        cmd_visible.bindings.root_search = Some(crate::persistence::CommandBinding::default());
+        commands.set(cmd_visible).unwrap();
+
+        // 隐藏命令：show_in_root_search=false
+        let mut cmd_hidden = crate::persistence::UserCommandDefinition::default();
+        cmd_hidden.id = "user.hidden_cmd".into();
+        cmd_hidden.title = "Visible Command Hidden".into();
+        cmd_hidden.enabled = true;
+        cmd_hidden.bindings.root_search = Some(crate::persistence::CommandBinding {
+            show_in_root_search: false,
+            ..Default::default()
+        });
+        commands.set(cmd_hidden).unwrap();
+
+        let results = command_search("Visible Command", 10, &commands);
+        assert!(results
+            .iter()
+            .any(|r| r.execute_id.as_ref() == "user.visible_cmd"));
+        assert!(!results
+            .iter()
+            .any(|r| r.execute_id.as_ref() == "user.hidden_cmd"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // K1: 命令执行——ui-owned 命令返回 UiCommand

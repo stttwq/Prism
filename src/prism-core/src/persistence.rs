@@ -337,7 +337,10 @@ pub struct CommandBindings {
 
 /// 单条 binding。K0 为占位结构；K2 §4.6 在 shortcut surface 增加 `shortcut_combo`
 /// 存组合键字符串（如 "Ctrl+Shift+S"），其余 surface 不使用此字段。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// K3 §4.4 在 keyword surface 增加 `trigger`（关键字路由触发词，可复用 keywords
+/// 首项），在 root_search surface 增加 `show_in_root_search`（默认 true——false
+/// 时命令不进根搜索 lane，只能经关键字/快捷键/动作面板到达）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandBinding {
     #[serde(default)]
     pub priority: i32,
@@ -345,6 +348,25 @@ pub struct CommandBinding {
     /// 解析与冲突检测在 WPF 设置页完成，broker 只存储与下发。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcut_combo: Option<String>,
+    /// K3 §4.4：仅 keyword binding 使用。关键字路由的触发词，可复用 `keywords`
+    /// 首项。None 时关键字路由不可达（需在设置页显式指定）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// K3 §4.4：仅 root_search binding 使用。默认 true——false 时命令不进根搜索
+    /// lane，只能经关键字/快捷键/动作面板到达。设计 §4.4 原文。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_in_root_search: bool,
+}
+
+impl Default for CommandBinding {
+    fn default() -> Self {
+        Self {
+            priority: 0,
+            shortcut_combo: None,
+            trigger: None,
+            show_in_root_search: true,
+        }
+    }
 }
 
 /// 命令使用记录。不存参数、不存 query（设计 §14 R14）。
@@ -367,6 +389,11 @@ pub struct CommandUsageEntry {
 
 fn default_true() -> bool {
     true
+}
+
+/// skip_serializing_if helper：show_in_root_search 默认 true，省略时不序列化。
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl VersionedData for CommandData {

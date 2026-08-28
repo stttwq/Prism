@@ -60,6 +60,9 @@ public sealed class SearchViewModel
     /// <summary>K1：命令目录快照缓存。null = 未装配（测试/无命令环境），
     /// 命令执行分支据此判定是否可用 ExecuteCommand。</summary>
     private readonly CommandCatalog? _commandCatalog;
+    /// <summary>K3 §4.4：当前命令关键字命中（参数态）。非 null 时 Enter 走
+    /// ExecuteCommandKeywordAsync（带 arguments.text），而非 ExecuteCommandAsync。</summary>
+    private CommandKeywordResult? _commandKeywordHit;
 
     public AppState State => _state;
 
@@ -543,6 +546,12 @@ public sealed class SearchViewModel
         // UiCommand 交给前端 handler 执行。
         if (item.Kind == "command")
         {
+            // K3 §4.4：命令关键字参数态——带 arguments.text 执行。
+            if (_commandKeywordHit is { } kwHit && kwHit.Command.Id == item.ExecuteId)
+            {
+                await ExecuteCommandKeywordAsync(kwHit).ConfigureAwait(true);
+                return;
+            }
             await ExecuteCommandAsync(item).ConfigureAwait(true);
             return;
         }
@@ -1392,6 +1401,20 @@ public sealed class SearchViewModel
             return;
         }
 
+        // K3 §4.4：命令关键字检测——插在引擎关键字之后，保证网页行为逐字节不变（P3）。
+        // 与 WebModeDetector 同构但独立：首词+空格才触发、长关键字优先、大小写不敏感。
+        // 命中后进入参数态：显示单行命令结果，Enter 时发 ExecuteCommand（source=keyword）。
+        if (_commandCatalog is not null && filterRewrite is null)
+        {
+            var cmdHit = CommandKeywordDetector.TryDetect(query, _commandCatalog.Snapshot);
+            if (cmdHit is not null)
+            {
+                _state.IsWebMode = false;
+                RunCommandKeywordSearch(query, cmdHit);
+                return;
+            }
+        }
+
         var context = ContextFor(query);
         // The broker never sees the `>`; it echoes back the stripped query, so every
         // comparison against the echo below has to use this form too.
@@ -1415,6 +1438,8 @@ public sealed class SearchViewModel
         // 常规搜索路径也必须取消遗留的 web 联想 Task.Run——从 web mode 切到非 web mode 时，
         // 旧的 Phase B 联想仍在飞行中，不取消它会通过 staleness 守卫后覆盖文件搜索结果。
         CancelSuggestions();
+        // K3 §4.4：离开命令关键字参数态——清空当前命中，避免后续命令行误走带参执行。
+        _commandKeywordHit = null;
         // 路径查询（P1，第一轮 bug 修复）不得走前缀缓存：缓存的键是上一次的
         // 完整查询（如 "E"），路径增长（"E:\foo"）是其前缀，但语义是"换了一个
         // 路径"，按标题子串过滤缓存必得空集——清缓存，直接发 broker。
@@ -1843,6 +1868,92 @@ public sealed class SearchViewModel
                 _state.Results = WebSearchCoordinator.BuildWebRows(directResult, suggestions, webMode);
                 _state.StatusMessage = "";
             });
+    }
+
+    /// <summary>
+    /// K3 §4.4：命令关键字参数态。照抄 RunWebSearch 的 staleness 纪律：
+    /// bump 搜索序号、取消在飞搜索与联想、清 complete-cache。
+    /// 显示单行命令结果，状态行显示命令标题 + input prompt。
+    /// Enter 时发 ExecuteCommand（source=keyword, arguments.text=剩余查询）。
+    /// </summary>
+    private void RunCommandKeywordSearch(string query, CommandKeywordResult hit)
+    {
+        var seq = ++_searchSeq;
+        CancelSearch();
+        CancelSuggestions();
+        _completeCache = null;
+        _commandKeywordHit = hit;
+
+        var cmd = hit.Command;
+        var title = string.IsNullOrEmpty(hit.QueryTerms)
+            ? cmd.Title
+            : $"{cmd.Title}：{hit.QueryTerms}";
+        var subtitle = string.IsNullOrEmpty(cmd.Subtitle) ? cmd.Title : cmd.Subtitle;
+
+        var directResult = new SearchResult(
+            Kind: "command",
+            Title: title,
+            Subtitle: subtitle,
+            ExecuteId: cmd.Id,
+            MatchSpans: Array.Empty<int>())
+        {
+            Target = new ActionTarget("command", cmd.Id),
+            // 稳定键：命令身份不随查询词变化，避免图标闪烁。
+            RowKey = "cmd:keyword:" + cmd.Id,
+        };
+
+        if (seq != _searchSeq) return;
+        if (!string.Equals(query, _state.Query, StringComparison.Ordinal)) return;
+
+        _state.Results = new List<SearchResult> { directResult };
+        _state.SelectedIndex = 0;
+        _state.Mode = PanelMode.Results;
+        _state.IsIndexing = false;
+        // 状态行：命令标题 + input prompt（如果有）
+        var prompt = string.IsNullOrEmpty(cmd.Input.Prompt) ? "" : $" {cmd.Input.Prompt}";
+        _state.StatusMessage = string.IsNullOrEmpty(hit.QueryTerms)
+            ? $"{cmd.Title}{prompt}"
+            : "";
+    }
+
+    /// <summary>
+    /// K3 §4.4：命令关键字参数态执行。从 RunCommandKeywordSearch 的结果行触发，
+    /// 组装 CommandInvocationContext（source=keyword, arguments.text=剩余查询）。
+    /// </summary>
+    private async Task ExecuteCommandKeywordAsync(CommandKeywordResult hit)
+    {
+        if (_pipe is not PipeClient realPipe)
+        {
+            _state.StatusMessage = "命令执行不可用";
+            return;
+        }
+        var cmdCtx = _searchContext.CommandContext;
+        var context = new CommandInvocationContext
+        {
+            CommandId = hit.Command.Id,
+            Source = "keyword",
+            Arguments = new CommandArgumentsDto { Text = hit.QueryTerms },
+            CurrentFolder = cmdCtx?.CurrentFolder,
+            HostKind = cmdCtx?.HostKind,
+            HostCapabilities = cmdCtx?.HostCapabilities ?? Array.Empty<string>(),
+        };
+        try
+        {
+            var uiCommandId = await realPipe.ExecuteCommandAsync(context).ConfigureAwait(true);
+            if (uiCommandId is not null)
+            {
+                if (!CommandHandlers.TryExecute(uiCommandId, context))
+                {
+                    _state.StatusMessage = "命令未注册：" + uiCommandId;
+                    return;
+                }
+            }
+            HideRequested?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "命令执行失败：" + ShortMsg(ex);
+        }
     }
 
     /// <summary>

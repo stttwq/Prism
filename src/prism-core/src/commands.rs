@@ -84,7 +84,7 @@ pub struct CommandBindingsDto {
 // current_folder、在动作面板用选中的 directory），全局 accepts 表达不了。
 // K2 §4.6：shortcut binding 增加 shortcut_combo 字段，存储组合键原始字符串。
 // broker 不解析——解析与冲突检测在 WPF 设置页完成。
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CommandBindingDto {
     pub priority: i32,
     /// "none" | "selection" | "current_folder" | "current_folder_or_prompt" | "staged_paths"
@@ -101,6 +101,38 @@ pub struct CommandBindingDto {
     /// K2 §4.6：仅 shortcut binding 使用。组合键原始字符串（如 "Ctrl+Shift+S"）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcut_combo: Option<String>,
+    /// K3 §4.4：仅 keyword binding 使用。关键字路由的触发词。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// K3 §4.4：仅 root_search binding 使用。默认 true——false 时命令不进根搜索。
+    #[serde(default = "default_true_dt", skip_serializing_if = "is_true_dt")]
+    pub show_in_root_search: bool,
+}
+
+impl Default for CommandBindingDto {
+    fn default() -> Self {
+        Self {
+            priority: 0,
+            input: String::new(),
+            cardinality: None,
+            target_kinds: Vec::new(),
+            requires_host_root: false,
+            shortcut_combo: None,
+            trigger: None,
+            show_in_root_search: true,
+        }
+    }
+}
+
+fn is_true_dt(v: &bool) -> bool {
+    *v
+}
+
+/// serde default for `show_in_root_search`。Serialize-only 类型不生成调用，
+/// 但属性保留供未来 Deserialize 复用——与持久化端 `CommandBinding` 对齐。
+#[allow(dead_code)]
+fn default_true_dt() -> bool {
+    true
 }
 
 fn is_false(v: &bool) -> bool {
@@ -163,6 +195,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     target_kinds: vec!["directory".into()],
                     requires_host_root: false,
                     shortcut_combo: None,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -195,6 +228,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: None,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -226,6 +260,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: None,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -378,6 +413,7 @@ impl CommandStore {
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: Some(entry.combo.clone()),
+                    ..Default::default()
                 });
             }
         }
@@ -678,6 +714,8 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: None,
+                    trigger: None,
+                    show_in_root_search: b.show_in_root_search,
                 }),
             keyword: command
                 .bindings
@@ -690,6 +728,11 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: None,
+                    trigger: b
+                        .trigger
+                        .clone()
+                        .or_else(|| command.keywords.first().cloned()),
+                    show_in_root_search: true,
                 }),
             action_panel: command
                 .bindings
@@ -702,6 +745,8 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: None,
+                    trigger: None,
+                    show_in_root_search: true,
                 }),
             staging: command
                 .bindings
@@ -714,6 +759,8 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: None,
+                    trigger: None,
+                    show_in_root_search: true,
                 }),
             shortcut: command
                 .bindings
@@ -726,6 +773,8 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     target_kinds: Vec::new(),
                     requires_host_root: false,
                     shortcut_combo: b.shortcut_combo.clone(),
+                    trigger: None,
+                    show_in_root_search: true,
                 }),
         },
         danger: match command.danger.as_str() {

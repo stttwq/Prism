@@ -133,8 +133,17 @@ public sealed record CommandBindingsDto(
             && scEl.ValueKind == JsonValueKind.String
             ? scEl.GetString()
             : null;
+        // K3 §4.4：仅 keyword binding 携带。关键字路由的触发词。
+        var trigger = el.TryGetProperty("trigger", out var trEl)
+            && trEl.ValueKind == JsonValueKind.String
+            ? trEl.GetString()
+            : null;
+        // K3 §4.4：仅 root_search binding 携带。默认 true（缺省时视为可见）。
+        var showInRootSearch = !el.TryGetProperty("show_in_root_search", out var srsEl)
+            || srsEl.ValueKind != JsonValueKind.False;
         return new CommandBindingDto(
-            priority, input, cardinality, targetKinds, requiresHostRoot, shortcutCombo);
+            priority, input, cardinality, targetKinds, requiresHostRoot, shortcutCombo,
+            trigger, showInRootSearch);
     }
 }
 
@@ -142,6 +151,8 @@ public sealed record CommandBindingsDto(
 /// K2 §4.3：按 surface 扩展。Cardinality/TargetKinds/RequiresHostRoot 容忍缺字段
 /// （旧 broker 的 binding 只有 priority + input）。
 /// K2 §4.6：ShortcutCombo 仅 shortcut binding 携带（组合键原始字符串）。
+/// K3 §4.4：Trigger 仅 keyword binding 携带（路由触发词）；
+/// ShowInRootSearch 仅 root_search binding 携带（默认 true）。
 /// </summary>
 public sealed record CommandBindingDto(
     int Priority,
@@ -149,7 +160,9 @@ public sealed record CommandBindingDto(
     string? Cardinality,
     IReadOnlyList<string> TargetKinds,
     bool RequiresHostRoot,
-    string? ShortcutCombo)
+    string? ShortcutCombo,
+    string? Trigger = null,
+    bool ShowInRootSearch = true)
 {
     // 兼容旧调用点（K1 只传 priority + input）。
     public CommandBindingDto(int Priority, string Input)
