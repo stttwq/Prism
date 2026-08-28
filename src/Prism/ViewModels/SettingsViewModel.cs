@@ -47,6 +47,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private string _commandConflictText = "";
     /// <summary>命令 tab 的通用状态提示。</summary>
     private string _commandStatusText = "";
+    private readonly Func<Task>? _onCommandsChanged;
 
     private bool _autoStartEnabled;
     private HotkeyMode _hotkeyMode;
@@ -92,7 +93,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Action<string>? onFaviconGranted = null,
         Func<Task<IReadOnlyList<AliasEntry>>>? onAliasList = null,
         Func<ActionTarget, Task>? onAliasDelete = null,
-        PipeClient? commandPipe = null)
+        PipeClient? commandPipe = null,
+        Func<Task>? onCommandsChanged = null)
     {
         _store = store;
         _autoStart = autoStart;
@@ -107,6 +109,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onAliasList = onAliasList;
         _onAliasDelete = onAliasDelete;
         _commandPipe = commandPipe;
+        _onCommandsChanged = onCommandsChanged;
 
         // 读失败（文件被锁/ACL 拒绝）带默认值打开设置页：Load 在持续 IO 失败时会
         // 上抛，不接住的话构造器在 UI 线程炸掉、设置窗无声打不开。Save 前会重新
@@ -1137,6 +1140,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
             // 刷新目录
             await LoadCommandsAsync().ConfigureAwait(true);
+            // 通知搜索 VM 刷新共享 CommandCatalog，否则关键字路由看不到新命令
+            if (_onCommandsChanged is not null)
+                await _onCommandsChanged().ConfigureAwait(true);
         }
         catch (Exception ex)
         {
@@ -1150,6 +1156,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         try
         {
             await _commandPipe.CommandDeleteAsync(commandId).ConfigureAwait(true);
+            if (_onCommandsChanged is not null)
+                await _onCommandsChanged().ConfigureAwait(true);
         }
         catch { /* 幂等，静默 */ }
     }
@@ -1169,7 +1177,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 return;
             }
             var result = await _commandPipe.CommandPreviewAsync(
-                SelectedCommand.Id, "settings", "test").ConfigureAwait(true);
+                SelectedCommand.Id, "root", "test").ConfigureAwait(true);
             if (result is null)
             {
                 CommandPreviewText = "预览不可用";
@@ -1346,6 +1354,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             }
 
             await LoadCommandsAsync().ConfigureAwait(true);
+            if (_onCommandsChanged is not null)
+                await _onCommandsChanged().ConfigureAwait(true);
             if (errors.Count > 0)
                 CommandStatusText = $"导入 {imported} 条，{errors.Count} 条失败：{errors[0]}";
             else

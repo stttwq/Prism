@@ -288,7 +288,12 @@ public partial class App : Application
             onFaviconGranted: DownloadFavicon,
             onAliasList: ListBackendAliasesAsync,
             onAliasDelete: DeleteBackendAliasAsync,
-            commandPipe: _pipe);
+            commandPipe: _pipe,
+            onCommandsChanged: async () =>
+            {
+                if (_commandCatalog is not null)
+                    await _commandCatalog.RefreshAsync().ConfigureAwait(true);
+            });
         _settingsWindow = new SettingsWindow(vm);
         _settingsWindow.Closed += (_, _) =>
         {

@@ -87,7 +87,16 @@ public sealed class CommandEditItem : INotifyPropertyChanged
     public string Handler
     {
         get => _handler;
-        set { if (_handler != value) { _handler = value; OnPropertyChanged(); } }
+        set
+        {
+            if (_handler != value)
+            {
+                _handler = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(IsOpenUrl));
+                OnPropertyChanged(nameof(IsLaunchProgram));
+            }
+        }
     }
 
     public bool IsOpenUrl => Handler == "open_url";
@@ -178,8 +187,12 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         {
             RootSearch = new CommandBindingSpecDto { ShowInRootSearch = ShowInRootSearch },
         };
-        if (!string.IsNullOrWhiteSpace(Trigger))
-            bindings.Keyword = new CommandBindingSpecDto { Trigger = Trigger.Trim() };
+        // 关键字路由：Trigger 优先；留空时用 Keywords 首项自动回退。
+        var trigger = Trigger.Trim();
+        if (string.IsNullOrEmpty(trigger) && keywords.Count > 0)
+            trigger = keywords[0];
+        if (!string.IsNullOrEmpty(trigger))
+            bindings.Keyword = new CommandBindingSpecDto { Trigger = trigger };
         if (!string.IsNullOrWhiteSpace(ShortcutCombo))
             bindings.Shortcut = new CommandBindingSpecDto { ShortcutCombo = ShortcutCombo.Trim() };
 

@@ -41,14 +41,14 @@ public static class CommandKeywordDetector
 
         var rest = restSpan.Trim().ToString();
 
-        // 候选集：有 keyword binding 且 enabled+usable 的命令，展平所有关键字。
-        // trigger 字段优先于 keywords 首项（broker 侧已做此回退，此处对齐）。
+        // 候选集：enabled+usable 的命令，展平所有可用关键字。
+        // keyword binding 的 trigger 优先；若无 binding 但有 keywords 字段，用 keywords。
         var candidates = new List<(CommandDescriptor Command, string Keyword)>();
         foreach (var cmd in commands)
         {
-            if (!cmd.Enabled || !cmd.IsUsable || cmd.Bindings.Keyword is null)
+            if (!cmd.Enabled || !cmd.IsUsable)
                 continue;
-            var trigger = cmd.Bindings.Keyword.Trigger;
+            var trigger = cmd.Bindings.Keyword?.Trigger;
             if (!string.IsNullOrEmpty(trigger))
             {
                 candidates.Add((cmd, trigger));
