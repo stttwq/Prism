@@ -728,6 +728,75 @@ public sealed class SearchViewModel
         }
     }
 
+    /// <summary>
+    /// K2 §4.5 commit 6：暂存区多目标 ZIP。与 copy_paths 共用预检 + 守卫，
+    /// 额外携带 output_path（SaveFileDialog 选定）。
+    /// </summary>
+    public async Task ExecuteStagingZipCommandAsync(
+        string commandId, IReadOnlyList<string> stagedPaths, string outputPath)
+    {
+        if (_actionInFlight) return;
+        _actionInFlight = true;
+        try
+        {
+            await ExecuteStagingZipCoreAsync(commandId, stagedPaths, outputPath).ConfigureAwait(true);
+        }
+        finally
+        {
+            _actionInFlight = false;
+        }
+    }
+
+    private async Task ExecuteStagingZipCoreAsync(
+        string commandId, IReadOnlyList<string> stagedPaths, string outputPath)
+    {
+        if (stagedPaths.Count == 0)
+        {
+            _state.StatusMessage = "暂存区为空";
+            return;
+        }
+        if (stagedPaths.Count > 128)
+        {
+            _state.StatusMessage = "暂存区超过 128 项，请先缩减";
+            return;
+        }
+        var approxBytes = stagedPaths.Sum(p => p.Length + 4) + outputPath.Length + 256;
+        if (approxBytes > 512 * 1024)
+        {
+            _state.StatusMessage = "暂存区路径总量超过 512 KiB";
+            return;
+        }
+        if (_pipe is not PipeClient realPipe)
+        {
+            _state.StatusMessage = "命令执行不可用";
+            return;
+        }
+        var context = new CommandInvocationContext
+        {
+            CommandId = commandId,
+            Source = "staging",
+            StagedPaths = stagedPaths,
+            Arguments = new CommandArgumentsDto { OutputPath = outputPath },
+        };
+        try
+        {
+            var uiCommandId = await realPipe.ExecuteCommandAsync(context).ConfigureAwait(true);
+            if (uiCommandId is not null)
+            {
+                if (!CommandHandlers.TryExecute(uiCommandId, context))
+                {
+                    _state.StatusMessage = "命令未注册：" + uiCommandId;
+                    return;
+                }
+            }
+            _state.StatusMessage = $"已压缩 {stagedPaths.Count} 个文件至 {System.IO.Path.GetFileName(outputPath)}";
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "压缩失败：" + ShortMsg(ex);
+        }
+    }
+
     public async Task RevealSelectedAsync()
     {
         if (_state.Mode == PanelMode.Actions) return;

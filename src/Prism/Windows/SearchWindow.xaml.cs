@@ -1135,7 +1135,7 @@ public partial class SearchWindow : Window
     {
         if (_vm is null || _staging is null || _staging.Count == 0) return;
 
-        // 固定菜单：copy_paths（K2 首批唯一 staging 命令）。
+        // 固定菜单（§4.7：2 条命令不做抽象）。
         var menu = new ContextMenu();
         var copyItem = new MenuItem
         {
@@ -1144,12 +1144,50 @@ public partial class SearchWindow : Window
         };
         copyItem.Click += async (_, _) =>
         {
-            // UI 线程快照 staged_paths（staging 变更只在 UI 线程，快照安全）。
             var paths = _staging.Items.Select(i => i.Path).ToArray();
             await _vm.ExecuteStagingCommandAsync("prism.staging.copy_paths", paths)
                 .ConfigureAwait(true);
         };
         menu.Items.Add(copyItem);
+
+        // K2 §4.5：多目标 ZIP。需输出路径——前台 SaveFileDialog。
+        var zipItem = new MenuItem
+        {
+            Header = "压缩为 ZIP",
+            ToolTip = $"暂存区 {_staging.Count} 个文件（需 7-Zip）",
+        };
+        zipItem.Click += async (_, _) =>
+        {
+            var paths = _staging.Items.Select(i => i.Path).ToArray();
+            // §4.7 执行流：SaveFileDialog 选输出路径。
+            _contextMenuActionPending = true;
+            _ignoreDeactivate = true;
+            _modalDialogs++;
+            try
+            {
+                var dialog = new Microsoft.Win32.SaveFileDialog
+                {
+                    Filter = "ZIP 文件 (*.zip)|*.zip",
+                    FileName = "staging.zip",
+                    Title = "选择 ZIP 输出路径",
+                };
+                var ok = dialog.ShowDialog() == true;
+                if (!ok) return;
+                await _vm.ExecuteStagingZipCommandAsync("prism.staging.zip", paths, dialog.FileName)
+                    .ConfigureAwait(true);
+            }
+            finally
+            {
+                _modalDialogs--;
+                _contextMenuActionPending = false;
+                if (!_contextMenuOpen)
+                    ReleaseDeactivateGuardAfterDelay();
+                if (IsVisible && !_hiding)
+                    Header.FocusQuery();
+            }
+        };
+        menu.Items.Add(zipItem);
+
         menu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
         menu.PlacementTarget = Staging;
         menu.IsOpen = true;

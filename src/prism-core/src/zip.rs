@@ -277,6 +277,152 @@ pub(crate) fn zip_external(
     }
 }
 
+/// K2 §4.5-3：批量 ZIP 仅在检测到外部压缩程序（7-Zip/自定义）时可用。
+/// Shell COM 的 `CopyHere` 多输入完成时机不可判定（§4.5-3），
+/// 首版不勉强用 COM 拼多输入。返回 true=外部程序可用，false=需在目录标禁用。
+pub(crate) fn has_external_zip_program(custom_path: Option<&str>) -> bool {
+    matches!(get_zip_program(custom_path), ZipProgram::External { .. })
+}
+
+/// K2 §4.5：多目标 ZIP。不复用 `unique_zip_path`——输出路径由调用方显式给出
+/// （WPF 侧 SaveFileDialog 选择 `arguments.output_path`）。仅外部程序路径
+/// （§4.5-3：Shell COM 多输入完成不可判定，首版限定外部程序）。
+///
+/// 输出冲突：不静默覆盖，返回 `ShellErrorKind::Conflict`。
+/// 部分失败：返回 `ZipSummary`（成功/失败/取消三类计数 + 有界错误摘要）。
+pub(crate) fn zip_many(
+    sources: &[String],
+    output_path: &str,
+    custom_zip_program: Option<&str>,
+) -> Result<ZipSummary, ShellError> {
+    // 输出路径校验：.zip 后缀 + 冲突检测（与单目标一致）。
+    if !output_path.to_lowercase().ends_with(".zip") {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "output path must end with .zip",
+        ));
+    }
+    if std::path::Path::new(output_path).exists() {
+        return Err(ShellError::new(
+            ShellErrorKind::Conflict,
+            "output zip already exists",
+        ));
+    }
+    // UNC 拒绝（§4.7 末段：mutation 类命令直接拒绝 UNC）。
+    if output_path.starts_with(r"\\") {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "UNC paths are not allowed for ZIP output",
+        ));
+    }
+    // 仅外部程序（§4.5-3）。
+    let ZipProgram::External {
+        exe_path,
+        is_seven_zip,
+    } = get_zip_program(custom_zip_program)
+    else {
+        return Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            "批量 ZIP 需要 7-Zip 或自定义压缩程序（Windows 内置不支持多输入）",
+        ));
+    };
+
+    // 逐项压缩到同一个 zip——7z a 可多次调用追加，或一次传多个 source。
+    // 首版用一次传多 source（7z a output source1 source2 ...）。
+    if sources.is_empty() {
+        return Err(ShellError::new(
+            ShellErrorKind::TargetInvalid,
+            "no sources to compress",
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new(&exe_path);
+        if is_seven_zip {
+            cmd.arg("a").arg(output_path).arg("-aoa");
+            for src in sources {
+                cmd.arg(src);
+            }
+        } else {
+            // 自定义程序：传所有 source + output。
+            for src in sources {
+                cmd.arg(src);
+            }
+            cmd.arg(output_path);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ShellError::new(ShellErrorKind::System, e.to_string()))?;
+        let deadline = std::time::Instant::now() + zip_external_timeout();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(ShellError::new(
+                            ShellErrorKind::System,
+                            format!(
+                                "压缩程序超过 {} 秒未退出，已终止（结果未知）",
+                                zip_external_timeout().as_secs()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(ShellError::new(ShellErrorKind::System, e.to_string())),
+            }
+        };
+        if status.success() {
+            return Ok(ZipSummary {
+                succeeded: sources.len() as u32,
+                failed: 0,
+                cancelled: false,
+                errors: Vec::new(),
+            });
+        }
+        // 7-Zip 退出码 1 = 警告（部分跳过），算成功。
+        match status.code() {
+            Some(1) if is_seven_zip => Ok(ZipSummary {
+                succeeded: sources.len() as u32,
+                failed: 0,
+                cancelled: false,
+                errors: Vec::new(),
+            }),
+            Some(code) => Err(ShellError::new(
+                ShellErrorKind::System,
+                format!("ZIP program exited with code {code}"),
+            )),
+            None => Err(ShellError::new(
+                ShellErrorKind::System,
+                "ZIP program was terminated by signal",
+            )),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (sources, exe_path, is_seven_zip);
+        Err(ShellError::new(
+            ShellErrorKind::Unsupported,
+            "ZIP is only available on Windows",
+        ))
+    }
+}
+
+/// K2 §4.5：多目标 ZIP 汇总。`succeeded`/`failed`/`errors` 暂未在 handler 中
+/// 透传给前端（首版用 Status 消息），但保留字段以对齐设计 §4.5-5 的汇总语义。
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct ZipSummary {
+    pub succeeded: u32,
+    pub failed: u32,
+    pub cancelled: bool,
+    /// 有界错误摘要（首条错误即可，多目标单进程压缩要么全成要么全败）。
+    pub errors: Vec<String>,
+}
+
 /// 外部压缩程序等待上限（2026-08-24 全仓检验）。这条路径在连接读循环内联
 /// 执行（S2a 快路径，刻意绕过 STA 队列预算），一个永不退出的自定义压缩程序
 /// （GUI 弹窗等输入、被挂起、机器休眠穿越）会把整条前端连接永久头阻塞。

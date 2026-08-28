@@ -50,6 +50,10 @@ pub struct CommandDescriptor {
     pub bindings: CommandBindingsDto,
     pub danger: &'static str,
     pub enabled: bool,
+    /// K2 §4.5：命令不可用原因（如「需要 7-Zip」）。enabled=false 时非空。
+    /// skip_serializing_if 保证旧前端 JSON 逐字节不变（enabled=true 时缺省）。
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub disabled_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +129,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             },
             danger: "normal",
             enabled: true,
+            disabled_reason: String::new(),
         },
         CommandDescriptor {
             id: "prism.terminal.open".into(),
@@ -157,6 +162,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             },
             danger: "normal",
             enabled: true,
+            disabled_reason: String::new(),
         },
         CommandDescriptor {
             // K2 §4.7：暂存区批量复制路径至剪贴板。无损操作、不探测存在性，
@@ -187,6 +193,38 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             },
             danger: "normal",
             enabled: true,
+            disabled_reason: String::new(),
+        },
+        CommandDescriptor {
+            // K2 §4.5：暂存区多目标 ZIP。enabled/disabled_reason 在 catalog()
+            // 中按 7-Zip 可用性动态调整——§4.5-3：Shell COM 多输入完成不可判定，
+            // 首版仅外部程序可用，否则标禁用。
+            id: "prism.staging.zip".into(),
+            title: "压缩暂存区为 ZIP".into(),
+            subtitle: "将暂存区所有文件压缩为单个 ZIP（需 7-Zip）".into(),
+            icon_glyph: String::new(),
+            owner: "broker",
+            trust: "builtin",
+            keywords: Vec::new(),
+            input: CommandInputDto {
+                kind: "none",
+                required: false,
+                prompt: String::new(),
+            },
+            bindings: CommandBindingsDto {
+                staging: Some(CommandBindingDto {
+                    priority: 1,
+                    input: "staged_paths".into(),
+                    cardinality: Some("many".into()),
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
+                }),
+                ..Default::default()
+            },
+            // enabled + disabled_reason 在 catalog() 中动态设置。
+            danger: "normal",
+            enabled: true,
+            disabled_reason: String::new(),
         },
     ]
 }
@@ -203,11 +241,14 @@ pub enum BrokerHandlerId {
     SystemLock,
     /// K2 §4.7：暂存区复制路径至剪贴板。纯文本输出、不探测存在性。
     CopyPaths,
+    /// K2 §4.5：暂存区多目标 ZIP。需 7-Zip（Shell COM 多输入完成不可判定）。
+    StagingZip,
 }
 
 const BROKER_HANDLERS: &[(&str, BrokerHandlerId)] = &[
     ("prism.terminal.open", BrokerHandlerId::OpenTerminalHere),
     ("prism.staging.copy_paths", BrokerHandlerId::CopyPaths),
+    ("prism.staging.zip", BrokerHandlerId::StagingZip),
 ];
 
 /// 查 broker-owned 命令是否有对应 handler。
@@ -292,6 +333,16 @@ impl CommandStore {
     /// 注册 handler 才进目录（owner 分工：UI-owned 原样下发，WPF 侧过滤）。
     pub fn catalog(&self) -> Vec<CommandDescriptor> {
         let mut items = builtin_catalog();
+        // K2 §4.5-3：staging ZIP 仅在外部压缩程序可用时启用。Shell COM
+        // 多输入完成不可判定，首版不勉强用 COM。
+        if !crate::zip::has_external_zip_program(None) {
+            for item in items.iter_mut() {
+                if item.id == "prism.staging.zip" {
+                    item.enabled = false;
+                    item.disabled_reason = "需要 7-Zip 或自定义压缩程序".into();
+                }
+            }
+        }
         let state = self
             .state
             .read()
@@ -574,6 +625,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
             _ => "normal",
         },
         enabled: command.enabled,
+        disabled_reason: String::new(),
     }
 }
 
@@ -838,9 +890,9 @@ mod tests {
     fn set_persist_load_roundtrip() {
         let (store, dir) = store("roundtrip");
         store.set(user_cmd("user.test")).unwrap();
-        assert_eq!(store.catalog().len(), 4, "3 builtin + 1 user");
+        assert_eq!(store.catalog().len(), 5, "4 builtin + 1 user");
         let reloaded = CommandStore::load(&dir);
-        assert_eq!(reloaded.catalog().len(), 4);
+        assert_eq!(reloaded.catalog().len(), 5);
         assert_eq!(reloaded.generation(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -858,8 +910,8 @@ mod tests {
         .unwrap();
         let store = CommandStore::load(&dir);
         assert!(
-            store.catalog().len() == 3,
-            "future version → 空用户表 + 3 builtin"
+            store.catalog().len() == 4,
+            "future version → 空用户表 + 4 builtin"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -874,7 +926,7 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
 
         let store = CommandStore::load(&dir);
-        assert_eq!(store.catalog().len(), 3, "损坏 → 空用户表 + 3 builtin");
+        assert_eq!(store.catalog().len(), 4, "损坏 → 空用户表 + 4 builtin");
 
         let mut isolated = 0;
         for entry in std::fs::read_dir(&dir).unwrap() {
@@ -920,8 +972,8 @@ mod tests {
         assert_eq!(store.generation(), 4);
         store.set_enabled("user.b", false).unwrap();
         assert_eq!(store.generation(), 5);
-        // enabled=false 不进 catalog，只剩 builtin（K2 §4.7 后为 3 条）。
-        assert_eq!(store.catalog().len(), 3, "3 builtin only (user.b disabled)");
+        // enabled=false 不进 catalog（用户命令），只剩 builtin（K2 §4.5 后为 4 条）。
+        assert_eq!(store.catalog().len(), 4, "4 builtin only (user.b disabled)");
     }
 
     // R6: 并发 mutation 不撕裂

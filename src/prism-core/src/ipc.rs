@@ -2188,6 +2188,60 @@ async fn execute_command(
                         },
                     }
                 }
+                crate::commands::BrokerHandlerId::StagingZip => {
+                    // K2 §4.5：多目标 ZIP。P2 第二次校验。
+                    if context.staged_paths.is_empty() {
+                        return Response::Error {
+                            message: "暂存区为空，没有文件可压缩".into(),
+                            category: Some(ShellErrorKind::TargetInvalid),
+                        };
+                    }
+                    // §4.7 末段：mutation 类命令直接拒绝 UNC。
+                    for path in &context.staged_paths {
+                        if path.starts_with(r"\\") {
+                            return Response::Error {
+                                message: "暂存区含 UNC 路径，ZIP 不支持网络路径".into(),
+                                category: Some(ShellErrorKind::TargetInvalid),
+                            };
+                        }
+                    }
+                    // output_path 由 WPF 侧 SaveFileDialog 选择（§4.5-1）。
+                    let Some(output_path) = &context.arguments.output_path else {
+                        return Response::Error {
+                            message: "未指定 ZIP 输出路径".into(),
+                            category: Some(ShellErrorKind::TargetInvalid),
+                        };
+                    };
+                    // zip_many 在 spawn_blocking 执行（外部进程，分钟级等待）。
+                    let output = output_path.clone();
+                    let sources = context.staged_paths.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::zip::zip_many(&sources, &output, None)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(summary)) => {
+                            let _ = commands.record_success(
+                                &desc.id,
+                                crate::history::now_utc(),
+                                history.is_enabled(),
+                            );
+                            // 暂存区不清空，显示汇总。
+                            Response::Status {
+                                is_indexing: false,
+                                cancelled: summary.cancelled,
+                            }
+                        }
+                        Ok(Err(error)) => Response::Error {
+                            message: format!("压缩失败：{}", error.message),
+                            category: Some(error.kind),
+                        },
+                        Err(error) => Response::Error {
+                            message: format!("压缩任务失败：{error}"),
+                            category: Some(ShellErrorKind::System),
+                        },
+                    }
+                }
             }
         }
         "ui" => Response::UiCommand {
@@ -6225,6 +6279,136 @@ mod pipe_lifecycle_tests {
             Response::Status { .. } => {}
             other => panic!("expected Status for UNC staging, got {other:?}"),
         }
+    }
+
+    // K2 §4.5 commit 6：staging ZIP handler 测试。
+    // 不真正压缩（避免修改磁盘 + 依赖 7-Zip），只验证校验路径。
+    // 注意：若机器未装 7-Zip，prism.staging.zip 在 catalog() 中标 enabled=false，
+    // execute_command 在 handler 前即返回「命令已禁用」——这是正确行为。
+    // 测试同时接受 disabled 和 handler 层校验两条路径。
+
+    fn staging_zip_ctx(
+        paths: Vec<String>,
+        output: Option<&str>,
+    ) -> crate::commands::CommandInvocationContext {
+        crate::commands::CommandInvocationContext {
+            command_id: "prism.staging.zip".into(),
+            source: crate::commands::InvocationSource::Staging,
+            staged_paths: paths,
+            arguments: crate::commands::CommandArguments {
+                output_path: output.map(String::from),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_zip_rejects_empty_staging() {
+        let (commands, shell, history) = staging_test_setup("zip-empty");
+        let response = execute_command(
+            staging_zip_ctx(vec![], Some(r"C:\out.zip")),
+            &commands,
+            &shell,
+            &history,
+        )
+        .await;
+        match response {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("暂存区为空") || message.contains("命令已禁用"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error for empty staging zip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_zip_rejects_missing_output_path() {
+        let (commands, shell, history) = staging_test_setup("zip-noout");
+        let response = execute_command(
+            staging_zip_ctx(vec![r"C:\a.txt".into()], None),
+            &commands,
+            &shell,
+            &history,
+        )
+        .await;
+        match response {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("输出路径") || message.contains("命令已禁用"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error for missing output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_zip_rejects_unc_source() {
+        let (commands, shell, history) = staging_test_setup("zip-unc");
+        let response = execute_command(
+            staging_zip_ctx(vec![r"\\server\share\file.txt".into()], Some(r"C:\out.zip")),
+            &commands,
+            &shell,
+            &history,
+        )
+        .await;
+        match response {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("UNC") || message.contains("命令已禁用"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error for UNC staging zip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_zip_rejects_non_zip_output() {
+        let (commands, shell, history) = staging_test_setup("zip-badext");
+        let response = execute_command(
+            staging_zip_ctx(vec![r"C:\a.txt".into()], Some(r"C:\out.rar")),
+            &commands,
+            &shell,
+            &history,
+        )
+        .await;
+        match response {
+            Response::Error { .. } => {}
+            other => panic!("expected Error for non-zip output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_zip_rejects_existing_output() {
+        let (commands, shell, history) = staging_test_setup("zip-conflict");
+        let tmp = std::env::temp_dir().join(format!("k2-zip-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("out.zip");
+        std::fs::write(&out, b"existing").unwrap();
+        let response = execute_command(
+            staging_zip_ctx(vec![r"C:\a.txt".into()], Some(out.to_str().unwrap())),
+            &commands,
+            &shell,
+            &history,
+        )
+        .await;
+        match response {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("exists")
+                        || message.contains("已存在")
+                        || message.contains("命令已禁用"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error for existing output, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
