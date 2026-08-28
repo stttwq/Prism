@@ -2152,6 +2152,42 @@ async fn execute_command(
                     message: "SystemLock 尚未实现".into(),
                     category: Some(ShellErrorKind::Unsupported),
                 },
+                crate::commands::BrokerHandlerId::CopyPaths => {
+                    // K2 §4.7：staging copy_paths。P2 第二次校验——validate()
+                    // 已过 128 项上限，此处再核一遍 staging 来源的显式约束：
+                    // 空暂存区不可执行（P4：空 → 禁用，不应到达 broker，
+                    // 但 P2 要求执行处再校验防篡改）。
+                    if context.staged_paths.is_empty() {
+                        return Response::Error {
+                            message: "暂存区为空，没有路径可复制".into(),
+                            category: Some(ShellErrorKind::TargetInvalid),
+                        };
+                    }
+                    // copy_paths 复制原始字符串、不探测存在性，因此不受 UNC 限制。
+                    let joined = context.staged_paths.join("\r\n");
+                    match _shell
+                        .execute(ShellOperation::CopyPathsText { text: joined })
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = commands.record_success(
+                                &desc.id,
+                                crate::history::now_utc(),
+                                history.is_enabled(),
+                            );
+                            // 汇总文案：成功 N 项。暂存区不清空（§4.7 末段：
+                            // 「保留暂存区内容不清空，显示汇总」）。
+                            Response::Status {
+                                is_indexing: false,
+                                cancelled: false,
+                            }
+                        }
+                        Err(error) => Response::Error {
+                            message: format!("复制路径失败：{}", error.message),
+                            category: Some(error.kind),
+                        },
+                    }
+                }
             }
         }
         "ui" => Response::UiCommand {
@@ -3467,6 +3503,10 @@ async fn run_shell(
         | ShellOperation::OpenWith(target) => Some((target.clone(), HistoryUse::Execute)),
         ShellOperation::Reveal(target) => Some((target.clone(), HistoryUse::Reveal)),
         ShellOperation::RunAction { target, .. } => Some((target.clone(), HistoryUse::Execute)),
+        // K2 §4.7：copy_paths 是暂存区批量操作，无单一 target 语义，不进
+        // 文件历史（按 search-key 记录频度的入口是单文件动作，staging 批量
+        // 不构成单文件访问记录）。
+        ShellOperation::CopyPathsText { .. } => None,
     };
     finish_shell_response(
         shell.execute(operation).await,
@@ -6059,7 +6099,7 @@ mod pipe_lifecycle_tests {
         let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
         let results = command_search("打开", 10, &commands);
         // 两条内置命令都有 root_search binding，都应出现
-        assert!(results.len() >= 1);
+        assert!(!results.is_empty());
         for r in &results {
             assert_eq!(r.kind, SearchResultKind::Command);
             assert!(r.target.kind == "command");
@@ -6108,7 +6148,85 @@ mod pipe_lifecycle_tests {
         let _ = std::fs::remove_dir_all(&history_dir);
     }
 
-    // K1: 命令搜索集成——协商连接下命令行出现在搜索结果中
+    // K2 §5 commit 5：copy_paths handler 集成测试。
+    //
+    // 不直接验证剪贴板内容（修改系统剪贴板会污染用户环境，且 CI 不稳定）。
+    // 覆盖：空拒绝、129 项拒绝、合法路径成功、UNC 路径在 copy_paths 下通过。
+    // 剪贴板写入由 actions.rs 的单元测试与 §5 手工验收覆盖。
+
+    fn staging_test_setup(
+        suffix: &str,
+    ) -> (
+        Arc<crate::commands::CommandStore>,
+        Arc<ShellExecutor>,
+        Arc<HistoryStore>,
+    ) {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        let shell = ShellExecutor::start().unwrap();
+        let history_dir =
+            std::env::temp_dir().join(format!("k2-staging-{suffix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let history = Arc::new(HistoryStore::load(&history_dir, true));
+        (commands, shell, history)
+    }
+
+    fn staging_ctx(paths: Vec<String>) -> crate::commands::CommandInvocationContext {
+        crate::commands::CommandInvocationContext {
+            command_id: "prism.staging.copy_paths".into(),
+            source: crate::commands::InvocationSource::Staging,
+            staged_paths: paths,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_paths_rejects_empty_staging() {
+        let (commands, shell, history) = staging_test_setup("empty");
+        // 空暂存区：validate() 通过（0 ≤ 128），但 handler 层 P2 第二次校验拒绝。
+        let response = execute_command(staging_ctx(vec![]), &commands, &shell, &history).await;
+        match response {
+            Response::Error { message, .. } => {
+                assert!(message.contains("暂存区为空"), "got: {message}")
+            }
+            other => panic!("expected Error for empty staging, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_paths_rejects_129_items() {
+        let (commands, shell, history) = staging_test_setup("129");
+        let paths = (0..129).map(|i| format!(r"C:\p{i}")).collect::<Vec<_>>();
+        let response = execute_command(staging_ctx(paths), &commands, &shell, &history).await;
+        // validate() 拒绝 129 项（>128）
+        match response {
+            Response::Error { .. } => {}
+            other => panic!("expected Error for 129 items, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_paths_succeeds_for_valid_paths() {
+        let (commands, shell, history) = staging_test_setup("valid");
+        let paths = vec![r"C:\a\file1.txt".into(), r"C:\b\folder".into()];
+        let response = execute_command(staging_ctx(paths), &commands, &shell, &history).await;
+        match response {
+            Response::Status { .. } => {}
+            other => panic!("expected Status for valid staging, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_paths_accepts_unc_paths() {
+        // K2 §4.7：copy_paths 复制原始字符串、不探测存在性，不受 UNC 限制。
+        let (commands, shell, history) = staging_test_setup("unc");
+        let paths = vec![r"\\server\share\file.txt".into()];
+        let response = execute_command(staging_ctx(paths), &commands, &shell, &history).await;
+        match response {
+            Response::Status { .. } => {}
+            other => panic!("expected Status for UNC staging, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn search_service_produces_command_rows_when_negotiated() {
         let aliases = Arc::new(crate::alias::AliasStore::load(&std::env::temp_dir()));

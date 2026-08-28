@@ -223,6 +223,7 @@ public partial class SearchWindow : Window
             Staging.DragOutStarted += () => _isDragging = true;
             Staging.DragOutFinished += OnDragOutFinished;
             Staging.OpenRequested += OpenStagedFile;
+            Staging.StagingCommandRequested += OnStagingCommandRequested;
             Staging.SaveWorksetRequested += () =>
             {
                 _contextMenuActionPending = true;
@@ -1122,6 +1123,36 @@ public partial class SearchWindow : Window
             if (_vm is not null)
                 _vm.State.StatusMessage = "暂存区打开失败：" + ex.Message;
         }
+    }
+
+    /// <summary>
+    /// K2 §4.7：「批」按钮点击——弹出固定命令菜单。当前只有 copy_paths 一条
+    /// staging 命令。§4.7 明确：为 2 条命令建可复用页面栈是过度工程，用固定
+    /// 菜单等命令增长再抽象。在 UI 线程快照暂存区路径——staging 变更只在
+    /// UI 线程，快照后无竞态。
+    /// </summary>
+    private void OnStagingCommandRequested()
+    {
+        if (_vm is null || _staging is null || _staging.Count == 0) return;
+
+        // 固定菜单：copy_paths（K2 首批唯一 staging 命令）。
+        var menu = new ContextMenu();
+        var copyItem = new MenuItem
+        {
+            Header = "复制路径至剪贴板",
+            ToolTip = $"暂存区 {_staging.Count} 个路径",
+        };
+        copyItem.Click += async (_, _) =>
+        {
+            // UI 线程快照 staged_paths（staging 变更只在 UI 线程，快照安全）。
+            var paths = _staging.Items.Select(i => i.Path).ToArray();
+            await _vm.ExecuteStagingCommandAsync("prism.staging.copy_paths", paths)
+                .ConfigureAwait(true);
+        };
+        menu.Items.Add(copyItem);
+        menu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        menu.PlacementTarget = Staging;
+        menu.IsOpen = true;
     }
 
     /// <summary>把当前选中结果加入暂存区（快捷键入口）。</summary>

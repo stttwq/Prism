@@ -394,6 +394,13 @@ fn clipboard_set_text(text: &str) -> Result<(), ShellError> {
     ))
 }
 
+/// K2 §4.7：把多行文本写入剪贴板。供 `ShellOperation::CopyPathsText` 在 STA
+/// worker 上调用——`run_action_direct` 路径上的 `clipboard_set_text` 只接单
+/// 路径，staging copy_paths 需要把多路径 join 后整体写入。
+pub(crate) fn clipboard_set_text_pub(text: &str) -> Result<(), ShellError> {
+    clipboard_set_text(text)
+}
+
 // ── 剪贴板：文件（CF_HDROP + Preferred DropEffect） ───────────
 
 /// DROPEFFECT_COPY = 1

@@ -657,6 +657,77 @@ public sealed class SearchViewModel
         };
     }
 
+    /// <summary>
+    /// K2 §4.7 commit 5：对暂存区执行命令。staging 来源——带 staged_paths
+    /// 数组发 ExecuteCommand。客户端预检 128 项上限与 512 KiB 聚合上限
+    /// （P4/P5），broker 侧二次校验（P2）。成功后暂存区不清空，显示汇总。
+    /// §4.8：复用 _actionInFlight 守卫，与动作面板/快捷键同等级。
+    /// </summary>
+    public async Task ExecuteStagingCommandAsync(string commandId, IReadOnlyList<string> stagedPaths)
+    {
+        if (_actionInFlight) return;
+        _actionInFlight = true;
+        try
+        {
+            await ExecuteStagingCommandCoreAsync(commandId, stagedPaths).ConfigureAwait(true);
+        }
+        finally
+        {
+            _actionInFlight = false;
+        }
+    }
+
+    private async Task ExecuteStagingCommandCoreAsync(string commandId, IReadOnlyList<string> stagedPaths)
+    {
+        // 预检在发 IPC 之前——即使 pipe 不可用也给出有意义的客户端侧错误。
+        if (stagedPaths.Count == 0)
+        {
+            _state.StatusMessage = "暂存区为空";
+            return;
+        }
+        if (stagedPaths.Count > 128)
+        {
+            _state.StatusMessage = "暂存区超过 128 项，请先缩减";
+            return;
+        }
+        // 客户端侧 512 KiB 预检（P5：客户端先检查 + broker 复核双侧）。
+        var approxBytes = stagedPaths.Sum(p => p.Length + 4) + 256;
+        if (approxBytes > 512 * 1024)
+        {
+            _state.StatusMessage = "暂存区路径总量超过 512 KiB";
+            return;
+        }
+        if (_pipe is not PipeClient realPipe)
+        {
+            _state.StatusMessage = "命令执行不可用";
+            return;
+        }
+        var context = new CommandInvocationContext
+        {
+            CommandId = commandId,
+            Source = "staging",
+            StagedPaths = stagedPaths,
+        };
+        try
+        {
+            var uiCommandId = await realPipe.ExecuteCommandAsync(context).ConfigureAwait(true);
+            if (uiCommandId is not null)
+            {
+                if (!CommandHandlers.TryExecute(uiCommandId, context))
+                {
+                    _state.StatusMessage = "命令未注册：" + uiCommandId;
+                    return;
+                }
+            }
+            // §4.7 末段：保留暂存区内容不清空，显示汇总。
+            _state.StatusMessage = $"已复制 {stagedPaths.Count} 个路径至剪贴板";
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "命令执行失败：" + ShortMsg(ex);
+        }
+    }
+
     public async Task RevealSelectedAsync()
     {
         if (_state.Mode == PanelMode.Actions) return;

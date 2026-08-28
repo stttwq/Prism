@@ -75,6 +75,13 @@ pub enum ShellOperation {
         /// settings.json 的 ZipProgram 字段值，仅 zip 动作使用。
         zip_program: Option<String>,
     },
+    /// K2 §4.7：把多行文本写入剪贴板（staging copy_paths 用）。
+    /// 走 STA worker 而非 async 上下文——Win32 剪贴板 API 必须
+    /// 在初始化过 COM 的单线程上调用，且 OpenClipboard 可能被
+    /// 其他进程持有而短暂阻塞。
+    CopyPathsText {
+        text: String,
+    },
 }
 
 struct WorkItem {
@@ -259,7 +266,9 @@ fn sta_wait_budget(operation: &ShellOperation) -> std::time::Duration {
         ShellOperation::Properties(_)
         | ShellOperation::OpenWith(_)
         | ShellOperation::RunAction { .. } => SLOW,
-        ShellOperation::Open(_) | ShellOperation::Reveal(_) => FAST,
+        ShellOperation::Open(_)
+        | ShellOperation::Reveal(_)
+        | ShellOperation::CopyPathsText { .. } => FAST,
     }
 }
 
@@ -323,6 +332,10 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
             args,
             zip_program,
         } => execute_run_action(target, action, args, zip_program),
+        ShellOperation::CopyPathsText { text } => {
+            crate::actions::clipboard_set_text_pub(&text)?;
+            Ok(ShellOutcome::Success)
+        }
     }
 }
 

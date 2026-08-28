@@ -442,6 +442,64 @@ public sealed class SearchViewModelTests
         Assert.Equal(0, client.RunActionCallCount);
     }
 
+    // K2 commit 5：staging 命令——客户端预检边界。
+    // FakeSearchClient 非 PipeClient → 命令执行不可用分支，但预检在发 IPC 之前。
+
+    [Fact]
+    public async Task StagingCommandEmptyPathsShowsMessage()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        await vm.ExecuteStagingCommandAsync("prism.staging.copy_paths", Array.Empty<string>());
+
+        Assert.Equal("暂存区为空", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task StagingCommandOver128ItemsShowsMessage()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        // 129 项——客户端预检在发 IPC 之前拒绝（P4：超限整体拒绝不截断）。
+        var paths = Enumerable.Range(0, 129).Select(i => $@"C:\p{i}").ToArray();
+        await vm.ExecuteStagingCommandAsync("prism.staging.copy_paths", paths);
+
+        Assert.Equal("暂存区超过 128 项，请先缩减", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task StagingCommandOver512KiBShowsMessage()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        // 单条路径足够长使聚合 > 512 KiB（P5：客户端预检）。
+        var hugePath = @"C:\" + new string('x', 524 * 1024);
+        await vm.ExecuteStagingCommandAsync("prism.staging.copy_paths", new[] { hugePath });
+
+        Assert.Equal("暂存区路径总量超过 512 KiB", state.StatusMessage);
+    }
+
+    [Fact]
+    public async Task StagingCommand128BoundaryNotRejectedByClient()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        // 128 项 = 上限边界——不应被预检拒绝，应到达 IPC 层（fake 非 PipeClient → 降级）。
+        var paths = Enumerable.Range(0, 128).Select(i => $@"C:\p{i}").ToArray();
+        await vm.ExecuteStagingCommandAsync("prism.staging.copy_paths", paths);
+
+        // fake client 非 PipeClient → 降级分支文案。
+        Assert.Equal("命令执行不可用", state.StatusMessage);
+    }
+
     [Fact]
     public async Task GenerationInvalidatesCacheAndLateResponseCannotOverwriteNewQuery()
     {

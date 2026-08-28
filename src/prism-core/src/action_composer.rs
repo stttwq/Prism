@@ -269,7 +269,7 @@ mod tests {
     fn command_panel_caps_at_five() {
         let (store, dir) = store("cap5");
         for i in 0..7 {
-            let mut cmd = crate::persistence::UserCommandDefinition {
+            let cmd = crate::persistence::UserCommandDefinition {
                 id: format!("user.cmd{i}"),
                 title: format!("测试命令{i}"),
                 enabled: true,

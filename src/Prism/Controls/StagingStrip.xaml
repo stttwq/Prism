@@ -85,6 +85,12 @@
                         Style="{StaticResource StripLinkButton}"
                         Content="清"
                         ToolTip="清空未标记文件（工作集文件保留）"/>
+                <Button x:Name="StagingCommandButton"
+                        Grid.Column="5"
+                        Style="{StaticResource StripLinkButton}"
+                        Content="批"
+                        ToolTip="对暂存区执行命令（复制路径等）"
+                        IsEnabled="False"/>
             </Grid>
         </Border>
         <!-- 工作集行：名字+文件数，tooltip 备注与文件清单（"点开看一眼"），

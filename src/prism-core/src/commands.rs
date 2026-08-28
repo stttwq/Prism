@@ -158,6 +158,36 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             danger: "normal",
             enabled: true,
         },
+        CommandDescriptor {
+            // K2 §4.7：暂存区批量复制路径至剪贴板。无损操作、不探测存在性，
+            // 因此不受 UNC 限制（§4.7 末段）。staging surface 是唯一入口——
+            // root_search/keyword/action_panel 都无 binding，命令本身在那些
+            // 入口不可见，与设计 §7.1（窗口/Web target 的命令动作首批不开）一致。
+            id: "prism.staging.copy_paths".into(),
+            title: "复制暂存区路径至剪贴板".into(),
+            subtitle: "将暂存区所有路径以换行分隔写入剪贴板".into(),
+            icon_glyph: String::new(),
+            owner: "broker",
+            trust: "builtin",
+            keywords: Vec::new(),
+            input: CommandInputDto {
+                kind: "none",
+                required: false,
+                prompt: String::new(),
+            },
+            bindings: CommandBindingsDto {
+                staging: Some(CommandBindingDto {
+                    priority: 0,
+                    input: "staged_paths".into(),
+                    cardinality: Some("many".into()),
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
+                }),
+                ..Default::default()
+            },
+            danger: "normal",
+            enabled: true,
+        },
     ]
 }
 
@@ -171,10 +201,14 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
 pub enum BrokerHandlerId {
     OpenTerminalHere,
     SystemLock,
+    /// K2 §4.7：暂存区复制路径至剪贴板。纯文本输出、不探测存在性。
+    CopyPaths,
 }
 
-const BROKER_HANDLERS: &[(&str, BrokerHandlerId)] =
-    &[("prism.terminal.open", BrokerHandlerId::OpenTerminalHere)];
+const BROKER_HANDLERS: &[(&str, BrokerHandlerId)] = &[
+    ("prism.terminal.open", BrokerHandlerId::OpenTerminalHere),
+    ("prism.staging.copy_paths", BrokerHandlerId::CopyPaths),
+];
 
 /// 查 broker-owned 命令是否有对应 handler。
 pub fn broker_handler(id: &str) -> Option<BrokerHandlerId> {
@@ -617,7 +651,7 @@ impl CommandInvocationContext {
             return Err("staged_paths exceeds 128 items".into());
         }
         for path in &self.staged_paths {
-            validate_path_field(path)?;
+            validate_staged_path(path)?;
         }
         if let Some(folder) = &self.current_folder {
             validate_path_field(folder)?;
@@ -692,6 +726,25 @@ fn validate_path_field(path: &str) -> Result<(), String> {
     }
     if !Path::new(path).is_absolute() {
         return Err("path field must be absolute".into());
+    }
+    Ok(())
+}
+
+/// K2 §4.7：staged_paths 的结构校验。与 `validate_path_field` 的区别：
+/// **不拒绝 UNC**——`copy_paths` 复制原始字符串、不探测存在性，因此不受
+/// UNC 限制（设计 §4.7 末段）。UNC 拒绝只对 mutation 类命令（ZIP）在
+/// handler 分发时执行，不在通用 `validate()` 里一刀切。
+/// 结构性检查（空/控制字符/长度/绝对路径）仍保留——staging 区的路径
+/// 来源是搜索结果，恒为绝对路径；copy_paths 不应接受垃圾输入。
+fn validate_staged_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.contains('\0') || path.chars().any(char::is_control) {
+        return Err("staged path is invalid".into());
+    }
+    if path.len() > PATH_MAX_BYTES {
+        return Err("staged path exceeds 32 KiB".into());
+    }
+    if !Path::new(path).is_absolute() {
+        return Err("staged path must be absolute".into());
     }
     Ok(())
 }
@@ -785,9 +838,9 @@ mod tests {
     fn set_persist_load_roundtrip() {
         let (store, dir) = store("roundtrip");
         store.set(user_cmd("user.test")).unwrap();
-        assert_eq!(store.catalog().len(), 3, "2 builtin + 1 user");
+        assert_eq!(store.catalog().len(), 4, "3 builtin + 1 user");
         let reloaded = CommandStore::load(&dir);
-        assert_eq!(reloaded.catalog().len(), 3);
+        assert_eq!(reloaded.catalog().len(), 4);
         assert_eq!(reloaded.generation(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -805,8 +858,8 @@ mod tests {
         .unwrap();
         let store = CommandStore::load(&dir);
         assert!(
-            store.catalog().len() == 2,
-            "future version → 空用户表 + 2 builtin"
+            store.catalog().len() == 3,
+            "future version → 空用户表 + 3 builtin"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -821,7 +874,7 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
 
         let store = CommandStore::load(&dir);
-        assert_eq!(store.catalog().len(), 2, "损坏 → 空用户表 + 2 builtin");
+        assert_eq!(store.catalog().len(), 3, "损坏 → 空用户表 + 3 builtin");
 
         let mut isolated = 0;
         for entry in std::fs::read_dir(&dir).unwrap() {
@@ -867,8 +920,8 @@ mod tests {
         assert_eq!(store.generation(), 4);
         store.set_enabled("user.b", false).unwrap();
         assert_eq!(store.generation(), 5);
-        // enabled=false 不进 catalog，只剩 builtin
-        assert_eq!(store.catalog().len(), 2, "2 builtin only (user.b disabled)");
+        // enabled=false 不进 catalog，只剩 builtin（K2 §4.7 后为 3 条）。
+        assert_eq!(store.catalog().len(), 3, "3 builtin only (user.b disabled)");
     }
 
     // R6: 并发 mutation 不撕裂
@@ -916,10 +969,11 @@ mod tests {
         ctx.staged_paths = (0..129).map(|i| format!(r"C:\p{i}")).collect();
         assert!(ctx.validate().is_err());
 
-        // 单路径 UNC 拒绝
+        // K2 §4.7：UNC 路径在 validate() 层不拒绝——copy_paths 复制原始字符串
+        // 不受 UNC 限制。UNC 拒绝只对 mutation 类命令在 handler 分发时执行。
         let mut ctx = base();
         ctx.staged_paths = vec![r"\\server\share".into()];
-        assert!(ctx.validate().is_err());
+        assert!(ctx.validate().is_ok());
 
         // 单路径相对拒绝
         let mut ctx = base();

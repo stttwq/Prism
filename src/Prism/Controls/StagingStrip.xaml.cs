@@ -29,11 +29,16 @@ public partial class StagingStrip : UserControl
     /// <summary>「存」被点击：搜索窗负责起名/备注对话框与同名覆盖确认。</summary>
     public event Action? SaveWorksetRequested;
 
+    /// <summary>K2 §4.7：「批」被点击——对暂存区执行命令。搜索窗负责快照
+    /// 暂存区路径、预检上限、发 ExecuteCommand。</summary>
+    public event Action? StagingCommandRequested;
+
     public StagingStrip()
     {
         InitializeComponent();
         ClearButton.Click += (_, _) => _staging?.ClearUnmarked();
         SaveButton.Click += (_, _) => SaveWorksetRequested?.Invoke();
+        StagingCommandButton.Click += (_, _) => StagingCommandRequested?.Invoke();
         WorksetsButton.Click += (_, _) =>
         {
             _worksetsExpanded = !_worksetsExpanded;
@@ -57,6 +62,8 @@ public partial class StagingStrip : UserControl
         Root.Visibility = _staging.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         CountText.Text = _staging.Count.ToString();
         CountText.ToolTip = "暂存区文件数（带点 = 属于某个工作集）";
+        // K2 §4.7：空暂存区禁用「批」按钮（P4：空 → 禁用）。
+        StagingCommandButton.IsEnabled = _staging.Count > 0;
         foreach (var item in _staging.Items)
             ChipPanel.Children.Add(BuildChip(item));
 
