@@ -2158,11 +2158,27 @@ async fn execute_command(
             };
             match handler {
                 crate::commands::BrokerHandlerId::OpenTerminalHere => {
-                    let folder = context.current_folder.clone().unwrap_or_else(|| {
-                        std::env::current_dir()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default()
-                    });
+                    // K2 §4.4：action_panel 声明 input="selection"——对选中目录执行，
+                    // 不用 current_folder。root_search/shortcut 保持 current_folder 语义。
+                    let folder = match context.source {
+                        crate::commands::InvocationSource::ActionPanel => context
+                            .selection
+                            .as_ref()
+                            .and_then(|s| s.target.as_ref())
+                            .filter(|t| t.kind == "directory")
+                            .map(|t| t.value.clone())
+                            .or_else(|| context.current_folder.clone())
+                            .unwrap_or_else(|| {
+                                std::env::current_dir()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default()
+                            }),
+                        _ => context.current_folder.clone().unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        }),
+                    };
                     match crate::shell::open_terminal_at(&folder) {
                         Ok(()) => {
                             let _ = commands.record_success(
