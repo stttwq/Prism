@@ -12,6 +12,8 @@ public enum SearchResultKind
     /// <summary>K0：命令行（统一命令系统）。K0 无生产者，K1 接入。</summary>
     Command,
     More,
+    /// <summary>K3 §4.9：无结果兜底行（本地生成，不进 complete-cache）。</summary>
+    Fallback,
 }
 
 public sealed record SearchMatchMetadata(int Class, int Position, int Score);
@@ -89,6 +91,17 @@ public sealed record SearchResult(
         Subtitle: "热键: 双击 Ctrl",
         ExecuteId: "",
         MatchSpans: []);
+
+    /// <summary>K3 §4.9：无结果兜底行（本地生成）。</summary>
+    public static SearchResult Fallback(string query) => new(
+        Kind: "fallback",
+        Title: $"用默认引擎搜索「{query}」",
+        Subtitle: "Enter 用浏览器搜索此词",
+        ExecuteId: query,
+        MatchSpans: [])
+    {
+        RowKey = "fallback:" + query,
+    };
 
     /// <summary>
     /// 进结果列表前的双重去重（2026-08-25 用户报告修复）：

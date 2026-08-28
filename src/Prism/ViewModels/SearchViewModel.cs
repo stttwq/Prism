@@ -33,6 +33,8 @@ public sealed class SearchViewModel
     private IReadOnlyList<FilterTrigger> _filterTriggers = Settings.DefaultFilterTriggers();
     /// <summary>在线联想开关（G8），默认关闭。</summary>
     private bool _suggestionsEnabled;
+    /// <summary>K3 §4.9：无结果兜底行开关，默认开。</summary>
+    private bool _fallbackEnabled = true;
     private CancellationTokenSource? _searchCts;
     /// <summary>P4c: 网页联想的发起/取消/身份治理抽出到了 WebSearchCoordinator。</summary>
     private readonly WebSearchCoordinator _webSuggestions;
@@ -526,6 +528,13 @@ public sealed class SearchViewModel
             return;
         }
 
+        // K3 §4.9：兜底行 Enter = 用默认引擎搜索原词。
+        if (item.Kind == "fallback")
+        {
+            await ExecuteFallbackAsync(item.ExecuteId).ConfigureAwait(true);
+            return;
+        }
+
         // 工作集合成行（阶段三）：Enter = 载入暂存区（不隐藏窗口、不经 broker）。
         if (item.Kind == "workset")
         {
@@ -564,6 +573,35 @@ public sealed class SearchViewModel
         catch (Exception ex)
         {
             _state.StatusMessage = "打开失败：" + ShortMsg(ex);
+        }
+    }
+
+    /// <summary>
+    /// K3 §4.9：兜底行 Enter = 用默认引擎搜索原词。
+    /// 取引擎列表第一项（与 WebModeDetector 默认一致），构造 URL 经 broker 打开。
+    /// </summary>
+    private async Task ExecuteFallbackAsync(string query)
+    {
+        var engine = _webEngines.FirstOrDefault();
+        if (engine is null || string.IsNullOrEmpty(engine.UrlTemplate))
+        {
+            _state.StatusMessage = "无可用搜索引擎";
+            return;
+        }
+        var url = WebModeDetector.BuildUrl(engine.UrlTemplate, query);
+        if (string.IsNullOrEmpty(url))
+        {
+            _state.StatusMessage = "搜索 URL 构造失败";
+            return;
+        }
+        try
+        {
+            await _pipe.ExecuteAsync(new ActionTarget("web", url), query).ConfigureAwait(true);
+            HideRequested?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "搜索失败：" + ShortMsg(ex);
         }
     }
 
@@ -902,7 +940,7 @@ public sealed class SearchViewModel
         // workset 是前端合成行，没有可定位的文件系统对象。
         // K0 T10.5：命令行禁用 Reveal——命令没有「所在文件夹」，
         // 不禁用则命令 id 被送进 reveal 的 explorer /select 路径。
-        if (item is null || item.Kind is "more" or "web" or "workset" or "command") return;
+        if (item is null || item.Kind is "more" or "web" or "workset" or "command" or "fallback") return;
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
         try
@@ -1574,6 +1612,19 @@ public sealed class SearchViewModel
         var recall = BuildWorksetRecallRow(query);
         if (recall is not null)
             list.Insert(0, recall);
+        // K3 §4.9：无结果兜底行。本地生成，不进 complete-cache（缓存存 resp 不存 list）。
+        // 窗口查询（>）和过滤查询（ext:/path:）不走兜底——它们有专属空结果文案。
+        if (_fallbackEnabled
+            && resp.Items.Count == 0
+            && !resp.IsIndexing
+            && string.IsNullOrWhiteSpace(resp.IndexError)
+            && !string.IsNullOrWhiteSpace(query)
+            && !IsWindowQuery(query)
+            && !HasFilterToken(query)
+            && !IsCustomFilterTrigger(query))
+        {
+            list.Add(SearchResult.Fallback(query));
+        }
         // 全仓检验 2026-08-25 第二轮（F2）：State.Results 与 ResultList 显示集合必须
         // 同源去重——此前只在显示层去重，一旦 broker（或旧版本 broker）产出同键
         // 重复行，两列表索引错一位：选中/Enter 执行/Ctrl+N 全部偏移到错误的行。
