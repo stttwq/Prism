@@ -144,6 +144,15 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     priority: 0,
                     ..Default::default()
                 }),
+                // K2 §5 commit 3：动作面板命令段。对目录执行「在此打开终端」。
+                // 设计 §13.2 样例流：input=selection, cardinality=one, target_kinds=[directory]。
+                action_panel: Some(CommandBindingDto {
+                    priority: 0,
+                    input: "selection".into(),
+                    cardinality: Some("one".into()),
+                    target_kinds: vec!["directory".into()],
+                    requires_host_root: false,
+                }),
                 ..Default::default()
             },
             danger: "normal",
@@ -267,6 +276,20 @@ impl CommandStore {
     /// 目录代际。`load` 后为 1（0 保留给「未知/未协商」），每次 mutation 递增。
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// 命令的使用频度分（frecency 近似）。K2 composer 用它对命令段排序。
+    /// 取 success_count：已执行次数越多越靠前。frecency_milli 暂未填，留待
+    /// 与 history.rs 同款衰减计算统一接入（设计 §12-K2 标注 frecency 排序）。
+    pub fn usage_score(&self, id: &str) -> u32 {
+        self.usage
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.success_count)
+            .unwrap_or(0)
     }
 
     /// 整体替换/新增一条用户命令。校验前置（先校验再改内存态），成功后

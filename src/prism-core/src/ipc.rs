@@ -1078,6 +1078,32 @@ async fn handle_connection(
                             }
                         }
                     }
+                    Request::Actions { id, target } => {
+                        // K2 §4.4：caps 为真时在动作列表后追加命令段；为假时只返回
+                        // 内置段（K1 逐字节一致，P3）。命令身份仍被拒绝进文件动作面板。
+                        let resolved =
+                            resolve_target(target.clone(), id.clone(), Some(TargetKind::File));
+                        if TargetKind::parse(&resolved.kind) == Some(TargetKind::Command) {
+                            Response::Error {
+                                message: "命令不能通过该请求执行".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            let builtin = crate::actions::list_actions(&resolved);
+                            match crate::action_composer::compose(
+                                &resolved,
+                                builtin,
+                                &commands,
+                                caps.commands_v1,
+                            ) {
+                                Ok(items) => Response::Actions { items },
+                                Err(ShellError { kind, message }) => Response::Error {
+                                    message,
+                                    category: Some(kind),
+                                },
+                            }
+                        }
+                    }
                     Request::ExecuteCommand { context } => {
                         if !caps.commands_v1 {
                             Response::Error {
@@ -2070,6 +2096,24 @@ async fn execute_command(
             message: format!("命令已禁用：{}", context.command_id),
             category: Some(ShellErrorKind::TargetInvalid),
         };
+    }
+    // K2 §4.4 P2：动作面板来源二次校验。列出后用户可能改目录代际、目标文件
+    // 可能已删除——只信任前端把校验结果带回来是设计 §5.2 要求的同一道防线。
+    if context.source == crate::commands::InvocationSource::ActionPanel {
+        if let Some(selection) = &context.selection {
+            if let Some(target) = &selection.target {
+                if let Err(message) = crate::action_composer::validate_action_panel(
+                    target,
+                    &desc.id,
+                    commands.as_ref(),
+                ) {
+                    return Response::Error {
+                        message,
+                        category: Some(ShellErrorKind::TargetInvalid),
+                    };
+                }
+            }
+        }
     }
     match desc.owner {
         "broker" => {
