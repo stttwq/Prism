@@ -82,6 +82,8 @@ pub struct CommandBindingsDto {
 // K2 §4.3：按 surface 扩展。设计 §5.1 要求每个 surface 声明输入来源与适用性。
 // 不用一组全局 accepts——同一命令在不同入口取不同输入（如终端命令在根搜索用
 // current_folder、在动作面板用选中的 directory），全局 accepts 表达不了。
+// K2 §4.6：shortcut binding 增加 shortcut_combo 字段，存储组合键原始字符串。
+// broker 不解析——解析与冲突检测在 WPF 设置页完成。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CommandBindingDto {
     pub priority: i32,
@@ -96,6 +98,9 @@ pub struct CommandBindingDto {
     pub target_kinds: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_host_root: bool,
+    /// K2 §4.6：仅 shortcut binding 使用。组合键原始字符串（如 "Ctrl+Shift+S"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut_combo: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -157,6 +162,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     cardinality: Some("one".into()),
                     target_kinds: vec!["directory".into()],
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
                 ..Default::default()
             },
@@ -188,6 +194,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     cardinality: Some("many".into()),
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
                 ..Default::default()
             },
@@ -218,6 +225,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                     cardinality: Some("many".into()),
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
                 ..Default::default()
             },
@@ -284,13 +292,13 @@ impl CommandStore {
                 .ok()
                 .and_then(|envelope| envelope.into_compatible().ok())
         });
-        let (commands, isolated) = match loaded {
-            Some(data) => (data.commands, false),
+        let (commands, shortcut_bindings, isolated) = match loaded {
+            Some(data) => (data.commands, data.shortcut_bindings, false),
             None if path.exists() => {
                 crate::history::isolate(&path, crate::history::now_utc());
-                (Vec::new(), true)
+                (Vec::new(), Vec::new(), true)
             }
-            None => (Vec::new(), false),
+            None => (Vec::new(), Vec::new(), false),
         };
 
         let usage_loaded = std::fs::read(&usage_path).ok().and_then(|bytes| {
@@ -310,7 +318,10 @@ impl CommandStore {
         let store = Self {
             path,
             usage_path,
-            state: RwLock::new(CommandData { commands }),
+            state: RwLock::new(CommandData {
+                commands,
+                shortcut_bindings,
+            }),
             usage: RwLock::new(CommandUsageData {
                 entries: usage_entries,
             }),
@@ -331,6 +342,7 @@ impl CommandStore {
 
     /// 内置静态表 + 用户表合并。过滤 `enabled=false`；broker-owned 项还需有
     /// 注册 handler 才进目录（owner 分工：UI-owned 原样下发，WPF 侧过滤）。
+    /// K2 §4.6：合并 shortcut_bindings 映射——为有快捷键的命令填充 bindings.shortcut。
     pub fn catalog(&self) -> Vec<CommandDescriptor> {
         let mut items = builtin_catalog();
         // K2 §4.5-3：staging ZIP 仅在外部压缩程序可用时启用。Shell COM
@@ -355,7 +367,71 @@ impl CommandStore {
             // broker-owned 命令需要注册 handler；K0 用户表为空，此处无过滤发生。
             items.push(user_command_to_descriptor(command));
         }
+        // K2 §4.6：合并 shortcut_bindings。为目录中每条命令填充 bindings.shortcut。
+        // 内置命令不在 commands 向量中，shortcut_bindings 是它们唯一的快捷键存储。
+        for entry in &state.shortcut_bindings {
+            if let Some(item) = items.iter_mut().find(|d| d.id == entry.command_id) {
+                item.bindings.shortcut = Some(CommandBindingDto {
+                    priority: 0,
+                    input: String::new(),
+                    cardinality: None,
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
+                    shortcut_combo: Some(entry.combo.clone()),
+                });
+            }
+        }
         items
+    }
+
+    /// K2 §4.6：设置或清除命令的快捷键绑定。combo = None 或空串 = 清除。
+    /// 内置命令与用户命令都支持——绑定存在 CommandData.shortcut_bindings 映射中，
+    /// 不在 UserCommandDefinition.bindings 里（设计 §4.6：独立存储）。
+    pub fn set_shortcut_binding(
+        &self,
+        command_id: &str,
+        combo: Option<String>,
+    ) -> Result<(), String> {
+        validate_command_id(command_id)?;
+        {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let is_clear = combo.as_ref().is_none_or(|c| c.is_empty());
+            if is_clear {
+                state
+                    .shortcut_bindings
+                    .retain(|e| e.command_id != command_id);
+            } else {
+                let combo = combo.unwrap();
+                if combo.chars().count() > crate::persistence::SHORTCUT_COMBO_MAX_CHARS {
+                    return Err("shortcut combo exceeds 64 chars".into());
+                }
+                match state
+                    .shortcut_bindings
+                    .iter_mut()
+                    .find(|e| e.command_id == command_id)
+                {
+                    Some(entry) => entry.combo = combo,
+                    None => {
+                        if state.shortcut_bindings.len()
+                            >= crate::persistence::COMMAND_SHORTCUT_MAX_ENTRIES
+                        {
+                            return Err("shortcut bindings at capacity (64)".into());
+                        }
+                        state
+                            .shortcut_bindings
+                            .push(crate::persistence::CommandShortcutEntry {
+                                command_id: command_id.into(),
+                                combo,
+                            });
+                    }
+                }
+            }
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.persist()
     }
 
     /// 目录代际。`load` 后为 1（0 保留给「未知/未协商」），每次 mutation 递增。
@@ -572,6 +648,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     cardinality: None,
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
             keyword: command
                 .bindings
@@ -583,6 +660,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     cardinality: None,
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
             action_panel: command
                 .bindings
@@ -594,6 +672,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     cardinality: None,
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
             staging: command
                 .bindings
@@ -605,6 +684,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     cardinality: None,
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: None,
                 }),
             shortcut: command
                 .bindings
@@ -616,6 +696,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                     cardinality: None,
                     target_kinds: Vec::new(),
                     requires_host_root: false,
+                    shortcut_combo: b.shortcut_combo.clone(),
                 }),
         },
         danger: match command.danger.as_str() {
@@ -1283,6 +1364,127 @@ mod tests {
         assert_eq!(terminal.trust, "builtin");
         assert!(terminal.enabled);
         assert!(terminal.bindings.root_search.is_some());
+    }
+
+    // K2 §4.6：shortcut_bindings 设置/清除/目录合并。
+    #[test]
+    fn shortcut_binding_set_clear_and_catalog_merge() {
+        let (store, _dir) = store("shortcut");
+
+        // 初始：内置命令无 shortcut binding
+        let catalog = store.catalog();
+        let settings = catalog
+            .iter()
+            .find(|d| d.id == "prism.settings.open")
+            .unwrap();
+        assert!(
+            settings.bindings.shortcut.is_none(),
+            "no shortcut initially"
+        );
+
+        // 设置内置命令的快捷键
+        store
+            .set_shortcut_binding("prism.settings.open", Some("Ctrl+Shift+S".into()))
+            .unwrap();
+        assert_eq!(store.generation(), 2, "generation incremented");
+        let catalog = store.catalog();
+        let settings = catalog
+            .iter()
+            .find(|d| d.id == "prism.settings.open")
+            .unwrap();
+        let sc = settings.bindings.shortcut.as_ref().expect("shortcut set");
+        assert_eq!(sc.shortcut_combo.as_deref(), Some("Ctrl+Shift+S"));
+
+        // 清除
+        store
+            .set_shortcut_binding("prism.settings.open", None)
+            .unwrap();
+        let catalog = store.catalog();
+        let settings = catalog
+            .iter()
+            .find(|d| d.id == "prism.settings.open")
+            .unwrap();
+        assert!(settings.bindings.shortcut.is_none(), "cleared");
+
+        // 空串也清除
+        store
+            .set_shortcut_binding("prism.terminal.open", Some("Ctrl+T".into()))
+            .unwrap();
+        store
+            .set_shortcut_binding("prism.terminal.open", Some(String::new()))
+            .unwrap();
+        let catalog = store.catalog();
+        let terminal = catalog
+            .iter()
+            .find(|d| d.id == "prism.terminal.open")
+            .unwrap();
+        assert!(terminal.bindings.shortcut.is_none(), "empty string clears");
+    }
+
+    // K2 §4.6：shortcut_bindings 持久化往返。
+    #[test]
+    fn shortcut_binding_persists_across_reload() {
+        let (store, dir) = store("shortcut-persist");
+        store
+            .set_shortcut_binding("prism.settings.open", Some("Ctrl+Alt+P".into()))
+            .unwrap();
+        // 重新加载
+        let reloaded = CommandStore::load(&dir);
+        let catalog = reloaded.catalog();
+        let settings = catalog
+            .iter()
+            .find(|d| d.id == "prism.settings.open")
+            .unwrap();
+        let sc = settings
+            .bindings
+            .shortcut
+            .as_ref()
+            .expect("shortcut persisted");
+        assert_eq!(sc.shortcut_combo.as_deref(), Some("Ctrl+Alt+P"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // K2 §4.6：shortcut_bindings 校验——无效 id 拒绝、超长 combo 拒绝、容量上限。
+    #[test]
+    fn shortcut_binding_validation() {
+        let (store, _dir) = store("shortcut-val");
+
+        // 无效 id 拒绝
+        assert!(store
+            .set_shortcut_binding("badprefix", Some("Ctrl+S".into()))
+            .is_err());
+
+        // 超长 combo 拒绝
+        let long = "a".repeat(65);
+        assert!(store
+            .set_shortcut_binding("prism.settings.open", Some(long))
+            .is_err());
+
+        // 合法 combo 通过
+        assert!(store
+            .set_shortcut_binding("prism.settings.open", Some("Ctrl+Shift+F12".into()))
+            .is_ok());
+    }
+
+    // K2 §4.6：旧版 WPF 保存 settings.json 不影响命令绑定——
+    // shortcut_bindings 在 commands-v1.json 中，与 settings.json 完全分开。
+    #[test]
+    fn shortcut_bindings_independent_of_settings_json() {
+        let (store, dir) = store("shortcut-indep");
+        store
+            .set_shortcut_binding("prism.terminal.open", Some("Ctrl+T".into()))
+            .unwrap();
+
+        // 模拟旧版 WPF 写入一个不含 shortcut_bindings 的 settings.json——
+        // 这不影响 commands-v1.json。重新加载后 shortcut_bindings 仍在。
+        let reloaded = CommandStore::load(&dir);
+        let catalog = reloaded.catalog();
+        let terminal = catalog
+            .iter()
+            .find(|d| d.id == "prism.terminal.open")
+            .unwrap();
+        assert!(terminal.bindings.shortcut.is_some(), "shortcut survives");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // R7: ActionTarget{kind:"command"} validate

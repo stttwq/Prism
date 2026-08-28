@@ -185,6 +185,12 @@ pub enum Request {
     ExecuteCommand {
         context: crate::commands::CommandInvocationContext,
     },
+    /// K2 §4.6：设置或清除命令的快捷键绑定。combo 为 None = 清除。
+    /// 仅协商 commands_v1 的连接受理。
+    SetCommandShortcut {
+        command_id: String,
+        combo: Option<String>,
+    },
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -312,6 +318,8 @@ pub enum Response {
         id: String,
         context: crate::commands::CommandInvocationContext,
     },
+    /// K2 §4.6：快捷键绑定设置/清除回执。message 空串=成功，否则为错误文案。
+    CommandShortcutApplied { message: String },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
@@ -1114,6 +1122,26 @@ async fn handle_connection(
                             execute_command(context.clone(), &commands, &shell, &history).await
                         }
                     }
+                    Request::SetCommandShortcut { command_id, combo } => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command shortcut requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            let commands_for_blocking = commands.clone();
+                            let cid = command_id.clone();
+                            let combo_val = combo.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                commands_for_blocking.set_shortcut_binding(&cid, combo_val)
+                            })
+                            .await
+                            .unwrap_or_else(|error| Err(format!("set shortcut task: {error}")));
+                            Response::CommandShortcutApplied {
+                                message: result.err().unwrap_or_default(),
+                            }
+                        }
+                    }
                     _ => {
                         dispatch_non_search(
                             req,
@@ -1483,6 +1511,11 @@ async fn dispatch_non_search(
         // K1：ExecuteCommand 在连接循环内处理（需读 caps），这里不可达。
         Request::ExecuteCommand { .. } => Response::Error {
             message: "execute_command must be handled in the connection loop".into(),
+            category: None,
+        },
+        // K2 §4.6：SetCommandShortcut 在连接循环内处理（需读 caps），这里不可达。
+        Request::SetCommandShortcut { .. } => Response::Error {
+            message: "set_command_shortcut must be handled in the connection loop".into(),
             category: None,
         },
     }
@@ -6532,6 +6565,27 @@ mod pipe_lifecycle_tests {
                             "type": "command_catalog",
                             "generation": commands.generation(),
                             "items": items,
+                        })
+                    }
+                }
+                "set_command_shortcut" => {
+                    if !caps.commands_v1 {
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "command shortcut requires commands_v1 capability",
+                            "category": "unsupported",
+                        })
+                    } else {
+                        let command_id = req["command_id"].as_str().unwrap_or("").to_string();
+                        let combo = if req.get("combo").is_none() || req["combo"].is_null() {
+                            None
+                        } else {
+                            req["combo"].as_str().map(String::from)
+                        };
+                        let result = commands.set_shortcut_binding(&command_id, combo);
+                        serde_json::json!({
+                            "type": "command_shortcut_applied",
+                            "message": result.err().unwrap_or_default(),
                         })
                     }
                 }

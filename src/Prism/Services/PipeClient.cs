@@ -932,6 +932,35 @@ public sealed class PipeClient : ISearchClient, IDisposable
         return null;
     }
 
+    /// <summary>
+    /// K2 §4.6：设置或清除命令的快捷键绑定。combo=null=清除。
+    /// 返回错误文案（空串=成功）。
+    /// </summary>
+    internal async Task<string> SetCommandShortcutAsync(
+        string commandId, string? combo, CancellationToken ct = default)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["type"] = "set_command_shortcut",
+            ["command_id"] = commandId,
+            ["combo"] = combo,
+        };
+        var resp = await SendAsync(payload, ct, QueryReadTimeout).ConfigureAwait(false);
+        if (resp.TryGetProperty("type", out var type))
+        {
+            var typeStr = type.GetString();
+            if (typeStr == "error")
+            {
+                return resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+            }
+            if (typeStr == "command_shortcut_applied")
+            {
+                return resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+            }
+        }
+        return "unexpected response";
+    }
+
     internal static IReadOnlyList<AliasEntry> ParseAliasList(JsonElement resp)
     {
         var items = new List<AliasEntry>();

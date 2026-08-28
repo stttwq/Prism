@@ -128,22 +128,36 @@ public sealed record CommandBindingsDto(
         }
         var requiresHostRoot = el.TryGetProperty("requires_host_root", out var rhrEl)
             && rhrEl.ValueKind == JsonValueKind.True;
-        return new CommandBindingDto(priority, input, cardinality, targetKinds, requiresHostRoot);
+        // K2 §4.6：仅 shortcut binding 携带。组合键原始字符串（如 "Ctrl+Shift+S"）。
+        var shortcutCombo = el.TryGetProperty("shortcut_combo", out var scEl)
+            && scEl.ValueKind == JsonValueKind.String
+            ? scEl.GetString()
+            : null;
+        return new CommandBindingDto(
+            priority, input, cardinality, targetKinds, requiresHostRoot, shortcutCombo);
     }
 }
 
 /// <summary>
 /// K2 §4.3：按 surface 扩展。Cardinality/TargetKinds/RequiresHostRoot 容忍缺字段
 /// （旧 broker 的 binding 只有 priority + input）。
+/// K2 §4.6：ShortcutCombo 仅 shortcut binding 携带（组合键原始字符串）。
 /// </summary>
 public sealed record CommandBindingDto(
     int Priority,
     string Input,
     string? Cardinality,
     IReadOnlyList<string> TargetKinds,
-    bool RequiresHostRoot)
+    bool RequiresHostRoot,
+    string? ShortcutCombo)
 {
     // 兼容旧调用点（K1 只传 priority + input）。
     public CommandBindingDto(int Priority, string Input)
-        : this(Priority, Input, null, Array.Empty<string>(), false) { }
+        : this(Priority, Input, null, Array.Empty<string>(), false, null) { }
+
+    // 兼容旧调用点（K2 §4.3 前 5 参数）。
+    public CommandBindingDto(
+        int Priority, string Input, string? Cardinality,
+        IReadOnlyList<string> TargetKinds, bool RequiresHostRoot)
+        : this(Priority, Input, Cardinality, TargetKinds, RequiresHostRoot, null) { }
 }

@@ -153,13 +153,24 @@ public partial class App : Application
                 {
                     _ = Task.Run(async () =>
                     {
-                        try { await _commandCatalog!.RefreshAsync().ConfigureAwait(false); }
+                        try
+                        {
+                            await _commandCatalog!.RefreshAsync().ConfigureAwait(false);
+                            // K2 §4.6：目录刷新后同步命令快捷键表到窗口。
+                            // 窗口是懒创建的——可能此时还不存在，SetCommandShortcuts
+                            // 在 EnsureSearchWindow 中也会从当前快照初始化。
+                            var snapshot = _commandCatalog!.Snapshot;
+                            _ = Dispatcher.BeginInvoke(new Action(() =>
+                                _searchWindow?.SetCommandShortcuts(snapshot)));
+                        }
                         catch { /* 目录拉取失败不影响其他功能 */ }
                     });
                 }
                 else
                 {
                     _commandCatalog?.Clear();
+                    _ = Dispatcher.BeginInvoke(new Action(() =>
+                        _searchWindow?.SetCommandShortcuts(Array.Empty<Prism.Models.CommandDescriptor>())));
                 }
             }));
         _icons = new IconCache();
@@ -231,6 +242,10 @@ public partial class App : Application
         _searchWindow.Scope.SetCurrentDirectoryEnabled(_currentDirectorySearchEnabled);
         _searchWindow.SetActionHotkeys(_actionHotkeyBindings);
         _searchWindow.SetStagingAddHotkey(_stagingAddHotkey);
+        // K2 §4.6：懒创建窗口时从当前目录快照初始化命令快捷键表。
+        // 若连接尚未建立或目录未拉取，快照为空——连接成功后 RefreshAsync 会补上。
+        _searchWindow.SetCommandShortcuts(
+            _commandCatalog?.Snapshot ?? Array.Empty<Prism.Models.CommandDescriptor>());
         return _searchWindow;
     }
 

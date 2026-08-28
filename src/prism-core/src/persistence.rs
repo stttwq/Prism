@@ -210,14 +210,32 @@ pub const COMMAND_MAX_KEYWORDS: usize = 4;
 pub const COMMAND_KEYWORD_MAX_CHARS: usize = 16;
 pub const COMMAND_TITLE_MAX_CHARS: usize = 64;
 pub const COMMAND_SUBTITLE_MAX_CHARS: usize = 128;
+/// K2 §4.6：shortcut_combo 字段最大字符数（组合键串足够）。
+pub const SHORTCUT_COMBO_MAX_CHARS: usize = 64;
+/// K2 §4.6：shortcut_bindings 最多 64 条（内置命令 ≤ 6 + 用户命令 ≤ 512，取交集上限）。
+pub const COMMAND_SHORTCUT_MAX_ENTRIES: usize = 64;
 pub const COMMAND_USAGE_MAX_ENTRIES: usize = 2000;
 
 /// 用户命令目录。`UserCommandDefinition` 刻意不含 `owner`：用户命令的 owner 恒为
 /// broker、trust 恒为 user，由代码赋值，不从 JSON 读。
+/// K2 §4.6：`shortcut_bindings` 是独立的 command_id → combo 映射，broker 独占。
+/// 与 WPF 的 `settings.json` 的 `ActionHotkeys` 分开存储（设计 §7.2 + §14-R10）：
+/// 旧版 WPF 保存 settings.json 时会丢弃它不认识的字段，命令绑定写进去就没了。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandData {
     #[serde(default)]
     pub commands: Vec<UserCommandDefinition>,
+    /// K2 §4.6：命令快捷键绑定。key = command_id, value = combo string。
+    /// 空字符串 = 清除。内置命令也在此映射中存（它们不在 `commands` 向量中）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortcut_bindings: Vec<CommandShortcutEntry>,
+}
+
+/// K2 §4.6：快捷键绑定条目。用 Vec 而非 HashMap 保证 JSON 稳定。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandShortcutEntry {
+    pub command_id: String,
+    pub combo: String,
 }
 
 /// 持久化形态的用户命令定义（Deserialize 端）。与 broker 下发的 `CommandDescriptor`
@@ -273,11 +291,16 @@ pub struct CommandBindings {
     pub shortcut: Option<CommandBinding>,
 }
 
-/// 单条 binding（K0 不细化内部，保留为占位结构）。
+/// 单条 binding。K0 为占位结构；K2 §4.6 在 shortcut surface 增加 `shortcut_combo`
+/// 存组合键字符串（如 "Ctrl+Shift+S"），其余 surface 不使用此字段。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandBinding {
     #[serde(default)]
     pub priority: i32,
+    /// K2 §4.6：仅 shortcut binding 使用。组合键原始字符串，broker 不解析——
+    /// 解析与冲突检测在 WPF 设置页完成，broker 只存储与下发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut_combo: Option<String>,
 }
 
 /// 命令使用记录。不存参数、不存 query（设计 §14 R14）。
@@ -347,6 +370,24 @@ impl VersionedData for CommandData {
                 "" | "normal" | "elevated" | "destructive"
             ) {
                 return Err("command has an unsupported danger level".into());
+            }
+            // K2 §4.6：shortcut_combo 长度上限（组合键串如 "Ctrl+Shift+F12" ≤ 32 足够）。
+            if let Some(combo) = command.bindings.shortcut.as_ref() {
+                if let Some(c) = &combo.shortcut_combo {
+                    if c.chars().count() > SHORTCUT_COMBO_MAX_CHARS {
+                        return Err("shortcut_combo exceeds 64 chars".into());
+                    }
+                }
+            }
+        }
+        // K2 §4.6：shortcut_bindings 上限与长度校验。
+        if self.shortcut_bindings.len() > COMMAND_SHORTCUT_MAX_ENTRIES {
+            return Err("shortcut_bindings exceeds 64 entries".into());
+        }
+        for entry in &self.shortcut_bindings {
+            validate_command_id(&entry.command_id)?;
+            if entry.combo.chars().count() > SHORTCUT_COMBO_MAX_CHARS {
+                return Err("shortcut_binding combo exceeds 64 chars".into());
             }
         }
         Ok(())
@@ -523,6 +564,7 @@ mod tests {
                 };
                 513
             ],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(over).is_err());
 
@@ -534,6 +576,7 @@ mod tests {
                 title: title64,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(ok).is_ok());
 
@@ -545,6 +588,7 @@ mod tests {
                 title: title65,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(over_title).is_err());
 
@@ -557,6 +601,7 @@ mod tests {
                 keywords: five_kw,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(over_kw).is_err());
 
@@ -568,6 +613,7 @@ mod tests {
                 keywords: vec!["has space".into()],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(space_kw).is_err());
 
@@ -582,6 +628,7 @@ mod tests {
                 },
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(bad_input).is_err());
 
@@ -593,6 +640,7 @@ mod tests {
                 danger: "apocalypse".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(bad_danger).is_err());
 
@@ -603,6 +651,7 @@ mod tests {
                 title: "t".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(bad_id).is_err());
     }

@@ -35,6 +35,8 @@ public partial class SearchWindow : Window
     private PipeClient? _pipe;
     /// <summary>窗口级动作快捷键表（2026-08-21 设想）：未装配时空表，恒不命中。</summary>
     private ActionHotkeyTable _actionHotkeys = ActionHotkeyTable.Empty;
+    /// <summary>K2 §4.6：命令快捷键表。从 broker 目录快照构建，独立于 ActionHotkeys。</summary>
+    private CommandShortcutTable _commandShortcuts = CommandShortcutTable.Empty;
     /// <summary>暂存区（2026-08-22 计划）：未装配时快捷键恒不命中、条带不显示。</summary>
     private StagingArea? _staging;
     private (System.Windows.Input.Key Key, System.Windows.Input.ModifierKeys Mods)? _stagingAddHotkey;
@@ -1107,6 +1109,14 @@ public partial class SearchWindow : Window
     public void SetStagingAddHotkey(string? combo) =>
         _stagingAddHotkey = ActionHotkeyTable.Parse(combo ?? "");
 
+    /// <summary>
+    /// K2 §4.6：从 broker 目录快照刷新命令快捷键表。App 在目录拉取后调用。
+    /// 与 SetActionHotkeys 分开——命令快捷键存 broker 独占的 commands-v1.json，
+    /// 不经 settings.json 的 ActionHotkeys 字典。
+    /// </summary>
+    public void SetCommandShortcuts(IReadOnlyList<Prism.Models.CommandDescriptor> catalog) =>
+        _commandShortcuts = CommandShortcutTable.FromCatalog(catalog);
+
     /// <summary>点击暂存区 chip：Shell 打开（不经 broker、不记历史——暂存区取用
     /// 不是搜索挑选）。窗口保持可见（暂存区是拿取口，开完通常还要继续拿）。</summary>
     private void OpenStagedFile(string path)
@@ -1546,6 +1556,24 @@ public partial class SearchWindow : Window
             return;
         }
 
+        // K2 §4.6：命令快捷键。独立于 ActionHotkeys——语义不同（命令可能不需要
+        // 选中项）、存储不同（broker 独占 commands-v1.json vs settings.json）。
+        // 位于 _stagingAddHotkey 之后、导航键 switch 之前。保留键永远进不去
+        // （CommandShortcutTable 构建时已丢弃保留键）。
+        // 适用性：不需要 selection 的命令（input.kind=="none"）在无选中项时仍可触发；
+        // 需要 selection 的命令（input.kind!="none"）要求 Results 模式且有选中项。
+        if (_commandShortcuts.TryMatch(hotkeyKey, Keyboard.Modifiers, out var cmdEntry))
+        {
+            if (CommandShortcutApplies(cmdEntry))
+            {
+                // 与 Key.Enter 同纪律：先置 Handled 再 await。
+                e.Handled = true;
+                await RunCommandShortcutAsync(cmdEntry);
+                return;
+            }
+            // 不适用不吞键——按键落回原逻辑（与 ActionHotkeys 同纪律）。
+        }
+
         var mode = _vm.State.Mode;
 
         switch (e.Key)
@@ -1635,6 +1663,37 @@ public partial class SearchWindow : Window
             && target is not null
             && !string.IsNullOrEmpty(target.ExecuteId)
             && ActionHotkeyCatalog.AppliesTo(actionId, target.Kind);
+    }
+
+    /// <summary>
+    /// K2 §4.6：命令快捷键的适用性预检。
+    /// 不需要 selection 的命令（input.kind=="none"）在任何模式下都可触发——
+    /// 这正是命令快捷键与 ActionHotkeys 分开的原因（设计 §7.2-1）。
+    /// 需要 selection 的命令要求 Results 模式且有选中项。
+    /// </summary>
+    private bool CommandShortcutApplies(CommandShortcutEntry entry)
+    {
+        if (_vm is null) return false;
+        // 不需要 selection：随时可触发。
+        if (entry.InputKind is "none" or "")
+            return true;
+        // 需要 selection：要求 Results 模式 + 有选中项。
+        var target = _vm.State.SelectedResult;
+        return _vm.State.Mode == PanelMode.Results
+            && target is not null
+            && !string.IsNullOrEmpty(target.ExecuteId);
+    }
+
+    /// <summary>
+    /// K2 §4.6：命令快捷键命中后的执行入口。构造 source=shortcut 的
+    /// CommandInvocationContext，经 ExecuteCommand 走 broker。
+    /// 不需要 selection 的命令不传 Selection；需要 selection 的传当前选中项。
+    /// §4.8：复用 _actionInFlight 守卫，与动作面板/staging 同等级。
+    /// </summary>
+    private async Task RunCommandShortcutAsync(CommandShortcutEntry entry)
+    {
+        if (_vm is null) return;
+        await _vm.ExecuteShortcutCommandAsync(entry.CommandId).ConfigureAwait(true);
     }
 
     /// <summary>

@@ -797,6 +797,95 @@ public sealed class SearchViewModel
         }
     }
 
+    /// <summary>
+    /// K2 §4.6：命令快捷键执行入口。source=shortcut，经 ExecuteCommand 走 broker。
+    /// 不需要 selection 的命令（input.kind=="none"）不传 Selection；
+    /// 需要 selection 的命令传当前选中项的 typed target（P2：broker 二次校验）。
+    /// §4.8：复用 _actionInFlight 守卫，与动作面板/staging 同等级。
+    /// §4.9：执行前检查 catalog 代际一致性。
+    /// </summary>
+    public async Task ExecuteShortcutCommandAsync(string commandId)
+    {
+        if (_actionInFlight) return;
+        _actionInFlight = true;
+        try
+        {
+            await ExecuteShortcutCommandCoreAsync(commandId).ConfigureAwait(true);
+        }
+        finally
+        {
+            _actionInFlight = false;
+        }
+    }
+
+    private async Task ExecuteShortcutCommandCoreAsync(string commandId)
+    {
+        if (_pipe is not PipeClient realPipe)
+        {
+            _state.StatusMessage = "命令执行不可用";
+            return;
+        }
+
+        // §4.9：catalog 代际一致性检查——快捷键命中时 catalog 可能在等待刷新。
+        if (_commandCatalog is { IsAvailable: false })
+        {
+            _state.StatusMessage = "命令目录未就绪，请重试";
+            return;
+        }
+
+        // 构造调用上下文。不需要 selection 的命令（如打开设置）不传 Selection。
+        var cmdCtx = _searchContext.CommandContext;
+        var context = new CommandInvocationContext
+        {
+            CommandId = commandId,
+            Source = "shortcut",
+            CurrentFolder = cmdCtx?.CurrentFolder,
+            HostKind = cmdCtx?.HostKind,
+            HostCapabilities = cmdCtx?.HostCapabilities ?? Array.Empty<string>(),
+        };
+
+        // 需要 selection 的命令传当前选中项。input.kind != "none" 视为需要 selection。
+        // 命令面板执行（ExecutePanelCommandAsync）用同样方式从选中项构造 Selection。
+        var desc = _commandCatalog?.Snapshot.FirstOrDefault(d => d.Id == commandId);
+        if (desc is not null
+            && desc.Input.Kind is not "none" and not "")
+        {
+            var target = _state.SelectedResult;
+            if (target is null || string.IsNullOrEmpty(target.ExecuteId))
+            {
+                _state.StatusMessage = "此命令需要选中一个文件";
+                return;
+            }
+            context = context with
+            {
+                Selection = new CommandSelectionDto
+                {
+                    Target = target.ExecutionTarget,
+                    Title = target.Title,
+                    Subtitle = target.Subtitle,
+                },
+            };
+        }
+
+        try
+        {
+            var uiCommandId = await realPipe.ExecuteCommandAsync(context).ConfigureAwait(true);
+            if (uiCommandId is not null)
+            {
+                if (!CommandHandlers.TryExecute(uiCommandId, context))
+                {
+                    _state.StatusMessage = "命令未注册：" + uiCommandId;
+                    return;
+                }
+            }
+            HideRequested?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "命令执行失败：" + ShortMsg(ex);
+        }
+    }
+
     public async Task RevealSelectedAsync()
     {
         if (_state.Mode == PanelMode.Actions) return;
