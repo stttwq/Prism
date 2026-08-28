@@ -27,6 +27,16 @@ async fn main() {
     // K0：命令系统存储（目录 + 使用记录），用户数据，同 history/aliases 放数据目录。
     let commands = std::sync::Arc::new(prism_core::commands::CommandStore::load(&data_dir));
 
+    // K3 §4.5：启动确定性裁决——网页引擎关键字优先，冲突命令 keyword binding 禁用。
+    // 命令本体不禁用，仍可经根搜索/动作面板/快捷键到达。
+    {
+        let engine_keywords: Vec<String> = engines
+            .read()
+            .map(|guard| guard.iter().map(|e| e.keyword.clone()).collect())
+            .unwrap_or_default();
+        commands.startup_resolve(&engine_keywords);
+    }
+
     let shell = match shell::ShellExecutor::start() {
         Ok(shell) => shell,
         Err(error) => {

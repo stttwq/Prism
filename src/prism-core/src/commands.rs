@@ -315,6 +315,9 @@ pub struct CommandStore {
     persist_lock: Mutex<()>,
     usage_persist_lock: Mutex<()>,
     generation: AtomicU64,
+    /// K3 §4.5：启动裁决——关键字与网页引擎冲突的命令 id 集合。
+    /// catalog() 据此移除 keyword binding 并设 disabled_reason。空 = 无冲突。
+    disabled_keyword_commands: RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl CommandStore {
@@ -363,6 +366,7 @@ impl CommandStore {
             persist_lock: Mutex::new(()),
             usage_persist_lock: Mutex::new(()),
             generation: AtomicU64::new(1), // 0 保留给「未知/未协商」
+            disabled_keyword_commands: RwLock::new(std::collections::HashMap::new()),
         };
 
         // 隔离分支：原件已归档，立即回写合法空表让文件回到盘上。
@@ -417,6 +421,24 @@ impl CommandStore {
                 });
             }
         }
+        // K3 §4.5：启动裁决——关键字与网页引擎冲突的命令移除 keyword binding
+        // 并设 disabled_reason。命令本体不禁用，仍可经根搜索/动作面板/快捷键到达。
+        let disabled = self
+            .disabled_keyword_commands
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !disabled.is_empty() {
+            for item in items.iter_mut() {
+                if let Some(reason) = disabled.get(&item.id) {
+                    item.bindings.keyword = None;
+                    if item.disabled_reason.is_empty() {
+                        item.disabled_reason = reason.clone();
+                    }
+                }
+            }
+        }
+        drop(disabled);
+        drop(state);
         items
     }
 
@@ -583,6 +605,42 @@ impl CommandStore {
             commands: state.commands.clone(),
             shortcut_bindings: state.shortcut_bindings.clone(),
         }
+    }
+
+    /// K3 §4.5：启动确定性裁决。检查所有用户命令的 keyword binding trigger
+    /// 是否与网页引擎关键字冲突。冲突时网页优先——命令 keyword binding
+    /// 失效，写入 disabled_keyword_commands 集合，catalog() 据此设
+    /// disabled_reason 并移除 keyword binding。命令本体不禁用。
+    pub fn startup_resolve(&self, engine_keywords: &[String]) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let engine_set: std::collections::HashSet<&str> =
+            engine_keywords.iter().map(|s| s.as_str()).collect();
+
+        let mut disabled = std::collections::HashMap::new();
+        for cmd in &state.commands {
+            if let Some(ref binding) = cmd.bindings.keyword {
+                if let Some(ref trigger) = binding.trigger {
+                    let t = trigger.trim();
+                    if !t.is_empty() && engine_set.contains(t) {
+                        disabled.insert(cmd.id.clone(), format!("关键字与网页引擎「{}」冲突", t));
+                        crate::log(format!(
+                            "K3 §4.5 启动裁决：命令 {} 关键字「{}」与网页引擎冲突，keyword binding 禁用",
+                            cmd.id, t
+                        ));
+                    }
+                }
+            }
+        }
+        drop(state);
+
+        let mut map = self
+            .disabled_keyword_commands
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map = disabled;
     }
 
     /// 清空使用记录。经 `ClearHistory` 联动（K0 已接）。清内存 + 删/重写文件。
@@ -2356,5 +2414,68 @@ mod tests {
         let ids: Vec<&str> = kws.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"user.cmd_a"));
         assert!(ids.contains(&"user.cmd_b"));
+    }
+
+    // K3 §4.5：启动确定性裁决——网页引擎关键字优先，冲突命令 keyword binding 禁用。
+    #[test]
+    fn startup_resolve_disables_conflicting_keyword() {
+        let (store, dir) = store("startup-resolve");
+        let mut cmd = user_cmd("user.conflict_cmd");
+        cmd.title = "Conflict Command".into();
+        cmd.bindings.keyword = Some(crate::persistence::CommandBinding {
+            trigger: Some("g".into()),
+            ..Default::default()
+        });
+        cmd.enabled = true;
+        store.set(cmd).unwrap();
+
+        // 引擎关键字 "g" 与命令 keyword binding trigger "g" 冲突
+        store.startup_resolve(&["g".to_string()]);
+
+        let catalog = store.catalog();
+        let item = catalog
+            .iter()
+            .find(|d| d.id == "user.conflict_cmd")
+            .expect("conflict command in catalog");
+        assert!(item.bindings.keyword.is_none(), "keyword binding removed");
+        assert!(
+            !item.disabled_reason.is_empty(),
+            "disabled_reason set: {}",
+            item.disabled_reason
+        );
+        assert!(
+            item.enabled,
+            "command body not disabled — only keyword binding"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_resolve_no_conflict_keeps_keyword() {
+        let (store, dir) = store("startup-resolve-nocnf");
+        let mut cmd = user_cmd("user.safe_cmd");
+        cmd.bindings.keyword = Some(crate::persistence::CommandBinding {
+            trigger: Some("xyz".into()),
+            ..Default::default()
+        });
+        cmd.enabled = true;
+        store.set(cmd).unwrap();
+
+        // 引擎关键字 "g" 不与 "xyz" 冲突
+        store.startup_resolve(&["g".to_string()]);
+
+        let catalog = store.catalog();
+        let item = catalog
+            .iter()
+            .find(|d| d.id == "user.safe_cmd")
+            .expect("safe command in catalog");
+        assert!(
+            item.bindings.keyword.is_some(),
+            "keyword binding preserved (no conflict)"
+        );
+        assert!(item.disabled_reason.is_empty(), "no disabled_reason");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
