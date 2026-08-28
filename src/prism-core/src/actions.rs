@@ -236,6 +236,12 @@ fn action_item(id: ActionId) -> ActionItem {
         icon_glyph: id.icon_glyph().into(),
         has_submenu: false,
         is_section_header: false,
+        // K2 §4.2：内置动作默认值——invocation_kind=builtin_action、is_enabled=true，
+        // 其余 None。skip_serializing_if 保证不出现在 JSON 里。
+        invocation_kind: "builtin_action".into(),
+        command_id: None,
+        is_enabled: true,
+        disabled_reason: None,
     }
 }
 

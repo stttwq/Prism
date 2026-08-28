@@ -390,6 +390,9 @@ pub struct SearchResult {
 }
 
 /// 动作面板单项，字段对应 frontend-spec.md 第 2 节 `ActionItem` record。
+/// K2 §4.2：扩四字段。invocation_kind/command_id/is_enabled/disabled_reason。
+/// skip_serializing_if 保证内置动作 JSON 与 K1 逐字节一致（P3：未协商连接拿到的
+/// 动作列表完全没变化）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionItem {
     /// "open_folder"|"copy"|"cut"|"copy_path"|"shell:<n>" 等。
@@ -399,6 +402,19 @@ pub struct ActionItem {
     pub icon_glyph: String,
     pub has_submenu: bool,
     pub is_section_header: bool,
+    /// K2: "builtin_action" | "command"。默认 builtin_action。
+    #[serde(skip_serializing_if = "is_builtin_action")]
+    pub invocation_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(skip_serializing_if = "is_true")]
+    pub is_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+fn is_builtin_action(kind: &str) -> bool {
+    kind == "builtin_action"
 }
 
 /// 动作参数：copy_to/move_to 携带 destination，rename 携带 new_name。
@@ -5078,7 +5094,63 @@ mod protocol_tests {
         }
     }
 
-    /// 查询记忆键归一化：剥 `>` 前缀与过滤词，大小写/空白归一；
+    // K2 §4.2：内置 ActionItem 序列化后 JSON 与 K1 逐字节一致。
+    // skip_serializing_if 让新字段在默认值时不出现在 JSON 里，保证未协商
+    // commands_v1 的旧前端拿到的动作列表完全没变化（P3）。
+    #[test]
+    fn builtin_action_item_serializes_byte_identical_to_k1() {
+        let item = ActionItem {
+            id: "copy".into(),
+            label: "复制".into(),
+            icon_glyph: "\u{E8C8}".into(),
+            has_submenu: false,
+            is_section_header: false,
+            invocation_kind: "builtin_action".into(),
+            command_id: None,
+            is_enabled: true,
+            disabled_reason: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        // K1 格式：恰好 5 字段，无 invocation_kind/command_id/is_enabled/disabled_reason
+        let expected = r#"{"id":"copy","label":"复制","icon_glyph":"","has_submenu":false,"is_section_header":false}"#;
+        assert_eq!(json, expected);
+
+        // 命令动作：invocation_kind=command 时新字段出现
+        let cmd_item = ActionItem {
+            id: "cmd.terminal".into(),
+            label: "在此处打开终端".into(),
+            icon_glyph: String::new(),
+            has_submenu: false,
+            is_section_header: false,
+            invocation_kind: "command".into(),
+            command_id: Some("prism.terminal.open".into()),
+            is_enabled: true,
+            disabled_reason: None,
+        };
+        let cmd_json = serde_json::to_string(&cmd_item).unwrap();
+        assert!(cmd_json.contains(r#""invocation_kind":"command""#));
+        assert!(cmd_json.contains(r#""command_id":"prism.terminal.open""#));
+        // is_enabled=true 仍被 skip（is_true 谓词）
+        assert!(!cmd_json.contains(r#""is_enabled""#));
+        assert!(!cmd_json.contains(r#""disabled_reason""#));
+
+        // 禁用态：is_enabled=false 出现，disabled_reason 出现
+        let disabled = ActionItem {
+            id: "cmd.zip".into(),
+            label: "压缩为 ZIP".into(),
+            icon_glyph: String::new(),
+            has_submenu: false,
+            is_section_header: false,
+            invocation_kind: "command".into(),
+            command_id: Some("prism.staging.zip".into()),
+            is_enabled: false,
+            disabled_reason: Some("需要 7-Zip".into()),
+        };
+        let dis_json = serde_json::to_string(&disabled).unwrap();
+        assert!(dis_json.contains(r#""is_enabled":false"#));
+        assert!(dis_json.contains(r#""disabled_reason":"需要 7-Zip""#));
+    }
+
     /// 纯过滤词或空白没有记忆意义。
     #[test]
     fn query_pick_key_strips_prefixes_filters_and_normalizes() {

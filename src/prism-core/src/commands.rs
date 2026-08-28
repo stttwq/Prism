@@ -75,9 +75,27 @@ pub struct CommandBindingsDto {
     pub shortcut: Option<CommandBindingDto>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+// K2 §4.3：按 surface 扩展。设计 §5.1 要求每个 surface 声明输入来源与适用性。
+// 不用一组全局 accepts——同一命令在不同入口取不同输入（如终端命令在根搜索用
+// current_folder、在动作面板用选中的 directory），全局 accepts 表达不了。
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CommandBindingDto {
     pub priority: i32,
+    /// "none" | "selection" | "current_folder" | "current_folder_or_prompt" | "staged_paths"
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    pub input: String,
+    /// action_panel/staging 用："one" | "many"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality: Option<String>,
+    /// 适用的 target kind：["file","directory","application"]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_host_root: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// K1 两条内置命令，均带 root_search binding（在根搜索中可见、可执行）。
@@ -99,7 +117,10 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                 prompt: String::new(),
             },
             bindings: CommandBindingsDto {
-                root_search: Some(CommandBindingDto { priority: 0 }),
+                root_search: Some(CommandBindingDto {
+                    priority: 0,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             danger: "normal",
@@ -119,7 +140,10 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
                 prompt: String::new(),
             },
             bindings: CommandBindingsDto {
-                root_search: Some(CommandBindingDto { priority: 0 }),
+                root_search: Some(CommandBindingDto {
+                    priority: 0,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             danger: "normal",
@@ -436,6 +460,10 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                 .as_ref()
                 .map(|b| CommandBindingDto {
                     priority: b.priority,
+                    input: String::new(),
+                    cardinality: None,
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
                 }),
             keyword: command
                 .bindings
@@ -443,6 +471,10 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                 .as_ref()
                 .map(|b| CommandBindingDto {
                     priority: b.priority,
+                    input: String::new(),
+                    cardinality: None,
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
                 }),
             action_panel: command
                 .bindings
@@ -450,6 +482,10 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                 .as_ref()
                 .map(|b| CommandBindingDto {
                     priority: b.priority,
+                    input: String::new(),
+                    cardinality: None,
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
                 }),
             staging: command
                 .bindings
@@ -457,6 +493,10 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                 .as_ref()
                 .map(|b| CommandBindingDto {
                     priority: b.priority,
+                    input: String::new(),
+                    cardinality: None,
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
                 }),
             shortcut: command
                 .bindings
@@ -464,6 +504,10 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                 .as_ref()
                 .map(|b| CommandBindingDto {
                     priority: b.priority,
+                    input: String::new(),
+                    cardinality: None,
+                    target_kinds: Vec::new(),
+                    requires_host_root: false,
                 }),
         },
         danger: match command.danger.as_str() {

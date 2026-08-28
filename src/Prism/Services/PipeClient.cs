@@ -999,7 +999,28 @@ public sealed class PipeClient : ISearchClient, IDisposable
         var glyph = el.TryGetProperty("icon_glyph", out var g) ? g.GetString() ?? "" : "";
         var submenu = el.TryGetProperty("has_submenu", out var hs) && hs.ValueKind == JsonValueKind.True;
         var header = el.TryGetProperty("is_section_header", out var sh) && sh.ValueKind == JsonValueKind.True;
-        return new ActionItem(id, label, glyph, submenu, header);
+
+        // K2 §4.2：命令段字段。缺字段时默认值 = 内置动作语义。
+        var invocationKind = el.TryGetProperty("invocation_kind", out var ik)
+            ? ik.GetString() ?? "builtin_action"
+            : "builtin_action";
+        var commandId = el.TryGetProperty("command_id", out var cid)
+            && cid.ValueKind == JsonValueKind.String
+                ? cid.GetString()
+                : null;
+        var isEnabled = !el.TryGetProperty("is_enabled", out var en) || en.ValueKind != JsonValueKind.False;
+        var disabledReason = el.TryGetProperty("disabled_reason", out var dr)
+            && dr.ValueKind == JsonValueKind.String
+                ? dr.GetString()
+                : null;
+
+        return new ActionItem(id, label, glyph, submenu, header)
+        {
+            InvocationKind = invocationKind,
+            CommandId = commandId,
+            IsEnabled = isEnabled,
+            DisabledReason = disabledReason,
+        };
     }
 
     /// <summary>

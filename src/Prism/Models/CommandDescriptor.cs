@@ -116,8 +116,34 @@ public sealed record CommandBindingsDto(
             ? pri
             : 0;
         var input = el.TryGetProperty("input", out var iEl) ? iEl.GetString() ?? "" : "";
-        return new CommandBindingDto(priority, input);
+        var cardinality = el.TryGetProperty("cardinality", out var cEl) ? cEl.GetString() ?? null : null;
+        var targetKinds = new List<string>();
+        if (el.TryGetProperty("target_kinds", out var tkEl) && tkEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var tk in tkEl.EnumerateArray())
+            {
+                if (tk.ValueKind == JsonValueKind.String)
+                    targetKinds.Add(tk.GetString() ?? "");
+            }
+        }
+        var requiresHostRoot = el.TryGetProperty("requires_host_root", out var rhrEl)
+            && rhrEl.ValueKind == JsonValueKind.True;
+        return new CommandBindingDto(priority, input, cardinality, targetKinds, requiresHostRoot);
     }
 }
 
-public sealed record CommandBindingDto(int Priority, string Input);
+/// <summary>
+/// K2 §4.3：按 surface 扩展。Cardinality/TargetKinds/RequiresHostRoot 容忍缺字段
+/// （旧 broker 的 binding 只有 priority + input）。
+/// </summary>
+public sealed record CommandBindingDto(
+    int Priority,
+    string Input,
+    string? Cardinality,
+    IReadOnlyList<string> TargetKinds,
+    bool RequiresHostRoot)
+{
+    // 兼容旧调用点（K1 只传 priority + input）。
+    public CommandBindingDto(int Priority, string Input)
+        : this(Priority, Input, null, Array.Empty<string>(), false) { }
+}
