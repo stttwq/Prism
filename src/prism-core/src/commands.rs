@@ -16,8 +16,8 @@ use std::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::{
-    validate_command_id, CommandData, CommandUsageData, UserCommandDefinition, VersionedEnvelope,
-    COMMAND_MAX_ENTRIES, COMMAND_USAGE_MAX_ENTRIES,
+    validate_command_id, CommandData, CommandUsageData, UserCommandDefinition, UserHandlerKind,
+    VersionedEnvelope, COMMAND_MAX_ENTRIES, COMMAND_USAGE_MAX_ENTRIES,
 };
 use crate::shell::ActionTarget;
 
@@ -507,6 +507,16 @@ impl CommandStore {
         self.persist()
     }
 
+    /// K3 §4.1：按 id 查用户命令定义。execute_command 分派用户 handler 时取
+    /// handler_params。只查用户表，不查内置命令（内置不经 UserHandlerKind）。
+    pub fn get_user_command(&self, id: &str) -> Option<UserCommandDefinition> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.commands.iter().find(|c| c.id == id).cloned()
+    }
+
     /// 清空使用记录。经 `ClearHistory` 联动（K0 已接）。清内存 + 删/重写文件。
     pub fn clear_usage(&self) -> Result<(), String> {
         {
@@ -861,6 +871,146 @@ fn validate_path_field(path: &str) -> Result<(), String> {
         return Err("path field must be absolute".into());
     }
     Ok(())
+}
+
+// ── K3 §4.6：模板展开（执行与预览共用同一函数） ─────────────────────
+//
+// 占位符 v1：{query}（= arguments.text）、{current_folder}。
+// 修饰符：uppercase / lowercase / trim / percent-encode / raw，链式 | 分隔。
+// {query} 默认 percent-encode（复用 websearch::url_encode）。raw 修饰符跳过编码。
+// 设计 §10.2-4：仅显式标注 safe 的字段允许 raw——模板层用 |raw 显式声明。
+
+/// 模板展开上下文。执行路径与预览路径构造同一实例，保证展开一致（§4.6）。
+#[derive(Debug, Clone)]
+pub struct ExpansionContext {
+    /// {query} = arguments.text（用户在搜索框输入的文本）。
+    pub query: String,
+    /// {current_folder} = 调用时 current_folder 字段。
+    pub current_folder: String,
+}
+
+/// 模板展开错误。类型化返回，执行时不吞错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpandError {
+    /// 未知占位符名称（如 {unknown}）。
+    UnknownPlaceholder(String),
+    /// 修饰符语法错误（如 {query||}）。
+    BadModifier(String),
+}
+
+impl std::fmt::Display for ExpandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpandError::UnknownPlaceholder(name) => {
+                write!(f, "未知占位符：{{{name}}}")
+            }
+            ExpandError::BadModifier(msg) => write!(f, "修饰符错误：{msg}"),
+        }
+    }
+}
+
+/// 已知的占位符名称。
+const PLACEHOLDERS: &[&str] = &["query", "current_folder"];
+
+/// §4.6：单一模板展开入口。执行（ExecuteCommand）与预览（CommandPreview）
+/// **调用同一函数**——预览返回的就是执行时将用的最终字符串（构造保证一致）。
+pub fn expand_template(template: &str, ctx: &ExpansionContext) -> Result<String, ExpandError> {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // 找匹配的 }
+            let close = bytes[i + 1..]
+                .iter()
+                .position(|&b| b == b'}')
+                .ok_or(ExpandError::BadModifier(format!("缺少闭合 }} 在位置 {i}")))?;
+            let inner = &template[i + 1..i + 1 + close];
+            let expanded = expand_placeholder(inner, ctx)?;
+            out.push_str(&expanded);
+            i += close + 2; // 跳过 {...}
+        } else {
+            // 原样输出非占位符字符
+            let next_brace = bytes[i..].iter().position(|&b| b == b'{');
+            match next_brace {
+                Some(pos) => {
+                    out.push_str(&template[i..i + pos]);
+                    i += pos;
+                }
+                None => {
+                    out.push_str(&template[i..]);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 展开单个占位符（`{}` 内部内容）。格式：name 或 name|mod1|mod2。
+fn expand_placeholder(inner: &str, ctx: &ExpansionContext) -> Result<String, ExpandError> {
+    let parts: Vec<&str> = inner.split('|').map(|s| s.trim()).collect();
+    if parts.is_empty() || parts[0].is_empty() {
+        return Err(ExpandError::BadModifier("占位符名称为空".into()));
+    }
+    let name = parts[0];
+    if !PLACEHOLDERS.contains(&name) {
+        return Err(ExpandError::UnknownPlaceholder(name.to_string()));
+    }
+    let base_value = match name {
+        "query" => ctx.query.clone(),
+        "current_folder" => ctx.current_folder.clone(),
+        _ => unreachable!("checked above"),
+    };
+    // 默认：query 做 percent-encode，current_folder 不编码。
+    // raw 修饰符跳过编码；percent-encode 修饰符显式编码（对 current_folder 有意义）。
+    let mut value = base_value;
+    let mut raw = name != "query"; // query 默认编码；其余默认 raw
+    for modifier in &parts[1..] {
+        match *modifier {
+            "raw" => raw = true,
+            "percent-encode" => raw = false,
+            "trim" => value = value.trim().to_string(),
+            "uppercase" => value = value.to_uppercase(),
+            "lowercase" => value = value.to_lowercase(),
+            "" => return Err(ExpandError::BadModifier("空修饰符".into())),
+            other => return Err(ExpandError::BadModifier(format!("未知修饰符：{other}"))),
+        }
+    }
+    if raw {
+        Ok(value)
+    } else {
+        Ok(crate::websearch::url_encode(&value))
+    }
+}
+
+// ── K3 §4.2 语义层：open_url 校验（执行时第二次校验） ──────────────
+
+/// open_url 语义校验。url_template 展开后检查 scheme ∈ {http, https}。
+/// 保存时（CommandSet）与执行时（ExecuteCommand）都调用此函数。
+pub fn validate_open_url(url_template: &str, ctx: &ExpansionContext) -> Result<String, String> {
+    let url = expand_template(url_template, ctx).map_err(|e| e.to_string())?;
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err(format!("URL 协议必须是 http 或 https：{url}"));
+    }
+    // 拒绝 javascript: / file: 等——上面 scheme 检查已覆盖，但显式拒绝
+    // 让错误信息更清晰。
+    if lower.starts_with("javascript:") {
+        return Err("javascript: 协议被禁止".into());
+    }
+    if lower.starts_with("file:") {
+        return Err("file: 协议被禁止".into());
+    }
+    Ok(url)
+}
+
+/// 构造 open_url 的 ExpansionContext。
+pub fn expansion_context_from(context: &CommandInvocationContext) -> ExpansionContext {
+    ExpansionContext {
+        query: context.arguments.text.clone().unwrap_or_default(),
+        current_folder: context.current_folder.clone().unwrap_or_default(),
+    }
 }
 
 /// K2 §4.7：staged_paths 的结构校验。与 `validate_path_field` 的区别：
@@ -1593,5 +1743,116 @@ mod tests {
             None,
         );
         assert_eq!(target.kind, "command");
+    }
+
+    // ── K3 §4.6 commit 2：expand_template + open_url 校验 ─────────────
+
+    fn exp_ctx(query: &str) -> ExpansionContext {
+        ExpansionContext {
+            query: query.into(),
+            current_folder: r"C:\Users\test".into(),
+        }
+    }
+
+    #[test]
+    fn expand_query_default_percent_encoded() {
+        // {query} 默认百分号编码
+        let url = expand_template("https://x.test/search?q={query}", &exp_ctx("foo bar")).unwrap();
+        assert_eq!(url, "https://x.test/search?q=foo%20bar");
+    }
+
+    #[test]
+    fn expand_query_raw_not_encoded() {
+        // {query|raw} 不编码
+        let url = expand_template("https://x.test/{query|raw}", &exp_ctx("a+b")).unwrap();
+        assert_eq!(url, "https://x.test/a+b");
+    }
+
+    #[test]
+    fn expand_modifier_chain() {
+        // 修饰符链式 {query | trim | percent-encode}
+        let url = expand_template(
+            "https://x.test/?q={query | trim | percent-encode}",
+            &exp_ctx("  hi  "),
+        )
+        .unwrap();
+        assert_eq!(url, "https://x.test/?q=hi");
+    }
+
+    #[test]
+    fn expand_uppercase_lowercase() {
+        let u = expand_template("{query|uppercase}", &exp_ctx("hello")).unwrap();
+        assert_eq!(u, "HELLO");
+        let l = expand_template("{query|lowercase}", &exp_ctx("WORLD")).unwrap();
+        assert_eq!(l, "world");
+    }
+
+    #[test]
+    fn expand_static_url_no_query() {
+        // 定值 URL（无 {query}）可执行
+        let url = expand_template("https://example.com/page", &exp_ctx("ignored")).unwrap();
+        assert_eq!(url, "https://example.com/page");
+    }
+
+    #[test]
+    fn expand_current_folder() {
+        // {current_folder} 默认 raw（不编码）
+        let url = expand_template("file:///{current_folder}/index.html", &exp_ctx("")).unwrap();
+        assert_eq!(url, "file:///C:\\Users\\test/index.html");
+    }
+
+    #[test]
+    fn expand_unknown_placeholder_errors() {
+        // 未知占位符 → 类型化错误
+        let err = expand_template("https://x.test/{unknown}", &exp_ctx("x")).unwrap_err();
+        assert_eq!(err, ExpandError::UnknownPlaceholder("unknown".into()));
+    }
+
+    #[test]
+    fn expand_unknown_modifier_errors() {
+        let err = expand_template("{query|bogus}", &exp_ctx("x")).unwrap_err();
+        assert!(matches!(err, ExpandError::BadModifier(_)));
+    }
+
+    #[test]
+    fn validate_open_url_accepts_http() {
+        let url = validate_open_url("https://x.test/search?q={query}", &exp_ctx("test")).unwrap();
+        assert_eq!(url, "https://x.test/search?q=test");
+    }
+
+    #[test]
+    fn validate_open_url_rejects_javascript() {
+        // javascript: 拒绝
+        let err = validate_open_url("javascript:alert(1)", &exp_ctx("x")).unwrap_err();
+        assert!(err.contains("javascript") || err.contains("http"));
+    }
+
+    #[test]
+    fn validate_open_url_rejects_file_scheme() {
+        let err = validate_open_url("file:///C:/x", &exp_ctx("")).unwrap_err();
+        assert!(err.contains("file") || err.contains("http"));
+    }
+
+    #[test]
+    fn validate_open_url_rejects_bad_scheme() {
+        // 非 http/https scheme 拒绝
+        let err = validate_open_url("ftp://x.test", &exp_ctx("")).unwrap_err();
+        assert!(err.contains("http"));
+    }
+
+    #[test]
+    fn get_user_command_returns_definition() {
+        let (store, _dir) = store("get-user-cmd");
+        let mut cmd = user_cmd("user.url_cmd");
+        cmd.handler = UserHandlerKind::OpenUrl;
+        cmd.handler_params
+            .insert("url_template".into(), "https://x.test/{query}".into());
+        store.set(cmd).unwrap();
+        let got = store.get_user_command("user.url_cmd").unwrap();
+        assert_eq!(got.handler, UserHandlerKind::OpenUrl);
+        assert_eq!(
+            got.handler_params.get("url_template").unwrap(),
+            "https://x.test/{query}"
+        );
     }
 }

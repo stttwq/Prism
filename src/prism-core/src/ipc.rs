@@ -2108,7 +2108,7 @@ fn process_indexer_reply(
 async fn execute_command(
     context: crate::commands::CommandInvocationContext,
     commands: &Arc<crate::commands::CommandStore>,
-    _shell: &Arc<ShellExecutor>,
+    shell: &Arc<ShellExecutor>,
     history: &Arc<HistoryStore>,
 ) -> Response {
     if let Err(message) = context.validate() {
@@ -2150,146 +2150,209 @@ async fn execute_command(
     }
     match desc.owner {
         "broker" => {
-            let Some(handler) = crate::commands::broker_handler(&desc.id) else {
-                return Response::Error {
-                    message: format!("命令无 handler：{}", context.command_id),
-                    category: Some(ShellErrorKind::Unsupported),
-                };
-            };
-            match handler {
-                crate::commands::BrokerHandlerId::OpenTerminalHere => {
-                    // K2 §4.4：action_panel 声明 input="selection"——对选中目录执行，
-                    // 不用 current_folder。root_search/shortcut 保持 current_folder 语义。
-                    let folder = match context.source {
-                        crate::commands::InvocationSource::ActionPanel => context
-                            .selection
-                            .as_ref()
-                            .and_then(|s| s.target.as_ref())
-                            .filter(|t| t.kind == "directory")
-                            .map(|t| t.value.clone())
-                            .or_else(|| context.current_folder.clone())
-                            .unwrap_or_else(|| {
+            // K3 §4.1：先查内置 handler（BrokerHandlerId），找不到再查用户 handler
+            // （UserHandlerKind）。两个枚举无转换路径——分派逻辑独立，类型收口。
+            if let Some(handler) = crate::commands::broker_handler(&desc.id) {
+                match handler {
+                    crate::commands::BrokerHandlerId::OpenTerminalHere => {
+                        // K2 §4.4：action_panel 声明 input="selection"——对选中目录执行，
+                        // 不用 current_folder。root_search/shortcut 保持 current_folder 语义。
+                        let folder = match context.source {
+                            crate::commands::InvocationSource::ActionPanel => context
+                                .selection
+                                .as_ref()
+                                .and_then(|s| s.target.as_ref())
+                                .filter(|t| t.kind == "directory")
+                                .map(|t| t.value.clone())
+                                .or_else(|| context.current_folder.clone())
+                                .unwrap_or_else(|| {
+                                    std::env::current_dir()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_default()
+                                }),
+                            _ => context.current_folder.clone().unwrap_or_else(|| {
                                 std::env::current_dir()
                                     .map(|p| p.to_string_lossy().into_owned())
                                     .unwrap_or_default()
                             }),
-                        _ => context.current_folder.clone().unwrap_or_else(|| {
-                            std::env::current_dir()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        }),
-                    };
-                    match crate::shell::open_terminal_at(&folder) {
-                        Ok(()) => {
-                            let _ = commands.record_success(
-                                &desc.id,
-                                crate::history::now_utc(),
-                                history.is_enabled(),
-                            );
-                            Response::Status {
-                                is_indexing: false,
-                                cancelled: false,
-                            }
-                        }
-                        Err(error) => Response::Error {
-                            message: format!("打开终端失败：{}", error.message),
-                            category: Some(error.kind),
-                        },
-                    }
-                }
-                crate::commands::BrokerHandlerId::SystemLock => Response::Error {
-                    message: "SystemLock 尚未实现".into(),
-                    category: Some(ShellErrorKind::Unsupported),
-                },
-                crate::commands::BrokerHandlerId::CopyPaths => {
-                    // K2 §4.7：staging copy_paths。P2 第二次校验——validate()
-                    // 已过 128 项上限，此处再核一遍 staging 来源的显式约束：
-                    // 空暂存区不可执行（P4：空 → 禁用，不应到达 broker，
-                    // 但 P2 要求执行处再校验防篡改）。
-                    if context.staged_paths.is_empty() {
-                        return Response::Error {
-                            message: "暂存区为空，没有路径可复制".into(),
-                            category: Some(ShellErrorKind::TargetInvalid),
                         };
-                    }
-                    // copy_paths 复制原始字符串、不探测存在性，因此不受 UNC 限制。
-                    let joined = context.staged_paths.join("\r\n");
-                    match _shell
-                        .execute(ShellOperation::CopyPathsText { text: joined })
-                        .await
-                    {
-                        Ok(_) => {
-                            let _ = commands.record_success(
-                                &desc.id,
-                                crate::history::now_utc(),
-                                history.is_enabled(),
-                            );
-                            // 汇总文案：成功 N 项。暂存区不清空（§4.7 末段：
-                            // 「保留暂存区内容不清空，显示汇总」）。
-                            Response::Status {
-                                is_indexing: false,
-                                cancelled: false,
+                        match crate::shell::open_terminal_at(&folder) {
+                            Ok(()) => {
+                                let _ = commands.record_success(
+                                    &desc.id,
+                                    crate::history::now_utc(),
+                                    history.is_enabled(),
+                                );
+                                Response::Status {
+                                    is_indexing: false,
+                                    cancelled: false,
+                                }
                             }
+                            Err(error) => Response::Error {
+                                message: format!("打开终端失败：{}", error.message),
+                                category: Some(error.kind),
+                            },
                         }
-                        Err(error) => Response::Error {
-                            message: format!("复制路径失败：{}", error.message),
-                            category: Some(error.kind),
-                        },
                     }
-                }
-                crate::commands::BrokerHandlerId::StagingZip => {
-                    // K2 §4.5：多目标 ZIP。P2 第二次校验。
-                    if context.staged_paths.is_empty() {
-                        return Response::Error {
-                            message: "暂存区为空，没有文件可压缩".into(),
-                            category: Some(ShellErrorKind::TargetInvalid),
-                        };
-                    }
-                    // §4.7 末段：mutation 类命令直接拒绝 UNC。
-                    for path in &context.staged_paths {
-                        if path.starts_with(r"\\") {
+                    crate::commands::BrokerHandlerId::SystemLock => Response::Error {
+                        message: "SystemLock 尚未实现".into(),
+                        category: Some(ShellErrorKind::Unsupported),
+                    },
+                    crate::commands::BrokerHandlerId::CopyPaths => {
+                        // K2 §4.7：staging copy_paths。P2 第二次校验——validate()
+                        // 已过 128 项上限，此处再核一遍 staging 来源的显式约束：
+                        // 空暂存区不可执行（P4：空 → 禁用，不应到达 broker，
+                        // 但 P2 要求执行处再校验防篡改）。
+                        if context.staged_paths.is_empty() {
                             return Response::Error {
-                                message: "暂存区含 UNC 路径，ZIP 不支持网络路径".into(),
+                                message: "暂存区为空，没有路径可复制".into(),
                                 category: Some(ShellErrorKind::TargetInvalid),
                             };
                         }
+                        // copy_paths 复制原始字符串、不探测存在性，因此不受 UNC 限制。
+                        let joined = context.staged_paths.join("\r\n");
+                        match shell
+                            .execute(ShellOperation::CopyPathsText { text: joined })
+                            .await
+                        {
+                            Ok(_) => {
+                                let _ = commands.record_success(
+                                    &desc.id,
+                                    crate::history::now_utc(),
+                                    history.is_enabled(),
+                                );
+                                // 汇总文案：成功 N 项。暂存区不清空（§4.7 末段：
+                                // 「保留暂存区内容不清空，显示汇总」）。
+                                Response::Status {
+                                    is_indexing: false,
+                                    cancelled: false,
+                                }
+                            }
+                            Err(error) => Response::Error {
+                                message: format!("复制路径失败：{}", error.message),
+                                category: Some(error.kind),
+                            },
+                        }
                     }
-                    // output_path 由 WPF 侧 SaveFileDialog 选择（§4.5-1）。
-                    let Some(output_path) = &context.arguments.output_path else {
-                        return Response::Error {
-                            message: "未指定 ZIP 输出路径".into(),
-                            category: Some(ShellErrorKind::TargetInvalid),
-                        };
-                    };
-                    // zip_many 在 spawn_blocking 执行（外部进程，分钟级等待）。
-                    let output = output_path.clone();
-                    let sources = context.staged_paths.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::zip::zip_many(&sources, &output, None)
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(summary)) => {
-                            let _ = commands.record_success(
-                                &desc.id,
-                                crate::history::now_utc(),
-                                history.is_enabled(),
-                            );
-                            // 暂存区不清空，显示汇总。
-                            Response::Status {
-                                is_indexing: false,
-                                cancelled: summary.cancelled,
+                    crate::commands::BrokerHandlerId::StagingZip => {
+                        // K2 §4.5：多目标 ZIP。P2 第二次校验。
+                        if context.staged_paths.is_empty() {
+                            return Response::Error {
+                                message: "暂存区为空，没有文件可压缩".into(),
+                                category: Some(ShellErrorKind::TargetInvalid),
+                            };
+                        }
+                        // §4.7 末段：mutation 类命令直接拒绝 UNC。
+                        for path in &context.staged_paths {
+                            if path.starts_with(r"\\") {
+                                return Response::Error {
+                                    message: "暂存区含 UNC 路径，ZIP 不支持网络路径".into(),
+                                    category: Some(ShellErrorKind::TargetInvalid),
+                                };
                             }
                         }
-                        Ok(Err(error)) => Response::Error {
-                            message: format!("压缩失败：{}", error.message),
-                            category: Some(error.kind),
-                        },
-                        Err(error) => Response::Error {
-                            message: format!("压缩任务失败：{error}"),
-                            category: Some(ShellErrorKind::System),
-                        },
+                        // output_path 由 WPF 侧 SaveFileDialog 选择（§4.5-1）。
+                        let Some(output_path) = &context.arguments.output_path else {
+                            return Response::Error {
+                                message: "未指定 ZIP 输出路径".into(),
+                                category: Some(ShellErrorKind::TargetInvalid),
+                            };
+                        };
+                        // zip_many 在 spawn_blocking 执行（外部进程，分钟级等待）。
+                        let output = output_path.clone();
+                        let sources = context.staged_paths.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::zip::zip_many(&sources, &output, None)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(summary)) => {
+                                let _ = commands.record_success(
+                                    &desc.id,
+                                    crate::history::now_utc(),
+                                    history.is_enabled(),
+                                );
+                                // 暂存区不清空，显示汇总。
+                                Response::Status {
+                                    is_indexing: false,
+                                    cancelled: summary.cancelled,
+                                }
+                            }
+                            Ok(Err(error)) => Response::Error {
+                                message: format!("压缩失败：{}", error.message),
+                                category: Some(error.kind),
+                            },
+                            Err(error) => Response::Error {
+                                message: format!("压缩任务失败：{error}"),
+                                category: Some(ShellErrorKind::System),
+                            },
+                        }
                     }
+                } // 闭合内置 handler match
+            } else if let Some(user_cmd) = commands.get_user_command(&desc.id) {
+                // K3 §4.1 用户 handler 分派。UserHandlerKind 与 BrokerHandlerId
+                // 是独立枚举，此分支不共享 broker_handler 的 match。
+                let exp_ctx = crate::commands::expansion_context_from(&context);
+                match user_cmd.handler {
+                    crate::persistence::UserHandlerKind::OpenUrl => {
+                        let url_template = user_cmd
+                            .handler_params
+                            .get("url_template")
+                            .cloned()
+                            .unwrap_or_default();
+                        if url_template.is_empty() {
+                            return Response::Error {
+                                message: "命令缺少 url_template".into(),
+                                category: Some(ShellErrorKind::TargetInvalid),
+                            };
+                        }
+                        // §P2 执行层第三次校验：展开后 scheme 仍须 http/https。
+                        match crate::commands::validate_open_url(&url_template, &exp_ctx) {
+                            Ok(url) => {
+                                let target = crate::shell::ActionTarget::new(
+                                    crate::shell::TargetKind::Web,
+                                    url,
+                                );
+                                match shell.execute(ShellOperation::Open(target)).await {
+                                    Ok(_) => {
+                                        let _ = commands.record_success(
+                                            &desc.id,
+                                            crate::history::now_utc(),
+                                            history.is_enabled(),
+                                        );
+                                        Response::Status {
+                                            is_indexing: false,
+                                            cancelled: false,
+                                        }
+                                    }
+                                    Err(error) => Response::Error {
+                                        message: format!("打开 URL 失败：{}", error.message),
+                                        category: Some(error.kind),
+                                    },
+                                }
+                            }
+                            Err(message) => Response::Error {
+                                message,
+                                category: Some(ShellErrorKind::TargetInvalid),
+                            },
+                        }
+                    }
+                    crate::persistence::UserHandlerKind::LaunchProgram => {
+                        // K3 commit 3 实现。此 commit 仅占位——不执行。
+                        Response::Error {
+                            message: "launch_program handler 尚未实现".into(),
+                            category: Some(ShellErrorKind::Unsupported),
+                        }
+                    }
+                    crate::persistence::UserHandlerKind::Unknown => Response::Error {
+                        message: "命令 handler 类型未知或不受支持".into(),
+                        category: Some(ShellErrorKind::Unsupported),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: format!("命令无 handler：{}", context.command_id),
+                    category: Some(ShellErrorKind::Unsupported),
                 }
             }
         }
