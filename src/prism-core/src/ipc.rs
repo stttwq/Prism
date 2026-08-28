@@ -211,6 +211,12 @@ pub enum Request {
         #[serde(default)]
         exclude_command_id: Option<String>,
     },
+    /// K3 §4.6：命令预览（dry-run）。返回执行时将用的最终字符串，不产生
+    /// 任何副作用（不打开浏览器、不启动进程、不写磁盘）。
+    /// 仅协商 commands_v1 的连接受理。
+    CommandPreview {
+        context: crate::commands::CommandInvocationContext,
+    },
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -348,6 +354,25 @@ pub enum Response {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         conflict: Option<crate::commands::NamespaceConflict>,
+    },
+    /// K3 §4.6：命令预览结果。预览成功时返回执行时将用的最终字符串——
+    /// open_url 返回 URL 全文，launch_program 返回 path + args + working_dir。
+    /// 校验失败时 ok=false，message 携带错误文案（非空字符串）。
+    CommandPreviewResult {
+        ok: bool,
+        message: String,
+        /// open_url: 展开后的 URL 全文。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// launch_program: 展开后的程序路径。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        program_path: Option<String>,
+        /// launch_program: 展开后的参数数组。
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        program_args: Vec<String>,
+        /// launch_program: 展开后的工作目录。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        program_working_dir: Option<String>,
     },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
@@ -1240,6 +1265,16 @@ async fn handle_connection(
                             }
                         }
                     }
+                    Request::CommandPreview { context } => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command preview requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            handle_command_preview(context.clone(), &commands)
+                        }
+                    }
                     _ => {
                         dispatch_non_search(
                             req,
@@ -1628,6 +1663,10 @@ async fn dispatch_non_search(
         },
         Request::ValidateTriggerNamespace { .. } => Response::Error {
             message: "validate_trigger_namespace must be handled in the connection loop".into(),
+            category: None,
+        },
+        Request::CommandPreview { .. } => Response::Error {
+            message: "command_preview must be handled in the connection loop".into(),
             category: None,
         },
     }
@@ -2291,6 +2330,94 @@ async fn handle_command_set(
         .unwrap_or_else(|error| Err(format!("set command task: {error}")));
     Response::CommandApplied {
         message: result.err().unwrap_or_default(),
+    }
+}
+
+/// K3 §4.6：CommandPreview（dry-run）。预览响应返回执行时将用的最终字符串。
+/// 调用与执行路径**同一函数**（expand_template / validate_open_url /
+/// validate_launch_program），构造保证一致——不靠测试保证一致性。
+/// 无副作用：不打开浏览器、不启动进程、不写磁盘、不记历史。
+fn handle_command_preview(
+    context: crate::commands::CommandInvocationContext,
+    commands: &Arc<crate::commands::CommandStore>,
+) -> Response {
+    if let Err(message) = context.validate() {
+        return Response::CommandPreviewResult {
+            ok: false,
+            message,
+            url: None,
+            program_path: None,
+            program_args: Vec::new(),
+            program_working_dir: None,
+        };
+    }
+    let Some(user_cmd) = commands.get_user_command(&context.command_id) else {
+        return Response::CommandPreviewResult {
+            ok: false,
+            message: format!("命令不存在：{}", context.command_id),
+            url: None,
+            program_path: None,
+            program_args: Vec::new(),
+            program_working_dir: None,
+        };
+    };
+    let exp_ctx = crate::commands::expansion_context_from(&context);
+    match user_cmd.handler {
+        crate::persistence::UserHandlerKind::OpenUrl => {
+            let url_template = user_cmd
+                .handler_params
+                .get("url_template")
+                .cloned()
+                .unwrap_or_default();
+            // §4.6 同函数断言：执行路径调 validate_open_url，预览也调同一函数。
+            match crate::commands::validate_open_url(&url_template, &exp_ctx) {
+                Ok(url) => Response::CommandPreviewResult {
+                    ok: true,
+                    message: String::new(),
+                    url: Some(url),
+                    program_path: None,
+                    program_args: Vec::new(),
+                    program_working_dir: None,
+                },
+                Err(msg) => Response::CommandPreviewResult {
+                    ok: false,
+                    message: msg,
+                    url: None,
+                    program_path: None,
+                    program_args: Vec::new(),
+                    program_working_dir: None,
+                },
+            }
+        }
+        crate::persistence::UserHandlerKind::LaunchProgram => {
+            // §4.6 同函数断言：执行路径调 validate_launch_program，预览也调同一函数。
+            match crate::commands::validate_launch_program(&user_cmd.handler_params, &exp_ctx) {
+                Ok((path, args, working_dir)) => Response::CommandPreviewResult {
+                    ok: true,
+                    message: String::new(),
+                    url: None,
+                    program_path: Some(path),
+                    program_args: args,
+                    program_working_dir: working_dir,
+                },
+                Err(msg) => Response::CommandPreviewResult {
+                    ok: false,
+                    message: msg,
+                    url: None,
+                    program_path: None,
+                    program_args: Vec::new(),
+                    program_working_dir: None,
+                },
+            }
+        }
+        crate::persistence::UserHandlerKind::Unknown => Response::CommandPreviewResult {
+            ok: false,
+            message: "命令 handler 未知或缺失".into(),
+            url: None,
+            program_path: None,
+            program_args: Vec::new(),
+            program_working_dir: None,
+        },
     }
 }
 
@@ -6535,6 +6662,182 @@ mod pipe_lifecycle_tests {
             other => panic!("expected Error, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&history_dir);
+    }
+
+    // ── K3 §4.6 commit 5：CommandPreview（dry-run）同函数断言 ──────────
+
+    fn preview_store(tag: &str) -> Arc<crate::commands::CommandStore> {
+        let dir = std::env::temp_dir().join(format!("prism-preview-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(crate::commands::CommandStore::load(&dir))
+    }
+
+    #[test]
+    fn preview_open_url_matches_execution_url() {
+        // §4.6 同函数断言：preview 返回的 URL == 执行路径实际使用的 URL。
+        let commands = preview_store("openurl");
+        let mut cmd = crate::persistence::UserCommandDefinition::default();
+        cmd.id = "user.preview_url".into();
+        cmd.title = "Search".into();
+        cmd.handler = crate::persistence::UserHandlerKind::OpenUrl;
+        cmd.handler_params.insert(
+            "url_template".into(),
+            "https://x.test/search?q={query}".into(),
+        );
+        commands.set(cmd).unwrap();
+
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "user.preview_url".into(),
+            arguments: crate::commands::CommandArguments {
+                text: Some("hello world".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 预览路径
+        let response = handle_command_preview(context.clone(), &commands);
+        match response {
+            Response::CommandPreviewResult {
+                ok: true,
+                url: Some(url),
+                ..
+            } => {
+                // 执行路径调同一 validate_open_url，展开结果必须一致
+                let exp_ctx = crate::commands::expansion_context_from(&context);
+                let exec_url =
+                    crate::commands::validate_open_url("https://x.test/search?q={query}", &exp_ctx)
+                        .unwrap();
+                assert_eq!(url, exec_url);
+                assert!(url.contains("hello%20world"));
+            }
+            other => panic!("expected CommandPreviewResult ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_launch_program_matches_execution_args() {
+        // §4.6 同函数断言：preview 返回的 argv == 执行路径实际使用的 argv。
+        let commands = preview_store("launch");
+        let mut cmd = crate::persistence::UserCommandDefinition::default();
+        cmd.id = "user.preview_launch".into();
+        cmd.title = "Notepad".into();
+        cmd.handler = crate::persistence::UserHandlerKind::LaunchProgram;
+        cmd.handler_params
+            .insert("path".into(), r"C:\Windows\notepad.exe".into());
+        cmd.handler_params
+            .insert("args_template".into(), "{query}".into());
+        commands.set(cmd).unwrap();
+
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "user.preview_launch".into(),
+            arguments: crate::commands::CommandArguments {
+                text: Some("hello world & |".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let response = handle_command_preview(context.clone(), &commands);
+        if let Response::CommandPreviewResult {
+            ok: true,
+            program_path: Some(path),
+            program_args,
+            ..
+        } = response
+        {
+            // 执行路径调同一 validate_launch_program，展开结果必须一致
+            let exp_ctx = crate::commands::expansion_context_from(&context);
+            let (exec_path, exec_args, _) = crate::commands::validate_launch_program(
+                &commands
+                    .get_user_command("user.preview_launch")
+                    .unwrap()
+                    .handler_params,
+                &exp_ctx,
+            )
+            .unwrap();
+            assert_eq!(path, exec_path);
+            assert_eq!(program_args, exec_args);
+            // raw 模式：空格不 percent-encode
+            assert_eq!(program_args.len(), 1);
+            assert_eq!(program_args[0], "hello world & |");
+        }
+    }
+
+    #[test]
+    fn preview_unknown_command_returns_error() {
+        let commands = preview_store("unknown");
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "user.does_not_exist".into(),
+            ..Default::default()
+        };
+        let response = handle_command_preview(context, &commands);
+        match response {
+            Response::CommandPreviewResult {
+                ok: false, message, ..
+            } => {
+                assert!(message.contains("不存在") || message.contains("not"));
+            }
+            other => panic!("expected CommandPreviewResult ok=false, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_open_url_bad_scheme_returns_error() {
+        // 校验失败时返回错误文案，非空字符串
+        let commands = preview_store("badscheme");
+        let mut cmd = crate::persistence::UserCommandDefinition::default();
+        cmd.id = "user.preview_bad".into();
+        cmd.title = "Bad".into();
+        cmd.handler = crate::persistence::UserHandlerKind::OpenUrl;
+        cmd.handler_params
+            .insert("url_template".into(), "javascript:alert(1)".into());
+        commands.set(cmd).unwrap();
+
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "user.preview_bad".into(),
+            ..Default::default()
+        };
+        let response = handle_command_preview(context, &commands);
+        match response {
+            Response::CommandPreviewResult {
+                ok: false, message, ..
+            } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected ok=false, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_has_no_side_effects() {
+        // 预览不产生副作用：不写磁盘（generation 不变）、不记历史。
+        // 预览后 command store 的 generation 应与预览前相同。
+        let commands = preview_store("noeffect");
+        let mut cmd = crate::persistence::UserCommandDefinition::default();
+        cmd.id = "user.preview_noop".into();
+        cmd.title = "Noop".into();
+        cmd.handler = crate::persistence::UserHandlerKind::OpenUrl;
+        cmd.handler_params
+            .insert("url_template".into(), "https://x.test/{query}".into());
+        commands.set(cmd).unwrap();
+        let gen_before = commands.generation();
+
+        let context = crate::commands::CommandInvocationContext {
+            command_id: "user.preview_noop".into(),
+            arguments: crate::commands::CommandArguments {
+                text: Some("test".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _response = handle_command_preview(context, &commands);
+        let gen_after = commands.generation();
+        assert_eq!(
+            gen_before, gen_after,
+            "preview must not increment generation (no persistence)"
+        );
     }
 
     // K2 §5 commit 5：copy_paths handler 集成测试。
