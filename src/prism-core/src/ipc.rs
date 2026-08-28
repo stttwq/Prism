@@ -2338,10 +2338,42 @@ async fn execute_command(
                         }
                     }
                     crate::persistence::UserHandlerKind::LaunchProgram => {
-                        // K3 commit 3 实现。此 commit 仅占位——不执行。
-                        Response::Error {
-                            message: "launch_program handler 尚未实现".into(),
-                            category: Some(ShellErrorKind::Unsupported),
+                        // §4.3 + §4.2 语义层：路径校验 + argv 数组展开。
+                        // §P2 执行层第三次校验：路径仍存在、扩展名仍合法。
+                        match crate::commands::validate_launch_program(
+                            &user_cmd.handler_params,
+                            &exp_ctx,
+                        ) {
+                            Ok((path, args, working_dir)) => {
+                                match shell
+                                    .execute(ShellOperation::LaunchProgram {
+                                        path,
+                                        args,
+                                        working_dir,
+                                    })
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        let _ = commands.record_success(
+                                            &desc.id,
+                                            crate::history::now_utc(),
+                                            history.is_enabled(),
+                                        );
+                                        Response::Status {
+                                            is_indexing: false,
+                                            cancelled: false,
+                                        }
+                                    }
+                                    Err(error) => Response::Error {
+                                        message: format!("启动程序失败：{}", error.message),
+                                        category: Some(error.kind),
+                                    },
+                                }
+                            }
+                            Err(message) => Response::Error {
+                                message,
+                                category: Some(ShellErrorKind::TargetInvalid),
+                            },
                         }
                     }
                     crate::persistence::UserHandlerKind::Unknown => Response::Error {
@@ -3673,6 +3705,8 @@ async fn run_shell(
         // 文件历史（按 search-key 记录频度的入口是单文件动作，staging 批量
         // 不构成单文件访问记录）。
         ShellOperation::CopyPathsText { .. } => None,
+        // K3 §4.3：launch_program 是命令执行，走 record_success 而非文件历史。
+        ShellOperation::LaunchProgram { .. } => None,
     };
     finish_shell_response(
         shell.execute(operation).await,

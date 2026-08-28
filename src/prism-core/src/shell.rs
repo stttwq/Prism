@@ -82,6 +82,14 @@ pub enum ShellOperation {
     CopyPathsText {
         text: String,
     },
+    /// K3 §4.3：以当前用户权限启动程序。args 是**已展开的 token 数组**，
+    /// 由单一 Windows quoting 实现拼装，不经过 cmd /c、不做 shell 解析。
+    /// working_dir 为 None 时用进程默认目录。
+    LaunchProgram {
+        path: String,
+        args: Vec<String>,
+        working_dir: Option<String>,
+    },
 }
 
 struct WorkItem {
@@ -268,7 +276,8 @@ fn sta_wait_budget(operation: &ShellOperation) -> std::time::Duration {
         | ShellOperation::RunAction { .. } => SLOW,
         ShellOperation::Open(_)
         | ShellOperation::Reveal(_)
-        | ShellOperation::CopyPathsText { .. } => FAST,
+        | ShellOperation::CopyPathsText { .. }
+        | ShellOperation::LaunchProgram { .. } => FAST,
     }
 }
 
@@ -336,6 +345,11 @@ fn execute_on_sta(operation: ShellOperation) -> Result<ShellOutcome, ShellError>
             crate::actions::clipboard_set_text_pub(&text)?;
             Ok(ShellOutcome::Success)
         }
+        ShellOperation::LaunchProgram {
+            path,
+            args,
+            working_dir,
+        } => launch_program(&path, &args, working_dir.as_deref()),
     }
 }
 
@@ -704,6 +718,136 @@ fn shell_execute(target: &ActionTarget, verb: &str) -> Result<ShellOutcome, Shel
 #[cfg(not(windows))]
 fn shell_execute(target: &ActionTarget, _verb: &str) -> Result<ShellOutcome, ShellError> {
     target.validate()?;
+    Err(ShellError::new(
+        ShellErrorKind::Unsupported,
+        "Shell is only available on Windows",
+    ))
+}
+
+/// K3 §4.3：用 ShellExecuteExW 启动程序。args 是已展开的 token 数组，
+/// 由 `raw_arg` 逐个 quoting 后用空格拼接成 lpParameters——不经过 cmd /c、
+/// 不做 shell 解析。`{query}` 展开出的空格/引号/`&`/`|` 作为单个参数传递。
+#[cfg(windows)]
+fn launch_program(
+    path: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+) -> Result<ShellOutcome, ShellError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // 单一 Windows quoting 实现（CommandLineToArgvW 兼容）。
+    let params = args
+        .iter()
+        .map(|a| raw_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let file: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let params_wide: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
+    let dir_wide: Vec<u16> = working_dir
+        .map(|d| {
+            std::ffi::OsStr::new(d)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        })
+        .unwrap_or_default();
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: PCWSTR::null(), // 默认动词 = "open"
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: if params.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(params_wide.as_ptr())
+        },
+        lpDirectory: if dir_wide.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(dir_wide.as_ptr())
+        },
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+
+    let success = unsafe { ShellExecuteExW(&mut info) };
+    if success.is_ok() {
+        if !info.hProcess.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+            }
+        }
+        Ok(ShellOutcome::Success)
+    } else {
+        let err = windows::core::Error::from_win32();
+        Err(ShellError::new(
+            ShellErrorKind::System,
+            format!("ShellExecuteEx failed: {err}"),
+        ))
+    }
+}
+
+/// K3 §4.3：Windows 命令行参数 quoting（CommandLineToArgvW 兼容）。
+/// 含空格/引号/特殊字符的参数加引号并转义，纯安全字符原样输出。
+fn raw_arg(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".into();
+    }
+    // 仅空格/tab/引号需要引号包裹。反斜杠单独不需引号——只有后跟引号时
+    // 才需翻倍转义，在循环内处理。
+    let needs_quote = s.chars().any(|c| c == ' ' || c == '\t' || c == '"');
+    if !needs_quote {
+        return s.into();
+    }
+    // 标准算法：反斜杠只在后跟引号时翻倍，否则原样。
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut backslashes = 0;
+    for c in s.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+            }
+            '"' => {
+                for _ in 0..backslashes * 2 {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('\\');
+                out.push('"');
+            }
+            other => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(other);
+            }
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(not(windows))]
+fn launch_program(
+    _path: &str,
+    _args: &[String],
+    _working_dir: Option<&str>,
+) -> Result<ShellOutcome, ShellError> {
     Err(ShellError::new(
         ShellErrorKind::Unsupported,
         "Shell is only available on Windows",
@@ -1160,5 +1304,56 @@ mod tests {
             Ok(ShellOutcome::Success) | Err(ShellError { .. }) => {}
             Ok(ShellOutcome::Cancelled) => panic!("unexpected cancellation"),
         }
+    }
+
+    // ── K3 §4.3 commit 3：raw_arg quoting ──────────────────────────────
+
+    #[test]
+    fn raw_arg_simple_no_quote() {
+        assert_eq!(raw_arg("hello"), "hello");
+        assert_eq!(raw_arg("C:\\path\\to\\file"), "C:\\path\\to\\file");
+    }
+
+    #[test]
+    fn raw_arg_empty_string() {
+        assert_eq!(raw_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn raw_arg_space_quoted() {
+        assert_eq!(raw_arg("hello world"), "\"hello world\"");
+    }
+
+    #[test]
+    fn raw_arg_quote_escaped() {
+        // 含引号的参数：引号前加反斜杠转义
+        assert_eq!(raw_arg("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn raw_arg_backslash_before_quote_doubled() {
+        // 反斜杠后跟引号时翻倍，引号转义：path\" → "path\\\""
+        // raw string r#"..."# 终止于第一个 "#  故加 r###" 开闭
+        assert_eq!(raw_arg(r###"path\""###), r###""path\\\"""###);
+    }
+
+    #[test]
+    fn raw_arg_trailing_backslash_doubled() {
+        // 末尾反斜杠：若无需引号（无空格/引号）则原样返回，不强制加引号。
+        // CommandLineToArgvW 对无引号参数中的反斜杠原样接收。
+        assert_eq!(raw_arg(r"dir\"), r"dir\");
+        // 含空格+末尾反斜杠时才加引号，末尾反斜杠在闭合引号前翻倍。
+        assert_eq!(raw_arg("my dir\\"), r#""my dir\\""#);
+    }
+
+    #[test]
+    fn launch_program_sta_budget_is_fast() {
+        use std::time::Duration;
+        let op = ShellOperation::LaunchProgram {
+            path: r"C:\x.exe".into(),
+            args: vec![],
+            working_dir: None,
+        };
+        assert_eq!(sta_wait_budget(&op), Duration::from_secs(60));
     }
 }
