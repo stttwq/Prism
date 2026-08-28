@@ -1058,7 +1058,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     private void AddCommand()
     {
-        var item = new CommandEditItem { Handler = "open_url" };
+        // K3: broker 不分配 id——validate_command_id 拒绝空串。新建时立即生成
+        // user.<guid> 形式的唯一 id（小写无连字符，满足 [a-z0-9._-] 语法）。
+        var suffix = Guid.NewGuid().ToString("N");
+        var item = new CommandEditItem { Id = "user." + suffix, Handler = "open_url" };
         Commands.Add(item);
         SelectedCommand = item;
         CommandStatusText = "编辑后点「保存到 broker」生效";

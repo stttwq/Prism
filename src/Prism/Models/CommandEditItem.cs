@@ -51,7 +51,7 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         _handler = "open_url";
     }
 
-    /// <summary>唯一标识。空串=新建（保存时 broker 分配 id）。</summary>
+    /// <summary>唯一标识。新建时由 ViewModel 分配 user.<guid> 形式的 id。</summary>
     public string Id
     {
         get => _id;
