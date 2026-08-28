@@ -215,6 +215,12 @@ pub const SHORTCUT_COMBO_MAX_CHARS: usize = 64;
 /// K2 §4.6：shortcut_bindings 最多 64 条（内置命令 ≤ 6 + 用户命令 ≤ 512，取交集上限）。
 pub const COMMAND_SHORTCUT_MAX_ENTRIES: usize = 64;
 pub const COMMAND_USAGE_MAX_ENTRIES: usize = 2000;
+/// K3 §4.1：handler_params 键数上限。
+pub const COMMAND_HANDLER_PARAMS_MAX_KEYS: usize = 8;
+/// K3 §4.1：handler_params 单值字符上限。
+pub const COMMAND_HANDLER_PARAM_MAX_CHARS: usize = 1024;
+/// K3 §4.2：handler_params 键名字符上限（`[a-z_]+`，保留扩展空间）。
+pub const COMMAND_HANDLER_PARAM_KEY_MAX_CHARS: usize = 32;
 
 /// 用户命令目录。`UserCommandDefinition` 刻意不含 `owner`：用户命令的 owner 恒为
 /// broker、trust 恒为 user，由代码赋值，不从 JSON 读。
@@ -263,6 +269,44 @@ pub struct UserCommandDefinition {
     pub danger: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// K3 §4.1：用户态 handler。反序列化为独立枚举，与 `commands::BrokerHandlerId`
+    /// **没有任何转换路径**——类型层面保证导入 JSON 无法获得内置特权能力。
+    /// 未知字符串 → `Unknown`（条目不禁用整文件，仅自身标不可用）。
+    #[serde(default)]
+    pub handler: UserHandlerKind,
+    /// K3 §4.1：handler 参数。键 ≤8、单值 ≤1024 字符、键名 `[a-z_]+`。
+    /// 必选键由 handler 决定：open_url → `url_template`；launch_program → `path`。
+    #[serde(default)]
+    pub handler_params: std::collections::BTreeMap<String, String>,
+}
+
+/// K3 §4.1：用户命令可用的 handler 全集。**刻意不含内置 handler**，且不提供任何到
+/// `commands::BrokerHandlerId` 的转换——类型层面保证导入 JSON 无法获得特权能力。
+/// `Unknown` 是反序列化默认值：未知/缺失 handler 不使整文件失败，仅该条目标记不可用。
+/// 未知字符串（如 `staging_zip`）在自定义 Deserialize 里降级为 `Unknown` 而非报错
+/// （§4.1 A4 验收：类型无转换路径）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserHandlerKind {
+    #[default]
+    Unknown,
+    OpenUrl,
+    LaunchProgram,
+}
+
+impl<'de> Deserialize<'de> for UserHandlerKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer).unwrap_or_default();
+        match raw.as_str() {
+            "open_url" => Ok(UserHandlerKind::OpenUrl),
+            "launch_program" => Ok(UserHandlerKind::LaunchProgram),
+            // 未知/缺失 → Unknown，不报错（§4.1 单条降级语义）。
+            _ => Ok(UserHandlerKind::Unknown),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,6 +414,22 @@ impl VersionedData for CommandData {
                 "" | "normal" | "elevated" | "destructive"
             ) {
                 return Err("command has an unsupported danger level".into());
+            }
+            // K3 §4.2 结构层：handler_params 键数 / 值长 / 键名格式（无 I/O）。
+            // 必选键存在性与 scheme/路径校验属语义层，在 CommandSet（commit 4）执行。
+            if command.handler_params.len() > COMMAND_HANDLER_PARAMS_MAX_KEYS {
+                return Err("handler_params exceeds 8 keys".into());
+            }
+            for (key, value) in &command.handler_params {
+                if key.is_empty() || key.chars().count() > COMMAND_HANDLER_PARAM_KEY_MAX_CHARS {
+                    return Err("handler_params key is empty or exceeds 32 chars".into());
+                }
+                if !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    return Err("handler_params key contains invalid characters".into());
+                }
+                if value.chars().count() > COMMAND_HANDLER_PARAM_MAX_CHARS {
+                    return Err("handler_params value exceeds 1024 chars".into());
+                }
             }
             // K2 §4.6：shortcut_combo 长度上限（组合键串如 "Ctrl+Shift+F12" ≤ 32 足够）。
             if let Some(combo) = command.bindings.shortcut.as_ref() {
@@ -687,6 +747,142 @@ mod tests {
                 last_success_utc: 100,
                 frecency_milli: 500,
             }],
+        };
+        assert!(VersionedEnvelope::new(ok).is_ok());
+    }
+
+    // ── K3 §4.1 commit 1：UserHandlerKind + handler_params ─────────────
+
+    #[test]
+    fn user_handler_kind_default_is_unknown() {
+        let h: UserHandlerKind = serde_json::from_str("null").unwrap_or_default();
+        assert_eq!(h, UserHandlerKind::Unknown);
+    }
+
+    #[test]
+    fn user_handler_kind_unknown_string_decodes_to_unknown() {
+        // 未知 handler 字符串 → Unknown，不使整个文件失败（§4.1 Unknown 降级语义）。
+        let json = r#"{"schema_version":1,"data":{
+            "commands":[
+                {"id":"user.good","title":"ok","handler":"open_url","handler_params":{"url_template":"https://x.test/{query}"}},
+                {"id":"user.bad","title":"bad","handler":"staging_zip","handler_params":{"path":"C:\\x"}}
+            ]
+        }}"#;
+        let envelope: VersionedEnvelope<CommandData> = serde_json::from_str(json).unwrap();
+        let data = envelope.into_compatible().unwrap();
+        assert_eq!(data.commands.len(), 2);
+        assert_eq!(data.commands[0].handler, UserHandlerKind::OpenUrl);
+        assert_eq!(data.commands[1].handler, UserHandlerKind::Unknown);
+    }
+
+    #[test]
+    fn user_handler_kind_missing_field_defaults_unknown() {
+        // 现有 commands-v1.json 无 handler 字段 → Unknown，shortcut_bindings 不受影响。
+        let json = r#"{"schema_version":1,"data":{
+            "commands":[{"id":"user.legacy","title":"legacy"}],
+            "shortcut_bindings":[{"command_id":"user.legacy","combo":"Ctrl+Shift+T"}]
+        }}"#;
+        let envelope: VersionedEnvelope<CommandData> = serde_json::from_str(json).unwrap();
+        let data = envelope.into_compatible().unwrap();
+        assert_eq!(data.commands[0].handler, UserHandlerKind::Unknown);
+        assert!(data.commands[0].handler_params.is_empty());
+        assert_eq!(data.shortcut_bindings.len(), 1);
+        assert_eq!(data.shortcut_bindings[0].command_id, "user.legacy");
+    }
+
+    #[test]
+    fn user_handler_kind_serde_roundtrip() {
+        let def = UserCommandDefinition {
+            id: "user.roundtrip".into(),
+            title: "RT".into(),
+            handler: UserHandlerKind::LaunchProgram,
+            handler_params: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("path".into(), r"C:\Windows\notepad.exe".into());
+                m.insert("args_template".into(), "{query}".into());
+                m
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let back: UserCommandDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(def, back);
+    }
+
+    #[test]
+    fn user_handler_kind_rejects_staging_zip_string() {
+        // A4 验收：含 staging_zip 字符串的导入 JSON → 落 Unknown（类型无转换路径）。
+        let json = r#"{"schema_version":1,"data":{
+            "commands":[{"id":"user.evil","title":"evil","handler":"staging_zip"}]
+        }}"#;
+        let envelope: VersionedEnvelope<CommandData> = serde_json::from_str(json).unwrap();
+        let data = envelope.into_compatible().unwrap();
+        assert_eq!(data.commands[0].handler, UserHandlerKind::Unknown);
+    }
+
+    #[test]
+    fn handler_params_too_many_keys_rejected() {
+        let mut params = std::collections::BTreeMap::new();
+        for i in 0..9 {
+            params.insert(format!("k{i}"), "v".into());
+        }
+        let bad = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.too_many_keys".into(),
+                title: "t".into(),
+                handler_params: params,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(VersionedEnvelope::new(bad).is_err());
+    }
+
+    #[test]
+    fn handler_params_value_too_long_rejected() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("url_template".into(), "x".repeat(1025));
+        let bad = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.long_val".into(),
+                title: "t".into(),
+                handler_params: params,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(VersionedEnvelope::new(bad).is_err());
+    }
+
+    #[test]
+    fn handler_params_bad_key_name_rejected() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("URL_Template".into(), "https://x.test".into());
+        let bad = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.bad_key".into(),
+                title: "t".into(),
+                handler_params: params,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(VersionedEnvelope::new(bad).is_err());
+    }
+
+    #[test]
+    fn handler_params_valid_bounds_accepted() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("url_template".into(), "https://x.test/{query}".into());
+        let ok = CommandData {
+            commands: vec![UserCommandDefinition {
+                id: "user.ok_handler".into(),
+                title: "t".into(),
+                handler: UserHandlerKind::OpenUrl,
+                handler_params: params,
+                ..Default::default()
+            }],
+            ..Default::default()
         };
         assert!(VersionedEnvelope::new(ok).is_ok());
     }
