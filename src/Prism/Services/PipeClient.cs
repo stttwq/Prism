@@ -961,6 +961,120 @@ public sealed class PipeClient : ISearchClient, IDisposable
         return "unexpected response";
     }
 
+    /// <summary>
+    /// K3 §4.5：保存用户命令。返回空串=成功，否则为错误文案。
+    /// </summary>
+    internal async Task<string> CommandSetAsync(
+        UserCommandDefinition command, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            new { type = "command_set", command },
+            ct, QueryReadTimeout).ConfigureAwait(false);
+        if (resp.TryGetProperty("type", out var type))
+        {
+            var typeStr = type.GetString();
+            if (typeStr == "error")
+                return resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+            if (typeStr == "command_applied")
+                return resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+        }
+        return "unexpected response";
+    }
+
+    /// <summary>
+    /// K3 §4.5：删除用户命令。幂等。返回空串=成功。
+    /// </summary>
+    internal async Task<string> CommandDeleteAsync(
+        string commandId, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            new { type = "command_delete", command_id = commandId },
+            ct, QueryReadTimeout).ConfigureAwait(false);
+        if (resp.TryGetProperty("type", out var type))
+        {
+            var typeStr = type.GetString();
+            if (typeStr == "error")
+                return resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+            if (typeStr == "command_applied")
+                return resp.TryGetProperty("message", out var msgEl) ? msgEl.GetString() ?? "" : "";
+        }
+        return "unexpected response";
+    }
+
+    /// <summary>
+    /// K3 §4.5：触发词命名空间校验。broker 查全集（引擎/别名/命令/保留字）。
+    /// 返回 null=功能不可用（连接未协商或传输失败）。
+    /// </summary>
+    internal async Task<NamespaceValidationResult?> ValidateTriggerNamespaceAsync(
+        string trigger, string owner, string? excludeCommandId = null,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var payload = new Dictionary<string, object?>
+            {
+                ["type"] = "validate_trigger_namespace",
+                ["trigger"] = trigger,
+                ["owner"] = owner,
+                ["exclude_command_id"] = excludeCommandId,
+            };
+            var resp = await SendAsync(payload, ct, QueryReadTimeout).ConfigureAwait(false);
+            if (resp.TryGetProperty("type", out var type))
+            {
+                if (type.GetString() == "error")
+                    return new NamespaceValidationResult(false,
+                        new NamespaceConflictDto("error",
+                            resp.TryGetProperty("message", out var m) ? m.GetString() ?? "" : ""));
+                if (type.GetString() == "namespace_validation")
+                    return NamespaceValidationResult.Parse(resp);
+            }
+            return null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// K3 §4.6：命令预览（dry-run）。返回执行时将用的最终字符串，不产生副作用。
+    /// 返回 null=功能不可用。
+    /// </summary>
+    internal async Task<CommandPreviewResult?> CommandPreviewAsync(
+        string commandId, string source, string? argumentsText,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var payload = new Dictionary<string, object?>
+            {
+                ["type"] = "command_preview",
+                ["context"] = new Dictionary<string, object?>
+                {
+                    ["command_id"] = commandId,
+                    ["source"] = source,
+                    ["arguments"] = argumentsText is not null
+                        ? new Dictionary<string, object?> { ["text"] = argumentsText }
+                        : new Dictionary<string, object?>(),
+                    ["selection"] = null,
+                    ["staged_paths"] = Array.Empty<string>(),
+                    ["current_folder"] = null,
+                    ["host_kind"] = "explorer",
+                    ["host_capabilities"] = Array.Empty<string>(),
+                },
+            };
+            var resp = await SendAsync(payload, ct, QueryReadTimeout).ConfigureAwait(false);
+            if (resp.TryGetProperty("type", out var type))
+            {
+                if (type.GetString() == "error")
+                    return new CommandPreviewResult(false,
+                        resp.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "",
+                        null, null, [], null);
+                if (type.GetString() == "command_preview_result")
+                    return CommandPreviewResult.Parse(resp);
+            }
+            return null;
+        }
+        catch { return null; }
+    }
+
     internal static IReadOnlyList<AliasEntry> ParseAliasList(JsonElement resp)
     {
         var items = new List<AliasEntry>();

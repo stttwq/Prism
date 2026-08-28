@@ -34,6 +34,20 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     /// <summary>别名系统：删除一条绑定。</summary>
     private readonly Func<ActionTarget, Task>? _onAliasDelete;
 
+    // ── K3 §4.7 命令 tab 状态 ──
+    /// <summary>命令目录快照（从 broker 拉取）。</summary>
+    private IReadOnlyList<CommandDescriptor> _commandCatalog = Array.Empty<CommandDescriptor>();
+    /// <summary>命令编辑表（用户命令可编辑，内置只读展示）。</summary>
+    private ObservableCollection<CommandEditItem> _commands = [];
+    /// <summary>命令 pipe 客户端（由 App 注入，可能为 null=命令功能不可用）。</summary>
+    private readonly PipeClient? _commandPipe;
+    /// <summary>命令 tab 的实时预览文本。</summary>
+    private string _commandPreviewText = "";
+    /// <summary>命令 tab 的命名空间冲突提示。</summary>
+    private string _commandConflictText = "";
+    /// <summary>命令 tab 的通用状态提示。</summary>
+    private string _commandStatusText = "";
+
     private bool _autoStartEnabled;
     private HotkeyMode _hotkeyMode;
     private string _comboHotkey;
@@ -47,6 +61,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         public const int Web = 2;
         public const int Filters = 3;
         public const int About = 4;
+        public const int Commands = 5;
     }
 
     private int _selectedTab; // 0=常规 1=快速访问 2=网页搜索 3=关于
@@ -76,7 +91,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Func<string, bool>? onRequestFaviconGrant = null,
         Action<string>? onFaviconGranted = null,
         Func<Task<IReadOnlyList<AliasEntry>>>? onAliasList = null,
-        Func<ActionTarget, Task>? onAliasDelete = null)
+        Func<ActionTarget, Task>? onAliasDelete = null,
+        PipeClient? commandPipe = null)
     {
         _store = store;
         _autoStart = autoStart;
@@ -90,6 +106,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _onFaviconGranted = onFaviconGranted;
         _onAliasList = onAliasList;
         _onAliasDelete = onAliasDelete;
+        _commandPipe = commandPipe;
 
         // 读失败（文件被锁/ACL 拒绝）带默认值打开设置页：Load 在持续 IO 失败时会
         // 上抛，不接住的话构造器在 UI 线程炸掉、设置窗无声打不开。Save 前会重新
@@ -152,6 +169,15 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         RemoveActionHotkeyCommand = new RelayCommand(
             p => RemoveActionHotkey(p as ActionHotkeyEditItem),
             _ => ActionHotkeys.Count > 0);
+        // K3 §4.7：命令 tab 操作
+        AddCommandCommand = new RelayCommand(_ => AddCommand());
+        RemoveCommandCommand = new RelayCommand(_ => RemoveSelectedCommand(),
+            _ => SelectedCommand is not null && !SelectedCommand.IsBuiltin);
+        SaveCommandCommand = new RelayCommand(_ => _ = SaveCommandAsync(),
+            _ => SelectedCommand is not null && !SelectedCommand.IsBuiltin);
+        CommandPreviewCommand = new RelayCommand(_ => _ = PreviewCommandAsync(),
+            _ => SelectedCommand is not null && _commandPipe is not null);
+        ApplyTemplateCommand = new RelayCommand(p => ApplyTemplate(p as CommandTemplate));
         SelectTabCommand = new RelayCommand(p =>
         {
             if (p is int i) SelectedTab = i;
@@ -179,6 +205,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(IsWebTab));
             OnPropertyChanged(nameof(IsFiltersTab));
             OnPropertyChanged(nameof(IsAboutTab));
+            OnPropertyChanged(nameof(IsCommandsTab));
+            // K3 §4.7：切到命令 tab 时异步拉取命令目录
+            if (value == TabIndex.Commands)
+                _ = LoadCommandsAsync();
         }
     }
 
@@ -187,6 +217,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public bool IsWebTab => SelectedTab == TabIndex.Web;
     public bool IsFiltersTab => SelectedTab == TabIndex.Filters;
     public bool IsAboutTab => SelectedTab == TabIndex.About;
+    public bool IsCommandsTab => SelectedTab == TabIndex.Commands;
 
     /// <summary>是否使用双击 Ctrl 呼出（与 IsComboMode 互斥）。</summary>
     public bool IsDoubleCtrlMode
@@ -370,6 +401,59 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public ICommand SaveCommand { get; }
     public ICommand SelectTabCommand { get; }
     public ICommand ClearHistoryCommand { get; }
+
+    // K3 §4.7：命令 tab 的 ICommand 与属性
+    public ICommand AddCommandCommand { get; }
+    public ICommand RemoveCommandCommand { get; }
+    public ICommand SaveCommandCommand { get; }
+    public ICommand CommandPreviewCommand { get; }
+    public ICommand ApplyTemplateCommand { get; }
+
+    /// <summary>命令编辑列表（含内置只读展示 + 用户可编辑行）。</summary>
+    public ObservableCollection<CommandEditItem> Commands
+    {
+        get => _commands;
+        private set { _commands = value; OnPropertyChanged(); }
+    }
+
+    private CommandEditItem? _selectedCommand;
+    public CommandEditItem? SelectedCommand
+    {
+        get => _selectedCommand;
+        set
+        {
+            if (_selectedCommand == value) return;
+            _selectedCommand = value;
+            OnPropertyChanged();
+            // 选中命令变化时清空预览/冲突状态
+            CommandPreviewText = "";
+            CommandConflictText = "";
+        }
+    }
+
+    /// <summary>命令 tab 实时预览文本。</summary>
+    public string CommandPreviewText
+    {
+        get => _commandPreviewText;
+        set { if (_commandPreviewText != value) { _commandPreviewText = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>命令 tab 命名空间冲突提示。</summary>
+    public string CommandConflictText
+    {
+        get => _commandConflictText;
+        set { if (_commandConflictText != value) { _commandConflictText = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>命令 tab 通用状态提示。</summary>
+    public string CommandStatusText
+    {
+        get => _commandStatusText;
+        set { if (_commandStatusText != value) { _commandStatusText = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>命令功能是否可用（broker 未连接/未协商时为 false）。</summary>
+    public bool CommandsAvailable => _commandPipe is not null;
 
     /// <summary>别名系统：设置页展示的绑定列表（打开时拉取）。</summary>
     public ObservableCollection<AliasEntry> AliasEntries { get; } = new();
@@ -934,6 +1018,209 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             StatusMessage = "清除历史失败：" + ex.Message;
         }
     }
+
+    // ── K3 §4.7 命令 tab 方法 ──────────────────────────────────────────
+
+    /// <summary>拉取命令目录并填充编辑列表。</summary>
+    public async Task LoadCommandsAsync()
+    {
+        if (_commandPipe is null)
+        {
+            CommandStatusText = "命令功能不可用（后端未连接）";
+            return;
+        }
+        CommandStatusText = "加载中…";
+        try
+        {
+            var result = await _commandPipe.CommandListAsync().ConfigureAwait(true);
+            if (result is null)
+            {
+                CommandStatusText = "命令功能不可用";
+                return;
+            }
+            _commandCatalog = result.Value.Items;
+            Commands = new ObservableCollection<CommandEditItem>(
+                result.Value.Items.Select(d => new CommandEditItem(d)));
+            SelectedCommand = Commands.FirstOrDefault();
+            CommandStatusText = Commands.Count > 0 ? "" : "暂无命令，点「新建命令」添加";
+        }
+        catch (Exception ex)
+        {
+            CommandStatusText = "加载失败：" + ex.Message;
+        }
+    }
+
+    private void AddCommand()
+    {
+        var item = new CommandEditItem { Handler = "open_url" };
+        Commands.Add(item);
+        SelectedCommand = item;
+        CommandStatusText = "编辑后点「保存到 broker」生效";
+    }
+
+    private void RemoveSelectedCommand()
+    {
+        if (SelectedCommand is null || SelectedCommand.IsBuiltin) return;
+        if (!string.IsNullOrEmpty(SelectedCommand.Id) && _commandPipe is not null)
+            _ = DeleteCommandAsync(SelectedCommand.Id);
+        Commands.Remove(SelectedCommand);
+        SelectedCommand = Commands.FirstOrDefault();
+    }
+
+    private async Task SaveCommandAsync()
+    {
+        if (SelectedCommand is null || SelectedCommand.IsBuiltin) return;
+        if (string.IsNullOrWhiteSpace(SelectedCommand.Title))
+        {
+            CommandStatusText = "标题不能为空";
+            return;
+        }
+        if (_commandPipe is null)
+        {
+            CommandStatusText = "命令功能不可用";
+            return;
+        }
+
+        // §4.5：保存前校验触发词命名空间冲突
+        var trigger = SelectedCommand.Trigger.Trim();
+        if (!string.IsNullOrEmpty(trigger))
+        {
+            var ns = await _commandPipe.ValidateTriggerNamespaceAsync(
+                trigger, "command",
+                string.IsNullOrEmpty(SelectedCommand.Id) ? null : SelectedCommand.Id)
+                .ConfigureAwait(true);
+            if (ns is { Ok: false })
+            {
+                CommandConflictText = ns.Conflict is { } c
+                    ? $"冲突：{c.Kind}（{c.OwnerLabel}）"
+                    : "冲突";
+                CommandStatusText = "保存被拒：触发词冲突";
+                return;
+            }
+            CommandConflictText = "";
+        }
+
+        CommandStatusText = "保存中…";
+        try
+        {
+            var def = SelectedCommand.ToDefinition();
+            var msg = await _commandPipe.CommandSetAsync(def).ConfigureAwait(true);
+            if (!string.IsNullOrEmpty(msg))
+            {
+                CommandStatusText = "保存失败：" + msg;
+                return;
+            }
+
+            // 快捷键绑定
+            if (!string.IsNullOrWhiteSpace(SelectedCommand.ShortcutCombo))
+            {
+                var scMsg = await _commandPipe.SetCommandShortcutAsync(
+                    def.Id, SelectedCommand.ShortcutCombo.Trim()).ConfigureAwait(true);
+                if (!string.IsNullOrEmpty(scMsg))
+                    CommandStatusText = "命令已保存，快捷键失败：" + scMsg;
+                else
+                    CommandStatusText = "已保存";
+            }
+            else
+            {
+                CommandStatusText = "已保存";
+            }
+
+            // 刷新目录
+            await LoadCommandsAsync().ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            CommandStatusText = "保存失败：" + ex.Message;
+        }
+    }
+
+    private async Task DeleteCommandAsync(string commandId)
+    {
+        if (_commandPipe is null) return;
+        try
+        {
+            await _commandPipe.CommandDeleteAsync(commandId).ConfigureAwait(true);
+        }
+        catch { /* 幂等，静默 */ }
+    }
+
+    private async Task PreviewCommandAsync()
+    {
+        if (SelectedCommand is null || _commandPipe is null) return;
+        CommandPreviewText = "预览中…";
+        try
+        {
+            // 用临时 id 发预览——如果是新建命令（id 空），需要先让 broker 知道。
+            // broker 的 CommandPreview 基于 command_id 查目录。新建未保存的命令
+            // 无法预览（broker 没有 id）。编辑已存在的命令可以直接预览。
+            if (string.IsNullOrEmpty(SelectedCommand.Id))
+            {
+                CommandPreviewText = "请先保存命令再预览";
+                return;
+            }
+            var result = await _commandPipe.CommandPreviewAsync(
+                SelectedCommand.Id, "settings", "test").ConfigureAwait(true);
+            if (result is null)
+            {
+                CommandPreviewText = "预览不可用";
+                return;
+            }
+            if (!result.Ok)
+            {
+                CommandPreviewText = "预览失败：" + result.Message;
+                return;
+            }
+            if (result.Url is not null)
+                CommandPreviewText = "URL: " + result.Url;
+            else if (result.ProgramPath is not null)
+                CommandPreviewText = "程序: " + result.ProgramPath +
+                    (result.ProgramArgs.Count > 0
+                        ? "\n参数: " + string.Join(" ", result.ProgramArgs)
+                        : "") +
+                    (result.ProgramWorkingDir is not null
+                        ? "\n工作目录: " + result.ProgramWorkingDir
+                        : "");
+            else
+                CommandPreviewText = "预览完成（无输出）";
+        }
+        catch (Exception ex)
+        {
+            CommandPreviewText = "预览失败：" + ex.Message;
+        }
+    }
+
+    private void ApplyTemplate(CommandTemplate? template)
+    {
+        if (template is null || SelectedCommand is null) return;
+        SelectedCommand.Handler = template.Handler;
+        SelectedCommand.Title = template.Title;
+        SelectedCommand.UrlTemplate = template.UrlTemplate;
+        SelectedCommand.ProgramPath = template.ProgramPath;
+        SelectedCommand.ArgsTemplate = template.ArgsTemplate;
+        SelectedCommand.WorkingDir = template.WorkingDir;
+        SelectedCommand.KeywordsText = template.KeywordsText;
+        SelectedCommand.IconGlyph = template.IconGlyph;
+        // 触发 PropertyChanged 让 UI 刷新 handler 可见区域
+        OnPropertyChanged(nameof(SelectedCommand));
+    }
+
+    /// <summary>§4.7 模板预设 6–8 个，预填表单不绕过校验。</summary>
+    public static IReadOnlyList<CommandTemplate> CommandTemplates { get; } = new[]
+    {
+        new CommandTemplate("Google 搜索", "open_url", "Google 搜索",
+            "https://www.google.com/search?q={query}", "", "", "", "g", "&#xE721;"),
+        new CommandTemplate("百度搜索", "open_url", "百度搜索",
+            "https://www.baidu.com/s?wd={query}", "", "", "", "bd", "&#xE721;"),
+        new CommandTemplate("GitHub 仓库搜索", "open_url", "GitHub 搜索",
+            "https://github.com/search?q={query}&type=repositories", "", "", "", "gh", "&#xE721;"),
+        new CommandTemplate("用记事本打开", "launch_program", "用记事本打开",
+            "", "C:\\Windows\\System32\\notepad.exe", "{selection.target}", "", "np", "&#xE70F;"),
+        new CommandTemplate("用 VS Code 打开", "launch_program", "用 VS Code 打开",
+            "", "C:\\Program Files\\Microsoft VS Code\\Code.exe", "{selection.target}", "", "code", "&#xE70F;"),
+        new CommandTemplate("浏览器打开本地 HTML", "open_url", "打开本地 HTML",
+            "file:///{query}", "", "", "", "html", "&#xE774;"),
+    };
 
     private void OnPropertyChanged([CallerMemberName] string? name = null) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));

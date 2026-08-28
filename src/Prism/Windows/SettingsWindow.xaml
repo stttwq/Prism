@@ -485,6 +485,9 @@
                 <Button Content="过滤触发"
                         Command="{Binding SelectTabCommand}" CommandParameter="3"
                         Style="{StaticResource SettingsNavButton}"/>
+                <Button Content="命令"
+                        Command="{Binding SelectTabCommand}" CommandParameter="5"
+                        Style="{StaticResource SettingsNavButton}"/>
                 <Button Content="关于"
                         Command="{Binding SelectTabCommand}" CommandParameter="4"
                         Style="{StaticResource SettingsNavButton}"/>
@@ -1073,6 +1076,162 @@
                         </StackPanel>
                     </Button>
                 </UniformGrid>
+            </Grid>
+
+            <!-- 命令（K3 §4.7） -->
+            <Grid Grid.Row="0"
+                  Visibility="{Binding IsCommandsTab, Converter={StaticResource BoolToVis}}">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" Margin="0,0,0,12">
+                    <TextBlock Text="命令" FontSize="20" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
+                    <TextBlock Text="管理用户自定义命令。选中后在右侧编辑。命令数据存于 commands-v1.json，不进 settings.json。"
+                               FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <Grid Grid.Row="1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="2*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <!-- 命令列表 -->
+                    <Border Grid.Column="0" Margin="0,0,8,0"
+                            BorderBrush="{DynamicResource BorderSettingsInput}" BorderThickness="1">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <ListBox Grid.Row="0"
+                                     ItemsSource="{Binding Commands}"
+                                     SelectedItem="{Binding SelectedCommand, Mode=TwoWay}"
+                                     BorderThickness="0">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Margin="0,2">
+                                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold"
+                                                       FontSize="13"/>
+                                            <TextBlock FontSize="11"
+                                                       Foreground="{DynamicResource TextSubtitle}"
+                                                       Text="{Binding KeywordsText}"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <UniformGrid Grid.Row="1" Columns="2" Margin="0,8,0,0">
+                                <Button Content="新建命令"
+                                        Command="{Binding AddCommandCommand}"
+                                        Style="{StaticResource SettingsActionButton}"
+                                        Margin="0,0,4,0"/>
+                                <Button Content="删除选中"
+                                        Command="{Binding RemoveCommandCommand}"
+                                        Style="{StaticResource SettingsActionButton}"
+                                        Margin="4,0,0,0"/>
+                            </UniformGrid>
+                        </Grid>
+                    </Border>
+
+                    <!-- 编辑表单 -->
+                    <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" Margin="8,0,0,0">
+                        <StackPanel>
+                            <TextBlock Text="模板预设" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                            <ItemsControl ItemsSource="{Binding CommandTemplates}" Margin="0,0,0,12">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Button Content="{Binding DisplayName}"
+                                                Command="{Binding DataContext.ApplyTemplateCommand, RelativeSource={RelativeSource AncestorType=Grid}}"
+                                                CommandParameter="{Binding}"
+                                                Style="{StaticResource SettingsActionButton}"
+                                                Margin="0,0,4,4"
+                                                Padding="8,2"/>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+
+                            <TextBlock Text="标题" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBox Text="{Binding SelectedCommand.Title, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+
+                            <TextBlock Text="关键字（逗号分隔）" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBox Text="{Binding SelectedCommand.KeywordsText, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+
+                            <TextBlock Text="处理器类型" FontSize="13" Margin="0,0,0,2"/>
+                            <ComboBox SelectedValue="{Binding SelectedCommand.Handler}"
+                                       SelectedValuePath="Tag"
+                                       Margin="0,0,0,8">
+                                <ComboBoxItem Content="打开 URL" Tag="open_url"/>
+                                <ComboBoxItem Content="启动程序" Tag="launch_program"/>
+                            </ComboBox>
+
+                            <!-- open_url 字段 -->
+                            <StackPanel Visibility="{Binding SelectedCommand.IsOpenUrl, Converter={StaticResource BoolToVis}}">
+                                <TextBlock Text="URL 模板（{query} 占位查询词）" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBox Text="{Binding SelectedCommand.UrlTemplate, UpdateSourceTrigger=PropertyChanged}"
+                                         Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+                            </StackPanel>
+
+                            <!-- launch_program 字段 -->
+                            <StackPanel Visibility="{Binding SelectedCommand.IsLaunchProgram, Converter={StaticResource BoolToVis}}">
+                                <TextBlock Text="程序路径" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBox Text="{Binding SelectedCommand.ProgramPath, UpdateSourceTrigger=PropertyChanged}"
+                                         Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+                                <TextBlock Text="参数模板" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBox Text="{Binding SelectedCommand.ArgsTemplate, UpdateSourceTrigger=PropertyChanged}"
+                                         Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+                                <TextBlock Text="工作目录（可选）" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBox Text="{Binding SelectedCommand.WorkingDir, UpdateSourceTrigger=PropertyChanged}"
+                                         Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+                            </StackPanel>
+
+                            <TextBlock Text="触发词（关键字路由，留空则不经关键字路由）" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBox Text="{Binding SelectedCommand.Trigger, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,4"/>
+                            <TextBlock Text="{Binding CommandConflictText}" FontSize="12"
+                                       Foreground="{DynamicResource TextMatch}" Margin="0,0,0,8"
+                                       TextWrapping="Wrap"/>
+
+                            <TextBlock Text="快捷键（如 Ctrl+Shift+G，留空=无快捷键）" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBox Text="{Binding SelectedCommand.ShortcutCombo, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
+
+                            <CheckBox Content="在根搜索中显示"
+                                      IsChecked="{Binding SelectedCommand.ShowInRootSearch}"
+                                      Margin="0,0,0,8"/>
+                            <CheckBox Content="启用"
+                                      IsChecked="{Binding SelectedCommand.Enabled}"
+                                      Margin="0,0,0,12"/>
+
+                            <UniformGrid Columns="2" Margin="0,0,0,8">
+                                <Button Content="保存到 broker"
+                                        Command="{Binding SaveCommandCommand}"
+                                        Style="{StaticResource SettingsPrimaryButton}"
+                                        Margin="0,0,4,0"/>
+                                <Button Content="预览"
+                                        Command="{Binding CommandPreviewCommand}"
+                                        Style="{StaticResource SettingsActionButton}"
+                                        Margin="4,0,0,0"/>
+                            </UniformGrid>
+
+                            <TextBlock Text="{Binding CommandStatusText}" FontSize="12"
+                                       Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"
+                                       Margin="0,0,0,4"/>
+                            <TextBlock Text="{Binding CommandPreviewText}" FontSize="12"
+                                       FontFamily="Consolas"
+                                       Foreground="{DynamicResource TextQuery}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Grid>
             </Grid>
 
             <!-- 关于 -->
