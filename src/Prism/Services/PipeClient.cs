@@ -1075,6 +1075,111 @@ public sealed class PipeClient : ISearchClient, IDisposable
         catch { return null; }
     }
 
+    /// <summary>
+    /// K3 §4.8：导出用户命令。broker 返回持久化形态（UserCommandDefinition 列表）
+    /// + exported_at。内置命令不导出。返回 null=功能不可用。
+    /// </summary>
+    internal async Task<(IReadOnlyList<UserCommandDefinition> Commands, string ExportedAt)?>
+        CommandExportAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var resp = await SendAsync(
+                new { type = "command_export" },
+                ct, QueryReadTimeout).ConfigureAwait(false);
+            if (resp.TryGetProperty("type", out var type))
+            {
+                if (type.GetString() == "error")
+                    return null;
+                if (type.GetString() == "command_export_result")
+                {
+                    var exportedAt = resp.TryGetProperty("exported_at", out var ea)
+                        && ea.ValueKind == JsonValueKind.String
+                        ? ea.GetString() ?? "" : "";
+                    var commands = new List<UserCommandDefinition>();
+                    if (resp.TryGetProperty("envelope", out var env)
+                        && env.TryGetProperty("data", out var data)
+                        && data.TryGetProperty("commands", out var arr)
+                        && arr.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var el in arr.EnumerateArray())
+                        {
+                            if (el.ValueKind == JsonValueKind.Object)
+                            {
+                                var cmd = ParseUserCommandDefinition(el);
+                                if (cmd is not null) commands.Add(cmd);
+                            }
+                        }
+                    }
+                    return (commands, exportedAt);
+                }
+            }
+            return null;
+        }
+        catch { return null; }
+    }
+
+    private static UserCommandDefinition? ParseUserCommandDefinition(JsonElement el)
+    {
+        var cmd = new UserCommandDefinition
+        {
+            Id = el.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+            Title = el.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "",
+            Subtitle = el.TryGetProperty("subtitle", out var s) ? s.GetString() ?? "" : "",
+            IconGlyph = el.TryGetProperty("icon_glyph", out var ig) ? ig.GetString() ?? "" : "",
+            Danger = el.TryGetProperty("danger", out var d) ? d.GetString() ?? "normal" : "normal",
+            Enabled = el.TryGetProperty("enabled", out var en) && en.ValueKind == JsonValueKind.True,
+            Handler = el.TryGetProperty("handler", out var h) ? h.GetString() ?? "open_url" : "open_url",
+        };
+
+        // keywords
+        if (el.TryGetProperty("keywords", out var kw) && kw.ValueKind == JsonValueKind.Array)
+            foreach (var k in kw.EnumerateArray())
+                if (k.ValueKind == JsonValueKind.String) cmd.Keywords.Add(k.GetString() ?? "");
+
+        // handler_params
+        if (el.TryGetProperty("handler_params", out var hp) && hp.ValueKind == JsonValueKind.Object)
+            foreach (var p in hp.EnumerateObject())
+                if (p.Value.ValueKind == JsonValueKind.String)
+                    cmd.HandlerParams[p.Name] = p.Value.GetString() ?? "";
+
+        // input
+        if (el.TryGetProperty("input", out var inp) && inp.ValueKind == JsonValueKind.Object)
+        {
+            cmd.Input.Kind = inp.TryGetProperty("kind", out var ik) ? ik.GetString() ?? "none" : "none";
+            cmd.Input.Required = inp.TryGetProperty("required", out var ir) && ir.ValueKind == JsonValueKind.True;
+            cmd.Input.Prompt = inp.TryGetProperty("prompt", out var ip) ? ip.GetString() ?? "" : "";
+        }
+
+        // bindings
+        if (el.TryGetProperty("bindings", out var bnd) && bnd.ValueKind == JsonValueKind.Object)
+        {
+            cmd.Bindings.RootSearch = ParseBindingSpec(bnd, "root_search");
+            cmd.Bindings.Keyword = ParseBindingSpec(bnd, "keyword");
+            cmd.Bindings.ActionPanel = ParseBindingSpec(bnd, "action_panel");
+            cmd.Bindings.Staging = ParseBindingSpec(bnd, "staging");
+            cmd.Bindings.Shortcut = ParseBindingSpec(bnd, "shortcut");
+        }
+
+        return cmd;
+    }
+
+    private static CommandBindingSpecDto? ParseBindingSpec(JsonElement parent, string name)
+    {
+        if (!parent.TryGetProperty(name, out var el) || el.ValueKind != JsonValueKind.Object)
+            return null;
+        return new CommandBindingSpecDto
+        {
+            Priority = el.TryGetProperty("priority", out var p) && p.TryGetInt32(out var pv) ? pv : 0,
+            ShortcutCombo = el.TryGetProperty("shortcut_combo", out var sc) && sc.ValueKind == JsonValueKind.String
+                ? sc.GetString() : null,
+            Trigger = el.TryGetProperty("trigger", out var tr) && tr.ValueKind == JsonValueKind.String
+                ? tr.GetString() : null,
+            ShowInRootSearch = !el.TryGetProperty("show_in_root_search", out var srs)
+                || srs.ValueKind != JsonValueKind.False,
+        };
+    }
+
     internal static IReadOnlyList<AliasEntry> ParseAliasList(JsonElement resp)
     {
         var items = new List<AliasEntry>();

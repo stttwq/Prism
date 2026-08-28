@@ -1106,6 +1106,7 @@
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="*"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <ListBox Grid.Row="0"
                                      ItemsSource="{Binding Commands}"
@@ -1130,6 +1131,16 @@
                                         Margin="0,0,4,0"/>
                                 <Button Content="删除选中"
                                         Command="{Binding RemoveCommandCommand}"
+                                        Style="{StaticResource SettingsActionButton}"
+                                        Margin="4,0,0,0"/>
+                            </UniformGrid>
+                            <UniformGrid Grid.Row="2" Columns="2" Margin="0,4,0,0">
+                                <Button Content="导出"
+                                        Command="{Binding ExportCommandsCommand}"
+                                        Style="{StaticResource SettingsActionButton}"
+                                        Margin="0,0,4,0"/>
+                                <Button Content="导入"
+                                        Command="{Binding ImportCommandsCommand}"
                                         Style="{StaticResource SettingsActionButton}"
                                         Margin="4,0,0,0"/>
                             </UniformGrid>

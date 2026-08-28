@@ -217,6 +217,11 @@ pub enum Request {
     CommandPreview {
         context: crate::commands::CommandInvocationContext,
     },
+    /// K3 §4.8：导出用户命令。broker 返回持久化形态（UserCommandDefinition 列表）
+    /// + exported_at，包在 VersionedEnvelope 里。内置命令不导出。
+    ///
+    /// 仅协商 commands_v1 的连接受理。
+    CommandExport,
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -373,6 +378,14 @@ pub enum Response {
         /// launch_program: 展开后的工作目录。
         #[serde(skip_serializing_if = "Option::is_none")]
         program_working_dir: Option<String>,
+    },
+    /// K3 §4.8：命令导出结果。返回用户命令的持久化形态 + exported_at 时间戳。
+    /// 内置命令不导出（它们随版本走）。
+    CommandExportResult {
+        /// 版本化信封，schema_version 对应 CommandData::SCHEMA_VERSION。
+        envelope: crate::persistence::VersionedEnvelope<crate::persistence::CommandData>,
+        /// 导出时间（ISO 8601 UTC）。
+        exported_at: String,
     },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
@@ -1276,6 +1289,24 @@ async fn handle_connection(
                             handle_command_preview(context.clone(), &commands)
                         }
                     }
+                    Request::CommandExport => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command export requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            let snapshot = commands.data_snapshot();
+                            Response::CommandExportResult {
+                                envelope: crate::persistence::VersionedEnvelope {
+                                schema_version:
+                                    <crate::persistence::CommandData as crate::persistence::VersionedData>::SCHEMA_VERSION,
+                                    data: snapshot,
+                                },
+                                exported_at: crate::history::now_utc().to_string(),
+                            }
+                        }
+                    }
                     _ => {
                         dispatch_non_search(
                             req,
@@ -1668,6 +1699,10 @@ async fn dispatch_non_search(
         },
         Request::CommandPreview { .. } => Response::Error {
             message: "command_preview must be handled in the connection loop".into(),
+            category: None,
+        },
+        Request::CommandExport => Response::Error {
+            message: "command_export must be handled in the connection loop".into(),
             category: None,
         },
     }
@@ -6885,6 +6920,54 @@ mod pipe_lifecycle_tests {
             gen_before, gen_after,
             "preview must not increment generation (no persistence)"
         );
+    }
+
+    // K3 §4.8：导出往返——data_snapshot 返回用户命令深拷贝，
+    // 内置命令不在 CommandData 中自然不导出。
+    #[test]
+    fn command_export_snapshot_roundtrip() {
+        let commands = Arc::new(crate::commands::CommandStore::load(&std::env::temp_dir()));
+        let mut cmd1 = crate::persistence::UserCommandDefinition::default();
+        cmd1.id = "user.export_test1".into();
+        cmd1.title = "Export Test 1".into();
+        cmd1.handler = crate::persistence::UserHandlerKind::OpenUrl;
+        cmd1.handler_params
+            .insert("url_template".into(), "https://x.test/{query}".into());
+        commands.set(cmd1.clone()).unwrap();
+
+        let mut cmd2 = crate::persistence::UserCommandDefinition::default();
+        cmd2.id = "user.export_test2".into();
+        cmd2.title = "Export Test 2".into();
+        cmd2.handler = crate::persistence::UserHandlerKind::LaunchProgram;
+        cmd2.handler_params
+            .insert("path".into(), "C:/Windows/System32/notepad.exe".into());
+        commands.set(cmd2.clone()).unwrap();
+
+        let snapshot = commands.data_snapshot();
+        assert_eq!(snapshot.commands.len(), 2, "snapshot has user commands");
+        assert!(snapshot
+            .commands
+            .iter()
+            .any(|c| c.id == "user.export_test1"));
+        assert!(snapshot
+            .commands
+            .iter()
+            .any(|c| c.id == "user.export_test2"));
+        // 内置命令不在快照中
+        assert!(
+            !snapshot
+                .commands
+                .iter()
+                .any(|c| c.id.starts_with("builtin.")),
+            "builtin commands not in export snapshot"
+        );
+
+        // 往返：序列化→反序列化→比较
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: crate::persistence::CommandData = serde_json::from_str(&json).unwrap();
+        assert_eq!(snapshot, restored, "roundtrip preserves command data");
+
+        let _ = std::fs::remove_file(std::env::temp_dir().join("commands-v1.json"));
     }
 
     // K2 §5 commit 5：copy_paths handler 集成测试。

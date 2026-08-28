@@ -572,6 +572,19 @@ impl CommandStore {
         out
     }
 
+    /// K3 §4.8：导出用户命令的持久化形态快照（深拷贝）。
+    /// 内置命令不在 `CommandData` 中，自然不导出。
+    pub fn data_snapshot(&self) -> CommandData {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CommandData {
+            commands: state.commands.clone(),
+            shortcut_bindings: state.shortcut_bindings.clone(),
+        }
+    }
+
     /// 清空使用记录。经 `ClearHistory` 联动（K0 已接）。清内存 + 删/重写文件。
     pub fn clear_usage(&self) -> Result<(), String> {
         {

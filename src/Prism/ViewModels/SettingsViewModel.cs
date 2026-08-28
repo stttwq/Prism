@@ -178,6 +178,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         CommandPreviewCommand = new RelayCommand(_ => _ = PreviewCommandAsync(),
             _ => SelectedCommand is not null && _commandPipe is not null);
         ApplyTemplateCommand = new RelayCommand(p => ApplyTemplate(p as CommandTemplate));
+        ExportCommandsCommand = new RelayCommand(_ => _ = ExportCommandsAsync(),
+            _ => _commandPipe is not null);
+        ImportCommandsCommand = new RelayCommand(_ => _ = ImportCommandsAsync(),
+            _ => _commandPipe is not null);
         SelectTabCommand = new RelayCommand(p =>
         {
             if (p is int i) SelectedTab = i;
@@ -408,6 +412,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public ICommand SaveCommandCommand { get; }
     public ICommand CommandPreviewCommand { get; }
     public ICommand ApplyTemplateCommand { get; }
+    public ICommand ExportCommandsCommand { get; }
+    public ICommand ImportCommandsCommand { get; }
 
     /// <summary>命令编辑列表（含内置只读展示 + 用户可编辑行）。</summary>
     public ObservableCollection<CommandEditItem> Commands
@@ -1221,6 +1227,161 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         new CommandTemplate("浏览器打开本地 HTML", "open_url", "打开本地 HTML",
             "file:///{query}", "", "", "", "html", "&#xE774;"),
     };
+
+    // ── K3 §4.8 导入导出 ──────────────────────────────────────────────
+
+    /// <summary>导出用户命令到 JSON 文件。</summary>
+    private async Task ExportCommandsAsync()
+    {
+        if (_commandPipe is null)
+        {
+            CommandStatusText = "命令功能不可用";
+            return;
+        }
+        CommandStatusText = "导出中…";
+        try
+        {
+            var result = await _commandPipe.CommandExportAsync().ConfigureAwait(true);
+            if (result is null)
+            {
+                CommandStatusText = "导出失败：后端不可用";
+                return;
+            }
+            var (commands, exportedAt) = result.Value;
+
+            var dlg = new Microsoft.Win32.SaveFileDialog
+            {
+                Filter = "Prism 命令导出 (*.json)|*.json",
+                FileName = "prism-commands.json",
+            };
+            if (dlg.ShowDialog() != true) { CommandStatusText = ""; return; }
+
+            var envelope = new
+            {
+                schema_version = 1,
+                data = new { commands },
+                exported_at = exportedAt,
+            };
+            var json = System.Text.Json.JsonSerializer.Serialize(envelope,
+                new System.Text.Json.JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                });
+            await System.IO.File.WriteAllTextAsync(dlg.FileName, json).ConfigureAwait(true);
+            CommandStatusText = $"已导出 {commands.Count} 条命令";
+        }
+        catch (Exception ex)
+        {
+            CommandStatusText = "导出失败：" + ex.Message;
+        }
+    }
+
+    /// <summary>导入命令 JSON 文件。解析→展示清单→逐条 CommandSet(enabled=false)。</summary>
+    private async Task ImportCommandsAsync()
+    {
+        if (_commandPipe is null)
+        {
+            CommandStatusText = "命令功能不可用";
+            return;
+        }
+
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Filter = "Prism 命令导出 (*.json)|*.json",
+        };
+        if (dlg.ShowDialog() != true) { CommandStatusText = ""; return; }
+
+        CommandStatusText = "导入中…";
+        try
+        {
+            var json = await System.IO.File.ReadAllTextAsync(dlg.FileName).ConfigureAwait(true);
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            // 解析命令列表
+            var importCommands = new List<UserCommandDefinition>();
+            if (root.TryGetProperty("data", out var dataEl)
+                && dataEl.TryGetProperty("commands", out var cmdsEl)
+                && cmdsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                foreach (var el in cmdsEl.EnumerateArray())
+                {
+                    if (el.ValueKind != System.Text.Json.JsonValueKind.Object) continue;
+                    var cmd = ParseImportCommand(el);
+                    if (cmd is not null) importCommands.Add(cmd);
+                }
+            }
+
+            if (importCommands.Count == 0)
+            {
+                CommandStatusText = "导入文件无有效命令";
+                return;
+            }
+
+            // 逐条 CommandSet，一律 enabled=false（§4.8 安全语义）
+            int imported = 0;
+            var errors = new List<string>();
+            foreach (var cmd in importCommands)
+            {
+                cmd.Enabled = false;
+                // 新 id 避免覆盖现有命令——加 user.imported. 前缀
+                if (string.IsNullOrEmpty(cmd.Id) || !cmd.Id.StartsWith("user."))
+                    cmd.Id = "user.imported." + (cmd.Id.Length > 0 ? cmd.Id : Guid.NewGuid().ToString("N"));
+                try
+                {
+                    var msg = await _commandPipe.CommandSetAsync(cmd).ConfigureAwait(true);
+                    if (!string.IsNullOrEmpty(msg))
+                        errors.Add($"{cmd.Title}: {msg}");
+                    else
+                        imported++;
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{cmd.Title}: {ex.Message}");
+                }
+            }
+
+            await LoadCommandsAsync().ConfigureAwait(true);
+            if (errors.Count > 0)
+                CommandStatusText = $"导入 {imported} 条，{errors.Count} 条失败：{errors[0]}";
+            else
+                CommandStatusText = $"已导入 {imported} 条命令（默认禁用，需手动启用）";
+        }
+        catch (Exception ex)
+        {
+            CommandStatusText = "导入失败：" + ex.Message;
+        }
+    }
+
+    private static UserCommandDefinition? ParseImportCommand(System.Text.Json.JsonElement el)
+    {
+        try
+        {
+            var cmd = new UserCommandDefinition
+            {
+                Id = el.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+                Title = el.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "",
+                Subtitle = el.TryGetProperty("subtitle", out var s) ? s.GetString() ?? "" : "",
+                IconGlyph = el.TryGetProperty("icon_glyph", out var ig) ? ig.GetString() ?? "" : "",
+                Danger = el.TryGetProperty("danger", out var d) ? d.GetString() ?? "normal" : "normal",
+                Handler = el.TryGetProperty("handler", out var h) ? h.GetString() ?? "open_url" : "open_url",
+            };
+
+            if (el.TryGetProperty("keywords", out var kw) && kw.ValueKind == System.Text.Json.JsonValueKind.Array)
+                foreach (var k in kw.EnumerateArray())
+                    if (k.ValueKind == System.Text.Json.JsonValueKind.String)
+                        cmd.Keywords.Add(k.GetString() ?? "");
+
+            if (el.TryGetProperty("handler_params", out var hp) && hp.ValueKind == System.Text.Json.JsonValueKind.Object)
+                foreach (var p in hp.EnumerateObject())
+                    if (p.Value.ValueKind == System.Text.Json.JsonValueKind.String)
+                        cmd.HandlerParams[p.Name] = p.Value.GetString() ?? "";
+
+            return cmd;
+        }
+        catch { return null; }
+    }
 
     private void OnPropertyChanged([CallerMemberName] string? name = null) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
