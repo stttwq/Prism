@@ -296,16 +296,15 @@ public sealed class IconCache
 
         var flags = SHGFI_SYSICONINDEX;
         uint attrs = 0;
-        if (!exists)
+        // 与 LoadIcon32 同纪律：非可执行类强制 USEFILEATTRIBUTES，取类型图标
+        // 而非内容缩略图（高 DPI 下 jumbo 缩略图空白问题更明显）。
+        var isExeLike = IsExeLikePath(path);
+        if (!exists || isDir || !isExeLike)
         {
             flags |= SHGFI_USEFILEATTRIBUTES;
-            attrs = (path.EndsWith('\\') || path.EndsWith('/'))
+            attrs = isDir
                 ? FILE_ATTRIBUTE_DIRECTORY
                 : FILE_ATTRIBUTE_NORMAL;
-        }
-        else if (isDir)
-        {
-            attrs = FILE_ATTRIBUTE_DIRECTORY;
         }
 
         var shfi = new SHFILEINFO();
@@ -354,16 +353,19 @@ public sealed class IconCache
             // SMALLICON 在部分 DPI 下偏糊；LARGEICON=32 与列表一致。
             var flags = SHGFI_ICON | SHGFI_LARGEICON;
             uint attrs = 0;
-            if (!exists)
+
+            // 非 exe/lnk 等可执行类按扩展名缓存（CacheKey → "ext:.xxx"），
+            // 不需要逐文件图标。对存在的图片等文件，shell 在不加
+            // USEFILEATTRIBUTES 时可能返回内容缩略图而非类型关联图标——
+            // 缩略图缩到 32px 常变空白（浅色图片尤其）。强制用 USEFILEATTRIBUTES
+            // 取类型图标，和缓存键的语义一致。
+            var isExeLike = IsExeLikePath(path);
+            if (!exists || isDir || !isExeLike)
             {
                 flags |= SHGFI_USEFILEATTRIBUTES;
-                attrs = (path.EndsWith('\\') || path.EndsWith('/'))
+                attrs = isDir
                     ? FILE_ATTRIBUTE_DIRECTORY
                     : FILE_ATTRIBUTE_NORMAL;
-            }
-            else if (isDir)
-            {
-                attrs = FILE_ATTRIBUTE_DIRECTORY;
             }
 
             // 扩展名缓存命中路径时：若源文件不存在，用扩展名属性图标即可
@@ -371,15 +373,20 @@ public sealed class IconCache
             var hr = SHGetFileInfo(path, attrs, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
             if (hr == IntPtr.Zero || shfi.hIcon == IntPtr.Zero)
             {
-                // 回退：纯扩展名
-                if (!exists)
+                // 可执行类逐文件图标失败：回退到类型属性图标
+                if (isExeLike && exists && !isDir)
+                {
+                    flags |= SHGFI_USEFILEATTRIBUTES;
+                    attrs = FILE_ATTRIBUTE_NORMAL;
+                    shfi = new SHFILEINFO();
+                    hr = SHGetFileInfo(path, attrs, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
+                    if (hr == IntPtr.Zero || shfi.hIcon == IntPtr.Zero)
+                        return null;
+                }
+                else
+                {
                     return null;
-                flags |= SHGFI_USEFILEATTRIBUTES;
-                attrs = FILE_ATTRIBUTE_NORMAL;
-                shfi = new SHFILEINFO();
-                hr = SHGetFileInfo(path, attrs, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
-                if (hr == IntPtr.Zero || shfi.hIcon == IntPtr.Zero)
-                    return null;
+                }
             }
 
             try
@@ -408,6 +415,22 @@ public sealed class IconCache
     private const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
     private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+
+    /// <summary>与 CacheKey 一致的可执行类扩展名集合——逐文件图标，不加 USEFILEATTRIBUTES。</summary>
+    private static bool IsExeLikePath(string path)
+    {
+        try
+        {
+            var ext = Path.GetExtension(path);
+            return ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".msc", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".bat", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".com", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
 
     /// <summary>
     /// IImageList（系统图像列表）最小声明：vtable 槽位必须与 commoncontrols.h 逐一对齐——
