@@ -693,7 +693,9 @@ public sealed class SearchViewModel
         if (_state.Mode != PanelMode.Results) return;
         var item = _state.SelectedResult;
         if (item is null) return;
-        if (item.Kind is not ("file" or "folder")) return;
+        // K2 commit 4：门禁放宽至 app，与 GetActionsForAsync 对齐（此前 Tab 进面板
+        // 拒绝 app 而右键菜单接受，不一致）。回归测试 A1 确认 .lnk 语义未变。
+        if (item.Kind is not ("app" or "file" or "folder")) return;
         if (string.IsNullOrEmpty(item.ExecuteId)) return;
 
         var actions = await GetActionsForAsync(item).ConfigureAwait(true);
@@ -772,6 +774,12 @@ public sealed class SearchViewModel
         var action = _state.SelectedAction;
         var target = _state.ActionTarget;
         if (action is null || target is null) return;
+        // K2 commit 4：禁用项不可执行（展示 disabled_reason）。
+        if (!action.IsEnabled)
+        {
+            _state.StatusMessage = action.DisabledReason ?? "此动作当前不可用";
+            return;
+        }
 
         await RunActionOnAsync(target, action).ConfigureAwait(true);
     }
@@ -803,11 +811,65 @@ public sealed class SearchViewModel
         }
     }
 
+    /// <summary>
+    /// K2 commit 4：动作面板命令段执行。构造 source=action_panel 的
+    /// CommandInvocationContext（带 typed selection.target），发 ExecuteCommand。
+    /// broker 侧二次校验 target 适配性（§4.4 P2）。成功后隐藏窗口。
+    /// </summary>
+    private async Task ExecutePanelCommandAsync(SearchResult target, string commandId)
+    {
+        if (_pipe is not PipeClient realPipe)
+        {
+            _state.StatusMessage = "命令执行不可用";
+            return;
+        }
+        var cmdCtx = _searchContext.CommandContext;
+        var context = new CommandInvocationContext
+        {
+            CommandId = commandId,
+            Source = "action_panel",
+            Selection = new CommandSelectionDto
+            {
+                Target = target.ExecutionTarget,
+                Title = target.Title,
+                Subtitle = target.Subtitle,
+            },
+            CurrentFolder = cmdCtx?.CurrentFolder,
+            HostKind = cmdCtx?.HostKind,
+            HostCapabilities = cmdCtx?.HostCapabilities ?? Array.Empty<string>(),
+        };
+        try
+        {
+            var uiCommandId = await realPipe.ExecuteCommandAsync(context).ConfigureAwait(true);
+            if (uiCommandId is not null)
+            {
+                if (!CommandHandlers.TryExecute(uiCommandId, context))
+                {
+                    _state.StatusMessage = "命令未注册：" + uiCommandId;
+                    return;
+                }
+            }
+            HideRequested?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _state.StatusMessage = "命令执行失败：" + ShortMsg(ex);
+        }
+    }
+
     private async Task RunActionOnCoreAsync(SearchResult target, ActionItem action)
     {
         if (action.IsSectionHeader || string.IsNullOrEmpty(action.Id)) return;
         if (target.Kind is not ("app" or "file" or "folder") || string.IsNullOrEmpty(target.ExecuteId))
             return;
+
+        // K2 commit 4：命令动作按 InvocationKind 分派——走 ExecuteCommand，
+        // 绝不进入 rename/picker/delete 等硬编码内置动作分支。
+        if (action.InvocationKind == "command" && action.CommandId is { } cmdId)
+        {
+            await ExecutePanelCommandAsync(target, cmdId).ConfigureAwait(true);
+            return;
+        }
 
         // rename 需要内联编辑新文件名，不直接发送 IPC。
         if (action.Id == "rename")
@@ -1051,7 +1113,8 @@ public sealed class SearchViewModel
     private static int FirstSelectable(IReadOnlyList<ActionItem> items)
     {
         for (var i = 0; i < items.Count; i++)
-            if (!items[i].IsSectionHeader) return i;
+            // K2 commit 4：跳过禁用项（命令段可能因 7-Zip 缺失等标禁用）。
+            if (!items[i].IsSectionHeader && items[i].IsEnabled) return i;
         return -1;
     }
 

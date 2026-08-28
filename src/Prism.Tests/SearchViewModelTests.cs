@@ -393,6 +393,55 @@ public sealed class SearchViewModelTests
         await Eventually(() => client.SearchCount == 2);
     }
 
+    // K2 commit 4 回归：命令动作（InvocationKind=command）走 ExecuteCommand 降级分支，
+    // 不进 rename/picker/delete 硬编码内置分支。fake client 非 PipeClient → 降级。
+    [Fact]
+    public async Task CommandActionDoesNotEnterBuiltinBranches()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        var target = new SearchResult("folder", "Windows", @"C:\Windows", @"C:\Windows", []);
+        var cmdAction = new ActionItem("cmd:prism.terminal.open", "在此处打开终端", "", false, false)
+        {
+            InvocationKind = "command",
+            CommandId = "prism.terminal.open",
+        };
+        await vm.RunActionOnAsync(target, cmdAction);
+
+        // fake client 非 PipeClient → 降级分支文案。
+        Assert.Equal("命令执行不可用", state.StatusMessage);
+        // 确认没进内置动作路径（RunActionAsync 未被调用）。
+        Assert.Equal(0, client.RunActionCallCount);
+    }
+
+    // K2 commit 4 回归：禁用动作不可执行，展示 disabled_reason。
+    [Fact]
+    public async Task DisabledActionShowsReasonAndDoesNotExecute()
+    {
+        var client = new FakeSearchClient();
+        var state = new AppState();
+        var vm = new SearchViewModel(state, client, new ManualTimerFactory(), new ImmediateScheduler());
+
+        var target = new SearchResult("file", "x.txt", @"C:\x.txt", @"C:\x.txt", []);
+        var disabled = new ActionItem("zip", "压缩为 ZIP", "", false, false)
+        {
+            IsEnabled = false,
+            DisabledReason = "需要 7-Zip",
+        };
+
+        // 模拟动作面板选中禁用项 + Enter。
+        state.Mode = PanelMode.Actions;
+        state.Actions = new[] { disabled };
+        state.SelectedActionIndex = 0;
+        state.ActionTarget = target;
+        await vm.ExecuteActionAsync();
+
+        Assert.Equal("需要 7-Zip", state.StatusMessage);
+        Assert.Equal(0, client.RunActionCallCount);
+    }
+
     [Fact]
     public async Task GenerationInvalidatesCacheAndLateResponseCannotOverwriteNewQuery()
     {
@@ -1513,8 +1562,15 @@ public sealed class SearchViewModelTests
             return RunActionCoreAsync();
         }
 
-        private Task RunActionCoreAsync() =>
-            RunActionException is { } ex ? Task.FromException(ex) : Task.CompletedTask;
+        // K2 commit 4：命令动作不应进内置 RunActionAsync 路径。
+        private int _runActionCallCount;
+        public int RunActionCallCount => _runActionCallCount;
+
+        private Task RunActionCoreAsync()
+        {
+            _runActionCallCount++;
+            return RunActionException is { } ex ? Task.FromException(ex) : Task.CompletedTask;
+        }
 
         /// <summary>非空时 RunActionAsync 抛出该异常（F7 超时文案测试用）。</summary>
         public Exception? RunActionException { get; set; }
