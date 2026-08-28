@@ -517,6 +517,25 @@ impl CommandStore {
         state.commands.iter().find(|c| c.id == id).cloned()
     }
 
+    /// K3 §4.5：收集所有用户命令的关键字，供命名空间校验。
+    /// 返回 (command_id, keyword) 列表。enabled 和 disabled 的命令都收——
+    /// 禁用的命令关键字仍占命名空间（避免启用时突然冲突）。
+    pub fn all_command_keywords(&self) -> Vec<(String, String)> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out = Vec::new();
+        for command in &state.commands {
+            for kw in &command.keywords {
+                if !kw.trim().is_empty() {
+                    out.push((command.id.clone(), kw.trim().to_string()));
+                }
+            }
+        }
+        out
+    }
+
     /// 清空使用记录。经 `ClearHistory` 联动（K0 已接）。清内存 + 删/重写文件。
     pub fn clear_usage(&self) -> Result<(), String> {
         {
@@ -1102,6 +1121,96 @@ pub fn validate_user_danger(danger: &str) -> Result<(), String> {
     if danger == "elevated" {
         return Err("用户命令不能设置为 elevated（禁止 runas）".into());
     }
+    Ok(())
+}
+
+// ── K3 §4.5 命名空间统一校验 ────────────────────────────────────────
+
+/// 触发词所有者，标识校验请求来源。前端用此字段区分冲突来源展示。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerOwner {
+    Command,
+    WebEngine,
+}
+
+/// 冲突来源类型。前端据此展示「与网页引擎/别名/命令/保留字冲突」。
+#[derive(Debug, Clone, Serialize)]
+pub struct NamespaceConflict {
+    pub kind: &'static str,
+    /// 冲突方的可读标签（引擎名 / 别名目标 / 命令 id / 保留字本身）。
+    pub owner_label: String,
+}
+
+/// §4.5：触发词命名空间校验。broker 是唯一裁决者。
+///
+/// 查全集：网页引擎关键字 ∪ 别名词 ∪ 命令关键字 ∪ 保留字（`ext:` / `path:` / `>`）。
+/// 返回 `Ok(())` 表示无冲突，`Err` 带可读来源。`exclude_command_id` 用于排除
+/// 正在编辑的命令自身（编辑保存时自身的旧关键字不应与自己冲突）。
+pub fn validate_trigger_namespace(
+    trigger: &str,
+    owner: TriggerOwner,
+    engines: &[crate::websearch::WebEngine],
+    aliases: &[crate::persistence::AliasEntry],
+    command_keywords: &[(String, String)], // (command_id, keyword)
+    exclude_command_id: Option<&str>,
+) -> Result<(), NamespaceConflict> {
+    let trigger = trigger.trim();
+    if trigger.is_empty() {
+        return Ok(());
+    }
+    let trigger_lower = trigger.to_lowercase();
+    // 保留字前缀（§4.5）：ext: / path: 是查询过滤前缀，> 是动作动词前缀。
+    // 以这些前缀开头的触发词会与查询解析冲突。
+    const RESERVED_PREFIXES: &[&str] = &["ext:", "path:"];
+    for prefix in RESERVED_PREFIXES {
+        if trigger_lower.starts_with(prefix) {
+            return Err(NamespaceConflict {
+                kind: "reserved",
+                owner_label: format!("保留前缀 {prefix}"),
+            });
+        }
+    }
+    if trigger_lower == ">" {
+        return Err(NamespaceConflict {
+            kind: "reserved",
+            owner_label: "保留字 >".into(),
+        });
+    }
+    // 网页引擎关键字——大小写不敏感，与 try_match 一致。
+    for engine in engines {
+        if !engine.keyword.is_empty() && engine.keyword.eq_ignore_ascii_case(trigger) {
+            return Err(NamespaceConflict {
+                kind: "web_engine",
+                owner_label: format!("网页引擎 {}", engine.name),
+            });
+        }
+    }
+    // 别名词——小写匹配（alias.rs lookup_word 同款）。
+    for entry in aliases {
+        for word in &entry.words {
+            if word.eq_ignore_ascii_case(trigger) {
+                return Err(NamespaceConflict {
+                    kind: "alias",
+                    owner_label: format!("别名 {}", entry.target),
+                });
+            }
+        }
+    }
+    // 命令关键字——排除自身。
+    for (cid, kw) in command_keywords {
+        if Some(cid.as_str()) == exclude_command_id {
+            continue;
+        }
+        if kw.eq_ignore_ascii_case(trigger) {
+            return Err(NamespaceConflict {
+                kind: "command",
+                owner_label: format!("命令 {cid}"),
+            });
+        }
+    }
+    // owner 自身不做引擎/命令重复检查——owner 只影响前端展示来源标签。
+    let _ = owner;
     Ok(())
 }
 
@@ -2040,5 +2149,150 @@ mod tests {
         if let Ok((_, _, working_dir)) = result {
             assert_eq!(working_dir.as_deref(), Some(r"C:\Windows"));
         }
+    }
+
+    // ── K3 §4.5 commit 4：命名空间校验 ──────────────────────────────
+
+    fn ns_engine(keyword: &str, name: &str) -> crate::websearch::WebEngine {
+        crate::websearch::WebEngine {
+            keyword: keyword.into(),
+            name: name.into(),
+            url_template: "https://x.test/{q}".into(),
+        }
+    }
+
+    fn ns_alias(target: &str, words: &[&str]) -> crate::persistence::AliasEntry {
+        crate::persistence::AliasEntry {
+            kind: "file".into(),
+            target: target.into(),
+            words: words.iter().map(|w| (*w).into()).collect(),
+            bound_at_utc: 0,
+        }
+    }
+
+    #[test]
+    fn namespace_conflict_with_web_engine() {
+        let engines = vec![ns_engine("g", "Google")];
+        let err = validate_trigger_namespace("g", TriggerOwner::Command, &engines, &[], &[], None)
+            .unwrap_err();
+        assert_eq!(err.kind, "web_engine");
+        assert!(err.owner_label.contains("Google"));
+    }
+
+    #[test]
+    fn namespace_conflict_with_web_engine_case_insensitive() {
+        let engines = vec![ns_engine("bi", "Bing")];
+        let err = validate_trigger_namespace("BI", TriggerOwner::Command, &engines, &[], &[], None)
+            .unwrap_err();
+        assert_eq!(err.kind, "web_engine");
+    }
+
+    #[test]
+    fn namespace_conflict_with_alias() {
+        let aliases = vec![ns_alias(r"C:\x.txt", &["wx"])];
+        let err = validate_trigger_namespace("wx", TriggerOwner::Command, &[], &aliases, &[], None)
+            .unwrap_err();
+        assert_eq!(err.kind, "alias");
+        assert!(err.owner_label.contains("x.txt"));
+    }
+
+    #[test]
+    fn namespace_conflict_with_other_command_keyword() {
+        let command_keywords = vec![("user.cmd_a".into(), "calc".into())];
+        let err = validate_trigger_namespace(
+            "calc",
+            TriggerOwner::Command,
+            &[],
+            &[],
+            &command_keywords,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, "command");
+        assert!(err.owner_label.contains("user.cmd_a"));
+    }
+
+    #[test]
+    fn namespace_exclude_self_command_keyword() {
+        // 编辑保存时排除自身——不与自己旧关键字冲突。
+        let command_keywords = vec![("user.cmd_a".into(), "calc".into())];
+        let result = validate_trigger_namespace(
+            "calc",
+            TriggerOwner::Command,
+            &[],
+            &[],
+            &command_keywords,
+            Some("user.cmd_a"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn namespace_conflict_with_reserved_prefix() {
+        let err = validate_trigger_namespace("ext:", TriggerOwner::Command, &[], &[], &[], None)
+            .unwrap_err();
+        assert_eq!(err.kind, "reserved");
+    }
+
+    #[test]
+    fn namespace_conflict_with_reserved_gt() {
+        let err = validate_trigger_namespace(">", TriggerOwner::Command, &[], &[], &[], None)
+            .unwrap_err();
+        assert_eq!(err.kind, "reserved");
+    }
+
+    #[test]
+    fn namespace_conflict_with_path_prefix() {
+        let err = validate_trigger_namespace("path:", TriggerOwner::Command, &[], &[], &[], None)
+            .unwrap_err();
+        assert_eq!(err.kind, "reserved");
+    }
+
+    #[test]
+    fn namespace_empty_trigger_ok() {
+        let result = validate_trigger_namespace(
+            "",
+            TriggerOwner::Command,
+            &[ns_engine("g", "Google")],
+            &[],
+            &[],
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn namespace_no_conflict_ok() {
+        let engines = vec![ns_engine("g", "Google")];
+        let aliases = vec![ns_alias(r"C:\x.txt", &["wx"])];
+        let command_keywords = vec![("user.cmd_a".into(), "calc".into())];
+        let result = validate_trigger_namespace(
+            "unique",
+            TriggerOwner::Command,
+            &engines,
+            &aliases,
+            &command_keywords,
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn all_command_keywords_collects_enabled_and_disabled() {
+        let (store, _dir) = store("ns-keywords");
+        let mut cmd_a = user_cmd("user.cmd_a");
+        cmd_a.keywords = vec!["calc".into(), "notepad".into()];
+        cmd_a.enabled = true;
+        let mut cmd_b = user_cmd("user.cmd_b");
+        cmd_b.keywords = vec!["editor".into()];
+        cmd_b.enabled = false;
+        store.set(cmd_a).unwrap();
+        store.set(cmd_b).unwrap();
+        let kws = store.all_command_keywords();
+        // 两条命令、共 3 个关键字，disabled 命令的关键字也收录
+        assert_eq!(kws.len(), 3);
+        let ids: Vec<&str> = kws.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"user.cmd_a"));
+        assert!(ids.contains(&"user.cmd_b"));
     }
 }

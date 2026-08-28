@@ -191,6 +191,26 @@ pub enum Request {
         command_id: String,
         combo: Option<String>,
     },
+    /// K3 §4.5：保存/替换用户命令定义。语义层校验在 broker 侧执行
+    ///（路径存在性、协议白名单、关键字命名空间冲突）。拒绝而非静默修正。
+    /// 仅协商 commands_v1 的连接受理。
+    CommandSet {
+        command: crate::persistence::UserCommandDefinition,
+    },
+    /// K3 §4.5：删除用户命令。幂等。
+    /// 仅协商 commands_v1 的连接受理。
+    CommandDelete {
+        command_id: String,
+    },
+    /// K3 §4.5：触发词命名空间校验。broker 查全集（引擎/别名/命令/保留字）。
+    /// 前端保存前调用，通过才写盘。
+    ValidateTriggerNamespace {
+        trigger: String,
+        owner: crate::commands::TriggerOwner,
+        /// 编辑中的命令 id——排除自身，避免编辑保存时与自身旧关键字冲突。
+        #[serde(default)]
+        exclude_command_id: Option<String>,
+    },
 }
 
 /// 显式搜索模式。未知取值按 `all` 处理，避免新前端加模式后打死旧 broker。
@@ -320,6 +340,15 @@ pub enum Response {
     },
     /// K2 §4.6：快捷键绑定设置/清除回执。message 空串=成功，否则为错误文案。
     CommandShortcutApplied { message: String },
+    /// K3 §4.5：命令保存/删除回执。message 空串=成功，否则为错误文案。
+    CommandApplied { message: String },
+    /// K3 §4.5：触发词命名空间校验结果。ok=true 无冲突；
+    /// ok=false 时 conflict 携带来源信息（kind + owner_label）。
+    NamespaceValidation {
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conflict: Option<crate::commands::NamespaceConflict>,
+    },
     /// 出错时回传，前端在列表区以单行提示展示。
     Error {
         message: String,
@@ -1142,6 +1171,75 @@ async fn handle_connection(
                             }
                         }
                     }
+                    Request::CommandSet { command } => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command set requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            handle_command_set(command.clone(), &commands, &engines, &aliases).await
+                        }
+                    }
+                    Request::CommandDelete { command_id } => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message: "command delete requires commands_v1 capability".into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            let commands_for_blocking = commands.clone();
+                            let cid = command_id.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                commands_for_blocking.delete(&cid)
+                            })
+                            .await
+                            .unwrap_or_else(|error| Err(format!("delete command task: {error}")));
+                            Response::CommandApplied {
+                                message: result.err().unwrap_or_default(),
+                            }
+                        }
+                    }
+                    Request::ValidateTriggerNamespace {
+                        trigger,
+                        owner,
+                        exclude_command_id,
+                    } => {
+                        if !caps.commands_v1 {
+                            Response::Error {
+                                message:
+                                    "validate trigger namespace requires commands_v1 capability"
+                                        .into(),
+                                category: Some(ShellErrorKind::Unsupported),
+                            }
+                        } else {
+                            // §4.5：快照读（引擎/别名/命令关键字），无 I/O，
+                            // 不阻塞——命名空间校验是只读查询，直接在 async 线程做。
+                            let engine_snapshot = engines
+                                .read()
+                                .map(|guard| guard.clone())
+                                .unwrap_or_default();
+                            let alias_snapshot = aliases.list();
+                            let command_keywords = commands.all_command_keywords();
+                            match crate::commands::validate_trigger_namespace(
+                                trigger.as_str(),
+                                *owner,
+                                &engine_snapshot,
+                                &alias_snapshot,
+                                &command_keywords,
+                                exclude_command_id.as_deref(),
+                            ) {
+                                Ok(()) => Response::NamespaceValidation {
+                                    ok: true,
+                                    conflict: None,
+                                },
+                                Err(conflict) => Response::NamespaceValidation {
+                                    ok: false,
+                                    conflict: Some(conflict),
+                                },
+                            }
+                        }
+                    }
                     _ => {
                         dispatch_non_search(
                             req,
@@ -1516,6 +1614,20 @@ async fn dispatch_non_search(
         // K2 §4.6：SetCommandShortcut 在连接循环内处理（需读 caps），这里不可达。
         Request::SetCommandShortcut { .. } => Response::Error {
             message: "set_command_shortcut must be handled in the connection loop".into(),
+            category: None,
+        },
+        // K3 §4.5：CommandSet/CommandDelete/ValidateTriggerNamespace 在连接循环内
+        // 处理（需读 caps），这里不可达。
+        Request::CommandSet { .. } => Response::Error {
+            message: "command_set must be handled in the connection loop".into(),
+            category: None,
+        },
+        Request::CommandDelete { .. } => Response::Error {
+            message: "command_delete must be handled in the connection loop".into(),
+            category: None,
+        },
+        Request::ValidateTriggerNamespace { .. } => Response::Error {
+            message: "validate_trigger_namespace must be handled in the connection loop".into(),
             category: None,
         },
     }
@@ -2105,6 +2217,83 @@ fn process_indexer_reply(
 /// K1：命令执行分派。验证上下文 → 查目录 → 按 owner 路由。
 /// broker-owned：调用内置 handler（在此执行）。
 /// ui-owned：返回 `UiCommand` 交给前端执行。
+/// K3 §4.5：CommandSet 处理器。语义层校验（§4.2）+ 命名空间冲突检查（§4.5）。
+/// 语义校验可能触磁盘 I/O（路径存在性），故走 spawn_blocking。
+async fn handle_command_set(
+    command: crate::persistence::UserCommandDefinition,
+    commands: &Arc<crate::commands::CommandStore>,
+    engines: &SharedEngines,
+    aliases: &Arc<crate::alias::AliasStore>,
+) -> Response {
+    // 语义校验上下文：保存时无实际 query，用空串占位（模板结构校验不需要真实值）。
+    let exp_ctx = crate::commands::ExpansionContext {
+        query: String::new(),
+        current_folder: String::new(),
+    };
+    // §4.2 danger 校验
+    if let Err(msg) = crate::commands::validate_user_danger(&command.danger) {
+        return Response::CommandApplied { message: msg };
+    }
+    // §4.2 语义层：按 handler 类型校验
+    match command.handler {
+        crate::persistence::UserHandlerKind::OpenUrl => {
+            let url_template = command
+                .handler_params
+                .get("url_template")
+                .cloned()
+                .unwrap_or_default();
+            if let Err(msg) = crate::commands::validate_open_url(&url_template, &exp_ctx) {
+                return Response::CommandApplied { message: msg };
+            }
+        }
+        crate::persistence::UserHandlerKind::LaunchProgram => {
+            if let Err(msg) =
+                crate::commands::validate_launch_program(&command.handler_params, &exp_ctx)
+            {
+                return Response::CommandApplied { message: msg };
+            }
+        }
+        crate::persistence::UserHandlerKind::Unknown => {
+            return Response::CommandApplied {
+                message: "命令 handler 未知或缺失".into(),
+            };
+        }
+    }
+    // §4.5 命名空间冲突检查：逐条查命令关键字
+    let engine_snapshot = engines
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let alias_snapshot = aliases.list();
+    let command_keywords = commands.all_command_keywords();
+    for kw in &command.keywords {
+        if let Err(conflict) = crate::commands::validate_trigger_namespace(
+            kw,
+            crate::commands::TriggerOwner::Command,
+            &engine_snapshot,
+            &alias_snapshot,
+            &command_keywords,
+            Some(&command.id),
+        ) {
+            return Response::CommandApplied {
+                message: format!(
+                    "关键字「{}」与{}「{}」冲突",
+                    kw, conflict.kind, conflict.owner_label
+                ),
+            };
+        }
+    }
+    // 校验通过——持久化（spawn_blocking：落盘 I/O）
+    let commands_for_blocking = commands.clone();
+    let def = command.clone();
+    let result = tokio::task::spawn_blocking(move || commands_for_blocking.set(def))
+        .await
+        .unwrap_or_else(|error| Err(format!("set command task: {error}")));
+    Response::CommandApplied {
+        message: result.err().unwrap_or_default(),
+    }
+}
+
 async fn execute_command(
     context: crate::commands::CommandInvocationContext,
     commands: &Arc<crate::commands::CommandStore>,
