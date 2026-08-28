@@ -96,8 +96,13 @@ public sealed class CommandTargetSafetyTests
     // 用 SearchViewModelTests 同款 FakeSearchClient + 计数手法。
     // ------------------------------------------------------------------
 
+    // K2 commit 0：K1 让命令可执行后，K0 旧断言「命令行 Enter 被拒绝、状态显示
+    // "命令不可用"」的前提已不成立。改名后保留 K0 最高价值断言：命令 id 绝不能
+    // 进通用文件执行路径（ExecuteCallCount==0）。状态文案改为 fake pipe 降级
+    // 分支的真实输出 "命令执行不可用"——SearchViewModel.ExecuteCommandAsync 首行
+    // `if (_pipe is not PipeClient realPipe)` 在测试注入 fake client 时命中此处。
     [Fact]
-    public async Task Command_Row_Enter_Does_Not_Execute()
+    public async Task Command_Row_Enter_Does_Not_Use_File_Execute_Path()
     {
         var client = new CommandSafetyFakeClient();
         client.Enqueue(new SearchResponse("a", [
@@ -116,8 +121,10 @@ public sealed class CommandTargetSafetyTests
         Assert.Equal("command", state.Results[0].Kind);
         await vm.ExecuteSelectedAsync();
 
+        // K0 最高价值单行断言：命令 id 绝不进通用文件执行路径。
         Assert.Equal(0, client.ExecuteCallCount);
-        Assert.Equal("命令不可用", state.StatusMessage);
+        // fake pipe 降级分支文案。
+        Assert.Equal("命令执行不可用", state.StatusMessage);
     }
 
     [Fact]

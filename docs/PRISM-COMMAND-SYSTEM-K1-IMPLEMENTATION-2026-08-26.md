@@ -444,6 +444,10 @@ if (item.Kind is not ("file" or "folder")) return;
 过滤模式: "ext:txt 设置" → 无命令结果
 ```
 
+> **K2 修订（commit `5d4576e`）**：T5 第二条已被推翻。命令 lane 注入条件现为
+> `has_command_context && !has_filters`（`src/prism-core/src/ipc.rs:2371`），
+> root 不再是排除条件——有 root 时仍显示命令。过滤态仍排除命令。
+
 ### 单元测试补充
 
 **命令搜索逻辑** (`commands.rs`):
@@ -535,32 +539,32 @@ public void Command_Catalog_Updates_On_Connection() {
 ### 代码交付
 
 **Rust (prism-core)**
-- [ ] `commands.rs` - 扩展 handler 注册表
-- [ ] `ipc.rs` - 新增 `command_search` 函数
-- [ ] `ipc.rs` - 集成命令结果到 `search_service`  
-- [ ] `ipc.rs` - 新增 `ExecuteCommand` 请求处理
-- [ ] `shell.rs` - 实现 `open_terminal_at` 函数
+- [x] `commands.rs` - 扩展 handler 注册表
+- [x] `ipc.rs` - 新增 `command_search` 函数
+- [x] `ipc.rs` - 集成命令结果到 `search_service`  
+- [x] `ipc.rs` - 新增 `ExecuteCommand` 请求处理
+- [x] `shell.rs` - 实现 `open_terminal_at` 函数
 
 **C# (Prism)**
-- [ ] `SearchViewModel.cs` - 修改命令执行分支
-- [ ] `PipeClient.cs` - 新增 `ExecuteCommandAsync`
-- [ ] `App.xaml.cs` - 接线 `CommandCatalog`
-- [ ] `ResultList.cs` - 命令图标支持
-- [ ] `CommandInvocationContext.cs` - 新建上下文类型
+- [x] `SearchViewModel.cs` - 修改命令执行分支
+- [x] `PipeClient.cs` - 新增 `ExecuteCommandAsync`
+- [x] `App.xaml.cs` - 接线 `CommandCatalog`
+- [x] `ResultList.cs` - 命令图标支持
+- [x] `CommandInvocationContext.cs` - 新建上下文类型
 
 ### 测试交付
 
-- [ ] Rust 单元测试：命令搜索逻辑 (3个)
-- [ ] Rust 集成测试：执行路径 (2个)  
-- [ ] C# 单元测试：前端集成 (2个)
+- [x] Rust 单元测试：命令搜索逻辑 (3个)
+- [x] Rust 集成测试：执行路径 (2个)  
+- [x] C# 单元测试：前端集成 (2个)
 - [ ] 手工测试：核心场景 T1-T3
 - [ ] 手工测试：边界条件 T4-T5
 
 ### 文档交付
 
-- [ ] 本施工方案 (当前文档)
-- [ ] 代码注释：关键函数的设计理由
-- [ ] 测试说明：验证步骤与预期结果
+- [x] 本施工方案 (当前文档)
+- [x] 代码注释：关键函数的设计理由
+- [x] 测试说明：验证步骤与预期结果
 
 ---
 
