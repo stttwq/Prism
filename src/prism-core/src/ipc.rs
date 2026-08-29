@@ -2363,6 +2363,8 @@ async fn handle_command_set(
         query: String::new(),
         current_folder: String::new(),
         selection: None,
+        clipboard: None,
+        now: crate::filters::local_now(),
     };
     // §4.2 danger 校验
     if let Err(msg) = crate::commands::validate_user_danger(&command.danger) {

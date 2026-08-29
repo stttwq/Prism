@@ -278,6 +278,10 @@ pub struct UserCommandDefinition {
     /// 必选键由 handler 决定：open_url → `url_template`；launch_program → `path`。
     #[serde(default)]
     pub handler_params: std::collections::BTreeMap<String, String>,
+    /// K4a：无结果回退。根搜索空结果时该命令作为回退行出现（query 作为
+    /// arguments.text 传入）。default+skip 保持旧 commands-v1.json 逐字节不变。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback: bool,
 }
 
 /// K3 §4.1：用户命令可用的 handler 全集。**刻意不含内置 handler**，且不提供任何到
@@ -394,6 +398,11 @@ fn default_true() -> bool {
 /// skip_serializing_if helper：show_in_root_search 默认 true，省略时不序列化。
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+/// K4a：fallback 为默认值 false 时省略（与 is_true 对称）。
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl VersionedData for CommandData {
@@ -815,6 +824,33 @@ mod tests {
         assert!(data.commands[0].handler_params.is_empty());
         assert_eq!(data.shortcut_bindings.len(), 1);
         assert_eq!(data.shortcut_bindings[0].command_id, "user.legacy");
+    }
+
+    // ── K4a：fallback 字段 ─────────────────────────────────────────────
+
+    #[test]
+    fn fallback_missing_field_defaults_false_and_roundtrips() {
+        // 旧 commands-v1.json 无 fallback 字段 → false（存量文件兼容）。
+        let json = r#"{"schema_version":1,"data":{
+            "commands":[{"id":"user.legacy","title":"legacy"}]
+        }}"#;
+        let envelope: VersionedEnvelope<CommandData> = serde_json::from_str(json).unwrap();
+        let data = envelope.into_compatible().unwrap();
+        assert!(!data.commands[0].fallback);
+
+        // true 序列化/反序列化往返；false 省略（旧文件逐字节不变）。
+        let def = UserCommandDefinition {
+            id: "user.fb".into(),
+            title: "FB".into(),
+            fallback: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(json.contains("\"fallback\":true"));
+        let back: UserCommandDefinition = serde_json::from_str(&json).unwrap();
+        assert!(back.fallback);
+        let plain = serde_json::to_string(&UserCommandDefinition::default()).unwrap();
+        assert!(!plain.contains("fallback"));
     }
 
     #[test]

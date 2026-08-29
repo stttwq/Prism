@@ -54,6 +54,9 @@ pub struct CommandDescriptor {
     /// skip_serializing_if 保证旧前端 JSON 逐字节不变（enabled=true 时缺省）。
     #[serde(skip_serializing_if = "str::is_empty")]
     pub disabled_reason: String,
+    /// K4a：无结果回退——根搜索空结果时该命令作为回退行出现。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,6 +170,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             danger: "normal",
             enabled: true,
             disabled_reason: String::new(),
+            fallback: false,
         },
         CommandDescriptor {
             id: "prism.terminal.open".into(),
@@ -202,6 +206,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             danger: "normal",
             enabled: true,
             disabled_reason: String::new(),
+            fallback: false,
         },
         CommandDescriptor {
             // K2 §4.7：暂存区批量复制路径至剪贴板。无损操作、不探测存在性，
@@ -235,6 +240,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             danger: "normal",
             enabled: true,
             disabled_reason: String::new(),
+            fallback: false,
         },
         CommandDescriptor {
             // K2 §4.5：暂存区多目标 ZIP。enabled/disabled_reason 在 catalog()
@@ -268,6 +274,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             danger: "normal",
             enabled: true,
             disabled_reason: String::new(),
+            fallback: false,
         },
     ]
 }
@@ -857,6 +864,7 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
         },
         enabled: command.enabled,
         disabled_reason: String::new(),
+        fallback: command.fallback,
     }
 }
 
@@ -879,6 +887,10 @@ pub struct CommandInvocationContext {
     pub current_folder: Option<String>,
     #[serde(default)]
     pub host_kind: Option<String>,
+    /// K4a：剪贴板文本。UI 进程在调用点读取后传入；仅作 {clipboard} 取值源，
+    /// 不参与路径/权限判定，绝不写入日志。None = 读取失败/旧前端未传。
+    #[serde(default)]
+    pub clipboard: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1031,6 +1043,12 @@ pub struct ExpansionContext {
     /// G7c 修复：模板预设用 {selection.target}，但引擎此前不支持该占位符——
     /// 展开失败把字面 `{selection.target}` 当参数传给程序（记事本报"文件不存在"）。
     pub selection: Option<String>,
+    /// {clipboard} = 剪贴板文本（K4a）。UI 进程在调用点读取后经
+    /// CommandInvocationContext.clipboard 传入；None = 读取失败/旧前端未传 → 空串。
+    pub clipboard: Option<String>,
+    /// {date} 取值基准（K4a）。filters::local_now()（GetLocalTime，本地时区）；
+    /// 显式入 ctx 而非展开时现取，保证同一模板内多次 {date} 一致且测试可固定。
+    pub now: crate::filters::LocalNow,
 }
 
 /// 模板展开错误。类型化返回，执行时不吞错误。
@@ -1054,7 +1072,17 @@ impl std::fmt::Display for ExpandError {
 }
 
 /// 已知的占位符名称。
-const PLACEHOLDERS: &[&str] = &["query", "current_folder", "selection.target"];
+const PLACEHOLDERS: &[&str] = &[
+    "query",
+    "current_folder",
+    "selection.target",
+    "clipboard",
+    "date",
+    "uuid",
+];
+
+/// {date} 的默认格式（K4a）：ISO 风格 yyyy-MM-dd。
+const DATE_DEFAULT_FORMAT: &str = "yyyy-MM-dd";
 
 /// §4.6：单一模板展开入口。执行（ExecuteCommand）与预览（CommandPreview）
 /// **调用同一函数**——预览返回的就是执行时将用的最终字符串（构造保证一致）。
@@ -1125,6 +1153,12 @@ fn expand_placeholder(
         "current_folder" => ctx.current_folder.clone(),
         // 无选中（关键字路由/根搜索直达）→ 空串；launch 参数侧把空展开丢掉。
         "selection.target" => ctx.selection.clone().unwrap_or_default(),
+        // 剪贴板读取失败/未传 → 空串（与 selection 同语义，launch 侧丢空参）。
+        "clipboard" => ctx.clipboard.clone().unwrap_or_default(),
+        // 默认 yyyy-MM-dd；fmt: 修饰符在下方循环里重排。
+        "date" => format_date(DATE_DEFAULT_FORMAT, &ctx.now),
+        // 每次出现独立生成（同一模板两处 {uuid} = 两个值，与 Raycast 一致）。
+        "uuid" => uuid_v4(),
         _ => unreachable!("checked above"),
     };
     // 默认：query 做 percent-encode，current_folder 不编码。
@@ -1139,6 +1173,19 @@ fn expand_placeholder(
             "trim" => value = value.trim().to_string(),
             "uppercase" => value = value.to_uppercase(),
             "lowercase" => value = value.to_lowercase(),
+            // K4a：参数化修饰符。目前仅 date 支持（{date|fmt:yyyyMMdd}）。
+            other if other.starts_with("fmt:") => {
+                if name != "date" {
+                    return Err(ExpandError::BadModifier(format!(
+                        "fmt 修饰符仅支持 date 占位符：{other}"
+                    )));
+                }
+                let pattern = &other["fmt:".len()..];
+                if pattern.is_empty() {
+                    return Err(ExpandError::BadModifier("空 fmt 模式".into()));
+                }
+                value = format_date(pattern, &ctx.now);
+            }
             "" => return Err(ExpandError::BadModifier("空修饰符".into())),
             other => return Err(ExpandError::BadModifier(format!("未知修饰符：{other}"))),
         }
@@ -1148,6 +1195,120 @@ fn expand_placeholder(
     } else {
         Ok(crate::websearch::url_encode(&value))
     }
+}
+
+/// K4a：{date} 格式化。token 集（最长匹配优先）：yyyy yy MM M dd d HH H mm m ss s，
+/// 其余字符字面输出（含中文）。now 来自 filters::local_now()（本地时区）。
+fn format_date(pattern: &str, now: &crate::filters::LocalNow) -> String {
+    let hour = now.secs_of_day / 3600;
+    let minute = (now.secs_of_day % 3600) / 60;
+    let second = now.secs_of_day % 60;
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut rest = pattern;
+    while !rest.is_empty() {
+        let (tok, text) = if let Some(s) = rest.strip_prefix("yyyy") {
+            (s, format!("{:04}", now.year))
+        } else if let Some(s) = rest.strip_prefix("yy") {
+            (s, format!("{:02}", now.year % 100))
+        } else if let Some(s) = rest.strip_prefix("MM") {
+            (s, format!("{:02}", now.month))
+        } else if let Some(s) = rest.strip_prefix('M') {
+            (s, now.month.to_string())
+        } else if let Some(s) = rest.strip_prefix("dd") {
+            (s, format!("{:02}", now.day))
+        } else if let Some(s) = rest.strip_prefix('d') {
+            (s, now.day.to_string())
+        } else if let Some(s) = rest.strip_prefix("HH") {
+            (s, format!("{hour:02}"))
+        } else if let Some(s) = rest.strip_prefix('H') {
+            (s, hour.to_string())
+        } else if let Some(s) = rest.strip_prefix("mm") {
+            (s, format!("{minute:02}"))
+        } else if let Some(s) = rest.strip_prefix('m') {
+            (s, minute.to_string())
+        } else if let Some(s) = rest.strip_prefix("ss") {
+            (s, format!("{second:02}"))
+        } else if let Some(s) = rest.strip_prefix('s') {
+            (s, second.to_string())
+        } else {
+            // 非 token 字符（含多字节 UTF-8）按字面输出。
+            let ch = rest.chars().next().expect("non-empty checked");
+            (&rest[ch.len_utf8()..], ch.to_string())
+        };
+        out.push_str(&text);
+        rest = tok;
+    }
+    out
+}
+
+/// K4a：UUID v4。BCryptGenRandom 取 16 字节熵；失败（实际不会发生）退化为
+/// 墙钟纳秒 + 进程内计数器——唯一性仍够模板用途（文件名/请求 id），不用于密钥。
+/// ponytail: 计数器回退路径够用；要密码学保证时再换成 RtlGenRandom 重试。
+fn uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    #[cfg(windows)]
+    {
+        use windows::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        // SAFETY：系统首选 RNG，无句柄需求；失败走下方回退。
+        if unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.is_err() {
+            fill_fallback_random(&mut bytes);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fill_fallback_random(&mut bytes);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10x
+    let h: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        h[6],
+        h[7],
+        h[8],
+        h[9],
+        h[10],
+        h[11],
+        h[12],
+        h[13],
+        h[14],
+        h[15]
+    )
+}
+
+/// BCryptGenRandom 失败/非 Windows 的回退熵：墙钟纳秒 + 原子计数器。
+fn fill_fallback_random(bytes: &mut [u8; 16]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mix = nanos ^ counter.rotate_left(32).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    bytes[..8].copy_from_slice(&nanos.to_le_bytes());
+    bytes[8..].copy_from_slice(&mix.to_le_bytes());
+}
+
+/// K4a：按字节上限截断（UTF-8 字符边界安全）。剪贴板超 8 KiB 时静默截断——
+/// validate() 不报错，避免「剪贴板大了命令就失败」的意外。
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ── K3 §4.2 语义层：open_url 校验（执行时第二次校验） ──────────────
@@ -1180,6 +1341,12 @@ pub fn expansion_context_from(context: &CommandInvocationContext) -> ExpansionCo
             .selection
             .as_ref()
             .and_then(|s| s.target.as_ref().map(|t| t.value.clone())),
+        // K4a：剪贴板超限静默截断（8 KiB），不作为失败路径。
+        clipboard: context
+            .clipboard
+            .as_deref()
+            .map(|c| truncate_bytes(c, TEXT_MAX_BYTES).to_string()),
+        now: crate::filters::local_now(),
     }
 }
 
@@ -2090,11 +2257,25 @@ mod tests {
 
     // ── K3 §4.6 commit 2：expand_template + open_url 校验 ─────────────
 
+    /// 固定 {date} 基准：2026-08-29 14:05:09（周六），让日期测试可断言。
+    fn fixed_now() -> crate::filters::LocalNow {
+        crate::filters::LocalNow {
+            year: 2026,
+            month: 8,
+            day: 29,
+            days: crate::filters::days_from_civil(2026, 8, 29),
+            secs_of_day: 14 * 3600 + 5 * 60 + 9,
+            tz_offset: 8 * 3600,
+        }
+    }
+
     fn exp_ctx(query: &str) -> ExpansionContext {
         ExpansionContext {
             query: query.into(),
             current_folder: r"C:\Users\test".into(),
             selection: None,
+            clipboard: None,
+            now: fixed_now(),
         }
     }
 
@@ -2104,6 +2285,8 @@ mod tests {
             query: String::new(),
             current_folder: String::new(),
             selection: Some(r"D:\a b.txt".into()),
+            clipboard: None,
+            now: fixed_now(),
         };
         assert_eq!(
             expand_template_raw("{selection.target}", &with).unwrap(),
@@ -2134,6 +2317,8 @@ mod tests {
             query: String::new(),
             current_folder: String::new(),
             selection: Some(r"D:\a b.txt".into()),
+            clipboard: None,
+            now: fixed_now(),
         };
         let (_, args, _) = validate_launch_program(&params, &ctx).unwrap();
         assert_eq!(args, vec![r"D:\a b.txt", "{unknown}", "tail"]);
@@ -2197,6 +2382,107 @@ mod tests {
     fn expand_unknown_modifier_errors() {
         let err = expand_template("{query|bogus}", &exp_ctx("x")).unwrap_err();
         assert!(matches!(err, ExpandError::BadModifier(_)));
+    }
+
+    // ── K4a：{clipboard} / {date} / {uuid} ─────────────────────────────
+
+    #[test]
+    fn expand_clipboard_from_context_and_missing_is_empty() {
+        let mut ctx = exp_ctx("");
+        ctx.clipboard = Some("hello world".into());
+        // 默认 raw（不编码），与 current_folder 同规则。
+        assert_eq!(expand_template("{clipboard}", &ctx).unwrap(), "hello world");
+        // 显式 percent-encode 可用于 URL 参数。
+        assert_eq!(
+            expand_template("https://x.test/?q={clipboard|percent-encode}", &ctx).unwrap(),
+            "https://x.test/?q=hello%20world"
+        );
+        // None（读取失败/旧前端）→ 空串，launch 侧丢空参。
+        assert_eq!(
+            expand_template_raw("[{clipboard}]", &exp_ctx("")).unwrap(),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn expansion_context_from_truncates_clipboard() {
+        let invocation = CommandInvocationContext {
+            clipboard: Some("中".repeat(8 * 1024 + 16)), // 超 8 KiB 字节
+            ..Default::default()
+        };
+        let ctx = expansion_context_from(&invocation);
+        let clipped = ctx.clipboard.expect("clipboard should be present");
+        assert!(clipped.len() <= TEXT_MAX_BYTES);
+        assert!(clipped.is_char_boundary(clipped.len()));
+        // 未超限不截断
+        let invocation = CommandInvocationContext {
+            clipboard: Some("ok".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            expansion_context_from(&invocation).clipboard.as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn expand_date_default_format() {
+        assert_eq!(
+            expand_template("{date}", &exp_ctx("")).unwrap(),
+            "2026-08-29"
+        );
+    }
+
+    #[test]
+    fn expand_date_fmt_tokens() {
+        // 全 token 集 + 字面字符（含中文与分隔符）。
+        assert_eq!(
+            expand_template("{date|fmt:yyyyMMdd}", &exp_ctx("")).unwrap(),
+            "20260829"
+        );
+        assert_eq!(
+            expand_template("{date|fmt:HH:mm:ss}", &exp_ctx("")).unwrap(),
+            "14:05:09"
+        );
+        assert_eq!(
+            expand_template("{date|fmt:yyyy年M月d日}", &exp_ctx("")).unwrap(),
+            "2026年8月29日"
+        );
+        assert_eq!(
+            expand_template("{date|fmt:yy/M/d H:m:s}", &exp_ctx("")).unwrap(),
+            "26/8/29 14:5:9"
+        );
+    }
+
+    #[test]
+    fn expand_date_fmt_errors() {
+        // 空模式
+        let err = expand_template("{date|fmt:}", &exp_ctx("")).unwrap_err();
+        assert!(matches!(err, ExpandError::BadModifier(_)));
+        // fmt 用在非 date 占位符上
+        let err = expand_template("{query|fmt:yyyyMMdd}", &exp_ctx("x")).unwrap_err();
+        assert!(matches!(err, ExpandError::BadModifier(_)));
+    }
+
+    #[test]
+    fn expand_uuid_v4_shape_and_uniqueness() {
+        let a = expand_template("{uuid}", &exp_ctx("")).unwrap();
+        let b = expand_template("{uuid}", &exp_ctx("")).unwrap();
+        assert_ne!(a, b, "两次生成应不同");
+        assert_eq!(a.len(), 36);
+        let dash_at = |i: usize| a.as_bytes()[i] == b'-';
+        assert!(dash_at(8) && dash_at(13) && dash_at(18) && dash_at(23));
+        for (i, ch) in a.chars().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                continue;
+            }
+            assert!(ch.is_ascii_hexdigit(), "非法字符 {ch} at {i}");
+        }
+        assert_eq!(&a[14..15], "4", "version nibble 应为 4");
+        assert!(
+            matches!(&a[19..20], "8" | "9" | "a" | "b"),
+            "variant 应为 10x"
+        );
     }
 
     #[test]
@@ -2305,6 +2591,8 @@ mod tests {
             query: "hello world & |".into(),
             current_folder: String::new(),
             selection: None,
+            clipboard: None,
+            now: fixed_now(),
         };
         // notepad.exe 存在（标准 Windows 路径），且 .exe 合法
         let result = validate_launch_program(&params, &ctx);
