@@ -69,8 +69,12 @@ fn command_panel_segment(target: &ActionTarget, commands: &CommandStore) -> Vec<
             if desc.danger == "destructive" {
                 return None;
             }
-            // broker-owned 需有 handler；ui-owned 信任目录
-            if desc.owner == "broker" && broker_handler(&desc.id).is_none() {
+            // broker-owned **内置**命令需有注册 handler；用户命令（trust=user）
+            // 经 UserHandlerKind 分派（execute_command 走 get_user_command），
+            // 不需要 BrokerHandlerId——此前按 owner==broker 一刀切，用户命令
+            // 永远进不了面板。
+            if desc.owner == "broker" && desc.trust != "user" && broker_handler(&desc.id).is_none()
+            {
                 return None;
             }
             let score = commands.usage_score(&desc.id);
@@ -145,7 +149,9 @@ pub fn validate_action_panel(
     if desc.danger == "destructive" {
         return Err("危险命令不能从动作面板执行".into());
     }
-    if desc.owner == "broker" && broker_handler(&desc.id).is_none() {
+    // 同 command_panel_segment：只对内置命令要求注册 handler，用户命令走
+    // UserHandlerKind 分派。
+    if desc.owner == "broker" && desc.trust != "user" && broker_handler(&desc.id).is_none() {
         return Err("命令无 handler".into());
     }
     Ok(())
@@ -183,6 +189,39 @@ mod tests {
         assert!(!items
             .iter()
             .any(|i| i.is_section_header && i.label == "命令"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 用户命令（trust=user）+ action_panel 绑定 → 文件目标的命令段出现该命令。
+    // 回归：此前 owner==broker 一刀切要求注册 handler，用户命令永远进不了面板。
+    #[test]
+    fn user_command_with_panel_binding_shows_on_file_target() {
+        use crate::persistence::{CommandBinding, CommandBindings, UserCommandDefinition};
+        let (store, dir) = store("user_panel");
+        let def = UserCommandDefinition {
+            id: "user.panel".into(),
+            title: "用记事本打开".into(),
+            keywords: vec!["np".into()],
+            bindings: CommandBindings {
+                action_panel: Some(CommandBinding::default()),
+                ..Default::default()
+            },
+            handler: crate::persistence::UserHandlerKind::LaunchProgram,
+            // Default 派生的 enabled 是 false（serde 侧才有 default_true），
+            // 直接构造必须显式 true。
+            enabled: true,
+            ..Default::default()
+        };
+        store.set(def).unwrap();
+
+        let target = dir_target(TargetKind::File, r"C:\Windows\notepad.exe");
+        let items = compose(&target, actions::list_actions(&target), &store, true).unwrap();
+        assert!(items
+            .iter()
+            .any(|i| i.command_id.as_deref() == Some("user.panel")));
+
+        // ExecuteCommand 二次校验同样放行用户命令。
+        assert!(validate_action_panel(&target, "user.panel", &store).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
