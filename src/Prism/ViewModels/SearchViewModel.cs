@@ -1623,7 +1623,8 @@ public sealed class SearchViewModel
             && !HasFilterToken(query)
             && !IsCustomFilterTrigger(query))
         {
-            list.Add(SearchResult.Fallback(query));
+            list.Add(SearchResult.Fallback(query,
+                _webEngines.FirstOrDefault()?.UrlTemplate));
         }
         // 全仓检验 2026-08-25 第二轮（F2）：State.Results 与 ResultList 显示集合必须
         // 同源去重——此前只在显示层去重，一旦 broker（或旧版本 broker）产出同键

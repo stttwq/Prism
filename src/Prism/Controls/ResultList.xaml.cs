@@ -486,6 +486,29 @@ public partial class ResultList : UserControl
                 continue;
             }
 
+            // K3 §4.9 兜底行：ExecuteId 是查询词不是路径，走文件图标分支只会拿到
+            // 空白文档图标——用默认引擎图标（IconUrl 是引擎 URL 模板，同 web 行）。
+            if (item.Kind == "fallback")
+            {
+                if (_webIcons is not null)
+                {
+                    var url = item.IconUrl ?? "";
+                    var fbKey = "fallback:" + _webIcons.IconKey(url);
+                    var next = _webIcons.GetIcon(url);
+                    if (!Equals(icon.Tag as string, fbKey) || !ReferenceEquals(icon.Source, next))
+                    {
+                        icon.Tag = fbKey;
+                        icon.Source = next;
+                    }
+                }
+                else
+                {
+                    icon.Tag = null;
+                    icon.Source = null;
+                }
+                continue;
+            }
+
             // "window" carries an enumeration token, not a path — asking the shell for an
             // icon from it would just fail per row.
             if (item.Kind == "web")

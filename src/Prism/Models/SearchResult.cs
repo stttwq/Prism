@@ -55,6 +55,12 @@ public sealed record SearchResult(
     public ActionTarget? Target { get; init; }
 
     /// <summary>
+    /// 图标来源 URL（可选）。仅 fallback 行使用：ResultList 据此取默认引擎图标
+    /// （内置引擎名推断 / favicon / 通用 W），ExecuteId 是查询词不是 URL。
+    /// </summary>
+    public string? IconUrl { get; init; }
+
+    /// <summary>
     /// 行身份键（可选）。ResultList 用它决定"同一行更新"还是"删旧插新"。
     /// 网页模式的行内容每次按键都变（URL 与标题都含查询词），若按内容比对身份，
     /// 行会被反复删除重建，容器重建瞬间图标为空——表现为每敲一个字母图标闪一下。
@@ -92,8 +98,8 @@ public sealed record SearchResult(
         ExecuteId: "",
         MatchSpans: []);
 
-    /// <summary>K3 §4.9：无结果兜底行（本地生成）。</summary>
-    public static SearchResult Fallback(string query) => new(
+    /// <summary>K3 §4.9：无结果兜底行（本地生成）。engineUrl 供图标装饰取默认引擎图标。</summary>
+    public static SearchResult Fallback(string query, string? engineUrl = null) => new(
         Kind: "fallback",
         Title: $"用默认引擎搜索「{query}」",
         Subtitle: "Enter 用浏览器搜索此词",
@@ -101,6 +107,7 @@ public sealed record SearchResult(
         MatchSpans: [])
     {
         RowKey = "fallback:" + query,
+        IconUrl = engineUrl,
     };
 
     /// <summary>
