@@ -306,6 +306,11 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public ObservableCollection<WebEngineEditItem> Engines { get; }
 
+    /// <summary>触发词类型全集（与 FilterTriggerDetector.TryRewrite 分支同口径），
+    /// 供类型列 ComboBox 与保存校验共用。</summary>
+    public static readonly string[] FilterTypeOptions =
+        { "ext", "path", "size", "dm", "dc", "file", "folder" };
+
     public ObservableCollection<FilterTriggerEditItem> FilterTriggers { get; }
 
     /// <summary>动作快捷键行集合：默认空，用户逐个添加（第一轮 bug 修复）。</summary>
@@ -857,9 +862,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 SelectedFilterTrigger = row;
                 return;
             }
-            if (trig.FilterType is not ("ext" or "path"))
+            if (!FilterTypeOptions.Contains(trig.FilterType, StringComparer.Ordinal))
             {
-                StatusMessage = $"触发词「{trig.Keyword}」的类型必须是 ext 或 path";
+                StatusMessage = $"触发词「{trig.Keyword}」的类型必须是 {string.Join(" / ", FilterTypeOptions)}";
                 SelectedTab = TabIndex.Filters;
                 SelectedFilterTrigger = row;
                 return;

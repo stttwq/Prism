@@ -21,7 +21,7 @@ public sealed record WebEngine(string Keyword, string Name, string UrlTemplate);
 /// 纯前端重写，broker 的 parse_query 自动拆分。
 /// </summary>
 /// <param name="Keyword">触发关键词（如 "tz"）。</param>
-/// <param name="FilterType">过滤类型："ext" 或 "path"。</param>
+/// <param name="FilterType">过滤类型：ext / path / size / dm / dc / file / folder。</param>
 /// <param name="Description">显示名（如 "扩展名过滤"）。</param>
 public sealed record FilterTrigger(string Keyword, string FilterType, string Description);
 
