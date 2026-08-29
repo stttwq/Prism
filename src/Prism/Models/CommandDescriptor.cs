@@ -21,7 +21,8 @@ public sealed record CommandDescriptor(
     string Danger,
     bool Enabled,
     bool IsUsable,
-    bool Fallback = false)
+    bool Fallback = false,
+    IReadOnlyList<CommandArgumentSpecDto>? Arguments = null)
 {
     /// <summary>
     /// 从 JSON 解析命令描述。未知字段不抛；无法识别的 owner/danger/input.kind
@@ -62,9 +63,25 @@ public sealed record CommandDescriptor(
         // K4a：无结果回退标记（缺省 false，旧 broker 无此字段）。
         var fallback = el.TryGetProperty("fallback", out var fbEl) && fbEl.ValueKind == JsonValueKind.True;
 
+        // K4b：声明式参数（缺省空表，旧 broker 无此字段）。
+        var arguments = new List<CommandArgumentSpecDto>();
+        if (el.TryGetProperty("arguments", out var argsEl) && argsEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var a in argsEl.EnumerateArray())
+            {
+                if (a.ValueKind != JsonValueKind.Object) continue;
+                arguments.Add(new CommandArgumentSpecDto
+                {
+                    Name = a.TryGetProperty("name", out var nEl) ? nEl.GetString() ?? "" : "",
+                    Required = a.TryGetProperty("required", out var rEl) && rEl.ValueKind == JsonValueKind.True,
+                    Default = a.TryGetProperty("default", out var defEl) ? defEl.GetString() ?? "" : "",
+                });
+            }
+        }
+
         return new CommandDescriptor(
             id, title, subtitle, iconGlyph, owner, trust,
-            keywords, input, bindings, danger, enabled, isUsable, fallback);
+            keywords, input, bindings, danger, enabled, isUsable, fallback, arguments);
     }
 
     private static bool IsKnownOwner(string owner) =>

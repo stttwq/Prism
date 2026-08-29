@@ -30,6 +30,25 @@ public partial class SettingsWindow : Window
 
     private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
 
+    /// <summary>
+    /// K4b：参数表格增删行。纯视图层集合操作（SelectedCommand 来自 DataContext），
+    /// 结构校验（数量/重名/必填顺序）在 broker 保存时做——UI 侧不重复规则。
+    /// </summary>
+    private void AddArgumentRow_Click(object sender, RoutedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel { SelectedCommand: { } cmd })
+            cmd.Arguments.Add(new CommandArgumentEditItem());
+    }
+
+    private void RemoveArgumentRow_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: CommandArgumentEditItem row }
+            && DataContext is SettingsViewModel { SelectedCommand: { } cmd })
+        {
+            cmd.Arguments.Remove(row);
+        }
+    }
+
     /// <summary>按系统主题把 DWM 非客户区（标题栏/边框/系统按钮）切深浅色。</summary>
     private void ApplyTitleBarTheme()
     {

@@ -1213,6 +1213,49 @@
                             <TextBox Text="{Binding SelectedCommand.KeywordsText, UpdateSourceTrigger=PropertyChanged}"
                                      Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
 
+                            <!-- K4b：声明式参数。空白位置切分，按行序传入 {arg.name}；
+                                 结构校验（数量/重名/必填顺序）在 broker 保存时做。 -->
+                            <TextBlock Text="参数（可选；执行时按空白切分、按行序传入 {arg.name}）" FontSize="13"
+                                       Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
+                            <Grid Margin="0,0,0,2">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="46"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="52"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="名称" FontSize="12" Foreground="{DynamicResource TextSubtitle}"/>
+                                <TextBlock Grid.Column="1" Text="必填" FontSize="12" Foreground="{DynamicResource TextSubtitle}"/>
+                                <TextBlock Grid.Column="2" Text="默认值" FontSize="12" Foreground="{DynamicResource TextSubtitle}"/>
+                            </Grid>
+                            <ItemsControl ItemsSource="{Binding SelectedCommand.Arguments}" Margin="0,0,0,4">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,0,0,4">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="46"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="52"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBox Grid.Column="0" Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}"
+                                                     Style="{StaticResource SettingsTextBoxStyle}"/>
+                                            <CheckBox Grid.Column="1" IsChecked="{Binding Required}"
+                                                      Style="{StaticResource SettingsCheckBoxStyle}"
+                                                      VerticalAlignment="Center" Margin="14,0,0,0"/>
+                                            <TextBox Grid.Column="2" Text="{Binding Default, UpdateSourceTrigger=PropertyChanged}"
+                                                     Style="{StaticResource SettingsTextBoxStyle}" Margin="8,0,0,0"/>
+                                            <Button Grid.Column="3" Content="删除"
+                                                    Style="{StaticResource SettingsActionButton}"
+                                                    Margin="8,0,0,0" Click="RemoveArgumentRow_Click"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <Button Content="+ 添加参数" HorizontalAlignment="Left"
+                                    Style="{StaticResource SettingsActionButton}"
+                                    Margin="0,0,0,8" Click="AddArgumentRow_Click"/>
+
                             <TextBlock Text="处理器类型" FontSize="13"
                                        Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <ComboBox SelectedValue="{Binding SelectedCommand.Handler}"
@@ -1234,7 +1277,7 @@
                             <!-- K4a：占位符速查（open_url / launch_program 共用） -->
                             <TextBlock FontSize="12" Foreground="{DynamicResource TextSubtitle}"
                                        TextWrapping="Wrap" Margin="0,0,0,8"
-                                       Text="占位符：{query} 查询词 · {current_folder} 当前目录 · {selection.target} 选中项 · {clipboard} 剪贴板（敏感内容慎用） · {date} 日期（默认 yyyy-MM-dd，可用 {date|fmt:yyyyMMdd HH:mm:ss}） · {uuid} 随机 UUID。修饰符：|raw |percent-encode |trim |uppercase |lowercase（URL 中 {query} 默认已编码）"/>
+                                       Text="占位符：{query} 查询词整段 · {arg.名} 声明参数（按空白切分、按行序传入） · {current_folder} 当前目录 · {selection.target} 选中项 · {clipboard} 剪贴板（敏感内容慎用） · {date} 日期（默认 yyyy-MM-dd，可用 {date|fmt:yyyyMMdd HH:mm:ss}） · {uuid} 随机 UUID。修饰符：|raw |percent-encode |trim |uppercase |lowercase（URL 中 {query} 默认已编码）。必填参数缺失时命令报错；含空格取值请用 {query}"/>
 
                             <!-- launch_program 字段 -->
                             <StackPanel Visibility="{Binding SelectedCommand.IsLaunchProgram, Converter={StaticResource BoolToVis}}">

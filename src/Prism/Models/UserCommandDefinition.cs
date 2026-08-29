@@ -51,6 +51,23 @@ public sealed class UserCommandDefinition
     /// <summary>K4a：无结果回退——根搜索空结果时该命令作为回退行出现。</summary>
     [JsonPropertyName("fallback")]
     public bool Fallback { get; set; }
+
+    /// <summary>K4b：声明式参数（≤8，必填先于可选）。空 = 无参数。</summary>
+    [JsonPropertyName("arguments")]
+    public List<CommandArgumentSpecDto> Arguments { get; set; } = [];
+}
+
+/// <summary>K4b：单个声明参数（对应 Rust CommandArgumentSpec）。</summary>
+public sealed class CommandArgumentSpecDto
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("required")]
+    public bool Required { get; set; }
+
+    [JsonPropertyName("default")]
+    public string Default { get; set; } = "";
 }
 
 /// <summary>命令输入要求（对应 Rust CommandInputSpec）。</summary>

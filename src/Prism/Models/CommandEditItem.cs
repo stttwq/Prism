@@ -28,6 +28,10 @@ public sealed class CommandEditItem : INotifyPropertyChanged
     private bool _enabled = true;
     private string _danger = "normal";
 
+    /// <summary>K4b：声明式参数行（表格编辑，broker 侧做结构校验）。</summary>
+    public System.Collections.ObjectModel.ObservableCollection<CommandArgumentEditItem> Arguments { get; } =
+        new();
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public CommandEditItem() { }
@@ -46,6 +50,13 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         _trigger = desc.Bindings.Keyword?.Trigger ?? "";
         _showInRootSearch = desc.Bindings.RootSearch?.ShowInRootSearch ?? true;
         _fallback = desc.Fallback;
+        foreach (var arg in desc.Arguments ?? [])
+            Arguments.Add(new CommandArgumentEditItem
+            {
+                Name = arg.Name,
+                Required = arg.Required,
+                Default = arg.Default,
+            });
 
         // handler 从 subtitle/handler 不可直接获取——CommandDescriptor 不含 handler 字段。
         // 用户命令从 Subtitle 反推不够可靠；对 builtin 命令 handler 字段无意义（不可编辑）。
@@ -223,6 +234,15 @@ public sealed class CommandEditItem : INotifyPropertyChanged
             Handler = Handler,
             HandlerParams = handlerParams,
             Fallback = Fallback,
+            Arguments = Arguments
+                .Where(a => !string.IsNullOrWhiteSpace(a.Name))
+                .Select(a => new CommandArgumentSpecDto
+                {
+                    Name = a.Name.Trim(),
+                    Required = a.Required,
+                    Default = a.Default.Trim(),
+                })
+                .ToList(),
         };
     }
 
@@ -241,3 +261,37 @@ public sealed record CommandTemplate(
     string WorkingDir,
     string KeywordsText,
     string IconGlyph);
+
+/// <summary>
+/// K4b：参数表格的可编辑行。INotifyPropertyChanged 供 CheckBox/TextBox 双向绑定；
+/// 结构校验（数量/重名/必填顺序）在 broker 侧做，UI 只过滤空名行。
+/// </summary>
+public sealed class CommandArgumentEditItem : INotifyPropertyChanged
+{
+    private string _name = "";
+    private bool _required;
+    private string _default = "";
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public string Name
+    {
+        get => _name;
+        set { if (_name != value) { _name = value; OnPropertyChanged(); } }
+    }
+
+    public bool Required
+    {
+        get => _required;
+        set { if (_required != value) { _required = value; OnPropertyChanged(); } }
+    }
+
+    public string Default
+    {
+        get => _default;
+        set { if (_default != value) { _default = value; OnPropertyChanged(); } }
+    }
+
+    private void OnPropertyChanged([CallerMemberName] string? name = null) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
