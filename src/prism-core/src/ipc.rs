@@ -2359,12 +2359,28 @@ async fn handle_command_set(
 ) -> Response {
     // 语义校验上下文：保存时无实际 query/selection，用空占位（模板结构校验
     // 不需要真实值；{selection.target} 展开为空 → launch 参数侧丢弃空参）。
+    // K4b：args 以声明 default 填充（required 无默认 → 空串）——保存时模板里的
+    // {arg.已声明} 可展开，未声明的 {arg.x} 照样报 UnknownPlaceholder。
     let exp_ctx = crate::commands::ExpansionContext {
         query: String::new(),
         current_folder: String::new(),
         selection: None,
         clipboard: None,
         now: crate::filters::local_now(),
+        args: command
+            .arguments
+            .iter()
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    if a.default.is_empty() {
+                        String::new()
+                    } else {
+                        a.default.clone()
+                    },
+                )
+            })
+            .collect(),
     };
     // §4.2 danger 校验
     if let Err(msg) = crate::commands::validate_user_danger(&command.danger) {
@@ -2458,7 +2474,24 @@ fn handle_command_preview(
             program_working_dir: None,
         };
     };
-    let exp_ctx = crate::commands::expansion_context_from(&context);
+    // K4b：声明式参数位置切分。必填缺失直接预览失败（与执行同一错误文案）。
+    let args = match crate::commands::resolve_arguments(
+        context.arguments.text.as_deref(),
+        &user_cmd.arguments,
+    ) {
+        Ok(map) => map,
+        Err(message) => {
+            return Response::CommandPreviewResult {
+                ok: false,
+                message,
+                url: None,
+                program_path: None,
+                program_args: Vec::new(),
+                program_working_dir: None,
+            };
+        }
+    };
+    let exp_ctx = crate::commands::expansion_context_from(&context, args);
     match user_cmd.handler {
         crate::persistence::UserHandlerKind::OpenUrl => {
             let url_template = user_cmd
@@ -2705,7 +2738,20 @@ async fn execute_command(
             } else if let Some(user_cmd) = commands.get_user_command(&desc.id) {
                 // K3 §4.1 用户 handler 分派。UserHandlerKind 与 BrokerHandlerId
                 // 是独立枚举，此分支不共享 broker_handler 的 match。
-                let exp_ctx = crate::commands::expansion_context_from(&context);
+                // K4b：声明式参数位置切分，必填缺失 → Error（UI 状态栏展示）。
+                let args = match crate::commands::resolve_arguments(
+                    context.arguments.text.as_deref(),
+                    &user_cmd.arguments,
+                ) {
+                    Ok(map) => map,
+                    Err(message) => {
+                        return Response::Error {
+                            message,
+                            category: Some(ShellErrorKind::TargetInvalid),
+                        };
+                    }
+                };
+                let exp_ctx = crate::commands::expansion_context_from(&context, args);
                 match user_cmd.handler {
                     crate::persistence::UserHandlerKind::OpenUrl => {
                         let url_template = user_cmd
@@ -6940,7 +6986,7 @@ mod pipe_lifecycle_tests {
                 ..
             } => {
                 // 执行路径调同一 validate_open_url，展开结果必须一致
-                let exp_ctx = crate::commands::expansion_context_from(&context);
+                let exp_ctx = crate::commands::expansion_context_from(&context, Default::default());
                 let exec_url =
                     crate::commands::validate_open_url("https://x.test/search?q={query}", &exp_ctx)
                         .unwrap();
@@ -6983,7 +7029,7 @@ mod pipe_lifecycle_tests {
         } = response
         {
             // 执行路径调同一 validate_launch_program，展开结果必须一致
-            let exp_ctx = crate::commands::expansion_context_from(&context);
+            let exp_ctx = crate::commands::expansion_context_from(&context, Default::default());
             let (exec_path, exec_args, _) = crate::commands::validate_launch_program(
                 &commands
                     .get_user_command("user.preview_launch")

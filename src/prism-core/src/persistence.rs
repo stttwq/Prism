@@ -221,6 +221,12 @@ pub const COMMAND_HANDLER_PARAMS_MAX_KEYS: usize = 8;
 pub const COMMAND_HANDLER_PARAM_MAX_CHARS: usize = 1024;
 /// K3 §4.2：handler_params 键名字符上限（`[a-z_]+`，保留扩展空间）。
 pub const COMMAND_HANDLER_PARAM_KEY_MAX_CHARS: usize = 32;
+/// K4b：声明式参数个数上限（与 handler_params 键数同口径）。
+pub const COMMAND_ARGS_MAX: usize = 8;
+/// K4b：参数名字符上限（`[a-z0-9_]+`）。
+pub const COMMAND_ARG_NAME_MAX_CHARS: usize = 32;
+/// K4b：参数默认值字符上限。
+pub const COMMAND_ARG_DEFAULT_MAX_CHARS: usize = 256;
 
 /// 用户命令目录。`UserCommandDefinition` 刻意不含 `owner`：用户命令的 owner 恒为
 /// broker、trust 恒为 user，由代码赋值，不从 JSON 读。
@@ -282,6 +288,21 @@ pub struct UserCommandDefinition {
     /// arguments.text 传入）。default+skip 保持旧 commands-v1.json 逐字节不变。
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
+    /// K4b：声明式参数（≤8，必填先于可选）。空白位置切分 arguments.text 后
+    /// `{arg.name}` 取值。空 = 无参数，`{query}` 仍为整段文本。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<CommandArgumentSpec>,
+}
+
+/// K4b：单个声明参数。required=true 时 default 必须为空；可选缺位填 default。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandArgumentSpec {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default: String,
 }
 
 /// K3 §4.1：用户命令可用的 handler 全集。**刻意不含内置 handler**，且不提供任何到
@@ -473,6 +494,41 @@ impl VersionedData for CommandData {
                     if c.chars().count() > SHORTCUT_COMBO_MAX_CHARS {
                         return Err("shortcut_combo exceeds 64 chars".into());
                     }
+                }
+            }
+            // K4b：声明式参数结构校验。语义层（模板 {arg.x} 引用）在 CommandSet
+            // 展开时校验（保存上下文以声明填 defaults）。
+            if command.arguments.len() > COMMAND_ARGS_MAX {
+                return Err("command declares more than 8 arguments".into());
+            }
+            let mut seen_args: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let mut optional_seen = false;
+            for arg in &command.arguments {
+                if arg.name.is_empty() || arg.name.chars().count() > COMMAND_ARG_NAME_MAX_CHARS {
+                    return Err("command argument name is empty or exceeds 32 chars".into());
+                }
+                if !arg
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return Err("command argument name contains invalid characters".into());
+                }
+                if !seen_args.insert(arg.name.as_str()) {
+                    return Err("command argument name is duplicated".into());
+                }
+                if arg.default.chars().count() > COMMAND_ARG_DEFAULT_MAX_CHARS {
+                    return Err("command argument default exceeds 256 chars".into());
+                }
+                if arg.required {
+                    if !arg.default.is_empty() {
+                        return Err("required argument cannot carry a default".into());
+                    }
+                } else {
+                    optional_seen = true;
+                }
+                if optional_seen && arg.required {
+                    return Err("required argument must precede optional ones".into());
                 }
             }
         }
@@ -851,6 +907,138 @@ mod tests {
         assert!(back.fallback);
         let plain = serde_json::to_string(&UserCommandDefinition::default()).unwrap();
         assert!(!plain.contains("fallback"));
+    }
+
+    // ── K4b：arguments 结构校验与持久化 ────────────────────────────────
+
+    fn data_with_command(mut cmd: UserCommandDefinition) -> CommandData {
+        cmd.id = "user.a".into();
+        cmd.title = "t".into();
+        let mut data = CommandData::default();
+        data.commands.push(cmd);
+        data
+    }
+
+    #[test]
+    fn command_arguments_validate_structure() {
+        // 合法：必填在前、可选带默认
+        let ok = data_with_command(UserCommandDefinition {
+            arguments: vec![
+                CommandArgumentSpec {
+                    name: "width".into(),
+                    required: true,
+                    default: String::new(),
+                },
+                CommandArgumentSpec {
+                    name: "height".into(),
+                    required: false,
+                    default: "10".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        assert!(VersionedData::validate(&ok).is_ok());
+
+        // 必填带 default 拒绝
+        let bad = data_with_command(UserCommandDefinition {
+            arguments: vec![CommandArgumentSpec {
+                name: "a".into(),
+                required: true,
+                default: "x".into(),
+            }],
+            ..Default::default()
+        });
+        assert!(VersionedData::validate(&bad).is_err());
+
+        // 必填排在可选之后拒绝
+        let bad = data_with_command(UserCommandDefinition {
+            arguments: vec![
+                CommandArgumentSpec {
+                    name: "a".into(),
+                    required: false,
+                    default: String::new(),
+                },
+                CommandArgumentSpec {
+                    name: "b".into(),
+                    required: true,
+                    default: String::new(),
+                },
+            ],
+            ..Default::default()
+        });
+        assert!(VersionedData::validate(&bad).is_err());
+
+        // 重名拒绝
+        let bad = data_with_command(UserCommandDefinition {
+            arguments: vec![
+                CommandArgumentSpec {
+                    name: "a".into(),
+                    required: true,
+                    default: String::new(),
+                },
+                CommandArgumentSpec {
+                    name: "a".into(),
+                    required: false,
+                    default: String::new(),
+                },
+            ],
+            ..Default::default()
+        });
+        assert!(VersionedData::validate(&bad).is_err());
+
+        // 非法字符拒绝（大写/空白）
+        let bad = data_with_command(UserCommandDefinition {
+            arguments: vec![CommandArgumentSpec {
+                name: "Bad Name".into(),
+                required: true,
+                default: String::new(),
+            }],
+            ..Default::default()
+        });
+        assert!(VersionedData::validate(&bad).is_err());
+
+        // 超过 8 个拒绝
+        let bad = data_with_command(UserCommandDefinition {
+            arguments: (0..9)
+                .map(|i| CommandArgumentSpec {
+                    name: format!("a{i}"),
+                    required: false,
+                    default: String::new(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+        assert!(VersionedData::validate(&bad).is_err());
+    }
+
+    #[test]
+    fn command_arguments_missing_field_defaults_empty_and_roundtrips() {
+        // 旧 commands-v1.json 无 arguments 字段 → 空
+        let json = r#"{"schema_version":1,"data":{
+            "commands":[{"id":"user.legacy","title":"legacy"}]
+        }}"#;
+        let envelope: VersionedEnvelope<CommandData> = serde_json::from_str(json).unwrap();
+        let data = envelope.into_compatible().unwrap();
+        assert!(data.commands[0].arguments.is_empty());
+
+        // 有值往返；空省略（旧文件逐字节不变）
+        let def = UserCommandDefinition {
+            id: "user.fb".into(),
+            title: "FB".into(),
+            arguments: vec![CommandArgumentSpec {
+                name: "width".into(),
+                required: true,
+                default: String::new(),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(json.contains("\"arguments\""));
+        let back: UserCommandDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.arguments.len(), 1);
+        assert_eq!(back.arguments[0].name, "width");
+        let plain = serde_json::to_string(&UserCommandDefinition::default()).unwrap();
+        assert!(!plain.contains("arguments"));
     }
 
     #[test]

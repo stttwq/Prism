@@ -57,6 +57,19 @@ pub struct CommandDescriptor {
     /// K4a：无结果回退——根搜索空结果时该命令作为回退行出现。
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
+    /// K4b：声明式参数（catalog 下发，编辑器回显用）。空省略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<CommandArgumentDto>,
+}
+
+/// K4b：声明参数的下行形态（对应 persistence::CommandArgumentSpec）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandArgumentDto {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    pub default: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,6 +184,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             enabled: true,
             disabled_reason: String::new(),
             fallback: false,
+            arguments: Vec::new(),
         },
         CommandDescriptor {
             id: "prism.terminal.open".into(),
@@ -207,6 +221,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             enabled: true,
             disabled_reason: String::new(),
             fallback: false,
+            arguments: Vec::new(),
         },
         CommandDescriptor {
             // K2 §4.7：暂存区批量复制路径至剪贴板。无损操作、不探测存在性，
@@ -241,6 +256,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             enabled: true,
             disabled_reason: String::new(),
             fallback: false,
+            arguments: Vec::new(),
         },
         CommandDescriptor {
             // K2 §4.5：暂存区多目标 ZIP。enabled/disabled_reason 在 catalog()
@@ -275,6 +291,7 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             enabled: true,
             disabled_reason: String::new(),
             fallback: false,
+            arguments: Vec::new(),
         },
     ]
 }
@@ -865,6 +882,15 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
         enabled: command.enabled,
         disabled_reason: String::new(),
         fallback: command.fallback,
+        arguments: command
+            .arguments
+            .iter()
+            .map(|a| CommandArgumentDto {
+                name: a.name.clone(),
+                required: a.required,
+                default: a.default.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1049,6 +1075,10 @@ pub struct ExpansionContext {
     /// {date} 取值基准（K4a）。filters::local_now()（GetLocalTime，本地时区）；
     /// 显式入 ctx 而非展开时现取，保证同一模板内多次 {date} 一致且测试可固定。
     pub now: crate::filters::LocalNow,
+    /// K4b：{arg.name} 取值源——resolve_arguments 按声明切分 arguments.text 的
+    /// 结果（保存校验路径以声明 default 填充）。未声明的 {arg.x} 在展开层报
+    /// UnknownPlaceholder，拼写错误预览即暴露。
+    pub args: std::collections::BTreeMap<String, String>,
 }
 
 /// 模板展开错误。类型化返回，执行时不吞错误。
@@ -1145,21 +1175,32 @@ fn expand_placeholder(
         return Err(ExpandError::BadModifier("占位符名称为空".into()));
     }
     let name = parts[0];
-    if !PLACEHOLDERS.contains(&name) {
+    // K4b：{arg.name} 动态命名空间，先于静态白名单。未声明的名字 →
+    // UnknownPlaceholder（暴露拼写错误）；已声明但取值为空 → 空串。
+    let arg_value = name.strip_prefix("arg.").map(|arg_name| {
+        ctx.args
+            .get(arg_name)
+            .cloned()
+            .ok_or_else(|| ExpandError::UnknownPlaceholder(name.to_string()))
+    });
+    if !PLACEHOLDERS.contains(&name) && arg_value.is_none() {
         return Err(ExpandError::UnknownPlaceholder(name.to_string()));
     }
-    let base_value = match name {
-        "query" => ctx.query.clone(),
-        "current_folder" => ctx.current_folder.clone(),
-        // 无选中（关键字路由/根搜索直达）→ 空串；launch 参数侧把空展开丢掉。
-        "selection.target" => ctx.selection.clone().unwrap_or_default(),
-        // 剪贴板读取失败/未传 → 空串（与 selection 同语义，launch 侧丢空参）。
-        "clipboard" => ctx.clipboard.clone().unwrap_or_default(),
-        // 默认 yyyy-MM-dd；fmt: 修饰符在下方循环里重排。
-        "date" => format_date(DATE_DEFAULT_FORMAT, &ctx.now),
-        // 每次出现独立生成（同一模板两处 {uuid} = 两个值，与 Raycast 一致）。
-        "uuid" => uuid_v4(),
-        _ => unreachable!("checked above"),
+    let base_value = match arg_value {
+        Some(value) => value?,
+        None => match name {
+            "query" => ctx.query.clone(),
+            "current_folder" => ctx.current_folder.clone(),
+            // 无选中（关键字路由/根搜索直达）→ 空串；launch 参数侧把空展开丢掉。
+            "selection.target" => ctx.selection.clone().unwrap_or_default(),
+            // 剪贴板读取失败/未传 → 空串（与 selection 同语义，launch 侧丢空参）。
+            "clipboard" => ctx.clipboard.clone().unwrap_or_default(),
+            // 默认 yyyy-MM-dd；fmt: 修饰符在下方循环里重排。
+            "date" => format_date(DATE_DEFAULT_FORMAT, &ctx.now),
+            // 每次出现独立生成（同一模板两处 {uuid} = 两个值，与 Raycast 一致）。
+            "uuid" => uuid_v4(),
+            _ => unreachable!("checked above"),
+        },
     };
     // 默认：query 做 percent-encode，current_folder 不编码。
     // raw 修饰符跳过编码；percent-encode 修饰符显式编码。
@@ -1332,8 +1373,12 @@ pub fn validate_open_url(url_template: &str, ctx: &ExpansionContext) -> Result<S
     Ok(url)
 }
 
-/// 构造 open_url 的 ExpansionContext。
-pub fn expansion_context_from(context: &CommandInvocationContext) -> ExpansionContext {
+/// 构造 open_url 的 ExpansionContext。`args` 为 resolve_arguments 的产出
+/// （保存校验路径以声明 default 填充）。
+pub fn expansion_context_from(
+    context: &CommandInvocationContext,
+    args: std::collections::BTreeMap<String, String>,
+) -> ExpansionContext {
     ExpansionContext {
         query: context.arguments.text.clone().unwrap_or_default(),
         current_folder: context.current_folder.clone().unwrap_or_default(),
@@ -1347,6 +1392,37 @@ pub fn expansion_context_from(context: &CommandInvocationContext) -> ExpansionCo
             .as_deref()
             .map(|c| truncate_bytes(c, TEXT_MAX_BYTES).to_string()),
         now: crate::filters::local_now(),
+        args,
+    }
+}
+
+/// K4b：位置切分 arguments.text 并按声明顺序传入。多余 token 忽略；可选缺位
+/// 填 default；必填缺位报错。v1 不支持引号——含空白取值用 {query}。
+pub fn resolve_arguments(
+    text: Option<&str>,
+    specs: &[crate::persistence::CommandArgumentSpec],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    if specs.is_empty() {
+        return Ok(out);
+    }
+    let tokens: Vec<&str> = text.unwrap_or_default().split_whitespace().collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        match tokens.get(index) {
+            Some(token) => {
+                out.insert(spec.name.clone(), (*token).to_string());
+            }
+            None if spec.required => missing.push(&spec.name),
+            None => {
+                out.insert(spec.name.clone(), spec.default.clone());
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(out)
+    } else {
+        Err(format!("缺少必填参数：{}", missing.join("、")))
     }
 }
 
@@ -2276,6 +2352,7 @@ mod tests {
             selection: None,
             clipboard: None,
             now: fixed_now(),
+            args: Default::default(),
         }
     }
 
@@ -2287,6 +2364,7 @@ mod tests {
             selection: Some(r"D:\a b.txt".into()),
             clipboard: None,
             now: fixed_now(),
+            args: Default::default(),
         };
         assert_eq!(
             expand_template_raw("{selection.target}", &with).unwrap(),
@@ -2319,6 +2397,7 @@ mod tests {
             selection: Some(r"D:\a b.txt".into()),
             clipboard: None,
             now: fixed_now(),
+            args: Default::default(),
         };
         let (_, args, _) = validate_launch_program(&params, &ctx).unwrap();
         assert_eq!(args, vec![r"D:\a b.txt", "{unknown}", "tail"]);
@@ -2410,7 +2489,7 @@ mod tests {
             clipboard: Some("中".repeat(8 * 1024 + 16)), // 超 8 KiB 字节
             ..Default::default()
         };
-        let ctx = expansion_context_from(&invocation);
+        let ctx = expansion_context_from(&invocation, Default::default());
         let clipped = ctx.clipboard.expect("clipboard should be present");
         assert!(clipped.len() <= TEXT_MAX_BYTES);
         assert!(clipped.is_char_boundary(clipped.len()));
@@ -2420,7 +2499,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            expansion_context_from(&invocation).clipboard.as_deref(),
+            expansion_context_from(&invocation, Default::default())
+                .clipboard
+                .as_deref(),
             Some("ok")
         );
     }
@@ -2483,6 +2564,66 @@ mod tests {
             matches!(&a[19..20], "8" | "9" | "a" | "b"),
             "variant 应为 10x"
         );
+    }
+
+    // ── K4b：声明式参数 ────────────────────────────────────────────────
+
+    fn arg_spec(
+        name: &str,
+        required: bool,
+        default: &str,
+    ) -> crate::persistence::CommandArgumentSpec {
+        crate::persistence::CommandArgumentSpec {
+            name: name.into(),
+            required,
+            default: default.into(),
+        }
+    }
+
+    #[test]
+    fn resolve_arguments_positional_and_defaults() {
+        let specs = vec![arg_spec("width", true, ""), arg_spec("height", false, "10")];
+        let args = resolve_arguments(Some("80 60"), &specs).unwrap();
+        assert_eq!(args["width"], "80");
+        assert_eq!(args["height"], "60");
+        // 可选缺位填 default
+        let args = resolve_arguments(Some("80"), &specs).unwrap();
+        assert_eq!(args["width"], "80");
+        assert_eq!(args["height"], "10");
+        // 多余 token 忽略
+        let args = resolve_arguments(Some("80 60 extra"), &specs).unwrap();
+        assert_eq!(args["height"], "60");
+    }
+
+    #[test]
+    fn resolve_arguments_missing_required_errors() {
+        let specs = vec![arg_spec("width", true, ""), arg_spec("height", true, "")];
+        let err = resolve_arguments(Some("80"), &specs).unwrap_err();
+        assert!(err.contains("height"), "got: {err}");
+        let err = resolve_arguments(None, &specs).unwrap_err();
+        assert!(err.contains("width"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_arguments_all_optional_empty_text_fills_defaults() {
+        let specs = vec![arg_spec("a", false, "x"), arg_spec("b", false, "")];
+        let args = resolve_arguments(None, &specs).unwrap();
+        assert_eq!(args["a"], "x");
+        assert_eq!(args["b"], "");
+        // 无参数命令 → 空 map，{query} 行为不变
+        assert!(resolve_arguments(Some("anything"), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expand_arg_placeholder_declared_and_unknown() {
+        let mut ctx = exp_ctx("");
+        ctx.args.insert("q".into(), "rust lang".into());
+        // 修饰符链照常可用
+        let url = expand_template("https://x.test/?q={arg.q|percent-encode}", &ctx).unwrap();
+        assert_eq!(url, "https://x.test/?q=rust%20lang");
+        // 未声明 → UnknownPlaceholder（拼写错误预览即暴露）
+        let err = expand_template("https://x.test/?q={arg.typo}", &exp_ctx("")).unwrap_err();
+        assert_eq!(err, ExpandError::UnknownPlaceholder("arg.typo".into()));
     }
 
     #[test]
@@ -2593,6 +2734,7 @@ mod tests {
             selection: None,
             clipboard: None,
             now: fixed_now(),
+            args: Default::default(),
         };
         // notepad.exe 存在（标准 Windows 路径），且 .exe 合法
         let result = validate_launch_program(&params, &ctx);
