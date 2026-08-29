@@ -2357,10 +2357,12 @@ async fn handle_command_set(
     engines: &SharedEngines,
     aliases: &Arc<crate::alias::AliasStore>,
 ) -> Response {
-    // 语义校验上下文：保存时无实际 query，用空串占位（模板结构校验不需要真实值）。
+    // 语义校验上下文：保存时无实际 query/selection，用空占位（模板结构校验
+    // 不需要真实值；{selection.target} 展开为空 → launch 参数侧丢弃空参）。
     let exp_ctx = crate::commands::ExpansionContext {
         query: String::new(),
         current_folder: String::new(),
+        selection: None,
     };
     // §4.2 danger 校验
     if let Err(msg) = crate::commands::validate_user_danger(&command.danger) {

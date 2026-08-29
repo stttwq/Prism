@@ -1027,6 +1027,10 @@ pub struct ExpansionContext {
     pub query: String,
     /// {current_folder} = 调用时 current_folder 字段。
     pub current_folder: String,
+    /// {selection.target} = 选中目标值（动作面板=面板行；无选中 = None → 空串）。
+    /// G7c 修复：模板预设用 {selection.target}，但引擎此前不支持该占位符——
+    /// 展开失败把字面 `{selection.target}` 当参数传给程序（记事本报"文件不存在"）。
+    pub selection: Option<String>,
 }
 
 /// 模板展开错误。类型化返回，执行时不吞错误。
@@ -1050,7 +1054,7 @@ impl std::fmt::Display for ExpandError {
 }
 
 /// 已知的占位符名称。
-const PLACEHOLDERS: &[&str] = &["query", "current_folder"];
+const PLACEHOLDERS: &[&str] = &["query", "current_folder", "selection.target"];
 
 /// §4.6：单一模板展开入口。执行（ExecuteCommand）与预览（CommandPreview）
 /// **调用同一函数**——预览返回的就是执行时将用的最终字符串（构造保证一致）。
@@ -1119,6 +1123,8 @@ fn expand_placeholder(
     let base_value = match name {
         "query" => ctx.query.clone(),
         "current_folder" => ctx.current_folder.clone(),
+        // 无选中（关键字路由/根搜索直达）→ 空串；launch 参数侧把空展开丢掉。
+        "selection.target" => ctx.selection.clone().unwrap_or_default(),
         _ => unreachable!("checked above"),
     };
     // 默认：query 做 percent-encode，current_folder 不编码。
@@ -1170,6 +1176,10 @@ pub fn expansion_context_from(context: &CommandInvocationContext) -> ExpansionCo
     ExpansionContext {
         query: context.arguments.text.clone().unwrap_or_default(),
         current_folder: context.current_folder.clone().unwrap_or_default(),
+        selection: context
+            .selection
+            .as_ref()
+            .and_then(|s| s.target.as_ref().map(|t| t.value.clone())),
     }
 }
 
@@ -1216,9 +1226,15 @@ pub fn validate_launch_program(
             // §4.3：token 列表的字符串形式。展开时按 token 逐个替换占位符，
             // 替换结果不再二次分词——用空白分割模板本身的 token。
             // §4.3：程序参数用 raw 展开——percent-encode 对 argv 无意义。
+            // G7c：展开为空（如 {selection.target} 无选中）→ 丢弃该参数，
+            // 程序无参启动；未知占位符/坏修饰符 → 保留原文暴露拼写错误。
             template
                 .split_whitespace()
-                .map(|tok| expand_template_raw(tok, ctx).unwrap_or_else(|_| tok.to_string()))
+                .filter_map(|tok| match expand_template_raw(tok, ctx) {
+                    Ok(v) if !v.trim().is_empty() => Some(v),
+                    Ok(_) => None,
+                    Err(_) => Some(tok.to_string()),
+                })
                 .collect()
         }
         _ => Vec::new(),
@@ -2078,7 +2094,49 @@ mod tests {
         ExpansionContext {
             query: query.into(),
             current_folder: r"C:\Users\test".into(),
+            selection: None,
         }
+    }
+
+    #[test]
+    fn expand_selection_target_with_and_without_selection() {
+        let with = ExpansionContext {
+            query: String::new(),
+            current_folder: String::new(),
+            selection: Some(r"D:\a b.txt".into()),
+        };
+        assert_eq!(
+            expand_template_raw("{selection.target}", &with).unwrap(),
+            r"D:\a b.txt"
+        );
+        // 无选中 → 空串（launch 参数侧丢弃空展开）。
+        let without = exp_ctx("");
+        assert_eq!(
+            expand_template_raw("{selection.target}", &without).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn launch_args_drop_empty_selection_and_keep_unknown() {
+        let mut params = launch_params(r"C:\Windows\notepad.exe");
+        params.insert(
+            "args_template".into(),
+            "{selection.target} {unknown} tail".into(),
+        );
+        // 无选中：空展开参数被丢弃（不再把字面 {selection.target} 传给程序），
+        // 未知占位符保留原文暴露拼写错误。
+        let ctx = exp_ctx("");
+        let (_, args, _) = validate_launch_program(&params, &ctx).unwrap();
+        assert_eq!(args, vec!["{unknown}", "tail"]);
+        // 有选中：目标路径作为单个参数（含空格不分词）。
+        let ctx = ExpansionContext {
+            query: String::new(),
+            current_folder: String::new(),
+            selection: Some(r"D:\a b.txt".into()),
+        };
+        let (_, args, _) = validate_launch_program(&params, &ctx).unwrap();
+        assert_eq!(args, vec![r"D:\a b.txt", "{unknown}", "tail"]);
     }
 
     #[test]
@@ -2246,6 +2304,7 @@ mod tests {
         let ctx = ExpansionContext {
             query: "hello world & |".into(),
             current_folder: String::new(),
+            selection: None,
         };
         // notepad.exe 存在（标准 Windows 路径），且 .exe 合法
         let result = validate_launch_program(&params, &ctx);

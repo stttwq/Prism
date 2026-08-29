@@ -186,6 +186,10 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         var bindings = new CommandBindingsSpecDto
         {
             RootSearch = new CommandBindingSpecDto { ShowInRootSearch = ShowInRootSearch },
+            // 默认进动作面板（target_kinds 空 = 接受所有目标类型）：动作面板是
+            // {selection.target} 唯一有值的入口——面板行就是选中文件。不默认绑的话
+            // 用户命令永远到不了面板（设置页也没有单独的面板开关）。
+            ActionPanel = new CommandBindingSpecDto { ShowInRootSearch = true },
         };
         // 关键字路由：Trigger 优先；留空时用 Keywords 首项自动回退。
         var trigger = Trigger.Trim();
