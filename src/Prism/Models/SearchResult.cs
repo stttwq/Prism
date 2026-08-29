@@ -61,6 +61,12 @@ public sealed record SearchResult(
     public string? IconUrl { get; init; }
 
     /// <summary>
+    /// K4a：仅「无结果回退命令」合成行设置——Enter 执行时该值作为 arguments.text
+    /// 传入（命令拿到 {query}）。wire 解析不填此字段，仅前端合成行使用。
+    /// </summary>
+    public string? FallbackQuery { get; init; }
+
+    /// <summary>
     /// 行身份键（可选）。ResultList 用它决定"同一行更新"还是"删旧插新"。
     /// 网页模式的行内容每次按键都变（URL 与标题都含查询词），若按内容比对身份，
     /// 行会被反复删除重建，容器重建瞬间图标为空——表现为每敲一个字母图标闪一下。
@@ -108,6 +114,21 @@ public sealed record SearchResult(
     {
         RowKey = "fallback:" + query,
         IconUrl = engineUrl,
+    };
+
+    /// <summary>
+    /// K4a：无结果回退命令行（本地合成，broker 无感知）。FallbackQuery 使 Enter
+    /// 执行时把查询词作为 arguments.text 传入命令（{query} 展开源）。
+    /// </summary>
+    public static SearchResult FallbackCommand(CommandDescriptor desc, string query) => new(
+        Kind: "command",
+        Title: desc.Title,
+        Subtitle: string.IsNullOrEmpty(desc.Subtitle) ? "无结果时回退执行" : desc.Subtitle,
+        ExecuteId: desc.Id,
+        MatchSpans: [])
+    {
+        RowKey = "fbcmd:" + desc.Id + ":" + query,
+        FallbackQuery = query,
     };
 
     /// <summary>

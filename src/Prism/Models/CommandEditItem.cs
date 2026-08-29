@@ -24,6 +24,7 @@ public sealed class CommandEditItem : INotifyPropertyChanged
     private string _trigger = "";
     private string _shortcutCombo = "";
     private bool _showInRootSearch = true;
+    private bool _fallback;
     private bool _enabled = true;
     private string _danger = "normal";
 
@@ -44,6 +45,7 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         _shortcutCombo = desc.Bindings.Shortcut?.ShortcutCombo ?? "";
         _trigger = desc.Bindings.Keyword?.Trigger ?? "";
         _showInRootSearch = desc.Bindings.RootSearch?.ShowInRootSearch ?? true;
+        _fallback = desc.Fallback;
 
         // handler 从 subtitle/handler 不可直接获取——CommandDescriptor 不含 handler 字段。
         // 用户命令从 Subtitle 反推不够可靠；对 builtin 命令 handler 字段无意义（不可编辑）。
@@ -144,6 +146,13 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         set { if (_showInRootSearch != value) { _showInRootSearch = value; OnPropertyChanged(); } }
     }
 
+    /// <summary>K4a：无结果回退——根搜索空结果时该命令作为回退行出现。</summary>
+    public bool Fallback
+    {
+        get => _fallback;
+        set { if (_fallback != value) { _fallback = value; OnPropertyChanged(); } }
+    }
+
     public bool Enabled
     {
         get => _enabled;
@@ -213,6 +222,7 @@ public sealed class CommandEditItem : INotifyPropertyChanged
             Enabled = Enabled,
             Handler = Handler,
             HandlerParams = handlerParams,
+            Fallback = Fallback,
         };
     }
 

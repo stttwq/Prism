@@ -911,6 +911,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
                 ["current_folder"] = context.CurrentFolder,
                 ["host_kind"] = context.HostKind,
                 ["host_capabilities"] = context.HostCapabilities.ToArray(),
+                // K4a：剪贴板文本仅在命令调用点读取（{clipboard} 取值源）。
+                ["clipboard"] = ReadClipboardForCommand(),
             },
         };
 
@@ -930,6 +932,29 @@ public sealed class PipeClient : ISearchClient, IDisposable
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// K4a：{clipboard} 取值源。调用点即读（UI 进程，broker 不读剪贴板）；
+    /// 剪贴板被其他进程占用/非文本时返回 null（broker 侧展开为空串）。
+    /// 8 KiB 字符上限与 broker validate 的 TEXT_MAX_BYTES 对齐，避免超限失败。
+    /// </summary>
+    private static string? ReadClipboardForCommand()
+    {
+        try
+        {
+            var text = System.Windows.Clipboard.GetText();
+            if (string.IsNullOrEmpty(text))
+            {
+                return null;
+            }
+            return text.Length <= 8 * 1024 ? text : text[..(8 * 1024)];
+        }
+        catch (Exception)
+        {
+            // COMException（剪贴板锁）/OutOfMemory 等一律降级为无剪贴板。
+            return null;
+        }
     }
 
     /// <summary>
@@ -1058,6 +1083,8 @@ public sealed class PipeClient : ISearchClient, IDisposable
                     ["current_folder"] = null,
                     ["host_kind"] = "explorer",
                     ["host_capabilities"] = Array.Empty<string>(),
+                    // K4a：预览与执行同函数（§4.6），预览也带真实剪贴板。
+                    ["clipboard"] = ReadClipboardForCommand(),
                 },
             };
             var resp = await SendAsync(payload, ct, QueryReadTimeout).ConfigureAwait(false);

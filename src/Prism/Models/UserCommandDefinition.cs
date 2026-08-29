@@ -47,6 +47,10 @@ public sealed class UserCommandDefinition
     /// <summary>handler 参数。open_url → url_template；launch_program → path + args_template + working_dir。</summary>
     [JsonPropertyName("handler_params")]
     public Dictionary<string, string> HandlerParams { get; set; } = [];
+
+    /// <summary>K4a：无结果回退——根搜索空结果时该命令作为回退行出现。</summary>
+    [JsonPropertyName("fallback")]
+    public bool Fallback { get; set; }
 }
 
 /// <summary>命令输入要求（对应 Rust CommandInputSpec）。</summary>

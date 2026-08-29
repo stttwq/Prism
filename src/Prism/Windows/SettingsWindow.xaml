@@ -1231,6 +1231,11 @@
                                          Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
                             </StackPanel>
 
+                            <!-- K4a：占位符速查（open_url / launch_program 共用） -->
+                            <TextBlock FontSize="12" Foreground="{DynamicResource TextSubtitle}"
+                                       TextWrapping="Wrap" Margin="0,0,0,8"
+                                       Text="占位符：{query} 查询词 · {current_folder} 当前目录 · {selection.target} 选中项 · {clipboard} 剪贴板（敏感内容慎用） · {date} 日期（默认 yyyy-MM-dd，可用 {date|fmt:yyyyMMdd HH:mm:ss}） · {uuid} 随机 UUID。修饰符：|raw |percent-encode |trim |uppercase |lowercase（URL 中 {query} 默认已编码）"/>
+
                             <!-- launch_program 字段 -->
                             <StackPanel Visibility="{Binding SelectedCommand.IsLaunchProgram, Converter={StaticResource BoolToVis}}">
                                 <TextBlock Text="程序路径" FontSize="13"
@@ -1262,6 +1267,11 @@
 
                             <CheckBox Content="在根搜索中显示"
                                       IsChecked="{Binding SelectedCommand.ShowInRootSearch}"
+                                      Style="{StaticResource SettingsCheckBoxStyle}"
+                                      Margin="0,0,0,8"/>
+                            <!-- K4a：勾选后根搜索无结果时该命令作为回退行出现（查询词传入 {query}） -->
+                            <CheckBox Content="无结果时作为回退命令显示"
+                                      IsChecked="{Binding SelectedCommand.Fallback}"
                                       Style="{StaticResource SettingsCheckBoxStyle}"
                                       Margin="0,0,0,8"/>
                             <CheckBox Content="启用"

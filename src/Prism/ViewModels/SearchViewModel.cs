@@ -692,6 +692,8 @@ public sealed class SearchViewModel
     /// <summary>
     /// 组装命令调用上下文。current_folder 取当前搜索上下文里的 CommandContext
     /// （已从 HostScopeController.Host.Root 填充）。
+    /// K4a：无结果回退命令行带 FallbackQuery——查询词作为 arguments.text 传入
+    /// （命令模板的 {query} 展开源），与关键字路径传参语义一致。
     /// </summary>
     private CommandInvocationContext BuildCommandInvocationContext(SearchResult item)
     {
@@ -700,6 +702,9 @@ public sealed class SearchViewModel
         {
             CommandId = item.ExecuteId,
             Source = "root",
+            Arguments = string.IsNullOrEmpty(item.FallbackQuery)
+                ? null
+                : new CommandArgumentsDto { Text = item.FallbackQuery },
             CurrentFolder = cmdCtx?.CurrentFolder,
             HostKind = cmdCtx?.HostKind,
             HostCapabilities = cmdCtx?.HostCapabilities ?? Array.Empty<string>(),
@@ -1625,6 +1630,12 @@ public sealed class SearchViewModel
             && !HasFilterToken(query)
             && !IsCustomFilterTrigger(query))
         {
+            // K4a：配置为回退的命令排最前（已确认的产品取向），默认 web 行保留最后。
+            foreach (var desc in _commandCatalog?.Snapshot ?? Array.Empty<CommandDescriptor>())
+            {
+                if (desc.Fallback)
+                    list.Add(SearchResult.FallbackCommand(desc, query));
+            }
             list.Add(SearchResult.Fallback(query,
                 _webEngines.FirstOrDefault()?.UrlTemplate));
         }

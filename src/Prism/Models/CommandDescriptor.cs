@@ -20,7 +20,8 @@ public sealed record CommandDescriptor(
     CommandBindingsDto Bindings,
     string Danger,
     bool Enabled,
-    bool IsUsable)
+    bool IsUsable,
+    bool Fallback = false)
 {
     /// <summary>
     /// 从 JSON 解析命令描述。未知字段不抛；无法识别的 owner/danger/input.kind
@@ -58,9 +59,12 @@ public sealed record CommandDescriptor(
         // 可用性判定：owner/danger/input.kind 必须是已知值。
         var isUsable = IsKnownOwner(owner) && IsKnownDanger(danger) && input.IsUsable;
 
+        // K4a：无结果回退标记（缺省 false，旧 broker 无此字段）。
+        var fallback = el.TryGetProperty("fallback", out var fbEl) && fbEl.ValueKind == JsonValueKind.True;
+
         return new CommandDescriptor(
             id, title, subtitle, iconGlyph, owner, trust,
-            keywords, input, bindings, danger, enabled, isUsable);
+            keywords, input, bindings, danger, enabled, isUsable, fallback);
     }
 
     private static bool IsKnownOwner(string owner) =>

@@ -1388,6 +1388,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 IconGlyph = el.TryGetProperty("icon_glyph", out var ig) ? ig.GetString() ?? "" : "",
                 Danger = el.TryGetProperty("danger", out var d) ? d.GetString() ?? "normal" : "normal",
                 Handler = el.TryGetProperty("handler", out var h) ? h.GetString() ?? "open_url" : "open_url",
+                // K4a：导入文件可携带 fallback 标记。
+                Fallback = el.TryGetProperty("fallback", out var fb) && fb.ValueKind == System.Text.Json.JsonValueKind.True,
             };
 
             if (el.TryGetProperty("keywords", out var kw) && kw.ValueKind == System.Text.Json.JsonValueKind.Array)
