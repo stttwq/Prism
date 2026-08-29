@@ -76,6 +76,9 @@ public sealed class CommandCatalog
         var (generation, items) = result.Value;
         var filtered = items
             .Where(d => d.IsUsable)
+            // broker 会下发 disabled 用户命令（设置页管理用）；搜索侧快照只留
+            // enabled——关键字路由/快捷键/动作面板消费者都基于此快照。
+            .Where(d => d.Enabled)
             .Where(d => d.Owner != "ui" || CommandHandlers.IsKnown(d.Id))
             .ToArray();
 

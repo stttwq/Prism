@@ -399,9 +399,10 @@ impl CommandStore {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for command in &state.commands {
-            if !command.enabled {
-                continue;
-            }
+            // disabled 用户命令也下发（enabled=false）。设置页必须看见它们才能
+            // 重新启用/删除——否则其关键字仍占命名空间（§4.5 all_command_keywords
+            // 含 disabled）却无处管理，成黑洞。执行面各自过滤 enabled：
+            // command_search / execute_command / action_composer 均已自行检查。
             // owner 分工：用户命令的 owner/trust 恒为 broker/user，由代码赋值。
             // broker-owned 命令需要注册 handler；K0 用户表为空，此处无过滤发生。
             items.push(user_command_to_descriptor(command));
@@ -1525,8 +1526,12 @@ mod tests {
         assert_eq!(store.generation(), 4);
         store.set_enabled("user.b", false).unwrap();
         assert_eq!(store.generation(), 5);
-        // enabled=false 不进 catalog（用户命令），只剩 builtin（K2 §4.5 后为 4 条）。
-        assert_eq!(store.catalog().len(), 4, "4 builtin only (user.b disabled)");
+        // disabled 用户命令仍进 catalog（enabled=false 下发，设置页可见可管理），
+        // 执行面（搜索/execute/动作面板）各自过滤 enabled。
+        let catalog = store.catalog();
+        assert_eq!(catalog.len(), 5, "4 builtin + user.b (disabled)");
+        let disabled = catalog.iter().find(|d| d.id == "user.b").unwrap();
+        assert!(!disabled.enabled);
     }
 
     // R6: 并发 mutation 不撕裂

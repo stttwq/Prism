@@ -1111,12 +1111,40 @@
                             <ListBox Grid.Row="0"
                                      ItemsSource="{Binding Commands}"
                                      SelectedItem="{Binding SelectedCommand, Mode=TwoWay}"
+                                     Background="Transparent"
                                      BorderThickness="0">
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="Background" Value="Transparent"/>
+                                        <Setter Property="Padding" Value="6,4"/>
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="ListBoxItem">
+                                                    <Border Background="{TemplateBinding Background}"
+                                                            Padding="{TemplateBinding Padding}"
+                                                            SnapsToDevicePixels="True">
+                                                        <ContentPresenter/>
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                                                        </Trigger>
+                                                        <Trigger Property="IsSelected" Value="True">
+                                                            <Setter Property="Background" Value="{DynamicResource BgItemSelected}"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <StackPanel Margin="0,2">
                                             <TextBlock Text="{Binding Title}" FontWeight="SemiBold"
-                                                       FontSize="13"/>
+                                                       FontSize="13"
+                                                       Foreground="{DynamicResource TextTitle}"/>
                                             <TextBlock FontSize="11"
                                                        Foreground="{DynamicResource TextSubtitle}"
                                                        Text="{Binding KeywordsText}"/>
@@ -1150,7 +1178,8 @@
                     <!-- 编辑表单 -->
                     <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" Margin="8,0,0,0">
                         <StackPanel>
-                            <TextBlock Text="模板预设" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                            <TextBlock Text="模板预设" FontSize="13" FontWeight="SemiBold"
+                                       Foreground="{DynamicResource TextTitle}" Margin="0,0,0,4"/>
                             <ItemsControl ItemsSource="{Binding CommandTemplates}" Margin="0,0,0,12">
                                 <ItemsControl.ItemsPanel>
                                     <ItemsPanelTemplate>
@@ -1169,58 +1198,70 @@
                                 </ItemsControl.ItemTemplate>
                             </ItemsControl>
 
-                            <TextBlock Text="标题" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBlock Text="标题" FontSize="13"
+                                       Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <TextBox Text="{Binding SelectedCommand.Title, UpdateSourceTrigger=PropertyChanged}"
                                      Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
 
-                            <TextBlock Text="关键字（逗号分隔）" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBlock Text="关键字（逗号分隔）" FontSize="13"
+                                       Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <TextBox Text="{Binding SelectedCommand.KeywordsText, UpdateSourceTrigger=PropertyChanged}"
                                      Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
 
-                            <TextBlock Text="处理器类型" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBlock Text="处理器类型" FontSize="13"
+                                       Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <ComboBox SelectedValue="{Binding SelectedCommand.Handler}"
-                                       SelectedValuePath="Tag"
-                                       Margin="0,0,0,8">
+                                      SelectedValuePath="Tag"
+                                      Style="{StaticResource SettingsComboBoxStyle}"
+                                      Margin="0,0,0,8">
                                 <ComboBoxItem Content="打开 URL" Tag="open_url"/>
                                 <ComboBoxItem Content="启动程序" Tag="launch_program"/>
                             </ComboBox>
 
                             <!-- open_url 字段 -->
                             <StackPanel Visibility="{Binding SelectedCommand.IsOpenUrl, Converter={StaticResource BoolToVis}}">
-                                <TextBlock Text="URL 模板（{query} 占位查询词）" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBlock Text="URL 模板（{query} 占位查询词）" FontSize="13"
+                                           Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                                 <TextBox Text="{Binding SelectedCommand.UrlTemplate, UpdateSourceTrigger=PropertyChanged}"
                                          Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
                             </StackPanel>
 
                             <!-- launch_program 字段 -->
                             <StackPanel Visibility="{Binding SelectedCommand.IsLaunchProgram, Converter={StaticResource BoolToVis}}">
-                                <TextBlock Text="程序路径" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBlock Text="程序路径" FontSize="13"
+                                           Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                                 <TextBox Text="{Binding SelectedCommand.ProgramPath, UpdateSourceTrigger=PropertyChanged}"
                                          Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
-                                <TextBlock Text="参数模板" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBlock Text="参数模板" FontSize="13"
+                                           Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                                 <TextBox Text="{Binding SelectedCommand.ArgsTemplate, UpdateSourceTrigger=PropertyChanged}"
                                          Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
-                                <TextBlock Text="工作目录（可选）" FontSize="13" Margin="0,0,0,2"/>
+                                <TextBlock Text="工作目录（可选）" FontSize="13"
+                                           Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                                 <TextBox Text="{Binding SelectedCommand.WorkingDir, UpdateSourceTrigger=PropertyChanged}"
                                          Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
                             </StackPanel>
 
-                            <TextBlock Text="触发词（关键字路由，留空则不经关键字路由）" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBlock Text="触发词（关键字路由，留空则不经关键字路由）" FontSize="13"
+                                       Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <TextBox Text="{Binding SelectedCommand.Trigger, UpdateSourceTrigger=PropertyChanged}"
                                      Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,4"/>
                             <TextBlock Text="{Binding CommandConflictText}" FontSize="12"
                                        Foreground="{DynamicResource TextMatch}" Margin="0,0,0,8"
                                        TextWrapping="Wrap"/>
 
-                            <TextBlock Text="快捷键（如 Ctrl+Shift+G，留空=无快捷键）" FontSize="13" Margin="0,0,0,2"/>
+                            <TextBlock Text="快捷键（如 Ctrl+Shift+G，留空=无快捷键）" FontSize="13"
+                                       Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <TextBox Text="{Binding SelectedCommand.ShortcutCombo, UpdateSourceTrigger=PropertyChanged}"
                                      Style="{StaticResource SettingsTextBoxStyle}" Margin="0,0,0,8"/>
 
                             <CheckBox Content="在根搜索中显示"
                                       IsChecked="{Binding SelectedCommand.ShowInRootSearch}"
+                                      Style="{StaticResource SettingsCheckBoxStyle}"
                                       Margin="0,0,0,8"/>
                             <CheckBox Content="启用"
                                       IsChecked="{Binding SelectedCommand.Enabled}"
+                                      Style="{StaticResource SettingsCheckBoxStyle}"
                                       Margin="0,0,0,12"/>
 
                             <UniformGrid Columns="2" Margin="0,0,0,8">

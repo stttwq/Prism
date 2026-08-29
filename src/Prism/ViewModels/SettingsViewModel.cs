@@ -1093,14 +1093,23 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             return;
         }
 
-        // §4.5：保存前校验触发词命名空间冲突
+        // §4.5：保存前校验触发词命名空间冲突。Trigger 与关键字都查——broker 侧
+        // 逐个关键字查（keywords 恒占命名空间），且 Trigger 留空时 ToDefinition
+        // 会回退用首关键字做路由触发词，只查 Trigger 会漏掉关键字冲突。
+        var excludeId = string.IsNullOrEmpty(SelectedCommand.Id) ? null : SelectedCommand.Id;
+        var candidates = new List<string>();
         var trigger = SelectedCommand.Trigger.Trim();
-        if (!string.IsNullOrEmpty(trigger))
+        if (trigger.Length > 0) candidates.Add(trigger);
+        foreach (var kw in SelectedCommand.KeywordsText.Split(','))
+        {
+            var t = kw.Trim();
+            if (t.Length > 0 && !candidates.Contains(t, StringComparer.OrdinalIgnoreCase))
+                candidates.Add(t);
+        }
+        foreach (var candidate in candidates)
         {
             var ns = await _commandPipe.ValidateTriggerNamespaceAsync(
-                trigger, "command",
-                string.IsNullOrEmpty(SelectedCommand.Id) ? null : SelectedCommand.Id)
-                .ConfigureAwait(true);
+                candidate, "command", excludeId).ConfigureAwait(true);
             if (ns is { Ok: false })
             {
                 CommandConflictText = ns.Conflict is { } c
@@ -1109,8 +1118,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 CommandStatusText = "保存被拒：触发词冲突";
                 return;
             }
-            CommandConflictText = "";
         }
+        CommandConflictText = "";
 
         CommandStatusText = "保存中…";
         try
