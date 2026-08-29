@@ -1200,6 +1200,8 @@
                                 </ItemsControl.ItemTemplate>
                             </ItemsControl>
 
+                            <!-- 内置命令（prism.*）定义只读，仅快捷键可改（broker 支持内置命令快捷键绑定） -->
+                            <StackPanel IsEnabled="{Binding SelectedCommand.IsUserCommand}">
                             <TextBlock Text="标题" FontSize="13"
                                        Foreground="{DynamicResource TextSubtitle}" Margin="0,0,0,2"/>
                             <TextBox Text="{Binding SelectedCommand.Title, UpdateSourceTrigger=PropertyChanged}"
@@ -1318,6 +1320,7 @@
                                       IsChecked="{Binding SelectedCommand.Enabled}"
                                       Style="{StaticResource SettingsCheckBoxStyle}"
                                       Margin="0,0,0,12"/>
+                            </StackPanel>
 
                             <UniformGrid Columns="2" Margin="0,0,0,8">
                                 <Button Content="保存到 broker"

@@ -60,6 +60,12 @@ pub struct CommandDescriptor {
     /// K4b：声明式参数（catalog 下发，编辑器回显用）。空省略。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<CommandArgumentDto>,
+    /// K4b 收尾：handler 与参数随 catalog 下发，编辑既有命令时回显
+    /// （此前编辑器拿不到 URL/程序路径，重存会被 open_url 校验拒绝）。
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub handler: &'static str,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub handler_params: std::collections::BTreeMap<String, String>,
 }
 
 /// K4b：声明参数的下行形态（对应 persistence::CommandArgumentSpec）。
@@ -185,6 +191,8 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             disabled_reason: String::new(),
             fallback: false,
             arguments: Vec::new(),
+            handler: "",
+            handler_params: Default::default(),
         },
         CommandDescriptor {
             id: "prism.terminal.open".into(),
@@ -222,6 +230,8 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             disabled_reason: String::new(),
             fallback: false,
             arguments: Vec::new(),
+            handler: "",
+            handler_params: Default::default(),
         },
         CommandDescriptor {
             // K2 §4.7：暂存区批量复制路径至剪贴板。无损操作、不探测存在性，
@@ -257,6 +267,8 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             disabled_reason: String::new(),
             fallback: false,
             arguments: Vec::new(),
+            handler: "",
+            handler_params: Default::default(),
         },
         CommandDescriptor {
             // K2 §4.5：暂存区多目标 ZIP。enabled/disabled_reason 在 catalog()
@@ -292,6 +304,8 @@ fn builtin_catalog() -> Vec<CommandDescriptor> {
             disabled_reason: String::new(),
             fallback: false,
             arguments: Vec::new(),
+            handler: "",
+            handler_params: Default::default(),
         },
     ]
 }
@@ -891,6 +905,12 @@ fn user_command_to_descriptor(command: &UserCommandDefinition) -> CommandDescrip
                 default: a.default.clone(),
             })
             .collect(),
+        handler: match command.handler {
+            crate::persistence::UserHandlerKind::OpenUrl => "open_url",
+            crate::persistence::UserHandlerKind::LaunchProgram => "launch_program",
+            crate::persistence::UserHandlerKind::Unknown => "",
+        },
+        handler_params: command.handler_params.clone(),
     }
 }
 

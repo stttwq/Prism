@@ -22,7 +22,9 @@ public sealed record CommandDescriptor(
     bool Enabled,
     bool IsUsable,
     bool Fallback = false,
-    IReadOnlyList<CommandArgumentSpecDto>? Arguments = null)
+    IReadOnlyList<CommandArgumentSpecDto>? Arguments = null,
+    string Handler = "",
+    IReadOnlyDictionary<string, string>? HandlerParams = null)
 {
     /// <summary>
     /// 从 JSON 解析命令描述。未知字段不抛；无法识别的 owner/danger/input.kind
@@ -79,9 +81,22 @@ public sealed record CommandDescriptor(
             }
         }
 
+        // K4b 收尾：handler 与参数（缺省空，旧 broker 无此字段）。
+        var handler = el.TryGetProperty("handler", out var hEl) ? hEl.GetString() ?? "" : "";
+        var handlerParams = new Dictionary<string, string>();
+        if (el.TryGetProperty("handler_params", out var hpEl) && hpEl.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var kv in hpEl.EnumerateObject())
+            {
+                if (kv.Value.ValueKind == JsonValueKind.String)
+                    handlerParams[kv.Name] = kv.Value.GetString() ?? "";
+            }
+        }
+
         return new CommandDescriptor(
             id, title, subtitle, iconGlyph, owner, trust,
-            keywords, input, bindings, danger, enabled, isUsable, fallback, arguments);
+            keywords, input, bindings, danger, enabled, isUsable, fallback, arguments,
+            handler, handlerParams);
     }
 
     private static bool IsKnownOwner(string owner) =>

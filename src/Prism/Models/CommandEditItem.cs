@@ -58,10 +58,18 @@ public sealed class CommandEditItem : INotifyPropertyChanged
                 Default = arg.Default,
             });
 
-        // handler 从 subtitle/handler 不可直接获取——CommandDescriptor 不含 handler 字段。
-        // 用户命令从 Subtitle 反推不够可靠；对 builtin 命令 handler 字段无意义（不可编辑）。
-        // 新建命令默认 open_url；编辑时由 ViewModel 从 broker preview 请求补充。
-        _handler = "open_url";
+        // handler 与参数：K4b 收尾起 catalog 随描述符下发，编辑既有命令可完整回显
+        // （此前 URL/程序路径丢失，重存被 broker 校验拒绝）。旧 broker 无此字段时
+        // 保持 open_url 默认。
+        if (!string.IsNullOrEmpty(desc.Handler))
+            _handler = desc.Handler;
+        if (desc.HandlerParams is { } hp)
+        {
+            if (hp.TryGetValue("url_template", out var url)) _urlTemplate = url;
+            if (hp.TryGetValue("path", out var path)) _programPath = path;
+            if (hp.TryGetValue("args_template", out var args)) _argsTemplate = args;
+            if (hp.TryGetValue("working_dir", out var wd)) _workingDir = wd;
+        }
     }
 
     /// <summary>唯一标识。新建时由 ViewModel 分配 user.<guid> 形式的 id。</summary>
@@ -176,8 +184,17 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         set { if (_danger != value) { _danger = value; OnPropertyChanged(); } }
     }
 
-    /// <summary>是否为内置命令（只读展示，不可编辑/删除）。</summary>
-    public bool IsBuiltin => !string.IsNullOrEmpty(Id) && Id.StartsWith("builtin.");
+    /// <summary>
+    /// 是否为内置命令（只读展示，仅快捷键可改；不可编辑/删除）。
+    /// broker 内置 id 一律 prism.* 前缀（prism.settings.open 等）；
+    /// "builtin." 是历史误判前缀，保留只为兼容。
+    /// </summary>
+    public bool IsBuiltin =>
+        !string.IsNullOrEmpty(Id) &&
+        (Id.StartsWith("prism.") || Id.StartsWith("builtin."));
+
+    /// <summary>用户命令 = 表单可编辑。XAML 绑定用。</summary>
+    public bool IsUserCommand => !IsBuiltin;
 
     /// <summary>从编辑态构造持久化形态，用于发送给 broker。</summary>
     public UserCommandDefinition ToDefinition()
