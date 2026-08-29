@@ -855,6 +855,10 @@ fn key_passes_filters(
     if !filters.ext_matches(name, is_directory) {
         return false;
     }
+    // G7c：stat 条件在拼音候选上同样生效（元数据来自索引记录）。
+    if !filters.stat_matches_record(volume, key.record, is_directory) {
+        return false;
+    }
     if has_path_filter {
         *path_constructions = path_constructions.saturating_add(1);
         match volume.path_for(key.record) {

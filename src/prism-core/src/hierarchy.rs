@@ -59,7 +59,7 @@ pub const FLAG_EXCLUDED: u16 = 0x0004;
 /// 4096× 密度检查拦截。
 const MAX_RECORD_NUMBER: usize = 16_777_216;
 const MAX_PATH_DEPTH: usize = 64;
-const NO_NAME: u32 = u32::MAX;
+pub(crate) const NO_NAME: u32 = u32::MAX;
 
 /// Deepest record [`VolumeIndex::path_for`] can still render, counted in hops above the
 /// volume root: the walk spends one iteration per component plus one for the root itself.
@@ -85,6 +85,20 @@ pub struct NodeSlot {
     pub flags: u16,
 }
 
+/// G7c：单记录文件元数据（size 字节 + mtime/ctime unix 秒）。全零 = 未知。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecordStat {
+    pub size: u64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+impl RecordStat {
+    pub(crate) fn is_known(&self) -> bool {
+        self.size != 0 || self.mtime != 0 || self.ctime != 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeId {
     pub guid: String,
@@ -100,6 +114,11 @@ pub struct VolumeIndex {
     pub root_record: u32,
     pub nodes: Vec<NodeSlot>,
     pub names: Vec<u8>,
+    /// G7c：每记录文件元数据，与 nodes 平行按记录号索引（同 sparse 语义）。
+    /// 全零 = 未知：serde skip 不入 sidecar（免格式版本化），服务启动后由维护
+    /// tick 分块填充；USN upsert 时清零，让下一个 tick 定向重 stat。
+    #[serde(skip)]
+    pub(crate) stats: Vec<RecordStat>,
     #[serde(skip)]
     initial_name_bytes: usize,
     #[serde(skip)]
@@ -433,6 +452,7 @@ impl VolumeIndex {
             root_record,
             nodes,
             names: Vec::new(),
+            stats: Vec::new(),
             initial_name_bytes: 0,
             dead_name_bytes: 0,
             names_fingerprint: NAMES_FNV_OFFSET,
@@ -468,6 +488,7 @@ impl VolumeIndex {
             ));
         }
         self.nodes.resize(required, NodeSlot::default());
+        self.stats.resize(required, RecordStat::default());
         Ok(())
     }
 
@@ -505,6 +526,8 @@ impl VolumeIndex {
             return Err(VolumeError::BrokenParentChain { record });
         }
         self.ensure_slot(record)?;
+        // G7c：新建/改名一律让 stat 失效（内容可能已变），维护 tick 重 stat。
+        self.invalidate_stat(record);
 
         let parent_excluded = self.nodes[parent_record as usize].flags & FLAG_EXCLUDED != 0;
         let excluded = parent_excluded
@@ -626,7 +649,9 @@ impl VolumeIndex {
     }
 
     pub fn memory_bytes(&self) -> usize {
-        self.nodes.capacity() * std::mem::size_of::<NodeSlot>() + self.names.capacity()
+        self.nodes.capacity() * std::mem::size_of::<NodeSlot>()
+            + self.names.capacity()
+            + self.stats.capacity() * std::mem::size_of::<RecordStat>()
     }
 
     /// AUDIT-2026-08-18 R-C2: 轻量结构不变量检查——开销 O(1)，不做 path_for 遍历。
@@ -798,6 +823,8 @@ impl VolumeIndex {
         if live_bound < self.nodes.len() {
             self.nodes.truncate(live_bound);
             self.nodes.shrink_to_fit();
+            self.stats.truncate(live_bound);
+            self.stats.shrink_to_fit();
         }
         // initial_name_bytes 基线随池重写由 recompute_derived_counters 恢复
         // （复审 M 2026-08-21：names.len() 即压缩后基线）。
@@ -831,6 +858,7 @@ impl VolumeIndex {
 
     pub(crate) fn rollback_mutations(&mut self, snapshot: MutationSnapshot) {
         self.nodes.truncate(snapshot.nodes_len);
+        self.stats.truncate(snapshot.nodes_len);
         for (record, slot) in snapshot.slots {
             self.nodes[record as usize] = slot;
         }
@@ -853,8 +881,27 @@ impl VolumeIndex {
                 return Err(VolumeError::SparseSlots { required, present });
             }
             self.nodes.resize(required, NodeSlot::default());
+            self.stats.resize(required, RecordStat::default());
         }
         Ok(())
+    }
+
+    /// G7c：记录元数据；未知（未填充/已失效）返回 None。
+    pub(crate) fn record_stat(&self, record: u32) -> Option<RecordStat> {
+        let stat = self.stats.get(record as usize)?;
+        stat.is_known().then_some(*stat)
+    }
+
+    pub(crate) fn invalidate_stat(&mut self, record: u32) {
+        if let Some(stat) = self.stats.get_mut(record as usize) {
+            *stat = RecordStat::default();
+        }
+    }
+
+    pub(crate) fn store_stat(&mut self, record: u32, stat: RecordStat) {
+        if let Some(slot) = self.stats.get_mut(record as usize) {
+            *slot = stat;
+        }
     }
 
     fn append_name(&mut self, name: &str) -> Result<u32, VolumeError> {
@@ -1154,6 +1201,9 @@ pub(crate) fn name_eq_ignore_case(left: &str, right: &str) -> bool {
 pub struct QueryFilters {
     exts: Vec<String>,
     paths: Vec<String>,
+    /// G7c：stat 类条件（size/dm/dc/file/folder）。判定需要每记录元数据
+    /// （VolumeIndex.stats），由 [`Self::stat_matches_record`] 在扫描内执行。
+    stat: crate::filters::StatFilterSet,
 }
 
 impl QueryFilters {
@@ -1164,7 +1214,17 @@ impl QueryFilters {
             .into_iter()
             .map(|needle| needle.to_lowercase())
             .collect();
-        Self { exts, paths }
+        Self {
+            exts,
+            paths,
+            stat: crate::filters::StatFilterSet::default(),
+        }
+    }
+
+    /// G7c：附带 stat 条件（size/dm/dc/file/folder）。
+    pub fn with_stat(mut self, stat: crate::filters::StatFilterSet) -> Self {
+        self.stat = stat;
+        self
     }
 
     pub fn none() -> Self {
@@ -1172,7 +1232,7 @@ impl QueryFilters {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.exts.is_empty() && self.paths.is_empty()
+        self.exts.is_empty() && self.paths.is_empty() && self.stat.is_empty()
     }
 
     /// True when at least one `path:` filter is present (requires path construction).
@@ -1212,6 +1272,29 @@ impl QueryFilters {
                 path.to_lowercase().contains(needle.as_str())
             }
         })
+    }
+
+    /// G7c：stat 条件判定——元数据来自索引记录（后台填充/USN 维护）。
+    /// 元数据未知 = 不匹配（宁缺毋滥，与 broker 后置 stat 失败淘汰同口径）。
+    pub(crate) fn stat_matches_record(
+        &self,
+        volume: &VolumeIndex,
+        record: u32,
+        is_directory: bool,
+    ) -> bool {
+        if self.stat.is_empty() {
+            return true;
+        }
+        match volume.record_stat(record) {
+            Some(stat) => crate::filters::stat_passes(
+                &self.stat,
+                is_directory,
+                Some(stat.size),
+                Some(stat.mtime),
+                Some(stat.ctime),
+            ),
+            None => false,
+        }
     }
 }
 
@@ -1351,6 +1434,11 @@ fn scan_slot_range<'a>(
         // construction and before the Top-K heap.
         let is_directory = slot.flags & FLAG_DIRECTORY != 0;
         if !filters.ext_matches(name, is_directory) {
+            continue;
+        }
+        // G7c：stat 条件（size/dm/dc/file/folder）——元数据查表，无 I/O，
+        // 仍在 Top-K 堆前，`is_truncated` 描述的是过滤后的集合。
+        if !filters.stat_matches_record(volume, record as u32, is_directory) {
             continue;
         }
         // G7: path filter — high cost, needs a constructed full path. Only run
@@ -1776,6 +1864,160 @@ mod tests {
         let both = QueryFilters::new(vec![], vec!["program".into(), "数据".into()]);
         assert!(both.path_matches("C:\\Program Files\\数据"));
         assert!(!both.path_matches("C:\\Program Files\\docs"));
+    }
+
+    // --- G7c: stat 过滤（size/dm/dc/file/folder）在扫描内按记录元数据判定 ---
+
+    fn stat_filters(field: &str, value: &str, now: &crate::filters::LocalNow) -> QueryFilters {
+        QueryFilters::new(vec![], vec![]).with_stat(crate::filters::stat_filter_set(
+            &[crate::indexer_ipc::SearchFilter {
+                field: field.into(),
+                value: value.into(),
+            }],
+            now,
+        ))
+    }
+
+    #[test]
+    fn g7c_stat_filter_matches_index_metadata_and_empty_query() {
+        let mut volume = dense_volume("Q:", 3);
+        let now = crate::filters::local_now();
+        let today_start = now.utc_epoch_of_day(now.days);
+        // rec 11 txt：小、今天创建/修改；rec 12 pdf：>1mb、远古；rec 13 元数据未知。
+        volume.store_stat(
+            11,
+            RecordStat {
+                size: 100,
+                mtime: today_start + 10,
+                ctime: today_start + 10,
+            },
+        );
+        volume.store_stat(
+            12,
+            RecordStat {
+                size: 5_000_000,
+                mtime: 1_000_000_000,
+                ctime: 1_000_000_000,
+            },
+        );
+        volume.store_stat(
+            10,
+            RecordStat {
+                size: 0,
+                mtime: today_start,
+                ctime: today_start,
+            },
+        );
+        let volumes = vec![volume];
+
+        // 纯 size 过滤 + 空名字查询（G7 门控放行）：>1mb 命中 12；目录 size
+        // 条件跳过（无大小语义）照常出；未知元数据的 13 不出。
+        let outcome = search_volumes_impl(
+            &volumes,
+            "",
+            10,
+            &[],
+            None,
+            &stat_filters("size", ">1mb", &now),
+            usize::MAX,
+        );
+        assert_eq!(outcome.items.len(), 2);
+        assert!(outcome
+            .items
+            .iter()
+            .any(|item| item.name == "FILE-000001.PDF"));
+        assert!(outcome.items.iter().any(|item| item.is_directory));
+
+        // dm:today → 11 + 目录（目录日期条件照常）。
+        let outcome = search_volumes_impl(
+            &volumes,
+            "",
+            10,
+            &[],
+            None,
+            &stat_filters("dm", "today", &now),
+            usize::MAX,
+        );
+        assert_eq!(outcome.items.len(), 2);
+
+        // file: 旗标 → 两个已知 stat 的文件（目录与未知 13 排除）。
+        let outcome = search_volumes_impl(
+            &volumes,
+            "",
+            10,
+            &[],
+            None,
+            &stat_filters("file", "", &now),
+            usize::MAX,
+        );
+        assert_eq!(outcome.items.len(), 2);
+
+        // folder: 旗标 → 只有目录。
+        let outcome = search_volumes_impl(
+            &volumes,
+            "",
+            10,
+            &[],
+            None,
+            &stat_filters("folder", "", &now),
+            usize::MAX,
+        );
+        assert_eq!(outcome.items.len(), 1);
+        assert!(outcome.items[0].is_directory);
+
+        // 名字词与 stat 条件 AND。
+        let outcome = search_volumes_impl(
+            &volumes,
+            "file",
+            10,
+            &[],
+            None,
+            &stat_filters("size", ">1mb", &now),
+            usize::MAX,
+        );
+        assert_eq!(outcome.items.len(), 1);
+
+        // 多 size 条件 OR（">1mb <200b" → 12 或 11）。
+        let multi = QueryFilters::new(vec![], vec![]).with_stat(crate::filters::stat_filter_set(
+            &[
+                crate::indexer_ipc::SearchFilter {
+                    field: "size".into(),
+                    value: ">1mb".into(),
+                },
+                crate::indexer_ipc::SearchFilter {
+                    field: "size".into(),
+                    value: "<200b".into(),
+                },
+            ],
+            &now,
+        ));
+        let outcome = search_volumes_impl(&volumes, "", 10, &[], None, &multi, usize::MAX);
+        assert_eq!(
+            outcome.items.len(),
+            3,
+            "12(>1mb) + 11(<200b) + 目录(size 跳过)"
+        );
+    }
+
+    #[test]
+    fn g7c_upsert_invalidates_stat_for_refresh() {
+        let mut volume = dense_volume("Q:", 1);
+        volume.store_stat(
+            11,
+            RecordStat {
+                size: 1,
+                mtime: 1,
+                ctime: 1,
+            },
+        );
+        assert!(volume.record_stat(11).is_some());
+        volume
+            .upsert(frn(11, 2), frn(10, 1), "file-000000.txt", false)
+            .unwrap();
+        assert!(
+            volume.record_stat(11).is_none(),
+            "改名/新建必须让 stat 失效等待维护 tick 重 stat"
+        );
     }
 
     // --- N2（FRESH-AUDIT-2026-08-19）: 并行扫描等价性与确定性 ------------------

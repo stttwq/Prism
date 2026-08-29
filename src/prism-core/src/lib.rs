@@ -45,7 +45,10 @@ pub fn build_id() -> String {
 
 pub const PIPE_NAME: &str = r"\\.\pipe\prism-core";
 pub const INDEXER_PIPE_NAME: &str = r"\\.\pipe\prism-indexer-v1";
-pub const INDEXER_PROTOCOL: u32 = 2;
+/// G7c：2→3，stat 过滤（size/dm/dc/file/folder）下沉索引器扫描内——broker
+/// 不再剥离 stat 字段，索引器 validate 接受并按每记录元数据判定。精确匹配
+/// 握手，旧服务/新 broker（或反向）组合走 protocol_mismatch 既有降级路径。
+pub const INDEXER_PROTOCOL: u32 = 3;
 
 pub fn log(msg: impl AsRef<str>) {
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -976,7 +976,7 @@
                 <StackPanel Grid.Row="0" Margin="0,0,0,12">
                     <TextBlock Text="过滤触发词" FontSize="20" FontWeight="SemiBold"
                                Foreground="{DynamicResource TextTitle}" Margin="0,0,0,8"/>
-                    <TextBlock Text="在搜索框输入「关键词 + 空格 + 内容」过滤文件；条件词之外的词都按文件名搜索，顺序随意。ext=扩展名（txt / txt,doc），path=路径，size=大小（>1mb、1mb..100mb、large），dm/dc=修改/创建日期（today、thisweek、2024、20240301、>2024），file/folder=只搜文件/文件夹。也可直接输入语法：ext:pdf 报告、size:>10mb 报告。"
+                    <TextBlock Text="在搜索框输入「关键词 + 空格 + 内容」过滤文件；条件词之外的词都按文件名搜索，顺序随意。ext=扩展名（txt / txt,doc），path=路径，size=大小（无单位=字节：>100 是 100 字节，一般写 >1mb、1mb..100mb、large），dm/dc=修改/创建日期（today、thisweek、2024=整年、20240301=精确到天，不带斜杠；>2024），file/folder=只搜文件/文件夹。也可直接输入语法：ext:pdf 报告、size:>10mb 报告。"
                                FontSize="12" Foreground="{DynamicResource TextSubtitle}" TextWrapping="Wrap"/>
                 </StackPanel>
 

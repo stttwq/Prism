@@ -154,6 +154,12 @@ pub struct SearchFilter {
 const FIELD_EXCLUDE_PATH: &str = "exclude_path";
 const FIELD_EXT: &str = "ext";
 const FIELD_PATH: &str = "path";
+/// G7c：stat 类过滤字段——判定在索引器扫描内用每记录元数据执行。
+const FIELD_SIZE: &str = "size";
+const FIELD_MODIFIED: &str = "dm";
+const FIELD_CREATED: &str = "dc";
+const FIELD_FILE: &str = "file";
+const FIELD_FOLDER: &str = "folder";
 
 /// H1（复审 2026-08-21）：查询长度上限。索引器管道对 Authenticated Users
 /// 开放，无界查询即使经 NameTerms 去重/封顶，归一化与分词本身也是每击键
@@ -198,6 +204,29 @@ pub fn validate_search_request(max: usize, filters: Option<&[SearchFilter]>) -> 
                         "{} filter value must be a non-empty, control-free string",
                         filter.field
                     ));
+                }
+            }
+            // G7c：stat 类过滤下沉到索引器扫描内——值格式按与 broker parse_query
+            // 同一解析器校验（解析失败的请求整体拒绝，不再静默降级）。
+            FIELD_SIZE => {
+                if !crate::filters::is_valid_size_value(filter.value.trim()) {
+                    return Err(format!("size filter value is invalid: {}", filter.value));
+                }
+            }
+            FIELD_MODIFIED | FIELD_CREATED => {
+                if !crate::filters::is_valid_date_value(
+                    filter.value.trim(),
+                    &crate::filters::local_now(),
+                ) {
+                    return Err(format!(
+                        "{} filter value is invalid: {}",
+                        filter.field, filter.value
+                    ));
+                }
+            }
+            FIELD_FILE | FIELD_FOLDER => {
+                if !filter.value.is_empty() {
+                    return Err(format!("{} filter takes no value", filter.field));
                 }
             }
             _ => {
@@ -293,6 +322,31 @@ mod tests {
         assert!(matches!(request, IndexerRequest::Hello { protocol: 2 }));
     }
 
+    /// G7c：stat 类过滤字段进索引器通道，值格式与 broker parse_query 同解析器。
+    #[test]
+    fn g7c_stat_filter_fields_validate() {
+        let ok = |field: &str, value: &str| {
+            validate_search_request(
+                10,
+                Some(&[SearchFilter {
+                    field: field.into(),
+                    value: value.into(),
+                }]),
+            )
+            .is_ok()
+        };
+        assert!(ok("size", ">10mb"));
+        assert!(ok("size", "1mb..100mb"));
+        assert!(ok("size", "large"));
+        assert!(ok("dm", "today"));
+        assert!(ok("dc", "2024"));
+        assert!(ok("file", ""));
+        assert!(ok("folder", ""));
+        assert!(!ok("size", "abc"));
+        assert!(!ok("dm", "2026/8/26"), "斜杠日期非法，须 20260826");
+        assert!(!ok("folder", "x"), "旗标不取值");
+    }
+
     #[test]
     fn missing_and_empty_filters_decode_to_equivalent_requests() {
         let missing: IndexerRequest =
@@ -381,7 +435,7 @@ mod tests {
     #[test]
     fn unknown_filter_field_is_still_rejected() {
         let unknown = [SearchFilter {
-            field: "size".into(),
+            field: "weird_field".into(),
             value: "100".into(),
         }];
         assert!(validate_search_request(8, Some(&unknown)).is_err());

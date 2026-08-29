@@ -2907,15 +2907,10 @@ async fn search_service(
     } else {
         Some(all_filters)
     };
-    // G7b：索引器通道只保留它认识的字段（ext/path/exclude_path）；stat 类
-    // （size/dm/dc/file/folder）不进索引器请求（它的 validate 会整请求拒绝），
-    // 在 broker 候选集上后置执行。校验也只针对索引器视图。
-    let indexer_filters: Option<Vec<SearchFilter>> = all_filters.as_ref().map(|list| {
-        list.iter()
-            .filter(|filter| !crate::filters::is_stat_filter_field(&filter.field))
-            .cloned()
-            .collect()
-    });
+    // G7c（协议 3）：stat 类（size/dm/dc/file/folder）不再剥离——索引器按每
+    // 记录元数据在扫描内判定，纯过滤查询从此覆盖全索引而非 Top-K 候选集。
+    // 旧服务（协议 <3）握手即 mismatch，走既有降级路径，不存在静默丢字段。
+    let indexer_filters: Option<Vec<SearchFilter>> = all_filters.clone();
     if let Err(message) = validate_search_request(max, indexer_filters.as_deref()) {
         return Response::Error {
             message,
@@ -2994,6 +2989,11 @@ async fn search_service(
     let result_slots = max.saturating_sub(items.len());
     let mut ranked = Vec::new();
     let exclusions = exclusion_paths(filters.as_deref());
+    // G7c：stat 条件在场（决定索引器请求配额放大）。
+    let has_stat_filters = filters.as_deref().is_some_and(|list| {
+        list.iter()
+            .any(|filter| crate::filters::is_stat_filter_field(&filter.field))
+    });
     let filter_set = history_filter_set(filters.as_deref());
     let history_weights = history.weights();
     let pinyin_enabled = preferences.pinyin_enabled();
@@ -3057,10 +3057,15 @@ async fn search_service(
         // 候选放宽：向索引器要 3× 槽位（上限沿用 MAX_SEARCH_RESULTS），让重度
         // 使用但匹配位置靠后的文件也能活到 broker 重排；最终截断仍在
         // result_slots，is_truncated 语义不变。协议与索引器代码零改动。
-        indexer_request_max(result_slots),
-        // G7b：索引器只认 ext/path/exclude_path——stat 类字段（size/dm/dc/
-        // file/folder）不转发（索引器 validate 会整请求拒绝），在 broker
-        // 候选集上后置执行。
+        // G7c：带 stat 过滤时放大到上限——过滤在索引器全扫描内做，候选池越
+        // 大覆盖越全（此前只有 Top-K 候选集，size/date 查询天然残缺）。
+        if has_stat_filters {
+            crate::indexer_ipc::MAX_SEARCH_RESULTS
+        } else {
+            indexer_request_max(result_slots)
+        },
+        // G7c（协议 3）：stat 字段原样转发，索引器扫描内判定；broker 后置
+        // apply_stat_filters 仍保留——负责历史注入行（不经索引器）。
         indexer_filters.as_deref(),
         preferences.pinyin_enabled(),
         root,

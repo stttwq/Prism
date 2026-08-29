@@ -1,21 +1,24 @@
-//! G7b：broker 侧 stat 过滤（`size:` / `dm:` / `dc:` / `file:` / `folder:`）。
+//! G7b+G7c：broker 侧 stat 过滤（`size:` / `dm:` / `dc:` / `file:` / `folder:`）。
 //!
-//! 索引器管道只认 ext / path / exclude_path——MFT 名字索引不存大小与时间戳，
-//! 加列 = 协议升级 + 全量重建，不做。size/日期/类型过滤在 broker 候选集
-//! （历史注入 + 索引器 Top-K）上逐条磁盘 stat，spawn_blocking 执行。
-//! 语义对齐 Everything 的常用过滤器，但候选来自「按名字匹配选出的 Top-K」，
-//! 所以设计上就是「过滤条件 + 文件名」形态：纯条件无名字（`size:>1mb`）没有
-//! 全索引扫描能力，索引器返回空候选，结果为空。
+//! G7c（2026-08-30）起判定下沉到索引器扫描内：VolumeIndex 每记录携带
+//! size/mtime/ctime（serde skip 不入 sidecar，服务启动后由维护 tick 分块
+//! 全树 stat 填充、USN 变更失效重填），`QueryFilters::stat_matches_record`
+//! 在 Top-K 堆前执行——纯过滤查询（`size:>1mb` 无名字词）从此覆盖全索引。
+//! 本模块保留：过滤值解析/校验、`StatFilterSet` 语义、扫描内与候选集后置
+//! （历史注入行不经索引器，broker 侧仍逐条磁盘 stat）共用的单条判定
+//! [`stat_passes`]。
 //!
 //! 日期边界用本地时区（GetLocalTime + GetTimeZoneInformation），与 Everything
 //! 的「今天」一致；不引入 chrono——民用日历换算用 Howard Hinnant 的
 //! days_from_civil 算法（纯整数，无查找表）。
 //!
 //! 语法（broker parse_query 负责 token 化，本模块负责校验与匹配）：
-//! - `size:` `>=`/`<=`/`>`/`<`/`=`前缀（可省）+ 数值 + 可选单位 b/kb/mb/gb/tb；
-//!   或 `N..M` 区间；或桶名 empty/tiny/small/medium/large/huge/gigantic。
-//! - `dm:`/`dc:` 同样前缀 + `YYYY[MM[DD]]` 紧凑日期；或 `d1..d2` 区间；或
-//!   today/yesterday/thisweek/lastweek/thismonth/lastmonth/thisyear/lastyear。
+//! - `size:` `>=`/`<=`/`>`/`<`/`=`前缀（可省）+ 数值 + 可选单位 b/kb/mb/gb/tb
+//!   （无单位 = 字节）；或 `N..M` 区间；或桶名 empty/tiny/small/medium/large/
+//!   huge/gigantic。
+//! - `dm:`/`dc:` 同样前缀 + `YYYY[MM[DD]]` 紧凑日期（无斜杠）；或 `d1..d2`
+//!   区间；或 today/yesterday/thisweek/lastweek/thismonth/lastmonth/thisyear/
+//!   lastyear。
 //! - `file:`/`folder:` 旗标，不取值（冒号后文本照常解析为下一 token）。
 
 use crate::indexer_ipc::SearchFilter;
@@ -174,7 +177,7 @@ impl LocalNow {
     pub fn day_of_week(&self) -> i64 {
         (self.days % 7 + 7 + 3) % 7
     }
-    fn utc_epoch_of_day(&self, civil_day: i64) -> i64 {
+    pub(crate) fn utc_epoch_of_day(&self, civil_day: i64) -> i64 {
         civil_day * 86400 - self.tz_offset
     }
 }
@@ -413,7 +416,7 @@ pub fn stat_filter_set(filters: &[SearchFilter], now: &LocalNow) -> StatFilterSe
     set
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct StatFilterSet {
     sizes: Vec<SizeSpec>,
     modified: Vec<DateSpec>,
@@ -446,35 +449,54 @@ pub fn apply_stat_filters(mut items: Vec<SearchResult>, set: &StatFilterSet) -> 
 
 fn passes(item: &SearchResult, set: &StatFilterSet) -> bool {
     let is_folder = item.kind == SearchResultKind::Folder;
-    if set.file_only && is_folder {
+    // 纯旗标条件不碰磁盘 stat（原语义）；有 size/date 条件时 stat 失败=候选失效。
+    if set.sizes.is_empty() && set.modified.is_empty() && set.created.is_empty() {
+        return stat_passes(set, is_folder, None, None, None);
+    }
+    let Ok(meta) = std::fs::metadata(item.execute_id.as_ref()) else {
+        return false;
+    };
+    stat_passes(
+        set,
+        is_folder,
+        Some(meta.len()),
+        system_time_epoch(meta.modified()),
+        system_time_epoch(meta.created()),
+    )
+}
+
+/// G7c：单条 stat 判定，索引器扫描内（元数据来自索引）与 broker 候选集后置
+/// （元数据来自现场磁盘 stat）共用同一语义。任一 size 条件命中即过（OR），
+/// dm/dc 同理；file/folder 旗标为 AND。size=None 表文件夹——size 条件跳过
+/// 文件夹（文件夹大小无 Everything 语义），日期条件对文件夹照常生效。
+/// size/mtime/ctime 传 None = 元数据未知（索引未填充/stat 失败）。
+pub(crate) fn stat_passes(
+    set: &StatFilterSet,
+    is_directory: bool,
+    size: Option<u64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+) -> bool {
+    if set.file_only && is_directory {
         return false;
     }
-    if set.folder_only && !is_folder {
+    if set.folder_only && !is_directory {
         return false;
     }
     if set.sizes.is_empty() && set.modified.is_empty() && set.created.is_empty() {
         return true;
     }
-    let Ok(meta) = std::fs::metadata(item.execute_id.as_ref()) else {
+    let (Some(size), Some(mtime), Some(ctime)) = (size, mtime, ctime) else {
         return false;
     };
-    if !set.sizes.is_empty() && !is_folder {
-        let len = meta.len();
-        if !set.sizes.iter().any(|s| s.matches(len)) {
-            return false;
-        }
+    if !set.sizes.is_empty() && !is_directory && !set.sizes.iter().any(|s| s.matches(size)) {
+        return false;
     }
-    if !set.modified.is_empty() {
-        match system_time_epoch(meta.modified()) {
-            Some(t) if set.modified.iter().any(|s| s.matches(t)) => {}
-            _ => return false,
-        }
+    if !set.modified.is_empty() && !set.modified.iter().any(|s| s.matches(mtime)) {
+        return false;
     }
-    if !set.created.is_empty() {
-        match system_time_epoch(meta.created()) {
-            Some(t) if set.created.iter().any(|s| s.matches(t)) => {}
-            _ => return false,
-        }
+    if !set.created.is_empty() && !set.created.iter().any(|s| s.matches(ctime)) {
+        return false;
     }
     true
 }
@@ -512,6 +534,58 @@ mod tests {
             days_from_civil(2024, 3, 1) - days_from_civil(2024, 2, 1),
             29
         );
+    }
+
+    /// G7c：扫描内/后置共用的单条判定语义。
+    #[test]
+    fn g7c_stat_passes_shared_predicate() {
+        let sf = |field: &str, value: &str| SearchFilter {
+            field: field.into(),
+            value: value.into(),
+        };
+        let now = now_fixed();
+        let file_only = stat_filter_set(&[sf("file", "")], &now);
+        assert!(stat_passes(&file_only, false, None, None, None));
+        assert!(!stat_passes(&file_only, true, None, None, None));
+        let folder_only = stat_filter_set(&[sf("folder", "")], &now);
+        assert!(!stat_passes(&folder_only, false, None, None, None));
+
+        // 元数据未知 = 不过 size/date 条件（索引未填充或 stat 失败同口径）。
+        let size = stat_filter_set(&[sf("size", ">1b")], &now);
+        assert!(!stat_passes(&size, false, None, None, None));
+        assert!(stat_passes(&size, false, Some(10), Some(0), Some(0)));
+        assert!(!stat_passes(&size, false, Some(0), Some(0), Some(0)));
+        // size 条件跳过文件夹（文件夹大小无语义），其余条件照常。
+        assert!(stat_passes(&size, true, Some(9_999_999), Some(0), Some(0)));
+
+        // 多 size 条件 OR；dm 与 dc 各自独立。
+        let multi = stat_filter_set(&[sf("size", ">1mb"), sf("size", "<200b")], &now);
+        assert!(stat_passes(&multi, false, Some(150), Some(0), Some(0)));
+        assert!(stat_passes(
+            &multi,
+            false,
+            Some(2_000_000),
+            Some(0),
+            Some(0)
+        ));
+        assert!(!stat_passes(&multi, false, Some(5_000), Some(0), Some(0)));
+
+        let modified = stat_filter_set(&[sf("dm", "20240315")], &now);
+        let day_start = now.utc_epoch_of_day(now.days);
+        assert!(stat_passes(
+            &modified,
+            false,
+            Some(1),
+            Some(day_start + 60),
+            Some(0)
+        ));
+        assert!(!stat_passes(
+            &modified,
+            false,
+            Some(1),
+            Some(day_start - 60),
+            Some(0)
+        ));
     }
 
     #[test]

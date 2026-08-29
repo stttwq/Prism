@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc, Notify};
 
-use crate::hierarchy::{ApplyOutcome, IndexState, VolumeId, VolumeIndex};
+use crate::hierarchy::{ApplyOutcome, IndexState, VolumeId, VolumeIndex, FLAG_PRESENT, NO_NAME};
 use crate::index_cache;
 use crate::indexer_ipc::{
     requested_root, validate_search_request, BuildProgress, IndexerItem, IndexerRequest,
@@ -1067,7 +1067,12 @@ impl ServiceState {
         let generation = state.generation;
         let exts = crate::indexer_ipc::ext_filters(filters);
         let paths = crate::indexer_ipc::path_filters(filters);
-        let has_query_filters = !exts.is_empty() || !paths.is_empty();
+        // G7c：stat 条件（size/dm/dc/file/folder）与 ext/path 同级参与门控与扫描。
+        let stat = crate::filters::stat_filter_set(
+            filters.unwrap_or_default(),
+            &crate::filters::local_now(),
+        );
+        let has_query_filters = !exts.is_empty() || !paths.is_empty() || !stat.is_empty();
         // G7: an empty name query normally means "no search", but when ext:/path:
         // filters are present the user wants all files matching the filters — the
         // empty name matches every candidate in match_metadata, so we must not
@@ -1092,7 +1097,8 @@ impl ServiceState {
         let query_filters = crate::hierarchy::QueryFilters::new(
             crate::indexer_ipc::ext_filters(filters),
             crate::indexer_ipc::path_filters(filters),
-        );
+        )
+        .with_stat(stat);
         let outcome =
             state.search_in_root_filtered(query, max, &exclusions, root_bound, &query_filters);
         let mut items: Vec<_> = outcome
@@ -1545,6 +1551,28 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                         }
                         Err(error) => {
                             logging::event_detail("error", "maintenance_compact_task", &error.to_string(), None, None);
+                        }
+                    }
+                }
+                // G7c：stat 元数据填充——每拍一块，收敛后每拍只剩全表 unknown
+                // 扫描（毫秒级）。与压缩同款 spawn_blocking + stop select。
+                {
+                    let fill_task = tokio::task::spawn_blocking({
+                        let state = state.clone();
+                        move || fill_stats_chunk_off_lock(&state)
+                    });
+                    tokio::pin!(fill_task);
+                    let result = tokio::select! {
+                        result = &mut fill_task => result,
+                        _ = stop.cancelled() => break,
+                    };
+                    match result {
+                        Ok(Ok(_filled)) => {}
+                        Ok(Err(error)) => {
+                            logging::event_detail("error", "stats_fill_failed", &error, None, None);
+                        }
+                        Err(error) => {
+                            logging::event_detail("error", "stats_fill_task", &error.to_string(), None, None);
                         }
                     }
                 }
@@ -2488,6 +2516,127 @@ fn compact_volumes_off_lock(state: &ServiceState) -> Result<(), String> {
     Ok(())
 }
 
+/// G7c：每 tick 最多 stat 这么多条未知元数据的在位记录。1.2M 记录首填约
+/// 60 拍（5s/tick ≈ 5 分钟收敛）；之后每拍只花一次全表 unknown 扫描（毫秒级）。
+const STATS_FILL_CHUNK: usize = 20_000;
+
+/// 永久不可 stat 的记录占位（path 断链/权限拒绝）：size=MAX 永不过任何
+/// size 条件、mtime/ctime=0 永不过日期条件——视为已知，不再每拍重试。
+fn unstatable_stat() -> crate::hierarchy::RecordStat {
+    crate::hierarchy::RecordStat {
+        size: u64::MAX,
+        mtime: 0,
+        ctime: 0,
+    }
+}
+
+/// G7c：锁外填充每记录 stat（size/mtime/ctime）。读锁收集一批未知记录的
+/// 路径 → 锁外逐条磁盘 stat → 短写锁写回。返回本拍处理的记录数（0=全部已知）。
+/// 与 compact 同一并发纪律：写回前按卷重找，卷被重建替换则丢弃本批。
+fn fill_stats_chunk_off_lock(state: &ServiceState) -> Result<u64, String> {
+    // 1) 读锁：收集未知记录 (卷 id, 记录号, 路径)；路径断链的记录就地产生
+    //    不可 stat 占位（记入 precomputed，写回阶段落表）。
+    let mut batch: Vec<(crate::hierarchy::VolumeId, Vec<(u32, String)>)> = Vec::new();
+    let mut precomputed: Vec<(
+        crate::hierarchy::VolumeId,
+        Vec<(u32, crate::hierarchy::RecordStat)>,
+    )> = Vec::new();
+    let mut remaining = STATS_FILL_CHUNK;
+    {
+        let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
+        let Some(index) = guard.as_ref() else {
+            return Ok(0);
+        };
+        for volume in &index.volumes {
+            if remaining == 0 {
+                break;
+            }
+            let mut pairs: Vec<(u32, String)> = Vec::new();
+            let mut pre: Vec<(u32, crate::hierarchy::RecordStat)> = Vec::new();
+            let len = volume.nodes.len().min(volume.stats.len());
+            for record in 0..len as u32 {
+                if remaining == 0 {
+                    break;
+                }
+                let slot = &volume.nodes[record as usize];
+                if slot.flags & FLAG_PRESENT == 0
+                    || slot.name_off == NO_NAME
+                    || volume.stats[record as usize].is_known()
+                {
+                    continue;
+                }
+                match volume.path_for(record) {
+                    Ok(path) => {
+                        pairs.push((record, path));
+                        remaining -= 1;
+                    }
+                    Err(_) => pre.push((record, unstatable_stat())),
+                }
+            }
+            if !pairs.is_empty() {
+                batch.push((volume.volume_id.clone(), pairs));
+            }
+            if !pre.is_empty() {
+                precomputed.push((volume.volume_id.clone(), pre));
+            }
+        }
+    }
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    // 2) 锁外 stat（只对收集到路径的记录）。
+    let mut stats: Vec<(
+        crate::hierarchy::VolumeId,
+        Vec<(u32, crate::hierarchy::RecordStat)>,
+    )> = precomputed;
+    let mut filled: u64 = 0;
+    for (volume_id, pairs) in &batch {
+        let mut per_volume: Vec<(u32, crate::hierarchy::RecordStat)> =
+            Vec::with_capacity(pairs.len());
+        for (record, path) in pairs {
+            let stat = std::fs::metadata(path)
+                .map(|meta| crate::hierarchy::RecordStat {
+                    size: meta.len(),
+                    mtime: system_time_to_epoch(meta.modified()),
+                    ctime: system_time_to_epoch(meta.created()),
+                })
+                .unwrap_or_else(|_| unstatable_stat());
+            per_volume.push((*record, stat));
+            filled += 1;
+        }
+        stats.push((volume_id.clone(), per_volume));
+    }
+    // 3) 短写锁写回；卷被重建替换/记录被删则丢弃单条。
+    let mut guard = state.index.write().map_err(|_| "index lock is poisoned")?;
+    for (volume_id, per_volume) in &stats {
+        let Some(volume) = guard.as_mut().and_then(|index| {
+            index
+                .volumes
+                .iter_mut()
+                .find(|volume| volume.volume_id == *volume_id)
+        }) else {
+            continue;
+        };
+        for (record, stat) in per_volume {
+            if volume
+                .nodes
+                .get(*record as usize)
+                .is_some_and(|slot| slot.flags & FLAG_PRESENT != 0)
+            {
+                volume.store_stat(*record, *stat);
+            }
+        }
+    }
+    Ok(filled)
+}
+
+fn system_time_to_epoch(t: std::io::Result<std::time::SystemTime>) -> i64 {
+    t.ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// S1: 单卷的「读锁 clone → 锁外压缩 → 短写锁换入」。
 /// clone 与换入之间 USN 到达（该卷 next_usn 前移）则丢弃重试（≤3 次）——
 /// 换入陈旧卷会丢事件，宁可放弃本轮等下一个 tick（计数器不清零，必然重触发）。
@@ -3253,6 +3402,64 @@ mod tests {
             },
             mount_path: format!("{letter}:\\"),
         }
+    }
+
+    /// G7c：stat 填充——真实临时文件，两拍收敛，size 过滤按索引元数据命中。
+    #[test]
+    fn g7c_stats_fill_chunk_stats_real_files() {
+        let tmp = std::env::temp_dir().join(format!("prism-stats-fill-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let big = tmp.join("big.bin");
+        std::fs::write(&big, vec![0u8; 2048]).unwrap();
+        let small = tmp.join("small.txt");
+        std::fs::write(&small, b"hi").unwrap();
+
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: "fill".into(),
+                serial: 1,
+            },
+            tmp.to_string_lossy().to_string(),
+            1,
+            1,
+            5,
+        )
+        .unwrap();
+        volume.prepare_initial_capacity(20, 2).unwrap();
+        volume.upsert(10, 5, "big.bin", false).unwrap();
+        volume.upsert(11, 5, "small.txt", false).unwrap();
+        let state = ServiceState::new();
+        state.publish(IndexState {
+            volumes: vec![volume],
+            generation: 1,
+            events_since_checkpoint: 0,
+        });
+
+        let first = fill_stats_chunk_off_lock(&state).unwrap();
+        assert!(first >= 2, "两个文件都应被 stat，实际 {first}");
+        assert_eq!(
+            fill_stats_chunk_off_lock(&state).unwrap(),
+            0,
+            "第二拍应无未知记录"
+        );
+
+        let guard = state.index.read().unwrap();
+        let index = guard.as_ref().unwrap();
+        let now = crate::filters::local_now();
+        let filters = crate::hierarchy::QueryFilters::new(vec![], vec![]).with_stat(
+            crate::filters::stat_filter_set(
+                &[crate::indexer_ipc::SearchFilter {
+                    field: "size".into(),
+                    value: ">1kb".into(),
+                }],
+                &now,
+            ),
+        );
+        let outcome = index.search_in_root_filtered("", 10, &[], None, &filters);
+        assert_eq!(outcome.items.len(), 1, "只有 big.bin >1kb");
+        assert!(outcome.items[0].path.ends_with("big.bin"));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
