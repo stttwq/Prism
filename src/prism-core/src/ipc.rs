@@ -1930,7 +1930,7 @@ async fn write_window_history(
 /// - `path:"unterminated` → 未闭合引号，回退为普通文本
 /// - `foo:bar` → 未知前缀，按普通文本处理
 fn parse_query(raw: &str) -> (String, Vec<SearchFilter>) {
-    let known_prefixes = ["ext:", "path:"];
+    let known_prefixes = ["ext:", "path:", "size:", "dm:", "dc:", "file:", "folder:"];
     let mut name_parts: Vec<&str> = Vec::new();
     let mut filters = Vec::new();
 
@@ -1961,6 +1961,60 @@ fn parse_query(raw: &str) -> (String, Vec<SearchFilter>) {
         if let Some(prefix) = matched {
             let field = prefix.trim_end_matches(':');
             let value_start = pos + prefix.len();
+            // G7b：file:/folder: 是旗标，不取值——冒号后的文本照常解析为下一
+            // token（"file: 报告" 与 "file:报告" 都是旗标 + 名字"报告"）。
+            if matches!(field, "file" | "folder") {
+                if filters.len() < crate::indexer_ipc::MAX_FILTERS {
+                    filters.push(SearchFilter {
+                        field: field.into(),
+                        value: String::new(),
+                    });
+                }
+                pos = value_start;
+                continue;
+            }
+
+            // An empty value (whitespace or end-of-string immediately after `:`) means the
+            // token is not a valid filter. Fall back to treating the entire token as plain
+            // text — the prefix itself becomes part of the name query.
+            if value_start >= bytes.len() || bytes[value_start].is_ascii_whitespace() {
+                name_parts.push(&raw[pos..value_start]);
+                pos = value_start;
+                continue;
+            }
+
+            // Read the value: either a quoted string or a whitespace-delimited token.
+            let (value, value_end, closed) = read_filter_value(raw, value_start);
+
+            if !closed || value.is_empty() {
+                // Unterminated quote or empty value: treat the whole token as plain text.
+                name_parts.push(&raw[pos..value_end]);
+                pos = value_end;
+                continue;
+            }
+
+            // G7b：size/dm/dc 值必须能解析——解析不了整 token 当普通文本（与
+            // ext 空值/未闭合引号同一降级语义），否则半截输入会静默变成"查不到"。
+            if matches!(field, "size" | "dm" | "dc") {
+                let valid = if field == "size" {
+                    crate::filters::is_valid_size_value(value)
+                } else {
+                    crate::filters::is_valid_date_value(value, &crate::filters::local_now())
+                };
+                if !valid {
+                    name_parts.push(&raw[pos..value_end]);
+                    pos = value_end;
+                    continue;
+                }
+                if filters.len() < crate::indexer_ipc::MAX_FILTERS {
+                    filters.push(SearchFilter {
+                        field: field.into(),
+                        value: value.to_owned(),
+                    });
+                }
+                pos = value_end;
+                continue;
+            }
 
             // An empty value (whitespace or end-of-string immediately after `:`) means the
             // token is not a valid filter. Fall back to treating the entire token as plain
@@ -2056,11 +2110,14 @@ fn normalize_ext(raw: &str) -> String {
     stripped.to_lowercase()
 }
 
-/// True when `filters` contains at least one `ext` or `path` entry (G7).
+/// True when the query carries any query filter (G7 + G7b stat 过滤)。
+/// ext:/path: 原生索引器过滤 + size:/dm:/dc:/file:/folder: broker stat 过滤——
+/// 过滤态下 apps/web/alias/command 全部让位，只回文件/文件夹。
+/// **不含 exclude_path**：那是 G3 作用域排除，不改变结果类型构成。
 fn has_query_filters(filters: &[SearchFilter]) -> bool {
     filters
         .iter()
-        .any(|filter| filter.field == "ext" || filter.field == "path")
+        .any(|filter| crate::filters::is_known_filter_field(&filter.field))
 }
 
 /// FRESH-AUDIT-2 F4: 把请求过滤器转成历史注入同样要遵守的 ext/path 匹配器。
@@ -2790,7 +2847,16 @@ async fn search_service(
     } else {
         Some(all_filters)
     };
-    if let Err(message) = validate_search_request(max, all_filters.as_deref()) {
+    // G7b：索引器通道只保留它认识的字段（ext/path/exclude_path）；stat 类
+    // （size/dm/dc/file/folder）不进索引器请求（它的 validate 会整请求拒绝），
+    // 在 broker 候选集上后置执行。校验也只针对索引器视图。
+    let indexer_filters: Option<Vec<SearchFilter>> = all_filters.as_ref().map(|list| {
+        list.iter()
+            .filter(|filter| !crate::filters::is_stat_filter_field(&filter.field))
+            .cloned()
+            .collect()
+    });
+    if let Err(message) = validate_search_request(max, indexer_filters.as_deref()) {
         return Response::Error {
             message,
             category: None,
@@ -2857,7 +2923,7 @@ async fn search_service(
     }
     let mut items = Vec::with_capacity(max.min(128));
     // G7: when ext:/path: filters are present, only files/folders are returned — no apps,
-    // web, or window results mixed in.
+    // web, or window results mixed in. G7b stat 过滤同样算过滤态。
     if !has_filters {
         if let Ok(guard) = engines.read() {
             if let Some(hit) = websearch::try_match(query, guard.as_slice()) {
@@ -2932,7 +2998,10 @@ async fn search_service(
         // 使用但匹配位置靠后的文件也能活到 broker 重排；最终截断仍在
         // result_slots，is_truncated 语义不变。协议与索引器代码零改动。
         indexer_request_max(result_slots),
-        filters.as_deref(),
+        // G7b：索引器只认 ext/path/exclude_path——stat 类字段（size/dm/dc/
+        // file/folder）不转发（索引器 validate 会整请求拒绝），在 broker
+        // 候选集上后置执行。
+        indexer_filters.as_deref(),
         preferences.pinyin_enabled(),
         root,
         // M13：路径分支留下的 deadline 继续管住兜底链；非路径查询则新开一条。
@@ -3017,6 +3086,21 @@ async fn search_service(
     if has_command_context && !has_filters {
         let command_results = command_search(&name_query, result_slots, commands);
         ranked.extend(command_results);
+    }
+    // G7b：stat 过滤（size:/dm:/dc:/file:/folder:）——候选集（历史注入 +
+    // 索引器 Top-K）齐了之后逐条磁盘 stat。放排序前：先过滤后排序，被过滤行
+    // 不花时间戳排序成本；几十到几千次 stat 是磁盘 I/O，进 spawn_blocking。
+    let stat_set = crate::filters::stat_filter_set(
+        filters.as_deref().unwrap_or_default(),
+        &crate::filters::local_now(),
+    );
+    if !stat_set.is_empty() {
+        let taken = std::mem::take(&mut ranked);
+        ranked = tokio::task::spawn_blocking(move || {
+            crate::filters::apply_stat_filters(taken, &stat_set)
+        })
+        .await
+        .unwrap_or_default();
     }
     // 查询记忆置顶：当前（规范化）查询串选中过的 target 在 kind 内、class 之前
     // 排最前——再次输入同样关键词，上次的选择就是第一条。仅全局搜索路径启用。
@@ -6210,6 +6294,71 @@ mod query_parser_tests {
             value: r"C:\x".into(),
         }]));
         assert!(!has_query_filters(&[]));
+    }
+
+    // ── G7b：stat 过滤（size/dm/dc/file/folder）─────────────────────────
+
+    fn sf(field: &str, value: &str) -> SearchFilter {
+        SearchFilter {
+            field: field.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn size_filter_parsed_with_name() {
+        let (name, filters) = parse_query("report size:>10mb");
+        assert_eq!(name, "report");
+        assert_eq!(filters, vec![sf("size", ">10mb")]);
+        assert!(has_query_filters(&filters));
+    }
+
+    #[test]
+    fn size_before_name_and_multiple_specs() {
+        let (name, filters) = parse_query("size:>1mb size:<100mb 报告");
+        assert_eq!(name, "报告");
+        assert_eq!(filters, vec![sf("size", ">1mb"), sf("size", "<100mb")]);
+    }
+
+    #[test]
+    fn invalid_size_value_falls_back_to_plain_text() {
+        let (name, filters) = parse_query("size:abc");
+        assert_eq!(name, "size:abc");
+        assert!(filters.is_empty());
+        assert!(!has_query_filters(&filters));
+    }
+
+    #[test]
+    fn date_filter_and_flag_parsed() {
+        let (name, filters) = parse_query("dm:today 报告");
+        assert_eq!(name, "报告");
+        assert_eq!(filters, vec![sf("dm", "today")]);
+
+        let (name, filters) = parse_query("dc:2024 ..ignore");
+        // "..ignore" 不是合法日期 → dc:2024 合法（紧凑年），".."+词进名字。
+        assert_eq!(filters, vec![sf("dc", "2024")]);
+        assert!(name.contains("..ignore"));
+
+        let (name, filters) = parse_query("file: 报告");
+        assert_eq!(name, "报告");
+        assert_eq!(filters, vec![sf("file", "")]);
+
+        // 旗标带附着值：冒号后文本照常成为名字 token。
+        let (name, filters) = parse_query("folder:xyz");
+        assert_eq!(name, "xyz");
+        assert_eq!(filters, vec![sf("folder", "")]);
+        assert!(has_query_filters(&filters));
+    }
+
+    #[test]
+    fn stat_filters_combined_with_ext() {
+        let (name, filters) = parse_query("report ext:pdf size:>1mb folder:");
+        // folder: 旗标后面是查询结尾。
+        assert_eq!(name, "report");
+        assert_eq!(
+            filters,
+            vec![ext("pdf"), sf("size", ">1mb"), sf("folder", "")]
+        );
     }
 
     /// 回归测试：中文输入（如"知乎"）不应在 parse_query 中 panic。

@@ -15,7 +15,74 @@ public sealed class FilterTriggerDetectorTests
         new("t", "ext", ""),
         new("tz", "ext", ""),
         new("pp", "path", ""),
+        new("dx", "size", ""),
+        new("xg", "dm", ""),
+        new("cj", "dc", ""),
+        new("wj", "file", ""),
+        new("wjia", "folder", ""),
     ];
+
+    [Fact]
+    public void Size_Condition_With_Name()
+    {
+        Assert.Equal("size:>10mb 报告", FilterTriggerDetector.TryRewrite("dx >10mb 报告", Triggers));
+    }
+
+    [Fact]
+    public void Size_Multiple_Conditions_Each_Own_Token()
+    {
+        // 条件各自成 token → broker 多条 size 过滤 AND 语义。
+        Assert.Equal(
+            "size:>1mb size:<100mb 报告",
+            FilterTriggerDetector.TryRewrite("dx >1mb <100mb 报告", Triggers));
+    }
+
+    [Fact]
+    public void Size_Bucket_And_Name_Tokens_Separated()
+    {
+        // "报告" 不是 size 形状 → 名字；"large" 是桶名 → 条件。
+        Assert.Equal("size:large 报告", FilterTriggerDetector.TryRewrite("dx large 报告", Triggers));
+    }
+
+    [Fact]
+    public void Date_Trigger_Rewrites_Named_And_Range()
+    {
+        Assert.Equal("dm:thisweek 报告", FilterTriggerDetector.TryRewrite("xg thisweek 报告", Triggers));
+        Assert.Equal("dm:2024 报告", FilterTriggerDetector.TryRewrite("xg 2024 报告", Triggers));
+        Assert.Equal(
+            "dc:20240101..20240131 报告",
+            FilterTriggerDetector.TryRewrite("cj 20240101..20240131 报告", Triggers));
+    }
+
+    [Fact]
+    public void Flag_Trigger_Takes_No_Value()
+    {
+        Assert.Equal("file: 报告", FilterTriggerDetector.TryRewrite("wj 报告", Triggers));
+        Assert.Equal("file:", FilterTriggerDetector.TryRewrite("wj ", Triggers));
+    }
+
+    [Fact]
+    public void Folder_Trigger_Longer_Keyword_First()
+    {
+        // "wjia 报告" 应命中 wjia（folder）而非 wj（file）。
+        var hit = FilterTriggerDetector.TryDetect("wjia 报告", Triggers);
+        Assert.NotNull(hit);
+        Assert.Equal("wjia", hit!.Trigger.Keyword);
+    }
+
+    [Fact]
+    public void Path_Condition_With_Name()
+    {
+        Assert.Equal(
+            @"path:D:\资料 报告",
+            FilterTriggerDetector.TryRewrite(@"pp D:\资料 报告", Triggers));
+        // 带空格的引号路径：两 token 合并回一个带引号路径值。
+        Assert.Equal(
+            @"path:""D:\my docs"" 报告",
+            FilterTriggerDetector.TryRewrite(@"pp ""D:\my docs"" 报告", Triggers));
+        // 无路径形 token：旧行为，整段作路径子串。
+        Assert.Equal("path:docs", FilterTriggerDetector.TryRewrite("pp docs", Triggers));
+    }
 
     [Fact]
     public void Bare_Keyword_Does_Not_Trigger()

@@ -271,9 +271,11 @@ public sealed class SearchViewModel
     {
         foreach (var token in query.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
         {
-            if (token.StartsWith("ext:", StringComparison.OrdinalIgnoreCase)
-                || token.StartsWith("path:", StringComparison.OrdinalIgnoreCase))
-                return true;
+            foreach (var prefix in new[] { "ext:", "path:", "size:", "dm:", "dc:", "file:", "folder:" })
+            {
+                if (token.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
         }
         return false;
     }

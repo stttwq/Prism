@@ -7,6 +7,7 @@ pub mod apps;
 pub mod commands;
 pub mod config;
 pub mod file_ops;
+pub mod filters;
 pub mod fs_util;
 pub mod hierarchy;
 pub mod history;
