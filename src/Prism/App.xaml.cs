@@ -151,20 +151,7 @@ public partial class App : Application
                 // K1：连接成功刷新命令目录，断开则清空。
                 if (connected)
                 {
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await _commandCatalog!.RefreshAsync().ConfigureAwait(false);
-                            // K2 §4.6：目录刷新后同步命令快捷键表到窗口。
-                            // 窗口是懒创建的——可能此时还不存在，SetCommandShortcuts
-                            // 在 EnsureSearchWindow 中也会从当前快照初始化。
-                            var snapshot = _commandCatalog!.Snapshot;
-                            _ = Dispatcher.BeginInvoke(new Action(() =>
-                                _searchWindow?.SetCommandShortcuts(snapshot)));
-                        }
-                        catch { /* 目录拉取失败不影响其他功能 */ }
-                    });
+                    _ = RefreshCatalogAfterConnectAsync();
                 }
                 else
                 {
@@ -220,6 +207,27 @@ public partial class App : Application
         // 放在服务构造完成后、TryStartBackendAsync 之后：此时 _vm / _icons 已就绪，
         // ToggleSearchWindow 可安全懒创建搜索窗。
         _singleInstance.StartForegroundListener(Dispatcher, ToggleSearchWindow);
+    }
+
+    /// <summary>
+    /// 连接建立后刷新命令目录并同步命令快捷键到搜索窗。触发点有二：
+    /// ConnectionChanged(true)（断连恢复）与 TryStartBackendAsync（启动成功——
+    /// 该路径上事件被 PipeClient 的状态去重吞掉，见彼处注释）。
+    /// </summary>
+    private async Task RefreshCatalogAfterConnectAsync()
+    {
+        if (_commandCatalog is null) return;
+        try
+        {
+            await _commandCatalog.RefreshAsync().ConfigureAwait(false);
+            // K2 §4.6：目录刷新后同步命令快捷键表到窗口。窗口是懒创建的——
+            // 可能此时还不存在，SetCommandShortcuts 在 EnsureSearchWindow 中
+            // 也会从当前快照初始化。
+            var snapshot = _commandCatalog.Snapshot;
+            _ = Dispatcher.BeginInvoke(new Action(() =>
+                _searchWindow?.SetCommandShortcuts(snapshot)));
+        }
+        catch { /* 目录拉取失败不影响其他功能 */ }
     }
 
     private SearchWindow EnsureSearchWindow()
@@ -486,6 +494,12 @@ public partial class App : Application
         {
             await _pipe.StartAsync();
             _state.IsBackendConnected = true;
+            // K4a：启动成功路径也刷新命令目录。StartWatchdog 预置 _wasConnected=true，
+            // 正常启动（broker 常驻、秒连）时 ConnectionChanged(true) 被
+            // NotifyConnection 的状态去重吞掉——挂在事件上的目录刷新从不执行，
+            // 快照恒空（存量缺陷：关键字路由/命令快捷键/无结果回退全部失效，
+            // 直到一次断连恢复或设置保存）。此处与事件路径做同一刷新。
+            _ = RefreshCatalogAfterConnectAsync();
             if (_store is not null)
             {
                 try

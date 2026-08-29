@@ -45,3 +45,33 @@
 
 - 运行时安装目录实际为 `D:\LS\Prism`（注册表 InstallLocation；早前记忆 E:\LS\Prism 已过时）。写该目录需提权（Users 组仅 RX）。
 - indexer 二进制本批未变，服务无需重启；broker + 前端重启即可。
+
+## 测试中发现并修复的存量缺陷（随本批提交）
+
+**命令目录在「broker 常驻」启动路径上从不刷新（K3 起即存在）。**
+`PipeClient.StartWatchdog` 预置 `_wasConnected = true`（F3 补丁语义），正常启动
+（broker 已在运行、秒连）时 `StartAsync` 的 `NotifyConnection(true)` 被
+`if (connected == _wasConnected) return` 去重吞掉——挂在 `ConnectionChanged` 上的
+`CommandCatalog.RefreshAsync` 成为死代码。后果：启动后快照恒空，关键字路由/
+命令快捷键/无结果回退全部失效，直到一次断连恢复或设置页保存才被填充。冷启动
+较慢（首连超时走异常路径复位 `_wasConnected`）时反而能恢复——所以历史上呈偶发。
+
+修复：App 侧抽 `RefreshCatalogAfterConnectAsync()`，`TryStartBackendAsync` 的
+`StartAsync` 成功路径与 `ConnectionChanged(true)` 两条路都调用。不动 PipeClient
+的事件语义（F1/F3 补丁刻意调过，改去重规则回归风险大）。
+
+## E2E 验证记录（2026-08-29，机器实测）
+
+管道层（artifacts\pipe-k4a-test.ps1，直连运行中 broker，12/12 PASS）：hello 协商、
+command_set 带 fallback、preview 含 clipboard 字段展开 `{clipboard|percent-encode}`/
+`{date|fmt:yyyyMMdd}`/`{uuid}`、uuid 两次生成不同、**不带 clipboard 字段的旧前端
+兼容**、catalog 下发 fallback:true、commands-v1.json 落盘、删除。
+
+GUI 层（artifacts\gui-k4a-fallback-test2.ps1，UIA 驱动真实前端，PASS）：建回退命令
+→ 重启前端 → 双击 Ctrl → ValuePattern 输入 zzqqxx7（SendKeys 会被中文 IME 吃掉）
+→ row[0]=回退命令行（Kind=command，FallbackQuery='zzqqxx7' 即 {query} 传参源）、
+row[1]=默认 web 行 → Enter 浏览器拉起（example.test，无害）→ 清理。截图
+artifacts\k4a-gui-fallback.png：命令行第一（Ctrl+1）、web 行第二（Ctrl+2），渲染正常。
+
+测试环境备忘：开发机上前端可能把 broker 从 `target\release` 自动拉起（进程自愈），
+其数据目录随 exe 路径——盘上验证持久化要先解析运行中 broker 的真实路径。
