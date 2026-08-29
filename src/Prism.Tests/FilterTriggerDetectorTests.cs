@@ -32,6 +32,38 @@ public sealed class FilterTriggerDetectorTests
     }
 
     [Fact]
+    public void Ext_Then_Name_Tokens_Keep_Both()
+    {
+        Assert.Equal("ext:txt 报告", FilterTriggerDetector.TryRewrite("tz txt 报告", Triggers));
+    }
+
+    [Fact]
+    public void Name_Only_Terms_Search_Name_Without_Filter()
+    {
+        // 非 ext 形状（中文）整段作文件名——旧行为 ext:「报告」永远查不到
+        Assert.Equal("报告", FilterTriggerDetector.TryRewrite("tz 报告", Triggers));
+    }
+
+    [Fact]
+    public void Name_First_Ext_Last_Is_Order_Free()
+    {
+        Assert.Equal("ext:txt 报告", FilterTriggerDetector.TryRewrite("tz 报告 txt", Triggers));
+    }
+
+    [Fact]
+    public void Numeric_Token_Treated_As_Name_Not_Ext()
+    {
+        // 纯数字（年份类）不当扩展名——须含字母
+        Assert.Equal("2024 报告", FilterTriggerDetector.TryRewrite("tz 2024 报告", Triggers));
+    }
+
+    [Fact]
+    public void Comma_Separated_Ext_Values_Preserved()
+    {
+        Assert.Equal("ext:txt,doc 报告", FilterTriggerDetector.TryRewrite("tz txt,doc 报告", Triggers));
+    }
+
+    [Fact]
     public void Path_Type_Rewrites_To_Path_Colon()
     {
         Assert.Equal("path:docs", FilterTriggerDetector.TryRewrite("pp docs", Triggers));

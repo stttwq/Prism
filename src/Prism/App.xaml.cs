@@ -295,12 +295,49 @@ public partial class App : Application
                     await _commandCatalog.RefreshAsync().ConfigureAwait(true);
             });
         _settingsWindow = new SettingsWindow(vm);
+        ApplySavedWindowBounds(_settingsWindow);
         _settingsWindow.Closed += (_, _) =>
         {
+            // 最大化时不把铺满全屏的尺寸存进去——记还原后的尺寸。
+            var source = _settingsWindow.WindowState == WindowState.Maximized
+                ? _settingsWindow.RestoreBounds
+                : new Rect(0, 0, _settingsWindow.ActualWidth, _settingsWindow.ActualHeight);
             _settingsWindow = null;
+            PersistWindowBounds(source.Width, source.Height);
         };
         _settingsWindow.Show();
         _settingsWindow.Activate();
+    }
+
+    /// <summary>打开设置窗时恢复上次尺寸（读盘真值；非法/超屏则保持 XAML 默认）。</summary>
+    private void ApplySavedWindowBounds(Window window)
+    {
+        if (_store is null) return;
+        try
+        {
+            var disk = _store.Load();
+            if (disk.SettingsWindowWidth <= 0 || disk.SettingsWindowHeight <= 0)
+                return;
+            var area = SystemParameters.WorkArea;
+            if (disk.SettingsWindowWidth >= window.MinWidth && disk.SettingsWindowWidth <= area.Width)
+                window.Width = disk.SettingsWindowWidth;
+            if (disk.SettingsWindowHeight >= window.MinHeight && disk.SettingsWindowHeight <= area.Height)
+                window.Height = disk.SettingsWindowHeight;
+        }
+        catch { /* 读不到设置就按默认尺寸 */ }
+    }
+
+    /// <summary>关窗时记忆尺寸。读盘真值打补丁（同 FaviconGrants 模式），不拿
+    /// 内存副本整写——避免覆盖设置保存后的其他字段。</summary>
+    private void PersistWindowBounds(double width, double height)
+    {
+        if (_store is null || width < 1 || height < 1) return;
+        try
+        {
+            var disk = _store.Load();
+            _store.Save(disk with { SettingsWindowWidth = width, SettingsWindowHeight = height });
+        }
+        catch { /* 尺寸记忆失败不影响关闭流程 */ }
     }
 
     /// <summary>

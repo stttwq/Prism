@@ -109,6 +109,10 @@ public sealed record Settings
     /// </summary>
     public int StagingCapacity { get; init; } = 5;
 
+    /// <summary>设置窗口记忆尺寸（前端专用字段，broker 加载时忽略）。0 = 从未保存过。</summary>
+    public double SettingsWindowWidth { get; init; }
+    public double SettingsWindowHeight { get; init; }
+
     /// <summary>
     /// 「加入暂存区」窗口级组合键（默认 "Ctrl+D"，空串 = 禁用）。
     /// 不塞进 ActionHotkeys：那是 broker 动作面板的前端静态镜像（有防漂移锚测试），
