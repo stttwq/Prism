@@ -2382,33 +2382,38 @@ async fn handle_command_set(
             })
             .collect(),
     };
+    // K4 收尾：内置命令（prism.*）= 可见字段覆盖。handler/danger 校验与
+    // handler_params 全部不适用（编辑器对内置命令禁用这些字段）。
+    let is_builtin_override = command.id.starts_with("prism.");
     // §4.2 danger 校验
-    if let Err(msg) = crate::commands::validate_user_danger(&command.danger) {
-        return Response::CommandApplied { message: msg };
-    }
-    // §4.2 语义层：按 handler 类型校验
-    match command.handler {
-        crate::persistence::UserHandlerKind::OpenUrl => {
-            let url_template = command
-                .handler_params
-                .get("url_template")
-                .cloned()
-                .unwrap_or_default();
-            if let Err(msg) = crate::commands::validate_open_url(&url_template, &exp_ctx) {
-                return Response::CommandApplied { message: msg };
-            }
+    if !is_builtin_override {
+        if let Err(msg) = crate::commands::validate_user_danger(&command.danger) {
+            return Response::CommandApplied { message: msg };
         }
-        crate::persistence::UserHandlerKind::LaunchProgram => {
-            if let Err(msg) =
-                crate::commands::validate_launch_program(&command.handler_params, &exp_ctx)
-            {
-                return Response::CommandApplied { message: msg };
+        // §4.2 语义层：按 handler 类型校验
+        match command.handler {
+            crate::persistence::UserHandlerKind::OpenUrl => {
+                let url_template = command
+                    .handler_params
+                    .get("url_template")
+                    .cloned()
+                    .unwrap_or_default();
+                if let Err(msg) = crate::commands::validate_open_url(&url_template, &exp_ctx) {
+                    return Response::CommandApplied { message: msg };
+                }
             }
-        }
-        crate::persistence::UserHandlerKind::Unknown => {
-            return Response::CommandApplied {
-                message: "命令 handler 未知或缺失".into(),
-            };
+            crate::persistence::UserHandlerKind::LaunchProgram => {
+                if let Err(msg) =
+                    crate::commands::validate_launch_program(&command.handler_params, &exp_ctx)
+                {
+                    return Response::CommandApplied { message: msg };
+                }
+            }
+            crate::persistence::UserHandlerKind::Unknown => {
+                return Response::CommandApplied {
+                    message: "命令 handler 未知或缺失".into(),
+                };
+            }
         }
     }
     // §4.5 命名空间冲突检查：逐条查命令关键字
@@ -2435,12 +2440,17 @@ async fn handle_command_set(
             };
         }
     }
-    // 校验通过——持久化（spawn_blocking：落盘 I/O）
+    // 校验通过——持久化（spawn_blocking：落盘 I/O）。内置命令走覆盖存储。
     let commands_for_blocking = commands.clone();
-    let def = command.clone();
-    let result = tokio::task::spawn_blocking(move || commands_for_blocking.set(def))
-        .await
-        .unwrap_or_else(|error| Err(format!("set command task: {error}")));
+    let result = if is_builtin_override {
+        tokio::task::spawn_blocking(move || commands_for_blocking.set_builtin_override(command))
+            .await
+            .unwrap_or_else(|error| Err(format!("set command task: {error}")))
+    } else {
+        tokio::task::spawn_blocking(move || commands_for_blocking.set(command))
+            .await
+            .unwrap_or_else(|error| Err(format!("set command task: {error}")))
+    };
     Response::CommandApplied {
         message: result.err().unwrap_or_default(),
     }

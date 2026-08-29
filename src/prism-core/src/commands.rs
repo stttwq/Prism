@@ -397,6 +397,7 @@ impl CommandStore {
             state: RwLock::new(CommandData {
                 commands,
                 shortcut_bindings,
+                builtin_overrides: Default::default(),
             }),
             usage: RwLock::new(CommandUsageData {
                 entries: usage_entries,
@@ -436,6 +437,36 @@ impl CommandStore {
             .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // K4 收尾：内置命令覆盖合并（标题/关键字/启用/根搜索可见）。
+        // 关键字覆盖同时补 keyword binding（trigger=首关键字），关键字路由即可达。
+        for (id, ov) in &state.builtin_overrides {
+            if let Some(item) = items.iter_mut().find(|d| d.id == *id) {
+                if !ov.title.is_empty() {
+                    item.title = ov.title.clone();
+                }
+                if !ov.keywords.is_empty() {
+                    item.keywords = ov.keywords.clone();
+                    item.bindings.keyword = Some(CommandBindingDto {
+                        priority: 0,
+                        input: String::new(),
+                        cardinality: None,
+                        target_kinds: Vec::new(),
+                        requires_host_root: false,
+                        shortcut_combo: None,
+                        trigger: ov.keywords.first().cloned(),
+                        show_in_root_search: true,
+                    });
+                }
+                if let Some(enabled) = ov.enabled {
+                    item.enabled = enabled;
+                }
+                if let Some(show) = ov.show_in_root_search {
+                    if let Some(rs) = item.bindings.root_search.as_mut() {
+                        rs.show_in_root_search = show;
+                    }
+                }
+            }
+        }
         for command in &state.commands {
             // disabled 用户命令也下发（enabled=false）。设置页必须看见它们才能
             // 重新启用/删除——否则其关键字仍占命名空间（§4.5 all_command_keywords
@@ -554,6 +585,11 @@ impl CommandStore {
     /// generation+1。K0 不接 IPC，仅 store 层实现并测试（D3）。
     pub fn set(&self, def: UserCommandDefinition) -> Result<(), String> {
         validate_command_id(&def.id)?;
+        // 防御：内置 id 走覆盖存储（handle_command_set 路由），不进用户表——
+        // 否则 catalog 会出现同 id 双条目。
+        if def.id.starts_with("prism.") {
+            return Err("内置命令 id 不可作为用户命令保存".into());
+        }
         {
             let mut state = self
                 .state
@@ -573,6 +609,19 @@ impl CommandStore {
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
         validate_command_id(id)?;
+        // 内置命令「删除」= 清除覆盖（恢复出厂），不能真的删掉内置条目。
+        if id.starts_with("prism.") {
+            {
+                let mut state = self
+                    .state
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.builtin_overrides.remove(id);
+            }
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.persist()?;
+            return Ok(());
+        }
         {
             let mut state = self
                 .state
@@ -583,6 +632,50 @@ impl CommandStore {
             if state.commands.len() == before {
                 return Ok(()); // 幂等成功
             }
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.persist()
+    }
+
+    /// K4 收尾：保存内置命令覆盖（标题/关键字/启用/根搜索可见）。
+    /// handler 与绑定结构不可覆盖——编辑器对内置命令禁用这些字段，这里只取可见字段。
+    pub fn set_builtin_override(&self, def: UserCommandDefinition) -> Result<(), String> {
+        validate_command_id(&def.id)?;
+        if !def.id.starts_with("prism.") {
+            return Err("非内置命令 id".into());
+        }
+        if def.title.chars().count() > crate::persistence::COMMAND_TITLE_MAX_CHARS {
+            return Err("command title exceeds 64 chars".into());
+        }
+        if def.keywords.len() > crate::persistence::COMMAND_MAX_KEYWORDS {
+            return Err("command has more than 4 keywords".into());
+        }
+        for keyword in &def.keywords {
+            if keyword.trim().is_empty()
+                || keyword.chars().count() > crate::persistence::COMMAND_KEYWORD_MAX_CHARS
+                || keyword.chars().any(char::is_whitespace)
+            {
+                return Err("command keyword is invalid".into());
+            }
+        }
+        let ov = crate::persistence::BuiltinOverride {
+            title: def.title,
+            keywords: def.keywords,
+            enabled: Some(def.enabled),
+            show_in_root_search: Some(
+                def.bindings
+                    .root_search
+                    .as_ref()
+                    .map(|b| b.show_in_root_search)
+                    .unwrap_or(true),
+            ),
+        };
+        {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.builtin_overrides.insert(def.id, ov);
         }
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.persist()
@@ -630,6 +723,14 @@ impl CommandStore {
                 }
             }
         }
+        // K4 收尾：内置命令覆盖的关键字同样占命名空间（§4.5 冲突检查防用户命令抢词）。
+        for (id, ov) in &state.builtin_overrides {
+            for kw in &ov.keywords {
+                if !kw.trim().is_empty() {
+                    out.push((id.clone(), kw.trim().to_string()));
+                }
+            }
+        }
         out
     }
 
@@ -643,6 +744,7 @@ impl CommandStore {
         CommandData {
             commands: state.commands.clone(),
             shortcut_bindings: state.shortcut_bindings.clone(),
+            builtin_overrides: state.builtin_overrides.clone(),
         }
     }
 

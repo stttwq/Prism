@@ -241,6 +241,23 @@ pub struct CommandData {
     /// 空字符串 = 清除。内置命令也在此映射中存（它们不在 `commands` 向量中）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shortcut_bindings: Vec<CommandShortcutEntry>,
+    /// K4 收尾：内置命令（prism.*）的可见字段覆盖。handler/绑定结构 broker 所有
+    /// 不可覆盖；key = 内置命令 id。空字段 = 不覆盖该项。BTreeMap 保证 JSON 稳定。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub builtin_overrides: std::collections::BTreeMap<String, BuiltinOverride>,
+}
+
+/// 内置命令覆盖条目。title 空 = 沿用内置标题。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinOverride {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_in_root_search: Option<bool>,
 }
 
 /// K2 §4.6：快捷键绑定条目。用 Vec 而非 HashMap 保证 JSON 稳定。

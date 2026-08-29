@@ -172,7 +172,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         RemoveActionHotkeyCommand = new RelayCommand(
             p => RemoveActionHotkey(p as ActionHotkeyEditItem),
             _ => ActionHotkeys.Count > 0);
-        // K3 §4.7：命令 tab 操作。保存对内置命令放行（只保存快捷键）；删除/预览仍限用户命令。
+        // K3 §4.7：命令 tab 操作。内置命令也可保存（broker 存覆盖）；删除/预览仍限用户命令。
         AddCommandCommand = new RelayCommand(_ => AddCommand());
         RemoveCommandCommand = new RelayCommand(_ => RemoveSelectedCommand(),
             _ => SelectedCommand is not null && !SelectedCommand.IsBuiltin);
@@ -1087,13 +1087,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private async Task SaveCommandAsync()
     {
         if (SelectedCommand is null) return;
-        // 内置命令（prism.*）：定义不可改，只保存快捷键绑定——broker 侧
-        // set_shortcut_binding 明确支持内置命令（K2 §4.6）。留空 = 清除。
-        if (SelectedCommand.IsBuiltin)
-        {
-            await SaveBuiltinShortcutAsync().ConfigureAwait(true);
-            return;
-        }
+        // 内置命令（prism.*）也可保存：broker 侧只取标题/关键字/启用/根搜索可见
+        // 存为覆盖（handler 等结构字段由内置定义，编辑器对其禁用）。删除内置
+        // = broker 清除覆盖恢复出厂。
         if (string.IsNullOrWhiteSpace(SelectedCommand.Title))
         {
             CommandStatusText = "标题不能为空";
@@ -1168,37 +1164,6 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         catch (Exception ex)
         {
             CommandStatusText = "保存失败：" + ex.Message;
-        }
-    }
-
-    /// <summary>内置命令只改快捷键绑定，不走定义保存（定义由 broker 内置）。</summary>
-    private async Task SaveBuiltinShortcutAsync()
-    {
-        if (_commandPipe is null)
-        {
-            CommandStatusText = "命令功能不可用";
-            return;
-        }
-        var item = SelectedCommand!;
-        CommandStatusText = "保存中…";
-        try
-        {
-            var combo = item.ShortcutCombo?.Trim() ?? "";
-            var msg = await _commandPipe.SetCommandShortcutAsync(
-                item.Id, combo).ConfigureAwait(true);
-            if (!string.IsNullOrEmpty(msg))
-            {
-                CommandStatusText = "快捷键保存失败：" + msg;
-                return;
-            }
-            CommandStatusText = combo.Length == 0 ? "已清除快捷键" : "已保存快捷键";
-            await LoadCommandsAsync().ConfigureAwait(true);
-            if (_onCommandsChanged is not null)
-                await _onCommandsChanged().ConfigureAwait(true);
-        }
-        catch (Exception ex)
-        {
-            CommandStatusText = "快捷键保存失败：" + ex.Message;
         }
     }
 
