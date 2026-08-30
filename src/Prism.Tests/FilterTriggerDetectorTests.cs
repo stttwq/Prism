@@ -131,6 +131,16 @@ public sealed class FilterTriggerDetectorTests
     }
 
     [Fact]
+    public void Second_Ascii_Token_Stays_Name_Not_Ext()
+    {
+        // 2026-08-30 用户实测回归："tz exe speed" 曾被重写为 "ext:exe,speed"——
+        // 普通文件名词 "speed" 被吞成第二个扩展名，搜出一堆不相干 .exe 软件。
+        // 只有第一个 ext 形 token 作过滤，其余保留为文件名搜索词。
+        Assert.Equal("ext:exe speed", FilterTriggerDetector.TryRewrite("tz exe speed", Triggers));
+        Assert.Equal("ext:txt 报告 txt2", FilterTriggerDetector.TryRewrite("tz txt 报告 txt2", Triggers));
+    }
+
+    [Fact]
     public void Path_Type_Rewrites_To_Path_Colon()
     {
         Assert.Equal("path:docs", FilterTriggerDetector.TryRewrite("pp docs", Triggers));

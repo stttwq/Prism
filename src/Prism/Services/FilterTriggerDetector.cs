@@ -130,10 +130,23 @@ public static class FilterTriggerDetector
     {
         if (terms.Length == 0)
             return "ext:";
-        Partition(terms, IsExtShape, out var exts, out var names);
-        if (exts.Count == 0)
+        // 歧义防护（2026-08-30 用户实测 "tz exe speed" 搜出一堆不相干 .exe）：
+        // IsExtShape 对任意 ASCII 字母数字词都为真——"speed"/"report" 这类普通
+        // 文件名词若被继续吞成第二个扩展名，查询就变成 "ext:exe,speed" 整段失配。
+        // 因此只有**第一个** ext 形 token 作过滤值，其余 token 一律保留为文件名；
+        // 要多个扩展名用逗号（"tz exe,msi 报告"）。
+        string? ext = null;
+        var names = new List<string>();
+        foreach (var token in terms.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (ext is null && IsExtShape(token))
+                ext = token;
+            else
+                names.Add(token);
+        }
+        if (ext is null)
             return terms;
-        var extToken = "ext:" + string.Join(",", exts);
+        var extToken = "ext:" + ext;
         return names.Count > 0 ? $"{extToken} {string.Join(" ", names)}" : extToken;
     }
 
