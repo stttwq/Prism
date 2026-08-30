@@ -405,8 +405,10 @@ public sealed class CommandEditItem : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
-/// <summary>命令模板预设（§4.7：预填表单，不绕过校验）。</summary>
+/// <summary>命令模板预设（§4.7：预填表单，不绕过校验）。A4（2026-08-30）：
+/// Kind 首位——套用模板同时收敛表单类型（selection 模板自动清关键字/根搜索）。</summary>
 public sealed record CommandTemplate(
+    string Kind,
     string DisplayName,
     string Handler,
     string Title,

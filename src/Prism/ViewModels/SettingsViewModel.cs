@@ -1227,6 +1227,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private void ApplyTemplate(CommandTemplate? template)
     {
         if (template is null || SelectedCommand is null) return;
+        // A4：先收敛类型——selection 类型会清关键字/根搜索并预填占位符，
+        // 再覆盖模板其余字段（SetKind 的预填不会覆盖模板值，因 ArgsTemplate
+        // 尚为空时才预填；模板字段随后显式赋值）。
+        SelectedCommand.SetKind(template.Kind);
         SelectedCommand.Handler = template.Handler;
         SelectedCommand.Title = template.Title;
         SelectedCommand.UrlTemplate = template.UrlTemplate;
@@ -1239,21 +1243,39 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(SelectedCommand));
     }
 
-    /// <summary>§4.7 模板预设 6–8 个，预填表单不绕过校验。</summary>
+    /// <summary>§4.7 模板预设，A4（2026-08-30）按类型组织并扩充到覆盖 Listary
+    /// 内置命令形态。修两条错模板：「用记事本打开」「用 VS Code 打开」原模板
+    /// 带关键字 np/code —— {selection.target} 在关键字路由下恒为空，是 §1.1
+    /// 「记事本开空白文件」的配置侧根因；现 Kind=selection、关键字位空串。</summary>
     public static IReadOnlyList<CommandTemplate> CommandTemplates { get; } = new[]
     {
-        new CommandTemplate("Google 搜索", "open_url", "Google 搜索",
+        // web：「用 X 搜我打的字」
+        new CommandTemplate("web", "Google 搜索", "open_url", "Google 搜索",
             "https://www.google.com/search?q={query}", "", "", "", "g", "&#xE721;"),
-        new CommandTemplate("百度搜索", "open_url", "百度搜索",
+        new CommandTemplate("web", "百度搜索", "open_url", "百度搜索",
             "https://www.baidu.com/s?wd={query}", "", "", "", "bd", "&#xE721;"),
-        new CommandTemplate("GitHub 仓库搜索", "open_url", "GitHub 搜索",
+        new CommandTemplate("web", "GitHub 仓库搜索", "open_url", "GitHub 搜索",
             "https://github.com/search?q={query}&type=repositories", "", "", "", "gh", "&#xE721;"),
-        new CommandTemplate("用记事本打开", "launch_program", "用记事本打开",
-            "", "C:\\Windows\\System32\\notepad.exe", "{selection.target}", "", "np", "&#xE70F;"),
-        new CommandTemplate("用 VS Code 打开", "launch_program", "用 VS Code 打开",
-            "", "C:\\Program Files\\Microsoft VS Code\\Code.exe", "{selection.target}", "", "code", "&#xE70F;"),
-        new CommandTemplate("浏览器打开本地 HTML", "open_url", "打开本地 HTML",
+        new CommandTemplate("web", "浏览器打开本地 HTML", "open_url", "打开本地 HTML",
             "file:///{query}", "", "", "", "html", "&#xE774;"),
+        // selection：「拿这个文件去做 X」——唯一入口是动作面板（选中文件按 →）
+        new CommandTemplate("selection", "用记事本打开", "launch_program", "用记事本打开",
+            "", "C:\\Windows\\System32\\notepad.exe", "{selection.target}", "", "", "&#xE70F;"),
+        new CommandTemplate("selection", "用 VS Code 打开", "launch_program", "用 VS Code 打开",
+            "", "C:\\Program Files\\Microsoft VS Code\\Code.exe", "{selection.target}", "", "", "&#xE70F;"),
+        new CommandTemplate("selection", "用默认程序打开", "launch_program", "用默认程序打开",
+            "", "C:\\Windows\\explorer.exe", "{selection.target}", "", "", "&#xE70F;"),
+        // open：「启动 X / 打开网址」——对齐 Listary hosts / connections
+        new CommandTemplate("open", "打开 hosts 文件", "launch_program", "打开 hosts 文件",
+            "", "C:\\Windows\\System32\\notepad.exe",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts", "", "hosts", "&#xE70F;"),
+        new CommandTemplate("open", "打开网络连接", "launch_program", "打开网络连接",
+            "", "C:\\Windows\\System32\\control.exe", "ncpa.cpl", "", "connections", "&#xE774;"),
+        // folder：「在这里做事」——对齐 Listary cmd
+        new CommandTemplate("folder", "在此打开终端", "launch_program", "在此打开终端",
+            "", "C:\\Windows\\System32\\cmd.exe", "", "{current_folder}", "cmd", "&#xE756;"),
+        new CommandTemplate("folder", "在此新建文件夹", "launch_program", "在此新建文件夹",
+            "", "C:\\Windows\\System32\\cmd.exe", "/C mkdir 新建文件夹", "{current_folder}", "mk", "&#xE8F4;"),
     };
 
     // ── K3 §4.8 导入导出 ──────────────────────────────────────────────
