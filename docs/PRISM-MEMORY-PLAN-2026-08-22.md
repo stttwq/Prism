@@ -143,3 +143,49 @@ reason（原为让 stat 失效而加，需求消失）。前端收口两处无�
 重建期瞬态（MFT 枚举池 + 拼音构建 + 新旧索引共存）是既知 Phase 2 议题，维持
 「据实报告、不谎报达标」口径。
 
+## 内存收口 III（2026-08-30，PRISM-COMMAND-SIMPLIFY-AND-MEMORY-III-PLAN-2026-08-30.md）
+
+### 稳态内存锚点（B5，2026-08-30 实测）
+
+数据源：`C:\ProgramData\Prism\indexer.jsonl` 的 `index_memory_trend` 分项日志
+（方案 II A3 拆出的 `nodes=` / `names=` / `pinyin=`）。实测样本（2 卷，2 卷
+MFT 槽合计 3,640,064）：
+
+```
+memory_bytes=89,470,555  nodes=43,680,768  names=45,128,846  pinyin=660,941
+```
+
+线性锚点：
+
+```
+Prism indexer 稳态内存锚点（2026-08-30 实测，2 卷 / 3.64M MFT 槽）：
+  nodes  ≈ 12 B × MFT 槽数            （43.68 MB ÷ 3.64M 槽 = 恰好 12 B；
+                                        稀疏、按 max_record 分配，与活跃文件数无关）
+  names  ≈ ~21 B × 活跃文件数          （45.13 MB ÷ 估算 210 万活跃文件——活跃数
+                                        无直接日志口径，按平均名长反推，误差 ±20%）
+  pinyin ≈ ~660 KB / 2 卷（含汉字文件占比低时是小项；随汉字文件数线性）
+  合计   ≈ 89.5 MB，折合 ~42 MB / 百万 MFT 槽（本机密度 ≈ 0.58 活跃/槽）
+判读规则：index_memory_trend 的 memory_bytes 超出锚点 1.5 倍即为异常，
+先看哪一个分项在涨——nodes 涨 = 槽数膨胀（大删除后未压缩），names 涨 =
+名字池死字节（未触发压缩）或文件量自然增长，pinyin 涨 = 拼音重建未释放。
+```
+
+判读案例回填：G7c 时代的 150 MB 异常里 `nodes` 分项会直接多出 86 MB
+（24 B/槽 stats 表的载体就是 nodes 平行分配）——有了分项锚点，这类回归
+读日志第一分钟即可定性，不用再像 G7c 排查那样靠读代码反推。
+
+### B2 名字池压缩去 clone 的收益与实测状态
+
+- **结构性收益**：压缩瞬间少一份整卷 `nodes` clone（本机 ~43 MB，2 卷
+  360 万槽；随槽数线性放大）。写锁从 O(1) 换入变为 O(活跃节点) 的 u32
+  就地写（毫秒级，与 USN apply 同量级）。
+- **实机 A/B 状态：未执行。** 重建门/压缩期峰值采样需提权停止服务、
+  删缓存强制重建，会中断正在使用的 Prism；按「不谎报达标」口径如实记录。
+  需要时运行 `tools/bench/Invoke-RebuildMemoryGate.ps1` 与压缩期
+  `Measure-ProcessMemory.ps1` 采样补 A/B 数字。
+- 已知代价（复查过，不动）：拼音重建的 `index.clone()`（`pinyin_sidecar`
+  build 需完整节点图抽不出紧凑子集，已由 `PINYIN_REBUILD_BACKOFF` 限频）；
+  broker `apply_stat_filters` 是幂等兜底；`enumerate_mft` 建卷期峰值
+  ~115 MB + 名字池为 Everything 同口径以内（Everything 官方口径：索引期间
+  每百万文件约 200 MB）。
+
