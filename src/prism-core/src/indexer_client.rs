@@ -107,6 +107,8 @@ pub struct SearchReply {
     pub name_candidates: Option<u64>,
     pub entered_top_k: Option<u64>,
     pub path_constructions: Option<u64>,
+    /// 内存收口 II：本次搜索消耗的现场 stat 次数（诊断）。
+    pub stat_calls: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +421,7 @@ async fn search_on_connection(
             name_candidates: Some(0),
             entered_top_k: Some(0),
             path_constructions: Some(0),
+            stat_calls: Some(0),
         });
     }
 
@@ -442,6 +445,7 @@ async fn search_on_connection(
             name_candidates,
             entered_top_k,
             path_constructions,
+            stat_calls,
             pinyin_status,
         } => {
             if pinyin_status.is_some() {
@@ -457,6 +461,7 @@ async fn search_on_connection(
                 name_candidates,
                 entered_top_k,
                 path_constructions,
+                stat_calls,
             })
         }
         IndexerResponse::Error { message } => Err(SearchFailure::semantic(message)),
@@ -642,6 +647,7 @@ async fn search_pipe_inner(
             name_candidates: Some(0),
             entered_top_k: Some(0),
             path_constructions: Some(0),
+            stat_calls: Some(0),
         });
     }
 
@@ -666,6 +672,7 @@ async fn search_pipe_inner(
             name_candidates,
             entered_top_k,
             path_constructions,
+            stat_calls,
             pinyin_status,
         } => {
             if pinyin_status.is_some() {
@@ -681,6 +688,7 @@ async fn search_pipe_inner(
                 name_candidates,
                 entered_top_k,
                 path_constructions,
+                stat_calls,
             })
         }
         IndexerResponse::Error { message } => Err(SearchFailure::semantic(message)),

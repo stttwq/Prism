@@ -66,6 +66,9 @@ pub enum IndexerResponse {
         entered_top_k: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path_constructions: Option<u64>,
+        /// 内存收口 II：本次搜索消耗的现场 stat 次数（诊断，供调 STAT_CALL_BUDGET）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stat_calls: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pinyin_status: Option<PinyinStatus>,
     },

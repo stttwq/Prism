@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc, Notify};
 
-use crate::hierarchy::{ApplyOutcome, IndexState, VolumeId, VolumeIndex, FLAG_PRESENT, NO_NAME};
+use crate::hierarchy::{ApplyOutcome, IndexState, VolumeId, VolumeIndex};
 use crate::index_cache;
 use crate::indexer_ipc::{
     requested_root, validate_search_request, BuildProgress, IndexerItem, IndexerRequest,
@@ -1090,6 +1090,7 @@ impl ServiceState {
                 name_candidates: Some(0),
                 entered_top_k: Some(0),
                 path_constructions: Some(0),
+                stat_calls: Some(0),
                 pinyin_status: Some(self.pinyin_status()),
             });
         }
@@ -1099,8 +1100,17 @@ impl ServiceState {
             crate::indexer_ipc::path_filters(filters),
         )
         .with_stat(stat);
-        let outcome =
-            state.search_in_root_filtered(query, max, &exclusions, root_bound, &query_filters);
+        // 内存收口 II（2026-08-30）：现场 stat 预算——字面与拼音扫描共享同一计数器，
+        // 超预算的候选直接丢弃（结果置 is_truncated，宁少勿全盘 I/O）。
+        let stat_budget = std::sync::atomic::AtomicU64::new(crate::hierarchy::STAT_CALL_BUDGET);
+        let outcome = state.search_in_root_filtered(
+            query,
+            max,
+            &exclusions,
+            root_bound,
+            &query_filters,
+            &stat_budget,
+        );
         let mut items: Vec<_> = outcome
             .items
             .into_iter()
@@ -1144,6 +1154,7 @@ impl ServiceState {
                         &exclusions,
                         root_bound,
                         &query_filters,
+                        &stat_budget,
                     );
                     matched_count = matched_count.saturating_add(pinyin.matched_count);
                     path_constructions =
@@ -1166,15 +1177,25 @@ impl ServiceState {
                 .then(left.is_directory.cmp(&right.is_directory))
         });
         items.truncate(max);
+        // 内存收口 II：stat 预算诊断与耗尽判定。stat_calls = 整次搜索（字面+拼音）
+        // 的现场 stat 次数；预算耗尽（还有 size/date 条件但计数器归零）= 扫描
+        // 提前收尾，如实置 truncated。
+        use std::sync::atomic::Ordering;
+        let stat_calls = crate::hierarchy::STAT_CALL_BUDGET - stat_budget.load(Ordering::Relaxed);
+        let stat_budget_exhausted =
+            query_filters.stat_needs_metadata() && stat_budget.load(Ordering::Relaxed) == 0;
         Ok(IndexerResponse::Results {
             generation,
             items,
-            is_truncated: outcome.is_truncated || matched_count > max as u64,
+            is_truncated: outcome.is_truncated
+                || matched_count > max as u64
+                || stat_budget_exhausted,
             matched_count: Some(matched_count),
             scanned_nodes: Some(outcome.scanned_nodes),
             name_candidates: Some(outcome.name_candidates),
             entered_top_k: Some(outcome.entered_top_k),
             path_constructions: Some(path_constructions),
+            stat_calls: Some(stat_calls),
             pinyin_status: Some(self.pinyin_status()),
         })
     }
@@ -1554,28 +1575,10 @@ pub async fn run(stop: Arc<Shutdown>) -> Result<(), String> {
                         }
                     }
                 }
-                // G7c：stat 元数据填充——每拍一块，收敛后每拍只剩全表 unknown
-                // 扫描（毫秒级）。与压缩同款 spawn_blocking + stop select。
-                {
-                    let fill_task = tokio::task::spawn_blocking({
-                        let state = state.clone();
-                        move || fill_stats_chunk_off_lock(&state)
-                    });
-                    tokio::pin!(fill_task);
-                    let result = tokio::select! {
-                        result = &mut fill_task => result,
-                        _ = stop.cancelled() => break,
-                    };
-                    match result {
-                        Ok(Ok(_filled)) => {}
-                        Ok(Err(error)) => {
-                            logging::event_detail("error", "stats_fill_failed", &error, None, None);
-                        }
-                        Err(error) => {
-                            logging::event_detail("error", "stats_fill_task", &error.to_string(), None, None);
-                        }
-                    }
-                }
+                // 内存收口 II（2026-08-30）：G7c 的 stat 元数据填充 tick 已删——
+                // 索引不再携带 size/mtime/ctime，size/date 过滤在搜索现场按需
+                // fs::metadata。5 秒一轮的全表 unknown 扫描曾把空闲修剪后的工作集
+                // 立刻拉回（约 130MB 顺序读），是「空闲只掉到 80MB」的直接原因。
                 if state.pinyin_needs_rebuild.load(Ordering::Acquire)
                     && state.pinyin_status() != PinyinStatus::Disabled
                     && last_pinyin_rebuild
@@ -2516,127 +2519,6 @@ fn compact_volumes_off_lock(state: &ServiceState) -> Result<(), String> {
     Ok(())
 }
 
-/// G7c：每 tick 最多 stat 这么多条未知元数据的在位记录。1.2M 记录首填约
-/// 60 拍（5s/tick ≈ 5 分钟收敛）；之后每拍只花一次全表 unknown 扫描（毫秒级）。
-const STATS_FILL_CHUNK: usize = 20_000;
-
-/// 永久不可 stat 的记录占位（path 断链/权限拒绝）：size=MAX 永不过任何
-/// size 条件、mtime/ctime=0 永不过日期条件——视为已知，不再每拍重试。
-fn unstatable_stat() -> crate::hierarchy::RecordStat {
-    crate::hierarchy::RecordStat {
-        size: u64::MAX,
-        mtime: 0,
-        ctime: 0,
-    }
-}
-
-/// G7c：锁外填充每记录 stat（size/mtime/ctime）。读锁收集一批未知记录的
-/// 路径 → 锁外逐条磁盘 stat → 短写锁写回。返回本拍处理的记录数（0=全部已知）。
-/// 与 compact 同一并发纪律：写回前按卷重找，卷被重建替换则丢弃本批。
-fn fill_stats_chunk_off_lock(state: &ServiceState) -> Result<u64, String> {
-    // 1) 读锁：收集未知记录 (卷 id, 记录号, 路径)；路径断链的记录就地产生
-    //    不可 stat 占位（记入 precomputed，写回阶段落表）。
-    let mut batch: Vec<(crate::hierarchy::VolumeId, Vec<(u32, String)>)> = Vec::new();
-    let mut precomputed: Vec<(
-        crate::hierarchy::VolumeId,
-        Vec<(u32, crate::hierarchy::RecordStat)>,
-    )> = Vec::new();
-    let mut remaining = STATS_FILL_CHUNK;
-    {
-        let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
-        let Some(index) = guard.as_ref() else {
-            return Ok(0);
-        };
-        for volume in &index.volumes {
-            if remaining == 0 {
-                break;
-            }
-            let mut pairs: Vec<(u32, String)> = Vec::new();
-            let mut pre: Vec<(u32, crate::hierarchy::RecordStat)> = Vec::new();
-            let len = volume.nodes.len().min(volume.stats.len());
-            for record in 0..len as u32 {
-                if remaining == 0 {
-                    break;
-                }
-                let slot = &volume.nodes[record as usize];
-                if slot.flags & FLAG_PRESENT == 0
-                    || slot.name_off == NO_NAME
-                    || volume.stats[record as usize].is_known()
-                {
-                    continue;
-                }
-                match volume.path_for(record) {
-                    Ok(path) => {
-                        pairs.push((record, path));
-                        remaining -= 1;
-                    }
-                    Err(_) => pre.push((record, unstatable_stat())),
-                }
-            }
-            if !pairs.is_empty() {
-                batch.push((volume.volume_id.clone(), pairs));
-            }
-            if !pre.is_empty() {
-                precomputed.push((volume.volume_id.clone(), pre));
-            }
-        }
-    }
-    if batch.is_empty() {
-        return Ok(0);
-    }
-    // 2) 锁外 stat（只对收集到路径的记录）。
-    let mut stats: Vec<(
-        crate::hierarchy::VolumeId,
-        Vec<(u32, crate::hierarchy::RecordStat)>,
-    )> = precomputed;
-    let mut filled: u64 = 0;
-    for (volume_id, pairs) in &batch {
-        let mut per_volume: Vec<(u32, crate::hierarchy::RecordStat)> =
-            Vec::with_capacity(pairs.len());
-        for (record, path) in pairs {
-            let stat = std::fs::metadata(path)
-                .map(|meta| crate::hierarchy::RecordStat {
-                    size: meta.len(),
-                    mtime: system_time_to_epoch(meta.modified()),
-                    ctime: system_time_to_epoch(meta.created()),
-                })
-                .unwrap_or_else(|_| unstatable_stat());
-            per_volume.push((*record, stat));
-            filled += 1;
-        }
-        stats.push((volume_id.clone(), per_volume));
-    }
-    // 3) 短写锁写回；卷被重建替换/记录被删则丢弃单条。
-    let mut guard = state.index.write().map_err(|_| "index lock is poisoned")?;
-    for (volume_id, per_volume) in &stats {
-        let Some(volume) = guard.as_mut().and_then(|index| {
-            index
-                .volumes
-                .iter_mut()
-                .find(|volume| volume.volume_id == *volume_id)
-        }) else {
-            continue;
-        };
-        for (record, stat) in per_volume {
-            if volume
-                .nodes
-                .get(*record as usize)
-                .is_some_and(|slot| slot.flags & FLAG_PRESENT != 0)
-            {
-                volume.store_stat(*record, *stat);
-            }
-        }
-    }
-    Ok(filled)
-}
-
-fn system_time_to_epoch(t: std::io::Result<std::time::SystemTime>) -> i64 {
-    t.ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// S1: 单卷的「读锁 clone → 锁外压缩 → 短写锁换入」。
 /// clone 与换入之间 USN 到达（该卷 next_usn 前移）则丢弃重试（≤3 次）——
 /// 换入陈旧卷会丢事件，宁可放弃本轮等下一个 tick（计数器不清零，必然重触发）。
@@ -3404,9 +3286,10 @@ mod tests {
         }
     }
 
-    /// G7c：stat 填充——真实临时文件，两拍收敛，size 过滤按索引元数据命中。
+    /// 内存收口 II：size 过滤走服务搜索路径——现场按需 stat 真实文件，
+    /// stat_calls 诊断如实上报（原 G7c 填充 tick 的机制测试随机制删除）。
     #[test]
-    fn g7c_stats_fill_chunk_stats_real_files() {
+    fn g7c_size_filter_stats_on_demand_via_service_search() {
         let tmp = std::env::temp_dir().join(format!("prism-stats-fill-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let big = tmp.join("big.bin");
@@ -3435,30 +3318,24 @@ mod tests {
             events_since_checkpoint: 0,
         });
 
-        let first = fill_stats_chunk_off_lock(&state).unwrap();
-        assert!(first >= 2, "两个文件都应被 stat，实际 {first}");
-        assert_eq!(
-            fill_stats_chunk_off_lock(&state).unwrap(),
-            0,
-            "第二拍应无未知记录"
-        );
-
-        let guard = state.index.read().unwrap();
-        let index = guard.as_ref().unwrap();
-        let now = crate::filters::local_now();
-        let filters = crate::hierarchy::QueryFilters::new(vec![], vec![]).with_stat(
-            crate::filters::stat_filter_set(
-                &[crate::indexer_ipc::SearchFilter {
-                    field: "size".into(),
-                    value: ">1kb".into(),
-                }],
-                &now,
-            ),
-        );
-        let outcome = index.search_in_root_filtered("", 10, &[], None, &filters);
-        assert_eq!(outcome.items.len(), 1, "只有 big.bin >1kb");
-        assert!(outcome.items[0].path.ends_with("big.bin"));
-        drop(guard);
+        let filters = vec![crate::indexer_ipc::SearchFilter {
+            field: "size".into(),
+            value: ">1kb".into(),
+        }];
+        let response = state.search("", 10, Some(&filters), None).unwrap();
+        let IndexerResponse::Results {
+            items,
+            stat_calls,
+            is_truncated,
+            ..
+        } = response
+        else {
+            panic!("expected Results");
+        };
+        assert_eq!(items.len(), 1, "只有 big.bin >1kb");
+        assert!(items[0].path.ends_with("big.bin"));
+        assert!(!is_truncated, "预算内全量覆盖，不应标 truncated");
+        assert_eq!(stat_calls, Some(2), "big.bin + small.txt 各现场 stat 一次");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

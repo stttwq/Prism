@@ -85,20 +85,6 @@ pub struct NodeSlot {
     pub flags: u16,
 }
 
-/// G7c：单记录文件元数据（size 字节 + mtime/ctime unix 秒）。全零 = 未知。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RecordStat {
-    pub size: u64,
-    pub mtime: i64,
-    pub ctime: i64,
-}
-
-impl RecordStat {
-    pub(crate) fn is_known(&self) -> bool {
-        self.size != 0 || self.mtime != 0 || self.ctime != 0
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeId {
     pub guid: String,
@@ -114,11 +100,6 @@ pub struct VolumeIndex {
     pub root_record: u32,
     pub nodes: Vec<NodeSlot>,
     pub names: Vec<u8>,
-    /// G7c：每记录文件元数据，与 nodes 平行按记录号索引（同 sparse 语义）。
-    /// 全零 = 未知：serde skip 不入 sidecar（免格式版本化），服务启动后由维护
-    /// tick 分块填充；USN upsert 时清零，让下一个 tick 定向重 stat。
-    #[serde(skip)]
-    pub(crate) stats: Vec<RecordStat>,
     #[serde(skip)]
     initial_name_bytes: usize,
     #[serde(skip)]
@@ -234,6 +215,8 @@ pub struct SearchOutcome {
     pub matched_count: u64,
     pub entered_top_k: u64,
     pub path_constructions: u64,
+    /// 内存收口 II：本次扫描消耗的现场 stat 次数（诊断用，供调 STAT_CALL_BUDGET）。
+    pub stat_calls: u64,
 }
 
 #[derive(Debug, Eq)]
@@ -452,7 +435,6 @@ impl VolumeIndex {
             root_record,
             nodes,
             names: Vec::new(),
-            stats: Vec::new(),
             initial_name_bytes: 0,
             dead_name_bytes: 0,
             names_fingerprint: NAMES_FNV_OFFSET,
@@ -488,7 +470,6 @@ impl VolumeIndex {
             ));
         }
         self.nodes.resize(required, NodeSlot::default());
-        self.stats.resize(required, RecordStat::default());
         Ok(())
     }
 
@@ -526,8 +507,6 @@ impl VolumeIndex {
             return Err(VolumeError::BrokenParentChain { record });
         }
         self.ensure_slot(record)?;
-        // G7c：新建/改名一律让 stat 失效（内容可能已变），维护 tick 重 stat。
-        self.invalidate_stat(record);
 
         let parent_excluded = self.nodes[parent_record as usize].flags & FLAG_EXCLUDED != 0;
         let excluded = parent_excluded
@@ -636,6 +615,7 @@ impl VolumeIndex {
             &[],
             None,
             &QueryFilters::none(),
+            &std::sync::atomic::AtomicU64::new(STAT_CALL_BUDGET),
         )
         .items
     }
@@ -649,9 +629,7 @@ impl VolumeIndex {
     }
 
     pub fn memory_bytes(&self) -> usize {
-        self.nodes.capacity() * std::mem::size_of::<NodeSlot>()
-            + self.names.capacity()
-            + self.stats.capacity() * std::mem::size_of::<RecordStat>()
+        self.nodes.capacity() * std::mem::size_of::<NodeSlot>() + self.names.capacity()
     }
 
     /// AUDIT-2026-08-18 R-C2: 轻量结构不变量检查——开销 O(1)，不做 path_for 遍历。
@@ -823,8 +801,6 @@ impl VolumeIndex {
         if live_bound < self.nodes.len() {
             self.nodes.truncate(live_bound);
             self.nodes.shrink_to_fit();
-            self.stats.truncate(live_bound);
-            self.stats.shrink_to_fit();
         }
         // initial_name_bytes 基线随池重写由 recompute_derived_counters 恢复
         // （复审 M 2026-08-21：names.len() 即压缩后基线）。
@@ -858,7 +834,6 @@ impl VolumeIndex {
 
     pub(crate) fn rollback_mutations(&mut self, snapshot: MutationSnapshot) {
         self.nodes.truncate(snapshot.nodes_len);
-        self.stats.truncate(snapshot.nodes_len);
         for (record, slot) in snapshot.slots {
             self.nodes[record as usize] = slot;
         }
@@ -881,27 +856,8 @@ impl VolumeIndex {
                 return Err(VolumeError::SparseSlots { required, present });
             }
             self.nodes.resize(required, NodeSlot::default());
-            self.stats.resize(required, RecordStat::default());
         }
         Ok(())
-    }
-
-    /// G7c：记录元数据；未知（未填充/已失效）返回 None。
-    pub(crate) fn record_stat(&self, record: u32) -> Option<RecordStat> {
-        let stat = self.stats.get(record as usize)?;
-        stat.is_known().then_some(*stat)
-    }
-
-    pub(crate) fn invalidate_stat(&mut self, record: u32) {
-        if let Some(stat) = self.stats.get_mut(record as usize) {
-            *stat = RecordStat::default();
-        }
-    }
-
-    pub(crate) fn store_stat(&mut self, record: u32, stat: RecordStat) {
-        if let Some(slot) = self.stats.get_mut(record as usize) {
-            *slot = stat;
-        }
     }
 
     fn append_name(&mut self, name: &str) -> Result<u32, VolumeError> {
@@ -978,6 +934,7 @@ impl IndexState {
             exclusion_paths,
             None,
             &QueryFilters::none(),
+            &std::sync::atomic::AtomicU64::new(STAT_CALL_BUDGET),
         )
     }
 
@@ -991,11 +948,21 @@ impl IndexState {
         exclusion_paths: &[String],
         root: Option<RootBound>,
     ) -> SearchOutcome {
-        self.search_in_root_filtered(query, max, exclusion_paths, root, &QueryFilters::none())
+        self.search_in_root_filtered(
+            query,
+            max,
+            exclusion_paths,
+            root,
+            &QueryFilters::none(),
+            &std::sync::atomic::AtomicU64::new(STAT_CALL_BUDGET),
+        )
     }
 
     /// G7: ext/path filter-aware variant. Filters are applied **before** the Top-K heap
     /// so truncation and ordering describe the filtered result set only.
+    ///
+    /// 内存收口 II：`stat_budget` 由调用方持有（字面与拼音扫描共享同一次搜索的
+    /// 现场.stat 配额）。
     pub fn search_in_root_filtered(
         &self,
         query: &str,
@@ -1003,8 +970,17 @@ impl IndexState {
         exclusion_paths: &[String],
         root: Option<RootBound>,
         filters: &QueryFilters,
+        stat_budget: &std::sync::atomic::AtomicU64,
     ) -> SearchOutcome {
-        search_volumes(&self.volumes, query, max, exclusion_paths, root, filters)
+        search_volumes(
+            &self.volumes,
+            query,
+            max,
+            exclusion_paths,
+            root,
+            filters,
+            stat_budget,
+        )
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -1201,8 +1177,9 @@ pub(crate) fn name_eq_ignore_case(left: &str, right: &str) -> bool {
 pub struct QueryFilters {
     exts: Vec<String>,
     paths: Vec<String>,
-    /// G7c：stat 类条件（size/dm/dc/file/folder）。判定需要每记录元数据
-    /// （VolumeIndex.stats），由 [`Self::stat_matches_record`] 在扫描内执行。
+    /// G7c：stat 类条件（size/dm/dc/file/folder）。内存收口 II（2026-08-30）：
+    /// 索引不再携带 size/mtime/ctime，size/date 判定在现场 `fs::metadata` 上执行，
+    /// 由 [`Self::stat_matches_path`] 在扫描内（路径已构造后）执行。
     stat: crate::filters::StatFilterSet,
 }
 
@@ -1240,6 +1217,16 @@ impl QueryFilters {
         !self.paths.is_empty()
     }
 
+    /// 内存收口 II：size/dm/dc 条件在场（判定需要现场磁盘 stat）。
+    pub(crate) fn stat_needs_metadata(&self) -> bool {
+        self.stat.needs_metadata()
+    }
+
+    /// 测试/拼音路径访问 stat 条件集（字段对 crate 内私有）。
+    pub(crate) fn stat_set(&self) -> &crate::filters::StatFilterSet {
+        &self.stat
+    }
+
     /// Low-cost extension check (no path construction needed).
     /// Directories never have an extension in this model.
     pub(crate) fn ext_matches(&self, name: &str, is_directory: bool) -> bool {
@@ -1274,26 +1261,23 @@ impl QueryFilters {
         })
     }
 
-    /// G7c：stat 条件判定——元数据来自索引记录（后台填充/USN 维护）。
-    /// 元数据未知 = 不匹配（宁缺毋滥，与 broker 后置 stat 失败淘汰同口径）。
-    pub(crate) fn stat_matches_record(
-        &self,
-        volume: &VolumeIndex,
-        record: u32,
-        is_directory: bool,
-    ) -> bool {
+    /// G7c：stat 条件判定。内存收口 II（2026-08-30）：元数据来自现场
+    /// `std::fs::metadata`（调用方保证 `path` 已构造）。取不到元数据 =
+    /// 不过 size/date 条件、file:/folder: 仍生效（与 broker 候选侧
+    /// apply_stat_filters 同口径）。
+    pub(crate) fn stat_matches_path(&self, path: &str, is_directory: bool) -> bool {
         if self.stat.is_empty() {
             return true;
         }
-        match volume.record_stat(record) {
-            Some(stat) => crate::filters::stat_passes(
+        match std::fs::metadata(path) {
+            Ok(meta) => crate::filters::stat_passes(
                 &self.stat,
                 is_directory,
-                Some(stat.size),
-                Some(stat.mtime),
-                Some(stat.ctime),
+                Some(meta.len()),
+                crate::filters::system_time_epoch(meta.modified()),
+                crate::filters::system_time_epoch(meta.created()),
             ),
-            None => false,
+            Err(_) => crate::filters::stat_passes(&self.stat, is_directory, None, None, None),
         }
     }
 }
@@ -1320,6 +1304,12 @@ const SCAN_CHUNK_SLOTS: usize = 256 * 1024;
 /// 恰好贴边——这里封 8 并给文档注明组合约束（broker 实际只有 1 条长连接）。
 const SCAN_MAX_THREADS: usize = 8;
 
+/// 内存收口 II（2026-08-30）：单次搜索允许的现场 stat 次数上限。超出后不再
+/// stat，剩余记录不进堆，结果置 is_truncated——宁可少给也不能让一次
+/// `size:>1gb` 打成全盘 I/O。并行路径共享同一个计数器（一次 fetch_add 相对
+/// 一次 metadata 系统调用可忽略；不做每线程配额，避免串行/并行结果不一致）。
+pub const STAT_CALL_BUDGET: u64 = 20_000;
+
 fn search_volumes(
     volumes: &[VolumeIndex],
     query: &str,
@@ -1327,6 +1317,7 @@ fn search_volumes(
     exclusion_paths: &[String],
     root: Option<RootBound>,
     filters: &QueryFilters,
+    stat_budget: &std::sync::atomic::AtomicU64,
 ) -> SearchOutcome {
     search_volumes_impl(
         volumes,
@@ -1336,6 +1327,7 @@ fn search_volumes(
         root,
         filters,
         PARALLEL_SCAN_MIN_SLOTS,
+        stat_budget,
     )
 }
 
@@ -1349,6 +1341,8 @@ struct ScanAccumulator<'a> {
     /// 只用于粗粒度观测，不参与等价性断言。
     entered_top_k: u64,
     path_constructions: u64,
+    /// 内存收口 II：本累积器消耗的现场 stat 次数（含成功与失败），供调预算。
+    stat_calls: u64,
 }
 
 impl<'a> ScanAccumulator<'a> {
@@ -1360,6 +1354,7 @@ impl<'a> ScanAccumulator<'a> {
             matched_count: 0,
             entered_top_k: 0,
             path_constructions: 0,
+            stat_calls: 0,
         }
     }
 
@@ -1384,11 +1379,19 @@ impl<'a> ScanAccumulator<'a> {
         self.path_constructions = self
             .path_constructions
             .saturating_add(other.path_constructions);
+        self.stat_calls = self.stat_calls.saturating_add(other.stat_calls);
     }
 }
 
 /// 扫描单个卷的一段连续槽位（N2 抽出，串行/并行共用，判定逻辑与抽出前逐行一致）。
 /// 参数多是刻意的：全部是热路径的直接输入，包一层上下文结构体只增加间接层。
+///
+/// 内存收口 II（2026-08-30）判定顺序：
+/// name → root → exclusion → ext → file:/folder:（读 flags，零 I/O）
+/// → 若 path 过滤或 stat 需要 metadata：构造一次 path（两种用途复用）
+/// → path 过滤 → size/dm/dc 现场 fs::metadata（受 `stat_budget` 预算约束，
+///    超预算丢弃并置 truncated）→ 进堆。
+/// `path_constructions` 现在也覆盖为 stat 构造的路径（语义仍是「构造了几次路径」）。
 #[allow(clippy::too_many_arguments)]
 fn scan_slot_range<'a>(
     volumes: &'a [VolumeIndex],
@@ -1400,9 +1403,14 @@ fn scan_slot_range<'a>(
     filters: &QueryFilters,
     has_path_filter: bool,
     max: usize,
+    stat_budget: &std::sync::atomic::AtomicU64,
     acc: &mut ScanAccumulator<'a>,
 ) {
+    use std::sync::atomic::Ordering;
     let volume = &volumes[volume_index];
+    // 路径只在 path 过滤或 size/dm/dc 判定时才需要构造（零 I/O 的 file:/folder:
+    // 不构造——它们能把大多数查询的候选砍在路径构造之前）。
+    let needs_path = has_path_filter || filters.stat.needs_metadata();
     for record in range {
         let Some(slot) = volume.nodes.get(record) else {
             continue;
@@ -1436,22 +1444,33 @@ fn scan_slot_range<'a>(
         if !filters.ext_matches(name, is_directory) {
             continue;
         }
-        // G7c：stat 条件（size/dm/dc/file/folder）——元数据查表，无 I/O，
-        // 仍在 Top-K 堆前，`is_truncated` 描述的是过滤后的集合。
-        if !filters.stat_matches_record(volume, record as u32, is_directory) {
+        // 内存收口 II：file:/folder: 旗标判定零 I/O，留在路径构造之前。
+        // 与 stat_passes 共用 dir_flag_passes，不在两处复制语义。
+        if !crate::filters::dir_flag_passes(&filters.stat, is_directory) {
             continue;
         }
-        // G7: path filter — high cost, needs a constructed full path. Only run
-        // when a path filter is present; still before the Top-K heap so
-        // `is_truncated` describes the filtered set only.
-        if has_path_filter {
+        // G7: path filter — high cost, needs a constructed full path. 内存收口 II：
+        // 同一条路径同时供 path 过滤与按需 stat 复用，只构造一次。仍在 Top-K 堆前，
+        // `is_truncated` 描述的是过滤后的集合。
+        if needs_path {
             acc.path_constructions = acc.path_constructions.saturating_add(1);
             let path = match volume.path_for(record as u32) {
                 Ok(path) => path,
                 Err(_) => continue,
             };
-            if !filters.path_matches(&path) {
+            if has_path_filter && !filters.path_matches(&path) {
                 continue;
+            }
+            // size/dm/dc：现场 fs::metadata，预算耗尽则丢弃该记录（结果置 truncated）。
+            if filters.stat.needs_metadata() {
+                if stat_budget.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                stat_budget.fetch_sub(1, Ordering::Relaxed);
+                acc.stat_calls = acc.stat_calls.saturating_add(1);
+                if !filters.stat_matches_path(&path, is_directory) {
+                    continue;
+                }
             }
         }
         acc.matched_count = acc.matched_count.saturating_add(1);
@@ -1476,6 +1495,7 @@ fn scan_slot_range<'a>(
 
 /// `search_volumes` 的可注入阈值版本（N2 等价性测试用 threshold=0 强制并行 /
 /// usize::MAX 强制串行做逐字节比对）。
+#[allow(clippy::too_many_arguments)]
 fn search_volumes_impl(
     volumes: &[VolumeIndex],
     query: &str,
@@ -1484,6 +1504,7 @@ fn search_volumes_impl(
     root: Option<RootBound>,
     filters: &QueryFilters,
     parallel_threshold: usize,
+    stat_budget: &std::sync::atomic::AtomicU64,
 ) -> SearchOutcome {
     // G7: an empty name query normally means "no search", but when ext:/path:
     // filters are present the empty name matches every candidate (match_metadata
@@ -1498,6 +1519,7 @@ fn search_volumes_impl(
             matched_count: 0,
             entered_top_k: 0,
             path_constructions: 0,
+            stat_calls: 0,
         };
     }
 
@@ -1519,6 +1541,7 @@ fn search_volumes_impl(
             filters,
             has_path_filter,
             max,
+            stat_budget,
         )
     } else {
         let mut acc = ScanAccumulator::new(max);
@@ -1535,6 +1558,7 @@ fn search_volumes_impl(
                 filters,
                 has_path_filter,
                 max,
+                stat_budget,
                 &mut acc,
             );
         }
@@ -1557,14 +1581,19 @@ fn search_volumes_impl(
             })
         })
         .collect();
+    // 内存收口 II：size/dm/dc 查询耗尽 stat 预算 = 扫描提前收尾，如实置 truncated。
+    use std::sync::atomic::Ordering;
+    let budget_exhausted =
+        filters.stat.needs_metadata() && stat_budget.load(Ordering::Relaxed) == 0;
     SearchOutcome {
         items,
-        is_truncated: acc.matched_count > max as u64,
+        is_truncated: acc.matched_count > max as u64 || budget_exhausted,
         scanned_nodes: acc.scanned_nodes,
         name_candidates: acc.name_candidates,
         matched_count: acc.matched_count,
         entered_top_k: acc.entered_top_k,
         path_constructions: acc.path_constructions,
+        stat_calls: acc.stat_calls,
     }
 }
 
@@ -1573,6 +1602,7 @@ fn search_volumes_impl(
 /// 扫描顺序，分 worker 与单实例语义一致）；块内只读共享 `&[VolumeIndex]`，
 /// 不新增锁。归并保持与串行完全相同的堆规则，全局 Top-K 与串行结果一致
 /// （RankedCandidate::Ord 是全序，无并列歧义）。
+#[allow(clippy::too_many_arguments)]
 fn parallel_scan<'a>(
     volumes: &'a [VolumeIndex],
     terms: &NameTerms,
@@ -1581,6 +1611,7 @@ fn parallel_scan<'a>(
     filters: &QueryFilters,
     has_path_filter: bool,
     max: usize,
+    stat_budget: &std::sync::atomic::AtomicU64,
 ) -> ScanAccumulator<'a> {
     let mut chunks: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
     for (volume_index, volume) in volumes.iter().enumerate() {
@@ -1613,6 +1644,7 @@ fn parallel_scan<'a>(
                 filters,
                 has_path_filter,
                 max,
+                stat_budget,
                 &mut acc,
             );
         }
@@ -1642,6 +1674,7 @@ fn parallel_scan<'a>(
                             filters,
                             has_path_filter,
                             max,
+                            stat_budget,
                             &mut local,
                         );
                     }
@@ -1736,6 +1769,10 @@ impl NormalizedExclusion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// 测试用 stat 预算：u64::MAX 等效不设限（等效性/过滤测试不关心预算）。
+    static TEST_STAT_BUDGET: AtomicU64 = AtomicU64::new(u64::MAX);
 
     // --- N1（FRESH-AUDIT-2026-08-19）: 大小写折叠零分配路径的语义锚定 ----------
 
@@ -1866,7 +1903,9 @@ mod tests {
         assert!(!both.path_matches("C:\\Program Files\\docs"));
     }
 
-    // --- G7c: stat 过滤（size/dm/dc/file/folder）在扫描内按记录元数据判定 ---
+    // --- G7c + 内存收口 II: stat 过滤（size/dm/dc/file/folder）在扫描内按需现场 stat ---
+    // 索引不再携带 size/mtime/ctime：测试用 tempdir 真文件 + 与索引路径对齐的
+    // 合成卷，让 fs::metadata 命中真实磁盘元数据。
 
     fn stat_filters(field: &str, value: &str, now: &crate::filters::LocalNow) -> QueryFilters {
         QueryFilters::new(vec![], vec![]).with_stat(crate::filters::stat_filter_set(
@@ -1878,40 +1917,55 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn g7c_stat_filter_matches_index_metadata_and_empty_query() {
-        let mut volume = dense_volume("Q:", 3);
-        let now = crate::filters::local_now();
-        let today_start = now.utc_epoch_of_day(now.days);
-        // rec 11 txt：小、今天创建/修改；rec 12 pdf：>1mb、远古；rec 13 元数据未知。
-        volume.store_stat(
-            11,
-            RecordStat {
-                size: 100,
-                mtime: today_start + 10,
-                ctime: today_start + 10,
+    /// tempdir + 真文件（small.txt 100B 今天 / large.pdf 2MB mtime 远古）+ sub 目录，
+    /// 返回与真实路径对齐的合成卷（record 11=small.txt、12=large.pdf、10=sub）。
+    fn real_file_volume(tag: &str) -> (VolumeIndex, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("prism-g7c-stat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("small.txt"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("large.pdf"), vec![0u8; 2_000_000]).unwrap();
+        // large.pdf 的 mtime 拨回远古，让 dm:today 语义可断言（ctime 无法用 std 设置）。
+        {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.join("large.pdf"))
+                .unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            ))
+            .unwrap();
+        }
+        let mut volume = VolumeIndex::new(
+            VolumeId {
+                guid: format!("vol-{tag}"),
+                serial: 7,
             },
-        );
-        volume.store_stat(
-            12,
-            RecordStat {
-                size: 5_000_000,
-                mtime: 1_000_000_000,
-                ctime: 1_000_000_000,
-            },
-        );
-        volume.store_stat(
+            dir.to_string_lossy().to_string(),
+            9,
             10,
-            RecordStat {
-                size: 0,
-                mtime: today_start,
-                ctime: today_start,
-            },
-        );
-        let volumes = vec![volume];
+            5,
+        )
+        .unwrap();
+        volume.prepare_initial_capacity(16, 3).unwrap();
+        volume.upsert(frn(10, 1), frn(5, 0), "sub", true).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(5, 0), "small.txt", false)
+            .unwrap();
+        volume
+            .upsert(frn(12, 1), frn(5, 0), "large.pdf", false)
+            .unwrap();
+        (volume, dir)
+    }
 
-        // 纯 size 过滤 + 空名字查询（G7 门控放行）：>1mb 命中 12；目录 size
-        // 条件跳过（无大小语义）照常出；未知元数据的 13 不出。
+    #[test]
+    fn g7c_stat_filter_matches_real_disk_metadata_and_empty_query() {
+        let (volume, dir) = real_file_volume("main");
+        let volumes = vec![volume];
+        let now = crate::filters::local_now();
+
+        // 纯 size 过滤 + 空名字查询（G7 门控放行）：>1mb 命中 large.pdf；目录 size
+        // 条件跳过（无大小语义）照常出（sub）。
         let outcome = search_volumes_impl(
             &volumes,
             "",
@@ -1920,15 +1974,17 @@ mod tests {
             None,
             &stat_filters("size", ">1mb", &now),
             usize::MAX,
+            &TEST_STAT_BUDGET,
         );
         assert_eq!(outcome.items.len(), 2);
-        assert!(outcome
-            .items
-            .iter()
-            .any(|item| item.name == "FILE-000001.PDF"));
+        assert!(outcome.items.iter().any(|item| item.name == "large.pdf"));
         assert!(outcome.items.iter().any(|item| item.is_directory));
+        assert_eq!(
+            outcome.stat_calls, 3,
+            "small/sub/large 三条候选各 stat 一次"
+        );
 
-        // dm:today → 11 + 目录（目录日期条件照常）。
+        // dm:today → small.txt + sub（large.pdf mtime 已拨回远古）。
         let outcome = search_volumes_impl(
             &volumes,
             "",
@@ -1937,10 +1993,12 @@ mod tests {
             None,
             &stat_filters("dm", "today", &now),
             usize::MAX,
+            &TEST_STAT_BUDGET,
         );
         assert_eq!(outcome.items.len(), 2);
 
-        // file: 旗标 → 两个已知 stat 的文件（目录与未知 13 排除）。
+        // file: 旗标 → 两个文件（目录排除）；folder: → 只有目录。
+        // 零 I/O 判定：不应消耗任何 stat 预算。
         let outcome = search_volumes_impl(
             &volumes,
             "",
@@ -1949,10 +2007,10 @@ mod tests {
             None,
             &stat_filters("file", "", &now),
             usize::MAX,
+            &TEST_STAT_BUDGET,
         );
         assert_eq!(outcome.items.len(), 2);
-
-        // folder: 旗标 → 只有目录。
+        assert_eq!(outcome.stat_calls, 0, "file:/folder: 零 I/O");
         let outcome = search_volumes_impl(
             &volumes,
             "",
@@ -1961,6 +2019,7 @@ mod tests {
             None,
             &stat_filters("folder", "", &now),
             usize::MAX,
+            &TEST_STAT_BUDGET,
         );
         assert_eq!(outcome.items.len(), 1);
         assert!(outcome.items[0].is_directory);
@@ -1968,16 +2027,17 @@ mod tests {
         // 名字词与 stat 条件 AND。
         let outcome = search_volumes_impl(
             &volumes,
-            "file",
+            "large",
             10,
             &[],
             None,
             &stat_filters("size", ">1mb", &now),
             usize::MAX,
+            &TEST_STAT_BUDGET,
         );
         assert_eq!(outcome.items.len(), 1);
 
-        // 多 size 条件 OR（">1mb <200b" → 12 或 11）。
+        // 多 size 条件 OR（">1mb <200b" → large.pdf 或 small.txt）。
         let multi = QueryFilters::new(vec![], vec![]).with_stat(crate::filters::stat_filter_set(
             &[
                 crate::indexer_ipc::SearchFilter {
@@ -1991,33 +2051,49 @@ mod tests {
             ],
             &now,
         ));
-        let outcome = search_volumes_impl(&volumes, "", 10, &[], None, &multi, usize::MAX);
+        let outcome = search_volumes_impl(
+            &volumes,
+            "",
+            10,
+            &[],
+            None,
+            &multi,
+            usize::MAX,
+            &TEST_STAT_BUDGET,
+        );
         assert_eq!(
             outcome.items.len(),
             3,
-            "12(>1mb) + 11(<200b) + 目录(size 跳过)"
+            "large.pdf(>1mb) + small.txt(<200b) + 目录(size 跳过)"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 内存收口 II：stat 预算耗尽 → 剩余记录不进堆，结果如实置 is_truncated。
+    /// 只断言 truncated，不断言具体条数（并行下哪些记录被砍取决于调度）。
     #[test]
-    fn g7c_upsert_invalidates_stat_for_refresh() {
-        let mut volume = dense_volume("Q:", 1);
-        volume.store_stat(
-            11,
-            RecordStat {
-                size: 1,
-                mtime: 1,
-                ctime: 1,
-            },
+    fn g7c_stat_budget_exhaustion_sets_truncated() {
+        let (volume, dir) = real_file_volume("budget");
+        let volumes = vec![volume];
+        let now = crate::filters::local_now();
+        let budget = AtomicU64::new(1);
+        let outcome = search_volumes_impl(
+            &volumes,
+            "",
+            10,
+            &[],
+            None,
+            &stat_filters("size", ">1mb", &now),
+            usize::MAX,
+            &budget,
         );
-        assert!(volume.record_stat(11).is_some());
-        volume
-            .upsert(frn(11, 2), frn(10, 1), "file-000000.txt", false)
-            .unwrap();
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(
-            volume.record_stat(11).is_none(),
-            "改名/新建必须让 stat 失效等待维护 tick 重 stat"
+            outcome.is_truncated,
+            "预算耗尽必须置 truncated（即使结果未填满 max）"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- N2（FRESH-AUDIT-2026-08-19）: 并行扫描等价性与确定性 ------------------
@@ -2060,8 +2136,26 @@ mod tests {
         let volumes = vec![dense_volume("C:", 30_000)];
         let filters = QueryFilters::none();
         for query in ["file", "文档", "mixed", "file-0000"] {
-            let serial = search_volumes_impl(&volumes, query, 8, &[], None, &filters, usize::MAX);
-            let parallel = search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
+            let serial = search_volumes_impl(
+                &volumes,
+                query,
+                8,
+                &[],
+                None,
+                &filters,
+                usize::MAX,
+                &TEST_STAT_BUDGET,
+            );
+            let parallel = search_volumes_impl(
+                &volumes,
+                query,
+                8,
+                &[],
+                None,
+                &filters,
+                1,
+                &TEST_STAT_BUDGET,
+            );
             assert_eq!(parallel.items.len(), serial.items.len(), "query={query}");
             for (p, s) in parallel.items.iter().zip(serial.items.iter()) {
                 assert_eq!(p.name, s.name, "query={query}");
@@ -2085,8 +2179,26 @@ mod tests {
             dense_volume("D:", 100), // 不足一块
         ];
         let filters = QueryFilters::none();
-        let serial = search_volumes_impl(&volumes, "file", 16, &[], None, &filters, usize::MAX);
-        let parallel = search_volumes_impl(&volumes, "file", 16, &[], None, &filters, 1);
+        let serial = search_volumes_impl(
+            &volumes,
+            "file",
+            16,
+            &[],
+            None,
+            &filters,
+            usize::MAX,
+            &TEST_STAT_BUDGET,
+        );
+        let parallel = search_volumes_impl(
+            &volumes,
+            "file",
+            16,
+            &[],
+            None,
+            &filters,
+            1,
+            &TEST_STAT_BUDGET,
+        );
         assert_eq!(parallel.items.len(), serial.items.len());
         for (p, s) in parallel.items.iter().zip(serial.items.iter()) {
             assert_eq!(
@@ -2103,8 +2215,26 @@ mod tests {
     fn n2_parallel_scan_is_deterministic() {
         let volumes = vec![dense_volume("C:", 12_000)];
         let filters = QueryFilters::none();
-        let first = search_volumes_impl(&volumes, "file", 8, &[], None, &filters, 1);
-        let second = search_volumes_impl(&volumes, "file", 8, &[], None, &filters, 1);
+        let first = search_volumes_impl(
+            &volumes,
+            "file",
+            8,
+            &[],
+            None,
+            &filters,
+            1,
+            &TEST_STAT_BUDGET,
+        );
+        let second = search_volumes_impl(
+            &volumes,
+            "file",
+            8,
+            &[],
+            None,
+            &filters,
+            1,
+            &TEST_STAT_BUDGET,
+        );
         assert_eq!(first.items.len(), second.items.len());
         for (a, b) in first.items.iter().zip(second.items.iter()) {
             assert_eq!(
@@ -2137,8 +2267,26 @@ mod tests {
             root_record: frn(2000, 1) as u32,
         });
         let filters = QueryFilters::none();
-        let serial = search_volumes_impl(&volumes, "file", 32, &[], root, &filters, usize::MAX);
-        let parallel = search_volumes_impl(&volumes, "file", 32, &[], root, &filters, 1);
+        let serial = search_volumes_impl(
+            &volumes,
+            "file",
+            32,
+            &[],
+            root,
+            &filters,
+            usize::MAX,
+            &TEST_STAT_BUDGET,
+        );
+        let parallel = search_volumes_impl(
+            &volumes,
+            "file",
+            32,
+            &[],
+            root,
+            &filters,
+            1,
+            &TEST_STAT_BUDGET,
+        );
         assert!(!serial.items.is_empty());
         assert_eq!(serial.matched_count, parallel.matched_count);
         assert_eq!(serial.items.len(), parallel.items.len());
@@ -2191,10 +2339,28 @@ mod tests {
         let filters = QueryFilters::none();
         for query in ["file", "文档"] {
             let serial_start = std::time::Instant::now();
-            let serial = search_volumes_impl(&volumes, query, 8, &[], None, &filters, usize::MAX);
+            let serial = search_volumes_impl(
+                &volumes,
+                query,
+                8,
+                &[],
+                None,
+                &filters,
+                usize::MAX,
+                &TEST_STAT_BUDGET,
+            );
             let serial_ms = serial_start.elapsed().as_millis();
             let parallel_start = std::time::Instant::now();
-            let parallel = search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
+            let parallel = search_volumes_impl(
+                &volumes,
+                query,
+                8,
+                &[],
+                None,
+                &filters,
+                1,
+                &TEST_STAT_BUDGET,
+            );
             let parallel_ms = parallel_start.elapsed().as_millis();
             assert_eq!(parallel.items.len(), serial.items.len());
             println!(
@@ -3122,7 +3288,8 @@ mod tests {
     fn ext_filter_returns_only_matching_extension_before_top_k() {
         let state = filter_fixture();
         let filters = QueryFilters::new(vec!["pdf".into()], vec![]);
-        let outcome = state.search_in_root_filtered("file", 8, &[], None, &filters);
+        let outcome =
+            state.search_in_root_filtered("file", 8, &[], None, &filters, &TEST_STAT_BUDGET);
         assert_eq!(
             outcome.items.len(),
             8,
@@ -3142,7 +3309,8 @@ mod tests {
     fn ext_filter_or_with_multiple_extensions() {
         let state = filter_fixture();
         let filters = QueryFilters::new(vec!["txt".into(), "pdf".into()], vec![]);
-        let outcome = state.search_in_root_filtered("file", 1000, &[], None, &filters);
+        let outcome =
+            state.search_in_root_filtered("file", 1000, &[], None, &filters, &TEST_STAT_BUDGET);
         assert_eq!(outcome.items.len(), 40, "all 20 txt + 20 pdf should match");
     }
 
@@ -3150,7 +3318,8 @@ mod tests {
     fn ext_filter_excludes_directories() {
         let state = filter_fixture();
         let filters = QueryFilters::new(vec!["txt".into()], vec![]);
-        let outcome = state.search_in_root_filtered("notes", 8, &[], None, &filters);
+        let outcome =
+            state.search_in_root_filtered("notes", 8, &[], None, &filters, &TEST_STAT_BUDGET);
         // The directory "notes" matches the name query but has no extension.
         assert!(
             outcome.items.is_empty(),
@@ -3162,7 +3331,8 @@ mod tests {
     fn path_filter_substring_match_case_insensitive() {
         let state = filter_fixture();
         let filters = QueryFilters::new(vec![], vec!["project x".into()]);
-        let outcome = state.search_in_root_filtered("design", 8, &[], None, &filters);
+        let outcome =
+            state.search_in_root_filtered("design", 8, &[], None, &filters, &TEST_STAT_BUDGET);
         assert_eq!(outcome.items.len(), 1);
         assert!(outcome.items[0].path.contains("Project X"));
     }
@@ -3172,7 +3342,8 @@ mod tests {
         let state = filter_fixture();
         // ext:pdf AND path:"Project X" → only design.pdf under Project X
         let filters = QueryFilters::new(vec!["pdf".into()], vec!["Project X".into()]);
-        let outcome = state.search_in_root_filtered("design", 8, &[], None, &filters);
+        let outcome =
+            state.search_in_root_filtered("design", 8, &[], None, &filters, &TEST_STAT_BUDGET);
         assert_eq!(outcome.items.len(), 1);
         assert!(outcome.items[0].name.contains("design"));
     }
@@ -3180,7 +3351,14 @@ mod tests {
     #[test]
     fn no_filters_returns_all_matching_candidates() {
         let state = filter_fixture();
-        let outcome = state.search_in_root_filtered("file", 8, &[], None, &QueryFilters::none());
+        let outcome = state.search_in_root_filtered(
+            "file",
+            8,
+            &[],
+            None,
+            &QueryFilters::none(),
+            &TEST_STAT_BUDGET,
+        );
         assert_eq!(outcome.items.len(), 8);
     }
 
@@ -3191,7 +3369,7 @@ mod tests {
         // not short-circuit when filters are present.
         let state = filter_fixture();
         let filters = QueryFilters::new(vec!["pdf".into()], vec![]);
-        let outcome = state.search_in_root_filtered("", 8, &[], None, &filters);
+        let outcome = state.search_in_root_filtered("", 8, &[], None, &filters, &TEST_STAT_BUDGET);
         assert_eq!(outcome.items.len(), 8, "should return 8 pdf files");
         assert!(
             outcome.items.iter().all(|item| item.name.ends_with(".pdf")),

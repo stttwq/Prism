@@ -1,9 +1,9 @@
 //! G7b+G7c：broker 侧 stat 过滤（`size:` / `dm:` / `dc:` / `file:` / `folder:`）。
 //!
-//! G7c（2026-08-30）起判定下沉到索引器扫描内：VolumeIndex 每记录携带
-//! size/mtime/ctime（serde skip 不入 sidecar，服务启动后由维护 tick 分块
-//! 全树 stat 填充、USN 变更失效重填），`QueryFilters::stat_matches_record`
-//! 在 Top-K 堆前执行——纯过滤查询（`size:>1mb` 无名字词）从此覆盖全索引。
+//! 内存收口 II（2026-08-30）起索引不再携带 size/mtime/ctime（全索引 stat 表
+//! 已删，24B/槽 常驻代价只服务过一次全新建卷）。size/date 判定改在扫描内
+//! 现场执行：`QueryFilters::stat_matches_path` 对已构造路径做 `fs::metadata`，
+//! 受 `STAT_CALL_BUDGET` 预算约束（超预算置 is_truncated，宁少勿全盘 I/O）。
 //! 本模块保留：过滤值解析/校验、`StatFilterSet` 语义、扫描内与候选集后置
 //! （历史注入行不经索引器，broker 侧仍逐条磁盘 stat）共用的单条判定
 //! [`stat_passes`]。
@@ -51,7 +51,7 @@ pub struct SizeSpec {
 
 impl SizeSpec {
     fn matches(&self, len: u64) -> bool {
-        len >= self.lo && self.hi.map_or(true, |hi| len <= hi)
+        len >= self.lo && self.hi.is_none_or(|hi| len <= hi)
     }
 }
 
@@ -232,16 +232,6 @@ fn parse_date_days(raw: &str) -> Option<(i64, i64)> {
 
 /// 命名日期 → 本地 civil 天 [start, end)。
 fn parse_named_days(raw: &str, now: &LocalNow) -> Option<(i64, i64)> {
-    const DATE_NAMED: &[&str] = &[
-        "today",
-        "yesterday",
-        "thisweek",
-        "lastweek",
-        "thismonth",
-        "lastmonth",
-        "thisyear",
-        "lastyear",
-    ];
     let d = now.days;
     let dow = now.day_of_week();
     let (y, m) = (now.year, now.month);
@@ -278,7 +268,7 @@ pub struct DateSpec {
 
 impl DateSpec {
     fn matches(&self, t: i64) -> bool {
-        self.lo.map_or(true, |lo| t >= lo) && self.hi.map_or(true, |hi| t <= hi)
+        self.lo.is_none_or(|lo| t >= lo) && self.hi.is_none_or(|hi| t <= hi)
     }
     fn days(now: &LocalNow, start: i64, end: i64) -> Self {
         DateSpec {
@@ -433,6 +423,13 @@ impl StatFilterSet {
             && self.modified.is_empty()
             && self.created.is_empty()
     }
+
+    /// 是否需要磁盘元数据。file:/folder: 从节点 flags 就能判，不需要 stat。
+    /// 内存收口 II（2026-08-30）：索引不再携带 size/mtime/ctime，
+    /// size/date 条件一律现场 fs::metadata。
+    pub fn needs_metadata(&self) -> bool {
+        !self.sizes.is_empty() || !self.modified.is_empty() || !self.created.is_empty()
+    }
 }
 
 /// 逐候选磁盘 stat。调用方放 spawn_blocking——几十到几千次 stat 是磁盘 I/O。
@@ -465,10 +462,17 @@ fn passes(item: &SearchResult, set: &StatFilterSet) -> bool {
     )
 }
 
+/// file:/folder: 旗标判定——只读 is_directory，零 I/O。扫描侧把它从
+/// stat_passes 提前出来（路径构造之前砍掉大部分 folder:/file: 不合格候选），
+/// 抽成独立函数让两处共用同一语义，不在 stat_passes 里复制逻辑。
+pub(crate) fn dir_flag_passes(set: &StatFilterSet, is_directory: bool) -> bool {
+    !(set.file_only && is_directory) && !(set.folder_only && !is_directory)
+}
+
 /// G7c：单条 stat 判定，索引器扫描内（元数据来自索引）与 broker 候选集后置
 /// （元数据来自现场磁盘 stat）共用同一语义。任一 size 条件命中即过（OR），
 /// dm/dc 同理；file/folder 旗标为 AND。size=None 表文件夹——size 条件跳过
-/// 文件夹（文件夹大小无 Everything 语义），日期条件对文件夹照常生效。
+/// 文件夹（文件夹大小无 Everything 语义），日期条件对文件/文件夹都适用。
 /// size/mtime/ctime 传 None = 元数据未知（索引未填充/stat 失败）。
 pub(crate) fn stat_passes(
     set: &StatFilterSet,
@@ -477,10 +481,7 @@ pub(crate) fn stat_passes(
     mtime: Option<i64>,
     ctime: Option<i64>,
 ) -> bool {
-    if set.file_only && is_directory {
-        return false;
-    }
-    if set.folder_only && !is_directory {
+    if !dir_flag_passes(set, is_directory) {
         return false;
     }
     if set.sizes.is_empty() && set.modified.is_empty() && set.created.is_empty() {
@@ -501,7 +502,7 @@ pub(crate) fn stat_passes(
     true
 }
 
-fn system_time_epoch(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
+pub(crate) fn system_time_epoch(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
     t.ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()

@@ -537,6 +537,7 @@ impl PinyinSidecar {
             exclusion_paths,
             None,
             &QueryFilters::none(),
+            &std::sync::atomic::AtomicU64::new(crate::hierarchy::STAT_CALL_BUDGET),
         )
     }
 
@@ -559,6 +560,7 @@ impl PinyinSidecar {
         exclusion_paths: &[String],
         root: Option<RootBound>,
         filters: &QueryFilters,
+        stat_budget: &std::sync::atomic::AtomicU64,
     ) -> PinyinSearchOutcome {
         let Some(normalized) = normalize_query(query) else {
             return PinyinSearchOutcome {
@@ -618,6 +620,7 @@ impl PinyinSidecar {
                     record.key,
                     filters,
                     has_path_filter,
+                    stat_budget,
                     &mut path_constructions,
                 ) {
                     continue;
@@ -656,6 +659,7 @@ impl PinyinSidecar {
                     *key,
                     filters,
                     has_path_filter,
+                    stat_budget,
                     &mut path_constructions,
                 ) {
                     continue;
@@ -835,13 +839,21 @@ fn key_is_in_root(
 /// G7: applies ext/path filters to a pinyin candidate before it enters the Top-K heap.
 /// Ext is a low-cost name check; path requires constructing the full path (high cost),
 /// counted in `path_constructions`. Returns true when the candidate passes all filters.
+///
+/// 内存收口 II（2026-08-30）：size/dm/dc 条件在拼音候选上同样按需现场 stat——
+/// 索引不再携带元数据。与字面路径共享同一个 `stat_budget` 计数器，预算耗尽时
+/// 候选丢弃（与字面侧同口径：宁少勿全盘 I/O）。判定顺序与字面侧一致：
+/// ext → file:/folder: 旗标（零 I/O）→ 构造路径（path 过滤与 stat 复用）
+/// → path 过滤 → 现场 stat。
 fn key_passes_filters(
     index: &IndexState,
     key: RecordKey,
     filters: &QueryFilters,
     has_path_filter: bool,
+    stat_budget: &std::sync::atomic::AtomicU64,
     path_constructions: &mut u64,
 ) -> bool {
+    use std::sync::atomic::Ordering;
     let Some(volume) = index.volumes.get(key.volume as usize) else {
         return false;
     };
@@ -855,16 +867,26 @@ fn key_passes_filters(
     if !filters.ext_matches(name, is_directory) {
         return false;
     }
-    // G7c：stat 条件在拼音候选上同样生效（元数据来自索引记录）。
-    if !filters.stat_matches_record(volume, key.record, is_directory) {
+    // file:/folder: 旗标零 I/O，留在路径构造之前（与字面路径共用 dir_flag_passes）。
+    if !crate::filters::dir_flag_passes(filters.stat_set(), is_directory) {
         return false;
     }
-    if has_path_filter {
+    let needs_path = has_path_filter || filters.stat_needs_metadata();
+    if needs_path {
         *path_constructions = path_constructions.saturating_add(1);
         match volume.path_for(key.record) {
             Ok(path) => {
-                if !filters.path_matches(&path) {
+                if has_path_filter && !filters.path_matches(&path) {
                     return false;
+                }
+                if filters.stat_needs_metadata() {
+                    if stat_budget.load(Ordering::Relaxed) == 0 {
+                        return false;
+                    }
+                    stat_budget.fetch_sub(1, Ordering::Relaxed);
+                    if !filters.stat_matches_path(&path, is_directory) {
+                        return false;
+                    }
                 }
             }
             Err(_) => return false,
@@ -1191,8 +1213,16 @@ mod tests {
         });
 
         assert_eq!(sidecar.search(&delta, &index, "wx", 8).items.len(), 3);
-        let scoped =
-            sidecar.search_in_root(&delta, &index, "wx", 8, &[], root, &QueryFilters::none());
+        let scoped = sidecar.search_in_root(
+            &delta,
+            &index,
+            "wx",
+            8,
+            &[],
+            root,
+            &QueryFilters::none(),
+            &std::sync::atomic::AtomicU64::new(crate::hierarchy::STAT_CALL_BUDGET),
+        );
         assert_eq!(scoped.items.len(), 1, "{:?}", scoped.items);
         assert_eq!(scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(
@@ -1204,8 +1234,16 @@ mod tests {
         // a rename outside it does not leak in.
         delta.apply(0, 11, Some("支付宝"), &[]).unwrap();
         delta.apply(0, 12, Some("支付宝"), &[]).unwrap();
-        let delta_scoped =
-            sidecar.search_in_root(&delta, &index, "zfb", 8, &[], root, &QueryFilters::none());
+        let delta_scoped = sidecar.search_in_root(
+            &delta,
+            &index,
+            "zfb",
+            8,
+            &[],
+            root,
+            &QueryFilters::none(),
+            &std::sync::atomic::AtomicU64::new(crate::hierarchy::STAT_CALL_BUDGET),
+        );
         assert_eq!(delta_scoped.items.len(), 1, "{:?}", delta_scoped.items);
         assert_eq!(delta_scoped.items[0].path, "C:\\项目\\微信");
         assert_eq!(delta_scoped.matched_count, 1);
