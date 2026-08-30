@@ -2420,6 +2420,16 @@ async fn handle_command_set(
             }
         }
     }
+    // A2.2（COMMAND-SIMPLIFY 2026-08-30）：{selection.target} 与关键字路由/
+    // 根搜索互斥——只在动作面板有值，恒展开为空的死配置在保存时拒绝。broker
+    // 是唯一裁决者（先例：validate_trigger_namespace），绕过 WPF 手改
+    // commands-v1.json / 旧版导入也配不出跑不通的命令。内置覆盖不适用
+    // （handler/params 由内置定义）。
+    if !is_builtin_override {
+        if let Err(msg) = crate::commands::validate_selection_target_binding(&command) {
+            return Response::CommandApplied { message: msg };
+        }
+    }
     // §4.5 命名空间冲突检查：逐条查命令关键字
     let engine_snapshot = engines
         .read()

@@ -164,6 +164,11 @@ fn is_false(v: &bool) -> bool {
 /// K1 两条内置命令，均带 root_search binding（在根搜索中可见、可执行）。
 /// `prism.settings.open` owner=ui → broker 返回 UiCommand 交给前端执行。
 /// `prism.terminal.open` owner=broker → broker 直接打开终端。
+/// A6（COMMAND-SIMPLIFY 2026-08-30）：trigger != keywords[0] 的存量命令核对
+/// 日志只发一次（catalog() 每次搜索都可能被调，不能刷屏）。
+static TRIGGER_MISMATCH_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn builtin_catalog() -> Vec<CommandDescriptor> {
     vec![
         CommandDescriptor {
@@ -475,6 +480,43 @@ impl CommandStore {
             // owner 分工：用户命令的 owner/trust 恒为 broker/user，由代码赋值。
             // broker-owned 命令需要注册 handler；K0 用户表为空，此处无过滤发生。
             items.push(user_command_to_descriptor(command));
+        }
+        // A6（COMMAND-SIMPLIFY 2026-08-30）：A2.3 把关键字路由触发词收敛为
+        // keywords[0]（WPF 删除了独立触发词输入框）。存量命令 trigger 与
+        // keywords[0] 不同的，触发词会因此变化——进程内首次 catalog 记一行
+        // 日志，便于事后核对（静默改用户配置比报错更坏，先落账）。
+        if !TRIGGER_MISMATCH_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let mismatches: Vec<String> = state
+                .commands
+                .iter()
+                .filter(|c| {
+                    !c.keywords.is_empty()
+                        && c.bindings
+                            .keyword
+                            .as_ref()
+                            .and_then(|b| b.trigger.as_deref())
+                            .is_some_and(|t| !t.is_empty() && t != c.keywords[0])
+                })
+                .map(|c| {
+                    let trigger = c
+                        .bindings
+                        .keyword
+                        .as_ref()
+                        .and_then(|b| b.trigger.as_deref())
+                        .unwrap_or_default();
+                    format!(
+                        "{} trigger={trigger:?} keywords[0]={:?}",
+                        c.id, c.keywords[0]
+                    )
+                })
+                .collect();
+            if !mismatches.is_empty() {
+                crate::log(format!(
+                    "trigger != keywords[0] on {} command(s); A2.3 collapses trigger to keywords[0]: {}",
+                    mismatches.len(),
+                    mismatches.join("; ")
+                ));
+            }
         }
         // K2 §4.6：合并 shortcut_bindings。为目录中每条命令填充 bindings.shortcut。
         // 内置命令不在 commands 向量中，shortcut_bindings 是它们唯一的快捷键存储。
@@ -1668,6 +1710,48 @@ pub fn validate_user_danger(danger: &str) -> Result<(), String> {
         return Err("用户命令不能设置为 elevated（禁止 runas）".into());
     }
     Ok(())
+}
+
+/// A2.2（COMMAND-SIMPLIFY 2026-08-30）：`{selection.target}` 与关键字路由/
+/// 根搜索互斥——它只在动作面板入口有值，其余入口恒展开为空。保存时做纯
+/// 结构判定（不展开、不触 I/O）。`{current_folder}` 不在此拒：Explorer 宿主
+/// 外合法展开为空，由 A2.1 的 strict 报错兜底，且关键字路由下它完全合法。
+pub fn validate_selection_target_binding(
+    command: &crate::persistence::UserCommandDefinition,
+) -> Result<(), String> {
+    let uses_selection = ["url_template", "args_template", "working_dir"]
+        .iter()
+        .any(|key| {
+            command
+                .handler_params
+                .get(*key)
+                .is_some_and(|v| v.contains("{selection.target}"))
+        });
+    if !uses_selection {
+        return Ok(());
+    }
+    let keyword_bound = command
+        .bindings
+        .keyword
+        .as_ref()
+        .and_then(|b| b.trigger.as_deref())
+        .is_some_and(|t| !t.trim().is_empty());
+    let shown_in_root = !matches!(
+        command
+            .bindings
+            .root_search
+            .as_ref()
+            .map(|b| b.show_in_root_search),
+        Some(false)
+    );
+    if keyword_bound || shown_in_root {
+        Err(
+            "{selection.target} 只在动作面板有值。请去掉关键字与根搜索显示，或改用 {query} 让用户手动输入路径"
+                .into(),
+        )
+    } else {
+        Ok(())
+    }
 }
 
 // ── K3 §4.5 命名空间统一校验 ────────────────────────────────────────
@@ -2955,6 +3039,66 @@ mod tests {
         assert!(validate_user_danger("elevated").is_err());
         assert!(validate_user_danger("normal").is_ok());
         assert!(validate_user_danger("").is_ok());
+    }
+
+    // ── A2.2（COMMAND-SIMPLIFY 2026-08-30）：selection.target 互斥校验 ──
+
+    fn selection_command() -> crate::persistence::UserCommandDefinition {
+        let mut cmd = crate::persistence::UserCommandDefinition::default();
+        cmd.id = "user.np".into();
+        cmd.title = "用记事本打开".into();
+        cmd.handler = crate::persistence::UserHandlerKind::LaunchProgram;
+        cmd.handler_params
+            .insert("args_template".into(), "{selection.target}".into());
+        cmd
+    }
+
+    #[test]
+    fn selection_target_with_keyword_binding_is_rejected() {
+        let mut cmd = selection_command();
+        cmd.keywords = vec!["np".into()];
+        cmd.bindings.keyword = Some(crate::persistence::CommandBinding {
+            trigger: Some("np".into()),
+            ..Default::default()
+        });
+        cmd.bindings.root_search = Some(crate::persistence::CommandBinding {
+            show_in_root_search: false,
+            ..Default::default()
+        });
+        let err = validate_selection_target_binding(&cmd).unwrap_err();
+        assert!(err.contains("动作面板"), "got: {err}");
+    }
+
+    #[test]
+    fn selection_target_shown_in_root_search_is_rejected() {
+        let mut cmd = selection_command();
+        cmd.bindings.root_search = Some(crate::persistence::CommandBinding::default());
+        let err = validate_selection_target_binding(&cmd).unwrap_err();
+        assert!(err.contains("动作面板"), "got: {err}");
+    }
+
+    #[test]
+    fn selection_target_panel_only_is_accepted() {
+        // A3 表单收敛后的合法形态：无关键字绑定 + root_search 显式 false。
+        let mut cmd = selection_command();
+        cmd.bindings.root_search = Some(crate::persistence::CommandBinding {
+            show_in_root_search: false,
+            ..Default::default()
+        });
+        assert!(validate_selection_target_binding(&cmd).is_ok());
+        // {current_folder} 不受互斥约束——关键字路由下完全合法。
+        let mut folder_cmd = crate::persistence::UserCommandDefinition::default();
+        folder_cmd.id = "user.cmd".into();
+        folder_cmd.handler = crate::persistence::UserHandlerKind::LaunchProgram;
+        folder_cmd
+            .handler_params
+            .insert("args_template".into(), "{current_folder}".into());
+        folder_cmd.keywords = vec!["cmd".into()];
+        folder_cmd.bindings.keyword = Some(crate::persistence::CommandBinding {
+            trigger: Some("cmd".into()),
+            ..Default::default()
+        });
+        assert!(validate_selection_target_binding(&folder_cmd).is_ok());
     }
 
     #[test]
