@@ -1553,9 +1553,17 @@ pub fn resolve_arguments(
 /// launch_program 语义校验。保存时（CommandSet）与执行时（ExecuteCommand）都调用。
 /// 路径须绝对、非 UNC、扩展名 .exe/.lnk、文件存在。working_dir 若非空须存在。
 /// §4.2-2：拒绝 .bat/.cmd/.ps1。
+///
+/// COMMAND-SIMPLIFY A2.1（2026-08-30）：`require_non_empty_args` 控制占位符
+/// 展开为空的行为——false = 丢弃空参（保存路径：上下文为空，占位符必然展开
+/// 为空，strict 会让任何带占位符的命令存不进去）；true = 报错（执行/预览路径：
+/// 空展开 = 配置错误或入口错误，静默丢参会把「notepad 无参启动开空白文档」
+/// 这种行为错误藏成成功）。G7c 曾以「不报错」换「报错文案难看」，本参数改
+/// 回报错且按占位符给出正确的错。
 pub fn validate_launch_program(
     handler_params: &std::collections::BTreeMap<String, String>,
     ctx: &ExpansionContext,
+    require_non_empty_args: bool,
 ) -> Result<(String, Vec<String>, Option<String>), String> {
     let path = handler_params
         .get("path")
@@ -1591,16 +1599,22 @@ pub fn validate_launch_program(
             // §4.3：token 列表的字符串形式。展开时按 token 逐个替换占位符，
             // 替换结果不再二次分词——用空白分割模板本身的 token。
             // §4.3：程序参数用 raw 展开——percent-encode 对 argv 无意义。
-            // G7c：展开为空（如 {selection.target} 无选中）→ 丢弃该参数，
-            // 程序无参启动；未知占位符/坏修饰符 → 保留原文暴露拼写错误。
-            template
-                .split_whitespace()
-                .filter_map(|tok| match expand_template_raw(tok, ctx) {
-                    Ok(v) if !v.trim().is_empty() => Some(v),
-                    Ok(_) => None,
-                    Err(_) => Some(tok.to_string()),
-                })
-                .collect()
+            // A2.1：含占位符的 token 展开为空 → strict 报错（执行/预览），
+            // 非 strict 丢弃（保存）。未知占位符/坏修饰符 → 保留原文暴露拼写
+            // 错误（既有设计，两条路径一致）。
+            let mut args = Vec::new();
+            for tok in template.split_whitespace() {
+                match expand_template_raw(tok, ctx) {
+                    Ok(v) if !v.trim().is_empty() => args.push(v),
+                    Ok(_) => {
+                        if require_non_empty_args {
+                            return Err(empty_expansion_error(tok));
+                        }
+                    }
+                    Err(_) => args.push(tok.to_string()),
+                }
+            }
+            args
         }
         _ => Vec::new(),
     };
@@ -1616,6 +1630,36 @@ pub fn validate_launch_program(
         _ => None,
     };
     Ok((path.to_string(), args, working_dir))
+}
+
+/// A2.1：strict 模式下占位符展开为空的报错文案，按占位符分流。
+/// `{selection.target}` / `{current_folder}` 给入口指引；`{query}` / `{arg.x}`
+/// 复用 `resolve_arguments` 的「缺少必填参数」口径；其余给通用文案。
+fn empty_expansion_error(token: &str) -> String {
+    if token.contains("{selection.target}") {
+        return "此命令需要先选中一个文件：在搜索结果里选中后按 → 打开动作面板执行".into();
+    }
+    if token.contains("{current_folder}") {
+        return "此命令需要当前文件夹：请在资源管理器窗口中呼出 Prism".into();
+    }
+    if token.contains("{query}") {
+        return "缺少必填参数：query".into();
+    }
+    if let Some(start) = token.find("{arg.") {
+        if let Some(end) = token[start..].find('}') {
+            return format!("缺少必填参数：{}", &token[start + 5..start + end]);
+        }
+    }
+    for name in PLACEHOLDERS {
+        if *name != "query"
+            && *name != "current_folder"
+            && *name != "selection.target"
+            && token.contains(&format!("{{{name}}}"))
+        {
+            return format!("占位符 {{{name}}} 取值为空");
+        }
+    }
+    "参数取值为空".into()
 }
 
 /// K3 §4.2-6：用户命令的 danger 不接受 elevated（用户命令不得请求 runas）。
@@ -2507,10 +2551,10 @@ mod tests {
             "args_template".into(),
             "{selection.target} {unknown} tail".into(),
         );
-        // 无选中：空展开参数被丢弃（不再把字面 {selection.target} 传给程序），
-        // 未知占位符保留原文暴露拼写错误。
+        // 无选中：空展开参数被丢弃（A2.1 strict=false 的保存路径行为；执行路径
+        // 现已改报错，见下方新测试），未知占位符保留原文暴露拼写错误。
         let ctx = exp_ctx("");
-        let (_, args, _) = validate_launch_program(&params, &ctx).unwrap();
+        let (_, args, _) = validate_launch_program(&params, &ctx, false).unwrap();
         assert_eq!(args, vec!["{unknown}", "tail"]);
         // 有选中：目标路径作为单个参数（含空格不分词）。
         let ctx = ExpansionContext {
@@ -2521,8 +2565,73 @@ mod tests {
             now: fixed_now(),
             args: Default::default(),
         };
-        let (_, args, _) = validate_launch_program(&params, &ctx).unwrap();
+        let (_, args, _) = validate_launch_program(&params, &ctx, false).unwrap();
         assert_eq!(args, vec![r"D:\a b.txt", "{unknown}", "tail"]);
+    }
+
+    // ── A2.1（COMMAND-SIMPLIFY 2026-08-30）：strict 模式空展开报错 ──────
+
+    #[test]
+    fn strict_empty_selection_target_errors_with_entry_hint() {
+        let mut params = launch_params(r"C:\Windows\notepad.exe");
+        params.insert("args_template".into(), "{selection.target}".into());
+        let err = validate_launch_program(&params, &exp_ctx(""), true).unwrap_err();
+        assert!(err.contains("选中"), "got: {err}");
+    }
+
+    #[test]
+    fn strict_false_keeps_save_path_behavior() {
+        // 保存路径（strict=false）不回归：空展开照旧丢弃，命令可保存。
+        let mut params = launch_params(r"C:\Windows\notepad.exe");
+        params.insert("args_template".into(), "{selection.target}".into());
+        let (_, args, _) = validate_launch_program(&params, &exp_ctx(""), false).unwrap();
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn strict_keeps_non_empty_expansion_and_literal_tokens() {
+        let mut params = launch_params(r"C:\Windows\notepad.exe");
+        params.insert("args_template".into(), "--flag {selection.target}".into());
+        let ctx = ExpansionContext {
+            query: String::new(),
+            current_folder: String::new(),
+            selection: Some(r"D:\a b.txt".into()),
+            clipboard: None,
+            now: fixed_now(),
+            args: Default::default(),
+        };
+        let (_, args, _) = validate_launch_program(&params, &ctx, true).unwrap();
+        assert_eq!(args, vec!["--flag", r"D:\a b.txt"]);
+        // 纯字面量 token 不含占位符，strict 不误报。
+        let mut params = launch_params(r"C:\Windows\notepad.exe");
+        params.insert("args_template".into(), "--flag".into());
+        let (_, args, _) = validate_launch_program(&params, &exp_ctx(""), true).unwrap();
+        assert_eq!(args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn strict_empty_expansion_messages_branch_by_placeholder() {
+        // current_folder 也置空：exp_ctx 助手默认填 C:\Users\test，{current_folder}
+        // 在那里非空、不会触发空展开分支。
+        let empty_ctx = ExpansionContext {
+            query: String::new(),
+            current_folder: String::new(),
+            selection: None,
+            clipboard: None,
+            now: fixed_now(),
+            args: Default::default(),
+        };
+        let mut params = launch_params(r"C:\Windows\notepad.exe");
+        params.insert("args_template".into(), "{current_folder}".into());
+        let err = validate_launch_program(&params, &empty_ctx, true).unwrap_err();
+        assert!(err.contains("资源管理器"), "got: {err}");
+        params.insert("args_template".into(), "{query}".into());
+        let err = validate_launch_program(&params, &empty_ctx, true).unwrap_err();
+        assert!(err.contains("缺少必填参数"), "got: {err}");
+        // {uuid} 永不为空（随机生成），用 {clipboard}（None → 空串）测通用文案。
+        params.insert("args_template".into(), "{clipboard}".into());
+        let err = validate_launch_program(&params, &empty_ctx, true).unwrap_err();
+        assert!(err.contains("占位符"), "got: {err}");
     }
 
     #[test]
@@ -2800,22 +2909,26 @@ mod tests {
 
     #[test]
     fn validate_launch_program_rejects_relative_path() {
-        let err =
-            validate_launch_program(&launch_params("notepad.exe"), &exp_ctx("x")).unwrap_err();
+        let err = validate_launch_program(&launch_params("notepad.exe"), &exp_ctx("x"), false)
+            .unwrap_err();
         assert!(err.contains("绝对路径"));
     }
 
     #[test]
     fn validate_launch_program_rejects_unc() {
-        let err = validate_launch_program(&launch_params(r"\\server\share\app.exe"), &exp_ctx("x"))
-            .unwrap_err();
+        let err = validate_launch_program(
+            &launch_params(r"\\server\share\app.exe"),
+            &exp_ctx("x"),
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("UNC"));
     }
 
     #[test]
     fn validate_launch_program_rejects_bat() {
-        let err =
-            validate_launch_program(&launch_params(r"C:\evil.bat"), &exp_ctx("x")).unwrap_err();
+        let err = validate_launch_program(&launch_params(r"C:\evil.bat"), &exp_ctx("x"), false)
+            .unwrap_err();
         assert!(err.contains("bat") || err.contains("exe") || err.contains("lnk"));
     }
 
@@ -2824,6 +2937,7 @@ mod tests {
         let err = validate_launch_program(
             &launch_params(r"C:\does_not_exist_xyz_999.exe"),
             &exp_ctx("x"),
+            false,
         )
         .unwrap_err();
         assert!(err.contains("不存在") || err.contains("exist"));
@@ -2832,7 +2946,7 @@ mod tests {
     #[test]
     fn validate_launch_program_rejects_missing_path() {
         let empty: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-        let err = validate_launch_program(&empty, &exp_ctx("x")).unwrap_err();
+        let err = validate_launch_program(&empty, &exp_ctx("x"), false).unwrap_err();
         assert!(err.contains("path"));
     }
 
@@ -2859,7 +2973,7 @@ mod tests {
             args: Default::default(),
         };
         // notepad.exe 存在（标准 Windows 路径），且 .exe 合法
-        let result = validate_launch_program(&params, &ctx);
+        let result = validate_launch_program(&params, &ctx, false);
         if let Ok((_, args, _)) = result {
             // 单 token {query} → 单个 arg，空格不裂成两个
             assert_eq!(args.len(), 1);
@@ -2873,7 +2987,7 @@ mod tests {
         // §10.2-5：working_dir 不存在 → 拒绝执行，不传空字符串继续。
         let mut params = launch_params(r"C:\Windows\notepad.exe");
         params.insert("working_dir".into(), r"C:\does_not_exist_xyz_999".into());
-        let err = validate_launch_program(&params, &exp_ctx("x")).unwrap_err();
+        let err = validate_launch_program(&params, &exp_ctx("x"), false).unwrap_err();
         assert!(err.contains("working_dir") || err.contains("不存在") || err.contains("exist"));
     }
 
@@ -2881,7 +2995,7 @@ mod tests {
     fn validate_launch_program_accepts_existing_working_dir() {
         let mut params = launch_params(r"C:\Windows\notepad.exe");
         params.insert("working_dir".into(), r"C:\Windows".into());
-        let result = validate_launch_program(&params, &exp_ctx("x"));
+        let result = validate_launch_program(&params, &exp_ctx("x"), false);
         if let Ok((_, _, working_dir)) = result {
             assert_eq!(working_dir.as_deref(), Some(r"C:\Windows"));
         }

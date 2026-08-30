@@ -2403,9 +2403,13 @@ async fn handle_command_set(
                 }
             }
             crate::persistence::UserHandlerKind::LaunchProgram => {
-                if let Err(msg) =
-                    crate::commands::validate_launch_program(&command.handler_params, &exp_ctx)
-                {
+                // A2.1：保存路径上下文为空（上方 exp_ctx 无 query/selection），
+                // 占位符必然展开为空——必须传 false，否则任何带占位符的命令都存不进去。
+                if let Err(msg) = crate::commands::validate_launch_program(
+                    &command.handler_params,
+                    &exp_ctx,
+                    false,
+                ) {
                     return Response::CommandApplied { message: msg };
                 }
             }
@@ -2531,7 +2535,9 @@ fn handle_command_preview(
         }
         crate::persistence::UserHandlerKind::LaunchProgram => {
             // §4.6 同函数断言：执行路径调 validate_launch_program，预览也调同一函数。
-            match crate::commands::validate_launch_program(&user_cmd.handler_params, &exp_ctx) {
+            // A2.1：预览必须显示执行时真会发生的事——空展开在此报错（strict）。
+            match crate::commands::validate_launch_program(&user_cmd.handler_params, &exp_ctx, true)
+            {
                 Ok((path, args, working_dir)) => Response::CommandPreviewResult {
                     ok: true,
                     message: String::new(),
@@ -2809,9 +2815,12 @@ async fn execute_command(
                     crate::persistence::UserHandlerKind::LaunchProgram => {
                         // §4.3 + §4.2 语义层：路径校验 + argv 数组展开。
                         // §P2 执行层第三次校验：路径仍存在、扩展名仍合法。
+                        // A2.1：执行路径 strict——占位符展开为空 = 报错，不再
+                        // 静默丢参（根因修复：notepad 无参启动开空白文档报成功）。
                         match crate::commands::validate_launch_program(
                             &user_cmd.handler_params,
                             &exp_ctx,
+                            true,
                         ) {
                             Ok((path, args, working_dir)) => {
                                 match shell
@@ -7051,6 +7060,7 @@ mod pipe_lifecycle_tests {
                     .unwrap()
                     .handler_params,
                 &exp_ctx,
+                true,
             )
             .unwrap();
             assert_eq!(path, exec_path);
