@@ -27,6 +27,10 @@ public sealed class CommandEditItem : INotifyPropertyChanged
     private bool _fallback;
     private bool _enabled = true;
     private string _danger = "normal";
+    // COMMAND-SIMPLIFY A3（2026-08-30）：命令类型（web/selection/open/folder/
+    // advanced）。不参与 ToDefinition() 输出——类型不进持久化格式（A1.1），只
+    // 驱动一级表单可见性与保存前的字段归一。既有命令按 A1.1 反推。
+    private string _commandKind = "web";
 
     /// <summary>K4b：声明式参数行（表格编辑，broker 侧做结构校验）。</summary>
     public System.Collections.ObjectModel.ObservableCollection<CommandArgumentEditItem> Arguments { get; } =
@@ -70,6 +74,24 @@ public sealed class CommandEditItem : INotifyPropertyChanged
             if (hp.TryGetValue("args_template", out var args)) _argsTemplate = args;
             if (hp.TryGetValue("working_dir", out var wd)) _workingDir = wd;
         }
+
+        // A1.1：类型不进持久化，重新编辑时反推。推错（落到 advanced）的代价
+        // 只是表单默认展开「高级」区，不影响任何行为——够用，不加 kind 字段。
+        _commandKind = InferKind(_handler, _urlTemplate, _argsTemplate);
+    }
+
+    /// <summary>A1.1 类型反推。顺序：① web → ② selection → ④ folder → 其余 advanced。</summary>
+    private static string InferKind(string handler, string urlTemplate, string argsTemplate)
+    {
+        if (handler == "open_url" && urlTemplate.Contains("{query}"))
+            return "web";
+        if (handler == "launch_program")
+        {
+            if (argsTemplate.Contains("{selection.target}")) return "selection";
+            if (argsTemplate.Contains("{current_folder}")) return "folder";
+            return "open";
+        }
+        return "advanced";
     }
 
     /// <summary>唯一标识。新建时由 ViewModel 分配 user.<guid> 形式的 id。</summary>
@@ -101,7 +123,15 @@ public sealed class CommandEditItem : INotifyPropertyChanged
     public string KeywordsText
     {
         get => _keywordsText;
-        set { if (_keywordsText != value) { _keywordsText = value; OnPropertyChanged(); } }
+        set
+        {
+            if (_keywordsText != value)
+            {
+                _keywordsText = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(EffectiveTriggerDisplay));
+            }
+        }
     }
 
     /// <summary>open_url | launch_program。</summary>
@@ -116,12 +146,97 @@ public sealed class CommandEditItem : INotifyPropertyChanged
                 OnPropertyChanged();
                 OnPropertyChanged(nameof(IsOpenUrl));
                 OnPropertyChanged(nameof(IsLaunchProgram));
+                OnPropertyChanged(nameof(ShowUrlTemplate));
+                OnPropertyChanged(nameof(ShowProgramPath));
+                OnPropertyChanged(nameof(ShowArgsTemplateTopLevel));
             }
         }
     }
 
     public bool IsOpenUrl => Handler == "open_url";
     public bool IsLaunchProgram => Handler == "launch_program";
+
+    /// <summary>A3：命令类型。四选一 radio 绑定（web/selection/open/folder）；
+    /// advanced = 反推不出的存量命令，一级表单只出标题/关键字，其余全在高级区。</summary>
+    public string CommandKind
+    {
+        get => _commandKind;
+        set
+        {
+            if (_commandKind != value)
+            {
+                _commandKind = value;
+                OnPropertyChanged();
+                RaiseKindDependentProperties();
+            }
+        }
+    }
+
+    private void RaiseKindDependentProperties()
+    {
+        OnPropertyChanged(nameof(IsKindWeb));
+        OnPropertyChanged(nameof(IsKindSelection));
+        OnPropertyChanged(nameof(IsKindOpen));
+        OnPropertyChanged(nameof(IsKindFolder));
+        OnPropertyChanged(nameof(IsAdvanced));
+        OnPropertyChanged(nameof(ShowUrlTemplate));
+        OnPropertyChanged(nameof(ShowProgramPath));
+        OnPropertyChanged(nameof(ShowArgsTemplateTopLevel));
+        OnPropertyChanged(nameof(ShowWebHint));
+        OnPropertyChanged(nameof(ShowSelectionHint));
+        OnPropertyChanged(nameof(ShowFolderHint));
+        OnPropertyChanged(nameof(KeywordsEnabled));
+    }
+
+    /// <summary>radio 双向绑定：选中即收敛类型（get-only 会让组内互斥失效）。</summary>
+    public bool IsKindWeb { get => CommandKind == "web"; set { if (value) SetKind("web"); } }
+    public bool IsKindSelection { get => CommandKind == "selection"; set { if (value) SetKind("selection"); } }
+    public bool IsKindOpen { get => CommandKind == "open"; set { if (value) SetKind("open"); } }
+    public bool IsKindFolder { get => CommandKind == "folder"; set { if (value) SetKind("folder"); } }
+    /// <summary>反推不出的存量命令：高级区默认展开，字段一个不丢。</summary>
+    public bool IsAdvanced => CommandKind == "advanced";
+
+    /// <summary>A3.2：radio 选中类型时收敛表单。② 自动清关键字/根搜索并预填
+    /// {selection.target}（配合 broker A2.2 互斥裁决，保存必过）；④ 预填
+    /// {current_folder}。①固定 open_url；③不动 handler（网址或程序都合法）。</summary>
+    public void SetKind(string kind)
+    {
+        if (CommandKind == kind) return;
+        CommandKind = kind;
+        switch (kind)
+        {
+            case "web":
+                Handler = "open_url";
+                break;
+            case "selection":
+                Handler = "launch_program";
+                KeywordsText = "";
+                ShowInRootSearch = false;
+                if (string.IsNullOrWhiteSpace(ArgsTemplate))
+                    ArgsTemplate = "{selection.target}";
+                break;
+            case "folder":
+                Handler = "launch_program";
+                if (string.IsNullOrWhiteSpace(ArgsTemplate))
+                    ArgsTemplate = "{current_folder}";
+                break;
+        }
+    }
+
+    /// <summary>一级表单 URL 模板可见性（web/open 类型；advanced 在高级区）。</summary>
+    public bool ShowUrlTemplate => IsOpenUrl && (IsKindWeb || IsKindOpen);
+    /// <summary>一级表单程序路径可见性（selection/open/folder 类型）。</summary>
+    public bool ShowProgramPath => IsLaunchProgram && (IsKindSelection || IsKindOpen || IsKindFolder);
+    /// <summary>④ 一级表单参数模板（预填 {current_folder}，可直接改）。</summary>
+    public bool ShowArgsTemplateTopLevel => IsLaunchProgram && IsKindFolder;
+
+    /// <summary>类型② 关键字输入框置灰（动作面板专用，关键字恒为空）。</summary>
+    public bool KeywordsEnabled => !IsKindSelection;
+
+    /// <summary>A3.5：一级占位符提示按类型收敛（完整速查在高级区）。</summary>
+    public bool ShowWebHint => IsKindWeb;
+    public bool ShowSelectionHint => IsKindSelection;
+    public bool ShowFolderHint => IsKindFolder;
 
     public string UrlTemplate
     {
@@ -145,6 +260,29 @@ public sealed class CommandEditItem : INotifyPropertyChanged
     {
         get => _workingDir;
         set { if (_workingDir != value) { _workingDir = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>
+    /// A2.3：关键字路由触发词 = Trigger（存量回显）留空时恒取关键字第一项
+    /// （ToDefinition 的既有兜底成为唯一路径）。只读展示，不再有独立输入框。
+    /// </summary>
+    public string EffectiveTriggerDisplay
+    {
+        get
+        {
+            var trigger = _trigger.Trim();
+            if (trigger.Length == 0)
+            {
+                foreach (var kw in _keywordsText.Split(','))
+                {
+                    var t = kw.Trim();
+                    if (t.Length > 0) { trigger = t; break; }
+                }
+            }
+            return trigger.Length > 0
+                ? $"关键字路由触发词：{trigger}（= 关键字第一项）"
+                : "不经过关键字路由（填写关键字后自动启用）";
+        }
     }
 
     public string Trigger
