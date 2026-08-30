@@ -312,10 +312,10 @@ function Get-IndexerStatus {
 
     $session = New-PipeSession -PipeName $PipeName -ConnectTimeoutMs $ConnectTimeoutMs
     try {
-        # INDEXER_PROTOCOL = 2 (bumped 2026-08-17 audit batch 5; this tool updated from 1).
-        $hello = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'hello'; protocol = 2 })
-        if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 2) {
-            throw 'Indexer protocol 2 handshake failed.'
+        # INDEXER_PROTOCOL = 3 (bumped 2026-08-30 G7c stat pushdown; tool updated).
+        $hello = Send-PipeRequest -Session $session -Request ([ordered]@{ type = 'hello'; protocol = 3 })
+        if ($hello.Response.type -ne 'hello' -or $hello.Response.protocol -ne 3) {
+            throw 'Indexer protocol 3 handshake failed.'
         }
         # L33（全仓复审 2026-08-22）：原第二段逐字节相同的断言是一次协议 bump 改重
         # 的痕迹（第二份本该检查别的字段），删除重复。

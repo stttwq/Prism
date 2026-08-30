@@ -86,3 +86,60 @@ USN 批次计入 `touch_activity` 使空闲计时器在正常文件活动下几�
   为「空闲门 + 重建门主动模式」，`-Passive` 不做哈希/SCM-PID 校验（免提权无安装侧访问）。
 - **无高危**。3 个中危已修：USN touch_activity、时钟回跳测试、spec 身份校验口径。
 
+## 内存收口 II（2026-08-30，PRISM-MEMORY-PLAN-II-2026-08-30.md）
+
+G7c（be29781，stat 过滤下沉索引器）引入回归：indexer 实测 150.2MB、空闲修剪后
+只掉到 ~80MB。根因两条，均出自 G7c 的全索引 `stats` 表：
+
+1. **根因 A**：`Vec<RecordStat>`（24B/槽）与 nodes 平行按 MFT 记录号全量分配，
+   固定每槽开销 12B→36B（3 倍），本机 2 卷约 360 万槽 ≈ +86MB。
+2. **根因 B**：维护 tick 每 5 秒全表扫描填 stat（收敛后照扫），把空闲 3 分钟
+   `SetProcessWorkingSetSizeEx` 修剪立即拉回——这是「只掉到 80MB」的直接原因。
+
+附带发现：缓存命中启动时 `stats` 不被 resize（`recompute_derived_counters` /
+`ensure_slot` 条件不成立），`size:`/`dm:`/`dc:` 查询永久零结果——24B/槽的常驻
+代价只有全新建卷那一次才换来功能。
+
+处置：**删表**而非瘦身。`refactor(index)` 提交删除 `RecordStat`/`stats`/填充
+tick，`size:/dm:/dc:` 改扫描内现场 `fs::metadata`（`STAT_CALL_BUDGET=20000`
+预算，超预算置 `is_truncated`）；`file:/folder:` 旗标判定零 I/O 提前到路径构造
+之前；拼音候选路径同口径按需 stat 并共享预算。USN watch mask 回退内容变更
+reason（原为让 stat 失效而加，需求消失）。前端收口两处无界字典
+（WebIconProvider 上限 256、图标失败计数隐藏时清）。
+
+### B 侧实测（2026-08-30，私有工作集口径，2 卷约 360 万槽）
+
+| 测量点 | Prism | prism-core | indexer | 合计 | 达标 |
+|---|---|---|---|---|---|
+| 单次搜索后立即 | 9.8MB | 2.6MB | **63.7MB** | 76.1MB | ✓ ≤100MB |
+| 空闲 3.5 分钟后 | 9.6MB | 2.5MB | **1.2MB** | 13.3MB | ✓ |
+| 空闲门禁脚本（5 样本 p50） | 10.4MB | 2.7MB | 67.4MB* | 80.5MB | ✓（脚本含 USN 活动） |
+
+\* 门禁脚本采样期间 USN 批次活跃（generation 612→621），indexer 被拉回工作集；
+空闲静默采样（上行 1.2MB）才是修剪恢复生效的口径。
+
+对照目标：indexer 搜索后立即 ≤65MB ✓（63.7，be29781 前基线 64.4）；空闲修剪后
+个位数 MB ✓（1.2，回归期 ~80）；三进程使用后合计 ≤100MB ✓（76.1）。
+
+### 功能回归
+
+- 缓存命中启动（不删缓存重启服务）后 `size:>1mb`、`dm:today` **有结果**
+  （修改前永久零结果——A4 缺陷验收通过）。
+- `ext:zip size:>1mb` 命中真实大文件；带名字词的 size 查询结果与语义不变。
+- 裸 `size:>5gb` 返回预算内候选并标 `is_truncated=true`（文档化取舍：
+  20000 次 stat 封顶换 86MB 常驻，宁少勿全盘 I/O）。
+
+### 工具链修正
+
+`tools/bench/Bench.Common.psm1` 的 indexer hello 握手常量 2→3（G7c bump 后
+脚本未跟上，重建门禁曾报 `protocol_mismatch: server=3 client=2`）。
+
+### 重建窗口门 B 侧（2026-08-30，据实报告：仍超线，与 08-22 B 侧同水位）
+
+删缓存→重启服务实测全新重建窗口（`artifacts/mem2-after-rebuild/`，6 样本）：
+三进程私有工作集峰值 **141.7MB > 100MB 硬门**（indexer 峰值 129.6MB）。
+对照：08-22 T5 的 B 侧重建门同样超线（139.8MB，`artifacts/elev-rebuild-gate-B.log`）
+——本轮删掉 24B/槽常驻表后重建窗口峰值**未回退**（+1.4%，文件量自然增长口径内），
+重建期瞬态（MFT 枚举池 + 拼音构建 + 新旧索引共存）是既知 Phase 2 议题，维持
+「据实报告、不谎报达标」口径。
+
