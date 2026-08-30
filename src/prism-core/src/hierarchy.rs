@@ -632,6 +632,15 @@ impl VolumeIndex {
         self.nodes.capacity() * std::mem::size_of::<NodeSlot>() + self.names.capacity()
     }
 
+    /// 内存收口 II（2026-08-30）：分项字节量，供 memory_trend 日志定位是哪张表在涨。
+    pub fn nodes_bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<NodeSlot>()
+    }
+
+    pub fn names_bytes(&self) -> usize {
+        self.names.capacity()
+    }
+
     /// AUDIT-2026-08-18 R-C2: 轻量结构不变量检查——开销 O(1)，不做 path_for 遍历。
     /// 全量 validate（含每节点 path_for）保留给 load 侧；save 侧走 validate_structure +
     /// 抽样 path_for。

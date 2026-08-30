@@ -811,9 +811,33 @@ impl ServiceState {
                 .read()
                 .map(|delta| delta.resident_bytes())
                 .unwrap_or(0);
+        // 内存收口 II（2026-08-30）：分项输出——只有合计数无法定位是哪张表在涨
+        //（G7c 的 150MB 回归全靠读代码反推）。pinyin= 合计里除 nodes/names 外
+        // 的部分（sidecar 主表 + delta 常驻）。
+        let nodes = state
+            .map(|value| {
+                value
+                    .volumes
+                    .iter()
+                    .map(VolumeIndex::nodes_bytes)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let names = state
+            .map(|value| {
+                value
+                    .volumes
+                    .iter()
+                    .map(VolumeIndex::names_bytes)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
         format!(
-            "memory_bytes={} volumes={} events_since_checkpoint={} pinyin={:?}",
+            "memory_bytes={} nodes={} names={} pinyin={} volumes={} events_since_checkpoint={} pinyin_status={:?}",
             memory,
+            nodes,
+            names,
+            memory.saturating_sub(nodes + names),
             state.map(|value| value.volumes.len()).unwrap_or(0),
             state
                 .map(|value| value.events_since_checkpoint)
@@ -3357,21 +3381,28 @@ mod tests {
             .is_ok_and(|response| matches!(response, IndexerResponse::Results { ref items, .. } if items.len() == 1)));
     }
 
-    /// S5: 内存趋势 detail 必须包含四个可回溯字段；空索引与已发布索引都有效。
+    /// S5: 内存趋势 detail 必须包含可回溯字段；空索引与已发布索引都有效。
+    /// 内存收口 II：新增 nodes/names 分项。
     #[test]
     fn memory_trend_detail_carries_all_observability_fields() {
         let empty = ServiceState::new();
         let detail = empty.memory_trend_detail();
         assert!(detail.contains("memory_bytes=0"), "{detail}");
+        assert!(detail.contains("nodes=0"), "{detail}");
+        assert!(detail.contains("names=0"), "{detail}");
         assert!(detail.contains("volumes=0"), "{detail}");
         assert!(detail.contains("events_since_checkpoint=0"), "{detail}");
-        assert!(detail.contains("pinyin="), "{detail}");
+        assert!(detail.contains("pinyin_status="), "{detail}");
 
         let state = ServiceState::new();
         state.merge_and_publish(test_volume("v1", "C:\\", "needle.txt"));
         let detail = state.memory_trend_detail();
         assert!(detail.contains("volumes=1"), "{detail}");
         assert!(!detail.contains("memory_bytes=0"), "{detail}");
+        assert!(
+            !detail.contains("nodes=0"),
+            "published volume must report nonzero node-table bytes: {detail}"
+        );
     }
 
     // --- S1（FRESH-AUDIT-2026-08-19）: 名字池压缩挪出写锁 -----------------------
