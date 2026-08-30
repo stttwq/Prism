@@ -557,6 +557,22 @@ mod platform {
         parse_usn_buffer(&output[..bytes])
     }
 
+    /// B3（MEMORY-PLAN-III 2026-08-30）：单次 MFT 建卷后回放的 USN 记录数上限。
+    /// 超过说明积压已大到「重扫 MFT 更划算」（Everything 同口径：卷变化大时走
+    /// fast reindex 而不是无限回放日志）。超限返回 Err，由既有的卷级重建路径
+    /// （journal wrap 同款）接管——不新增重建机制。不设防的旧实现积压多大吃
+    /// 多大内存（服务长期停机后启动 / Windows Update 重建期是不设防峰值）。
+    pub(super) const REPLAY_MAX_RECORDS: usize = 500_000;
+
+    /// B3 的上限判定抽成纯函数便于单测（真实句柄无法在单测里构造）。
+    pub(super) fn replay_budget_exceeded(replay_len: usize) -> Result<(), String> {
+        if replay_len > REPLAY_MAX_RECORDS {
+            Err("USN backlog exceeds replay budget; full rebuild".into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn replay_until(
         handle: &VolumeHandle,
         volume: &mut VolumeIndex,
@@ -576,6 +592,10 @@ mod platform {
             }
             replay.append(&mut records);
             cursor = next;
+            // B3：超限即放弃回放走全量重建。不做分块 apply——
+            // apply_replay_records 依赖「整批可见」解析子记录先于父记录到达的
+            // 情形，按块切会把跨块父子关系误判为不可达并静默丢文件。
+            replay_budget_exceeded(replay.len())?;
         }
         ensure_build_continues(should_cancel)?;
         let (outcome, skipped) = apply_replay_records(volume, &replay, cursor)?;
@@ -607,7 +627,13 @@ mod platform {
         let mut records = Vec::with_capacity(64_000);
         // name pool: 单一大 Vec<u8> 存所有文件名的 UTF-8 字节，O(1) 摊销分配。
         let mut name_pool = Vec::with_capacity(8 * 1024 * 1024);
-        let mut output = vec![0u8; 256 * 1024];
+        // B4（MEMORY-PLAN-III 2026-08-30）：1 MiB 枚举缓冲，对齐 Everything
+        // （第三方复现口径 1 MB）。360 万记录下 ioctl 次数降到 1/4。这块缓冲
+        // 是建卷期临时的，函数返回即释放，稳态零成本。watcher 的
+        // USN_READ_CHUNK 维持 256 KiB 不动——那是每卷常驻（升 1 MiB = 常驻
+        // +1.5 MB 换洪峰期次要收益），而监听循环 BytesToWaitFor=1 内核阻塞，
+        // 缓冲大小只在洪峰期影响 ioctl 次数。
+        let mut output = vec![0u8; 1024 * 1024];
         loop {
             ensure_build_continues(should_cancel)?;
             match ioctl_buffer_code(handle.0, FSCTL_ENUM_USN_DATA, &input, &mut output) {
@@ -839,6 +865,17 @@ mod tests {
     fn record(reason: u32) -> Vec<u8> {
         let name: Vec<u16> = "hello.txt".encode_utf16().collect();
         record_with_name(reason, &name)
+    }
+
+    /// B3（MEMORY-PLAN-III 2026-08-30）：回放积压超预算必须拒绝（走全量重建），
+    /// 恰好在预算内则放行。纯函数判定——真实卷句柄无法在单测中构造。
+    #[cfg(windows)]
+    #[test]
+    fn replay_budget_rejects_backlog_beyond_limit() {
+        let err = platform::replay_budget_exceeded(platform::REPLAY_MAX_RECORDS + 1).unwrap_err();
+        assert!(err.contains("budget"), "got: {err}");
+        assert!(platform::replay_budget_exceeded(platform::REPLAY_MAX_RECORDS).is_ok());
+        assert!(platform::replay_budget_exceeded(0).is_ok());
     }
 
     /// R-B4: 孤立代理对（unpaired surrogate）在 NTFS 文件名中合法——文件系统不校验
