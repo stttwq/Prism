@@ -336,6 +336,14 @@ public partial class ResultList : UserControl
         DecorateVisibleItems();
     }
 
+    /// <summary>
+    /// B2（内存收口 II 2026-08-30）：隐藏时清空图标失败重试计数。该表按
+    /// path@size 身份只增不减（原本仅 DPI 变化时清），进程生命周期内无界。
+    /// 失败计数语义是「本会话内别反复重试」——隐藏即会话边界，清掉不影响行为，
+    /// 下次呼出失败行会获得全新的重试配额。
+    /// </summary>
+    public void ClearIconFailureCounts() => _iconFailedAttempts.Clear();
+
     private void OnSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_syncing) return;

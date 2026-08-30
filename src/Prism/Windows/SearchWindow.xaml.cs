@@ -543,6 +543,8 @@ public partial class SearchWindow : Window
             // Bug 1：清空 WebIconProvider 按 origin 无界增长的瞬态缓存（每个 origin 持一个
             // frozen ImageSource 强引用，GC 回收不了）。下次网页搜索从磁盘 FaviconCache 重读。
             _webIcons?.ClearTransientCaches();
+            // B2（内存收口 II 2026-08-30）：图标失败重试计数随会话清零（见 ResultList）。
+            Results.ClearIconFailureCounts();
             // AUDIT-2026-08-18 C-D4: 删除 EmptyWorkingSet 调用（只逐出工作集不降私有提交，
             // 下次呼出软缺页变慢）。改 GC.Collect Forced + blocking:true + compacting:true
             // 确保真正压缩堆降私有提交。窗口已隐藏不卡交互。

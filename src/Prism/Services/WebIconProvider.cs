@@ -17,6 +17,13 @@ namespace Prism.Services;
 /// </summary>
 public sealed class WebIconProvider
 {
+    /// <summary>
+    /// B1（内存收口 II 2026-08-30）：<see cref="_resolved"/> / <see cref="_negative"/>
+    /// 的容量上限。超限整清（非 LRU）：长时间不隐藏的会话（常驻搜索框）原本
+    /// 无界增长；整清的代价只是一次后台磁盘重探测，低频路径可接受。
+    /// </summary>
+    private const int MaxTransientOrigins = 256;
+
     private readonly FaviconCache? _faviconCache;
     /// <summary>origin → 是否允许联网获取（读设置里的 FaviconGrants）。</summary>
     private readonly Func<string, bool>? _isGranted;
@@ -173,6 +180,15 @@ public sealed class WebIconProvider
                                 else
                                 {
                                     _negative.Add(origin);
+                                }
+                                // B1（内存收口 II）：超限整清——防止长时间不隐藏的
+                                // 会话里两个 origin 表无界增长（每个 resolved 条目
+                                // 持一个 frozen ImageSource 强引用）。
+                                if (_resolved.Count > MaxTransientOrigins
+                                    || _negative.Count > MaxTransientOrigins)
+                                {
+                                    _resolved.Clear();
+                                    _negative.Clear();
                                 }
                             }
                             // L 批次：完成即通知重绘，不等下一次按键的装饰周期。
