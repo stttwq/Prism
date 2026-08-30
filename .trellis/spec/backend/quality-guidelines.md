@@ -86,6 +86,29 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
 - `actions` / `run_action`: path validation same as execute/reveal (absolute only). Actions are a closed enum (`ActionId`), not free-form strings; unknown ids are rejected by `FromStr`. The allowlist is `TargetKind → Vec<ActionId>`: File gets 12 actions (incl. `open_with`), Directory gets 11 (no `open_with`), Application gets 4 (`locate_app`/`copy_app_path`/`app_properties`/`run_as_admin`), Window/Web get none. Broker re-validates target kind before routing — never trusts WPF-supplied paths. Mutation actions (`rename`/`copy_to`/`move_to`/`recycle`/`delete_permanent`/`zip`) use `IFileOperation` on the STA worker; `ActionArgs { destination, new_name }` carries parameters. `rename` rejects same-name (case-insensitive) before reaching IFileOperation. `zip` uses three-tier fallback: settings `ZipProgram` > auto-detected 7-Zip > Windows Shell COM. On clipboard `SetClipboardData` failure, `GlobalFree` the unowned `HGLOBAL` (system only takes ownership after success).
 - G7 `ext:` / `path:` query filtering: the **broker** parses `ext:` and `path:` tokens out of the raw query text via `parse_query` — the WPF never duplicates syntax rules. Parsed filters join the same `filters` channel as G3's `exclude_path` (field `ext` or `path`), not a second protocol lane. `ext:` values are comma-separated OR (each normalized: strip one leading dot, lowercase); `path:` values are case-insensitive path substrings AND'd together. Unrecognized prefixes, unterminated quotes, empty values and incomplete tokens all fall back to plain text — user input must never be silently lost. When any `ext`/`path` filter is active, apps, web and window results are suppressed (only files/folders return). Filters are applied **before** the Top-K heap in both the literal (`hierarchy.rs::search_volumes`) and pinyin (`pinyin_sidecar::search_in_root`) paths, so `is_truncated` describes the filtered set only. Extension check is low-cost (name only); path check constructs the full path only for candidates that already passed name + ext, and the construction count is reported in `path_constructions`.
 - G7c / memory-plan-II (2026-08-30) `size:` / `dm:` / `dc:` / `file:` / `folder:` filtering — **the index does NOT carry size/mtime/ctime; stat filtering is on-demand disk I/O. Do NOT sink per-record metadata back into the index.** The G7c full-index `stats` table (24 B/slot × every MFT record) cost ~86 MB resident on 2 volumes and was deleted (its upkeep tick also defeated idle trimming). Semantics now: `file:`/`folder:` are flag-only (`dir_flag_passes`, zero I/O, checked before path construction); `size:`/`dm:`/`dc:` are evaluated in-scan via `QueryFilters::stat_matches_path` (live `fs::metadata` on the already-constructed path) under a per-search budget `STAT_CALL_BUDGET = 20_000` shared by the literal and pinyin scans (one `AtomicU64`, passed from `ServiceState::search`). Budget exhaustion drops remaining stat-gated candidates and sets `is_truncated` — a bare `size:>1gb` deliberately covers only the first 20 000 stat-eligible candidates. Metadata unavailable = size/date conditions fail while `file:`/`folder:` still apply (same as broker-side `apply_stat_filters`, which stays as the idempotent final-candidate backstop). Failed stat attempts are reported in the optional `stat_calls` diagnostic field (`IndexerResponse::Results` / `SearchReply`). Consequence to keep in mind: cache-loaded starts and fresh builds behave identically (the old table silently produced zero results after a cache load — the deciding evidence for deletion).
+- **Maintenance-tick complexity red line (memory-plan-III B1, 2026-08-30): any task inside the
+  maintenance tick (`indexer_runtime.rs`, 5 s cadence) is capped at O(volume count) per beat — it
+  must NOT linearly traverse `nodes`, `names`, or any MFT-record-number-indexed table.** Reason:
+  idle trimming (`trim_working_set`) pulls the working set down to single-digit MB; any full-table
+  touch every 5 s drags it straight back up (the G7c stat-fill tick did exactly that and made
+  trimming pointless — root cause B of memory-plan-II §1's "idle only drops to 80 MB"). Whole-table
+  work must be gated one of three ways: ① a counter/threshold predicate that costs O(1) per volume
+  per beat (`needs_name_compact` in `hierarchy.rs` is the canonical positive example); ② its own
+  backoff (pinyin rebuild's `PINYIN_REBUILD_BACKOFF`); ③ event-volume/time gating (checkpoint's
+  500k events / 6 h). Reference point: Everything has no periodic full-table scan in twenty years —
+  not by discipline but by architecture; incremental USN reads are the only path.
+- Command-system semantics contract (command-simplify A6, 2026-08-30): ① for `launch_program`
+  commands, a placeholder token that expands to **empty fails at execute/preview time** with a
+  per-placeholder message (`{selection.target}`/`{current_folder}` give entry-point guidance) — the
+  old silently-drop-the-arg behavior survives only on the save path (`require_non_empty_args=false`,
+  because the save context has no query/selection and every placeholder expands empty there). ② A
+  command whose templates reference `{selection.target}` must NOT carry a keyword binding or
+  `show_in_root_search` — `validate_selection_target_binding` rejects the save (broker is the sole
+  judge; bypassing WPF cannot produce a dead configuration). Never re-add a `{selection.target}`
+  template with a keyword — that regression produced "notepad opens a blank file, reported as
+  success". ③ The keyword-routing trigger is always `keywords[0]`; the standalone trigger field was
+  removed from the settings form (existing commands with a differing trigger get one catalog-time
+  log line, then collapse to `keywords[0]`).
 
 ---
 
