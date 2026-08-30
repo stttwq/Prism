@@ -120,6 +120,62 @@ pub struct VolumeIndex {
 const NAMES_FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const NAMES_FNV_PRIME: u64 = 0x100000001b3;
 
+/// B2（MEMORY-PLAN-III 2026-08-30）：紧凑快照压缩的输出。`names` 池与偏移
+/// 映射在锁外算好，写锁内只做 O(活跃节点) 的 name_off 就地更新与 O(1) 换池。
+pub struct NameCompactOutput {
+    /// 压缩后的 names 池（每项以 0 结尾，与旧池同格式）。
+    pub names: Vec<u8>,
+    /// (record, new_name_off)，按 record 升序；只含池内有名字的在位槽。
+    pub map: Vec<(u32, u32)>,
+    pub names_fingerprint: u64,
+    /// 尾部界：覆盖所有在位槽自身记录号与 parent_record + 1（与旧算法同式）。
+    pub live_bound: usize,
+}
+
+/// B2：纯函数版名字池压缩——输入紧凑快照（names 池 + 在位槽三元组），输出
+/// 新池与偏移映射。算法与 [`VolumeIndex::compact_names_if_needed`] 逐字节同
+/// 源：按 record 升序遍历（快照即升序收集），跳过 NO_NAME，越界/未终止
+/// 返回 Err 走压缩失败的安全路径。`live_bound` 同旧算法：max(在位 record+1,
+/// parent_record+1)。
+pub fn compact_names_from_snapshot(
+    names_pool: &[u8],
+    present: &[(u32, u32, u32)],
+) -> Result<NameCompactOutput, String> {
+    let mut names = Vec::with_capacity(names_pool.len());
+    let mut map = Vec::with_capacity(present.len());
+    for &(record, _parent, name_off) in present {
+        if name_off == NO_NAME {
+            continue;
+        }
+        let start = name_off as usize;
+        // 与 compact_names_if_needed 同样的防御：越界返回 Err 走重建安全路径
+        // （release panic=abort，不能切片 panic）。
+        let name_bytes = names_pool
+            .get(start..)
+            .ok_or_else(|| format!("name offset {start} out of range"))?;
+        let end = name_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| start + offset)
+            .ok_or_else(|| "unterminated name pool entry".to_string())?;
+        let offset = u32::try_from(names.len()).map_err(|_| "name pool exceeds u32")?;
+        names.extend_from_slice(&names_pool[start..end]);
+        names.push(0);
+        map.push((record, offset));
+    }
+    names.shrink_to_fit();
+    let mut live_bound = 0usize;
+    for &(record, parent, _) in present {
+        live_bound = live_bound.max(record as usize + 1).max(parent as usize + 1);
+    }
+    Ok(NameCompactOutput {
+        names_fingerprint: names_pool_fingerprint(&names),
+        names,
+        map,
+        live_bound,
+    })
+}
+
 fn fold_names_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -814,6 +870,52 @@ impl VolumeIndex {
         // initial_name_bytes 基线随池重写由 recompute_derived_counters 恢复
         // （复审 M 2026-08-21：names.len() 即压缩后基线）。
         Ok(true)
+    }
+
+    /// B2（MEMORY-PLAN-III 2026-08-30）：收集名字池压缩所需的紧凑快照。
+    /// 读锁内 O(nodes) 扫描，但只搬「在位槽三元组 + names 池」，不克隆
+    /// nodes 全表（本机 2 卷约 43 MB）——压缩期间常驻少一份 nodes。
+    /// 返回（(record, parent_record, name_off) 按 record 升序, names 拷贝）。
+    pub fn name_compact_snapshot(&self) -> (Vec<(u32, u32, u32)>, Vec<u8>) {
+        let mut present = Vec::new();
+        for (record, slot) in self.nodes.iter().enumerate() {
+            if slot.flags & FLAG_PRESENT != 0 {
+                present.push((record as u32, slot.parent_record, slot.name_off));
+            }
+        }
+        (present, self.names.clone())
+    }
+
+    /// B2：把锁外算好的压缩结果就地应用到卷上。`snapshot_usn` 与收集快照时的
+    /// `next_usn` 不一致（USN 在锁外阶段到达）→ 返回 false 放弃本轮，状态
+    /// 不动（dead_name_bytes 不清零，下拍必然重触发）——与旧 clone 流程语义
+    /// 一致。调用方持有写锁。
+    pub fn apply_name_compact_if_current(
+        &mut self,
+        output: NameCompactOutput,
+        snapshot_usn: i64,
+    ) -> bool {
+        if self.next_usn != snapshot_usn {
+            return false;
+        }
+        for &(record, offset) in &output.map {
+            let record = record as usize;
+            if record >= self.nodes.len() {
+                return false; // 防御：快照与当前状态不兼容，放弃（不损坏索引）
+            }
+            self.nodes[record].name_off = offset;
+        }
+        self.names = output.names;
+        self.names_fingerprint = output.names_fingerprint;
+        self.dead_name_bytes = 0;
+        self.initial_name_bytes = self.names.len();
+        // 尾部界内的 tombstone 槽原样保留（sequence/flags 不动）；界外全非
+        // 在位槽（live_bound 定义），截断不丢任何在位节点，present_slots 不变。
+        if output.live_bound < self.nodes.len() {
+            self.nodes.truncate(output.live_bound);
+            self.nodes.shrink_to_fit();
+        }
+        true
     }
 
     pub(crate) fn snapshot_mutations(
@@ -2463,6 +2565,99 @@ mod tests {
 
         // 回收后路径构造仍正常。
         assert_eq!(volume.path_for(10).unwrap(), r"C:\dir");
+    }
+
+    /// B2（MEMORY-PLAN-III 2026-08-30）：紧凑快照压缩路线的有效性防线——
+    /// 偏移映射写错 = 索引损坏。构造带死名字的卷，走 snapshot → compact →
+    /// apply 新路径，断言每个在位节点的 path_for 与压缩前逐字节相同。
+    #[test]
+    fn snapshot_compact_preserves_path_for_byte_for_byte() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "带 空格 与 中文.txt", false)
+            .unwrap();
+        volume
+            .upsert(frn(12, 1), frn(10, 1), "victim.txt", false)
+            .unwrap();
+        volume
+            .upsert(frn(900, 1), frn(10, 1), "deep", true)
+            .unwrap();
+        for record in 901..911 {
+            volume
+                .upsert(
+                    frn(record, 1),
+                    frn(900, 1),
+                    &format!("f{record}.log"),
+                    false,
+                )
+                .unwrap();
+        }
+        // 制造死名字（高位的删一半，尾部界保持在位父目录之后）。
+        for record in (901..911).step_by(2) {
+            volume.delete(frn(record, 1)).unwrap();
+        }
+        volume.delete(frn(12, 1)).unwrap();
+        volume.dead_name_bytes = usize::MAX;
+
+        let paths_before: Vec<(u32, String)> = volume
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.flags & FLAG_PRESENT != 0)
+            .map(|(record, _)| (record as u32, volume.path_for(record as u32).unwrap()))
+            .collect();
+        assert!(paths_before.len() > 3);
+
+        let (present, names_pool) = volume.name_compact_snapshot();
+        let output = compact_names_from_snapshot(&names_pool, &present).unwrap();
+        assert!(volume.apply_name_compact_if_current(output, volume.next_usn));
+
+        for (record, path) in &paths_before {
+            assert_eq!(
+                &volume.path_for(*record).unwrap(),
+                path,
+                "偏移映射写错：record {record} 路径变了"
+            );
+        }
+        assert_eq!(volume.dead_name_bytes, 0);
+        assert_eq!(volume.initial_name_bytes, volume.names.len());
+        assert!(volume.names.len() < names_pool.len(), "死字节必须被回收");
+        // 尾部界与旧算法同式：覆盖在位 record 与其 parent。
+        let mut expected_bound = 0usize;
+        for (record, slot) in volume.nodes.iter().enumerate() {
+            if slot.flags & FLAG_PRESENT != 0 {
+                expected_bound = expected_bound
+                    .max(record + 1)
+                    .max(slot.parent_record as usize + 1);
+            }
+        }
+        assert_eq!(volume.nodes.len(), expected_bound);
+    }
+
+    /// B2：快照收集与换入之间 next_usn 前移 → 压缩被放弃且 dead_name_bytes
+    /// 未清零（下拍必然重触发，与旧 clone 流程语义一致）。
+    #[test]
+    fn snapshot_compact_abandoned_when_next_usn_advanced() {
+        let mut volume = volume();
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "old.txt", false)
+            .unwrap();
+        volume.delete(frn(11, 1)).unwrap();
+        volume.dead_name_bytes = usize::MAX;
+        let dead_before = volume.dead_name_bytes;
+
+        let (present, names_pool) = volume.name_compact_snapshot();
+        let output = compact_names_from_snapshot(&names_pool, &present).unwrap();
+        // 模拟 USN 到达：next_usn 前移。
+        volume.next_usn += 1;
+        assert!(!volume.apply_name_compact_if_current(output, volume.next_usn - 1));
+        assert_eq!(volume.dead_name_bytes, dead_before, "放弃时不得清零计数器");
+        // next_usn 一致时同一快照可再次应用（重试路径）。
+        let output = compact_names_from_snapshot(&names_pool, &present).unwrap();
+        assert!(volume.apply_name_compact_if_current(output, volume.next_usn));
+        assert_eq!(volume.dead_name_bytes, 0);
     }
 
     #[test]

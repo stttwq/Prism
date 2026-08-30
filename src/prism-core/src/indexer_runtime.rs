@@ -2543,16 +2543,19 @@ fn compact_volumes_off_lock(state: &ServiceState) -> Result<(), String> {
     Ok(())
 }
 
-/// S1: 单卷的「读锁 clone → 锁外压缩 → 短写锁换入」。
-/// clone 与换入之间 USN 到达（该卷 next_usn 前移）则丢弃重试（≤3 次）——
-/// 换入陈旧卷会丢事件，宁可放弃本轮等下一个 tick（计数器不清零，必然重触发）。
+/// S1: 单卷的「读锁快照 → 锁外压缩 → 短写锁换入」。
+/// B2（MEMORY-PLAN-III 2026-08-30）：读锁内不再整卷 clone（nodes 43 MB/2 卷，
+/// 压缩瞬间常驻翻倍），改为收集紧凑快照（在位槽三元组 + names 池）；压缩本
+/// 体在锁外纯函数完成；写锁内先校验 next_usn 未变（不变式与旧 clone 流程一致，
+/// 变了就丢弃重试 ≤3 次——换入陈旧结果会丢事件，宁可放弃本轮等下一个 tick，
+/// 计数器不清零必然重触发），然后就地施工。
 fn compact_one_volume_off_lock(
     state: &ServiceState,
     volume_id: &crate::hierarchy::VolumeId,
 ) -> Result<bool, String> {
     const RETRIES: usize = 3;
     for _ in 0..RETRIES {
-        let snapshot = {
+        let (present, names_pool, snapshot_usn) = {
             let guard = state.index.read().map_err(|_| "index lock is poisoned")?;
             let index = guard.as_ref().ok_or("index is not ready")?;
             let Some(volume) = index
@@ -2565,13 +2568,10 @@ fn compact_one_volume_off_lock(
             if !volume.needs_name_compact() {
                 return Ok(false); // 已被其他路径压缩过
             }
-            volume.clone()
+            let (present, names_pool) = volume.name_compact_snapshot();
+            (present, names_pool, volume.next_usn)
         };
-        let snapshot_usn = snapshot.next_usn;
-        let mut compacted = snapshot;
-        if !compacted.compact_names_if_needed()? {
-            return Ok(false);
-        }
+        let output = crate::hierarchy::compact_names_from_snapshot(&names_pool, &present)?;
         let mut guard = state.index.write().map_err(|_| "index lock is poisoned")?;
         let index = guard.as_mut().ok_or("index is not ready")?;
         let Some(slot) = index
@@ -2581,12 +2581,13 @@ fn compact_one_volume_off_lock(
         else {
             return Ok(false);
         };
-        if slot.next_usn != snapshot_usn {
-            continue; // USN 在 clone 期间到达：丢弃这次压缩，重试
-        }
         let mount = slot.mount_path.clone();
-        *slot = compacted;
-        log(format!("compacted name pool for {mount} (off-lock)"));
+        if !slot.apply_name_compact_if_current(output, snapshot_usn) {
+            continue; // USN 在锁外阶段到达：丢弃这次压缩，重试
+        }
+        log(format!(
+            "compacted name pool for {mount} (off-lock snapshot)"
+        ));
         return Ok(true);
     }
     Ok(false)
