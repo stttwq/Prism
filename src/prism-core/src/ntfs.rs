@@ -9,21 +9,13 @@ pub const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
 pub const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
 pub const USN_REASON_RENAME_OLD_NAME: u32 = 0x0000_1000;
 pub const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
-/// G7c：内容/属性变更也监听——索引现在携带 size/mtime/ctime，原地覆写不改名
-/// 也必须让 stat 失效（apply 侧置未知，维护 tick ≤5s 重 stat）。副作用是 USN
-/// 批次频率上升（每次写入都成批），apply 对这类记录只做一次 Vec 写，开销可忽略。
-pub const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
-pub const USN_REASON_DATA_EXTEND: u32 = 0x0000_0002;
-pub const USN_REASON_DATA_TRUNCATION: u32 = 0x0000_0004;
-pub const USN_REASON_BASIC_INFO_CHANGE: u32 = 0x0000_8000;
+// 内存收口 II（2026-08-30）：G7c 曾把 DATA_OVERWRITE/EXTEND/TRUNCATION/BASIC_INFO_CHANGE
+// 加进监听 mask（原地覆写也要让 stat 表失效）。索引不再携带 size/mtime/ctime，
+// 这个需求消失；内容写入（浏览器缓存、Windows Update）不再产生成批 USN 记录。
 pub const WATCH_REASON_MASK: u32 = USN_REASON_FILE_CREATE
     | USN_REASON_FILE_DELETE
     | USN_REASON_RENAME_OLD_NAME
-    | USN_REASON_RENAME_NEW_NAME
-    | USN_REASON_DATA_OVERWRITE
-    | USN_REASON_DATA_EXTEND
-    | USN_REASON_DATA_TRUNCATION
-    | USN_REASON_BASIC_INFO_CHANGE;
+    | USN_REASON_RENAME_NEW_NAME;
 
 #[derive(Debug, Clone)]
 pub struct UsnRecord {
@@ -222,17 +214,9 @@ fn apply_records_inner(
                     }
                     Err(error) => return Err(error.to_string()),
                 }
-            } else if record.reason
-                & (USN_REASON_DATA_OVERWRITE
-                    | USN_REASON_DATA_EXTEND
-                    | USN_REASON_DATA_TRUNCATION
-                    | USN_REASON_BASIC_INFO_CHANGE)
-                != 0
-            {
-                // G7c：内容/属性变更——stat 置未知，维护 tick 重 stat。改名/新建
-                // 记录走 upsert（内部同样清 stat）。
-                volume.invalidate_stat(record_number);
             }
+            // 内存收口 II（2026-08-30）：内容/属性变更 reason 已移出监听 mask，
+            // 索引也不再携带 size/mtime/ctime——这类历史 journal 记录直接忽略。
             // RENAME_OLD carries the old name. The following RENAME_NEW updates the same slot.
         }
 
