@@ -1,5 +1,5 @@
 # Prism G7 machine test: send search requests via named pipe and verify results.
-# Usage: powershell -ExecutionPolicy Bypass -File scripts\g7-machine-test.ps1
+# Usage: pwsh -ExecutionPolicy Bypass -File scripts\g7-machine-test.ps1
 
 $ErrorActionPreference = 'Stop'
 $PipeName = '\\.\pipe\prism-core'

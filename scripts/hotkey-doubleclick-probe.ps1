@@ -18,8 +18,8 @@
 # locale reads BOM-less UTF-8 as GBK and corrupts non-ASCII literals.
 #
 # USAGE
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-doubleclick-probe.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-doubleclick-probe.ps1 -SkipTimerRound
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-doubleclick-probe.ps1
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-doubleclick-probe.ps1 -SkipTimerRound
 #
 # Takes ~90s with the timer round, ~15s without. Injects Ctrl taps into the
 # session, so do not type during the run.

@@ -14,7 +14,7 @@ if not exist "%SRC%" (
     exit /b 1
 )
 set TMPTARGET=%TEMP%\prism-deploy-target.txt
-powershell -NoProfile -Command "(sc.exe qc PrismIndexer | Select-String 'BINARY_PATH_NAME').Line -replace '^[^:]*:\s*','' -replace [char]34,'' | Set-Content -NoNewline $env:TEMP\prism-deploy-target.txt" || exit /b 1
+pwsh -NoProfile -Command "(sc.exe qc PrismIndexer | Select-String 'BINARY_PATH_NAME').Line -replace '^[^:]*:\s*','' -replace [char]34,'' | Set-Content -NoNewline $env:TEMP\prism-deploy-target.txt" || exit /b 1
 set TARGET=
 set /p TARGET=<%TMPTARGET%
 del /F /Q "%TMPTARGET%" >nul 2>&1

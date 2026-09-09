@@ -15,7 +15,7 @@
 # BOM-less UTF-8 as GBK and corrupts non-ASCII literals.
 #
 # USAGE
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\g5-memory-soak.ps1 `
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\g5-memory-soak.ps1 `
 #     -BrokerPath "D:\<temp install>\prism-core.exe" [-Queries 400]
 
 [CmdletBinding()]

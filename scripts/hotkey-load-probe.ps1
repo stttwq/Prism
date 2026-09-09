@@ -16,8 +16,8 @@
 # ASCII only on purpose (see prism-build.ps1).
 #
 # USAGE
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-load-probe.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-load-probe.ps1 -SkipTimerRound
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-load-probe.ps1
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\hotkey-load-probe.ps1 -SkipTimerRound
 
 [CmdletBinding()]
 param([switch]$SkipTimerRound)
@@ -45,7 +45,7 @@ try {
     if ($SkipTimerRound) { $probeArgs += '-SkipTimerRound' }
     # Run as a native child so its exit code lands in $LASTEXITCODE; StrictMode makes
     # reading $LASTEXITCODE after an in-process script call a hard error.
-    & powershell @probeArgs
+    & pwsh @probeArgs
     $probeExit = $LASTEXITCODE
 }
 finally {

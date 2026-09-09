@@ -18,8 +18,8 @@
 #                 forbids `cmd /c` concatenation, so this verifies that rule
 #
 # USAGE
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\g5-temp-install.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\g5-temp-install.ps1 -Remove
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\g5-temp-install.ps1
+#   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\g5-temp-install.ps1 -Remove
 
 [CmdletBinding()]
 param([switch]$Remove)
