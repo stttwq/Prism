@@ -64,7 +64,7 @@ public partial class PinButton : UserControl
         // 省略 From：从当前（动画中的）角度平滑续接到新目标。
         rotate.BeginAnimation(
             RotateTransform.AngleProperty,
-            new DoubleAnimation(IsPinned ? 0 : 45, System.TimeSpan.FromMilliseconds(150))
+            new DoubleAnimation(IsPinned ? 0 : 45, System.TimeSpan.FromMilliseconds(120))
             {
                 EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
             });

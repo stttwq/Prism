@@ -11,13 +11,23 @@
         Opacity="0">
     <!-- 第九步：PinButton + ActionPanel + 圆角裁剪 + 展开动画 -->
     <Grid Margin="20">
-        <!-- 主卡片：圆角 + 阴影（A1②：阴影由 code-behind 管理，动画期间移除以减少逐帧栅格化）；Clip 保证列表不溢出圆角 -->
+        <!-- 主卡片：圆角 + 阴影（阴影常驻：高度动画已收敛到 Results↔Actions 跃迁、
+             每次会话至多几次，逐帧开销可忽略；此前的"动画期移除/结束恢复"在 50ms
+             防抖的打字节奏下反而制造阴影反复闪现。Clip 保证列表不溢出圆角） -->
         <Border x:Name="Card"
                 Background="{DynamicResource BgWindow}"
                 BorderBrush="{DynamicResource Divider}"
                 BorderThickness="1"
                 CornerRadius="10"
                 SnapsToDevicePixels="True">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="24"
+                                  Opacity="0.2"
+                                  ShadowDepth="6"
+                                  Direction="270"
+                                  Color="Black"
+                                  RenderingBias="Performance"/>
+            </Border.Effect>
             <Border.Clip>
                 <RectangleGeometry x:Name="CardClip" RadiusX="10" RadiusY="10"/>
             </Border.Clip>

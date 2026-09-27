@@ -179,7 +179,10 @@ public partial class ResultList : UserControl
                 // 淡入期间不得提前 Collapsed。
                 StatusText.Visibility = Visibility.Visible;
                 StatusText.BeginAnimation(OpacityProperty,
-                    new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100)));
+                    new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100))
+                    {
+                        EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                    });
             }
             else
             {

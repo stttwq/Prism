@@ -43,6 +43,12 @@ public partial class SearchWindow : Window
     private bool _contextMenuActionPending;
     private int _contextMenuRequestSeq;
     private double _panelTargetHeight;
+    /// <summary>PanelHost 高度动画在途标记：同目标的重复通知不得重启或打断在途动画。</summary>
+    private bool _heightAnimating;
+    /// <summary>ApplyState 上一次应用的面板三态：用于区分状态机跃迁与内容搅动（见 ApplyState）。</summary>
+    private PanelKind _lastPanelKind;
+
+    private enum PanelKind { None, Results, Actions }
     /// <summary>呼出捕获的串台序号：快速呼出/隐藏/再呼出时丢弃过期的后台识别结果。</summary>
     private int _captureSeq;
     /// <summary>隐藏后延迟 Trim 的计时器；再呼出时取消，避免影响下次呼出响应。</summary>
@@ -89,7 +95,7 @@ public partial class SearchWindow : Window
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero,
             _foregroundHookProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         SizeChanged += (_, _) => UpdateCardClip();
-        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; UpdateCardClip(); RestoreCardShadow(); };
+        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; UpdateCardClip(); };
         Closed += (_, _) =>
         {
             if (_foregroundHook != IntPtr.Zero) { UnhookWinEvent(_foregroundHook); _foregroundHook = IntPtr.Zero; }
@@ -377,7 +383,11 @@ public partial class SearchWindow : Window
         _hiding = true;
         _generationClient.SetActive(false);
         _ignoreDeactivate = true;
-        var fadeOut = new DoubleAnimation(Opacity, 0, TimeSpan.FromMilliseconds(FadeOutMs));
+        var fadeOut = new DoubleAnimation(Opacity, 0, TimeSpan.FromMilliseconds(FadeOutMs))
+        {
+            // 入场 EaseOut / 退场 EaseIn 对称：收尾不发硬。
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+        };
         fadeOut.Completed += (_, _) =>
         {
             Hide();
@@ -1171,6 +1181,20 @@ public partial class SearchWindow : Window
                 || !string.IsNullOrEmpty(state.StatusMessage));
         var showActions = state.Mode == PanelMode.Actions;
 
+        // 高度动画只服务面板状态机跃迁（Results↔Actions，用户按 →/← 的主动切换）。
+        // 查询驱动的内容增减——面板首现、行数/状态行变化——是内容搅动而非布局意图：
+        // 50ms 防抖下每批结果重定向一次 100ms 动画，面板永远在动，还把
+        // SizeToContent 的原生窗口 resize 摊进每一帧。内容变化直接落值。
+        // （None→Results 首现不动画：首个结果批之后紧跟第二批通知，展开动画
+        // 总会在半途被落值打断，与其制造"半展开+跳变"，不如一次到位。）
+        var kind = showActions ? PanelKind.Actions
+            : showResults ? PanelKind.Results
+            : PanelKind.None;
+        var animate = animatePanel
+            && kind != _lastPanelKind
+            && (kind == PanelKind.Actions || _lastPanelKind == PanelKind.Actions);
+        _lastPanelKind = kind;
+
         // 分隔线从隐藏变可见时淡入（隐藏仍瞬时收起）。
         var showDivider = showResults || showActions;
         if (showDivider && Divider.Visibility != Visibility.Visible)
@@ -1178,7 +1202,10 @@ public partial class SearchWindow : Window
             Divider.Visibility = Visibility.Visible;
             Divider.BeginAnimation(
                 OpacityProperty,
-                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100)));
+                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                });
         }
         else if (!showDivider && Divider.Visibility == Visibility.Visible)
         {
@@ -1195,7 +1222,7 @@ public partial class SearchWindow : Window
                 Actions.SelectedIndex = state.SelectedActionIndex;
             // Results 的 StatusMessage 在 Actions 态隐藏，改走底部 ActionStatus。
             Results.StatusMessage = "";
-            AnimatePanelHeight(Actions.Height > 0 ? Actions.Height : Actions.MinHeight, animatePanel);
+            AnimatePanelHeight(Actions.Height > 0 ? Actions.Height : Actions.MinHeight, animate);
             SetActionStatus(state.StatusMessage);
         }
         else if (showResults)
@@ -1207,7 +1234,7 @@ public partial class SearchWindow : Window
             if (Results.SelectedIndex != state.SelectedIndex)
                 Results.SelectedIndex = state.SelectedIndex;
             Results.StatusMessage = state.StatusMessage;
-            AnimatePanelHeight(Results.Height > 0 ? Results.Height : Results.MinHeight, animatePanel);
+            AnimatePanelHeight(Results.Height > 0 ? Results.Height : Results.MinHeight, animate);
             SetActionStatus("");
         }
         else
@@ -1215,7 +1242,7 @@ public partial class SearchWindow : Window
             Results.Visibility = Visibility.Collapsed;
             Actions.Visibility = Visibility.Collapsed;
             Results.StatusMessage = state.StatusMessage;
-            AnimatePanelHeight(0, animatePanel);
+            AnimatePanelHeight(0, animate);
             SetActionStatus("");
         }
 
@@ -1235,73 +1262,59 @@ public partial class SearchWindow : Window
         }
         else
         {
-            // A5：出现时淡入 100ms。
+            // A5：出现时淡入 100ms（EaseOut，与分隔线/面板展开同一节奏）。
             ActionStatus.Visibility = Visibility.Visible;
             ActionStatus.BeginAnimation(OpacityProperty,
-                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100)));
+                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(100))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                });
         }
     }
 
     private void AnimatePanelHeight(double target, bool animate)
     {
         if (double.IsNaN(target) || target < 0) target = 0;
-        if (Math.Abs(_panelTargetHeight - target) < 0.5)
+
+        // 动画在途且目的地未变：让它跑完。AppState 一次响应以通知突发到达，
+        // 重启会把跃迁展开动画打断成抖动；落值路径也不得掐断它——目的地相同，
+        // 让动画自然收尾与直接落值观感一致且更平滑。
+        if (Math.Abs(_panelTargetHeight - target) < 0.5
+            && (!animate || !IsVisible || _heightAnimating))
         {
-            // AppState raises several notifications for one response. Do not
-            // restart an in-flight animation when its destination is unchanged.
-            if (!animate || !IsVisible)
-            {
-                PanelHost.BeginAnimation(HeightProperty, null);
-                PanelHost.Height = target;
-            }
             return;
         }
-        _panelTargetHeight = target;
 
         if (!animate || !IsVisible)
         {
+            // 内容驱动的高度变化直接落值（见 ApplyState 的 animate 判定）。
+            // BeginAnimation(null) 同时是在途动画的取消：移除时钟不触发 Completed，
+            // 必须在这里复位标记。
+            _heightAnimating = false;
+            _panelTargetHeight = target;
             PanelHost.BeginAnimation(HeightProperty, null);
             PanelHost.Height = target;
-            // A1②：静止状态恢复阴影（动画期间临时移除以减少逐帧栅格化开销）。
-            RestoreCardShadow();
             return;
         }
+
+        _panelTargetHeight = target;
 
         var from = double.IsNaN(PanelHost.Height) ? 0 : PanelHost.ActualHeight;
         if (from <= 0 && PanelHost.Visibility == Visibility.Visible)
             from = PanelHost.ActualHeight;
+        _heightAnimating = true;
         var anim = new DoubleAnimation(from, target, TimeSpan.FromMilliseconds(PanelExpandMs))
         {
             EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
             FillBehavior = FillBehavior.Stop,
         };
-        // A1②：动画期间移除 DropShadowEffect，减少逐帧栅格化开销。
-        // 分层窗口整面重上传无法避免（需 A1① 去 AllowsTransparency），但省掉
-        // 阴影栅格化仍能显著降低逐帧 GPU 开销。动画结束后恢复。
-        Card.Effect = null;
         anim.Completed += (_, _) =>
         {
-            PanelHost.Height = target;
-            RestoreCardShadow();
+            _heightAnimating = false;
+            // FillBehavior.Stop 在完成后把值交还基值，这里以最终目标落定。
+            PanelHost.Height = _panelTargetHeight;
         };
         PanelHost.BeginAnimation(HeightProperty, anim);
-    }
-
-    private DropShadowEffect? _cachedShadow;
-
-    /// <summary>A1②：恢复 Card 的 DropShadowEffect（动画期间临时移除后恢复）。</summary>
-    private void RestoreCardShadow()
-    {
-        _cachedShadow ??= new DropShadowEffect
-        {
-            BlurRadius = 24,
-            Opacity = 0.20,
-            ShadowDepth = 6,
-            Direction = 270,
-            Color = Colors.Black,
-            RenderingBias = RenderingBias.Performance,
-        };
-        Card.Effect = _cachedShadow;
     }
 
     private void UpdateCardClip()

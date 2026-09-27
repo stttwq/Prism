@@ -14,6 +14,8 @@ namespace Prism.Controls;
 /// </summary>
 public partial class SearchHeader : UserControl
 {
+    private PanelMode _lastMode = PanelMode.Idle;
+
     public SearchHeader()
     {
         InitializeComponent();
@@ -55,8 +57,28 @@ public partial class SearchHeader : UserControl
 
         if (!visible)
         {
-            ScopeChipColumn.Width = new GridLength(0);
-            ScopeChip.Visibility = Visibility.Collapsed;
+            // 窗口不可见（呼出时的重置路径）或本就隐藏：瞬时收起，无动画可言。
+            if (!IsVisible || ScopeChip.Visibility != Visibility.Visible)
+            {
+                ScopeChipColumn.Width = new GridLength(0);
+                ScopeChip.Visibility = Visibility.Collapsed;
+                return;
+            }
+            // 可见→隐藏：对称退场淡出（EaseIn），列宽收起引发的输入行回流
+            // 延到透明之后。若淡出期间再次显示，BeginAnimation 摘除本时钟，
+            // Completed 不再触发，收起自然取消。
+            var exit = new DoubleAnimation(0, System.TimeSpan.FromMilliseconds(120))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+            };
+            exit.Completed += (_, _) =>
+            {
+                ScopeChipColumn.Width = new GridLength(0);
+                ScopeChip.Visibility = Visibility.Collapsed;
+                ScopeChip.BeginAnimation(OpacityProperty, null);
+                ScopeChip.Opacity = 1;
+            };
+            ScopeChip.BeginAnimation(OpacityProperty, exit);
             return;
         }
 
@@ -80,6 +102,16 @@ public partial class SearchHeader : UserControl
             slide.BeginAnimation(
                 TranslateTransform.XProperty,
                 new DoubleAnimation(-8, 0, ms) { EasingFunction = ease });
+        }
+        else
+        {
+            // 退场淡出中途改主意：从当前不透明度平滑续接到 1。
+            ScopeChip.BeginAnimation(
+                OpacityProperty,
+                new DoubleAnimation(1, System.TimeSpan.FromMilliseconds(120))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                });
         }
     }
 
@@ -107,13 +139,40 @@ public partial class SearchHeader : UserControl
     public void SetMode(PanelMode mode)
     {
         var actions = mode == PanelMode.Actions;
+        var entering = actions && _lastMode != PanelMode.Actions;
+        _lastMode = mode;
         ModeLabel.Visibility = actions ? Visibility.Visible : Visibility.Collapsed;
         ModeDivider.Visibility = actions ? Visibility.Visible : Visibility.Collapsed;
+        if (actions)
+        {
+            // 进入动作态：标签与竖线淡入 100ms，与下方面板的展开动画同一节奏——
+            // 此前头部瞬时出现、身体缓动，同屏两截不同步。重复 SetMode 不重播。
+            if (entering)
+            {
+                ModeLabel.BeginAnimation(OpacityProperty, EntranceFade());
+                ModeDivider.BeginAnimation(OpacityProperty, EntranceFade());
+            }
+        }
+        else
+        {
+            // 离开动作态瞬时收起：退场再做淡出需延迟 Collapsed，输入行回流
+            // 跳变只会推迟、不会消失。
+            ModeLabel.BeginAnimation(OpacityProperty, null);
+            ModeDivider.BeginAnimation(OpacityProperty, null);
+            ModeLabel.Opacity = 1;
+            ModeDivider.Opacity = 1;
+        }
         // 审计 U3：动作模式下输入框筛选的是动作列表，占位文案必须跟着换，
         // 否则用户会以为还能在这里搜文件（此前恒为"搜索应用和文件"）。
         Placeholder.Text = actions ? "输入以筛选动作" : "搜索应用和文件";
         UpdatePlaceholder();
     }
+
+    private static System.Windows.Media.Animation.DoubleAnimation EntranceFade() =>
+        new(0, 1, System.TimeSpan.FromMilliseconds(100))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
 
     private void OnQueryTextChanged(object sender, TextChangedEventArgs e)
     {
