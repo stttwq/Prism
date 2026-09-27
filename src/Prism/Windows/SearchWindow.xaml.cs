@@ -7,7 +7,6 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
-using System.Windows.Media.Effects;
 using System.Windows.Threading;
 using Prism.Models;
 using Prism.Services;
@@ -16,7 +15,9 @@ using Prism.ViewModels;
 namespace Prism.Windows;
 
 /// <summary>
-/// 主搜索窗口（无边框、置顶、宽 660px，顶部距屏幕 25% 高度）。
+/// 主搜索窗口（无边框、置顶、宽 620px，顶部距屏幕 25% 高度）。
+/// A1①：非分层窗口——窗口即卡片本体，圆角/阴影交 DWM（DwmWindowEffects +
+/// WindowChrome），整窗硬件合成，不再有分层窗口逐帧位图上传。
 /// 第九步：PinButton / ActionPanel / 深浅色 / 展开动画。
 /// </summary>
 public partial class SearchWindow : Window
@@ -94,8 +95,8 @@ public partial class SearchWindow : Window
         _foregroundHook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero,
             _foregroundHookProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-        SizeChanged += (_, _) => UpdateCardClip();
-        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; UpdateCardClip(); };
+        // A1①：DWM 系统圆角 + 隐藏 DWM 边框（阴影随 WindowChrome 帧自动存在）。
+        Loaded += (_, _) => { _hwnd = new WindowInteropHelper(this).Handle; DwmWindowEffects.Apply(_hwnd); };
         Closed += (_, _) =>
         {
             if (_foregroundHook != IntPtr.Zero) { UnhookWinEvent(_foregroundHook); _foregroundHook = IntPtr.Zero; }
@@ -849,7 +850,6 @@ public partial class SearchWindow : Window
             ? Visibility.Collapsed
             : Visibility.Visible;
         _vm?.SetScopeRoot(_scope.Root);
-        UpdateCardClip();
     }
 
     /// <summary>
@@ -1245,8 +1245,6 @@ public partial class SearchWindow : Window
             AnimatePanelHeight(0, animate);
             SetActionStatus("");
         }
-
-        UpdateCardClip();
     }
 
     private void SetActionStatus(string? message)
@@ -1315,15 +1313,6 @@ public partial class SearchWindow : Window
             PanelHost.Height = _panelTargetHeight;
         };
         PanelHost.BeginAnimation(HeightProperty, anim);
-    }
-
-    private void UpdateCardClip()
-    {
-        if (CardClip is null || Card is null) return;
-        var w = Card.ActualWidth;
-        var h = Card.ActualHeight;
-        if (w <= 0 || h <= 0) return;
-        CardClip.Rect = new Rect(0, 0, w, h);
     }
 
     private void SyncSelectionToList()

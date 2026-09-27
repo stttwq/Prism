@@ -2,35 +2,30 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:controls="clr-namespace:Prism.Controls"
-        Width="660" SizeToContent="Height"
-        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Width="620" SizeToContent="Height"
+        Background="{DynamicResource BgWindow}"
         Topmost="True" ShowInTaskbar="False" ShowActivated="True" Focusable="True"
         WindowStartupLocation="Manual"
         UseLayoutRounding="True"
         RenderOptions.BitmapScalingMode="HighQuality"
         Opacity="0">
-    <!-- 第九步：PinButton + ActionPanel + 圆角裁剪 + 展开动画 -->
-    <Grid Margin="20">
-        <!-- 主卡片：圆角 + 阴影（阴影常驻：高度动画已收敛到 Results↔Actions 跃迁、
-             每次会话至多几次，逐帧开销可忽略；此前的"动画期移除/结束恢复"在 50ms
-             防抖的打字节奏下反而制造阴影反复闪现。Clip 保证列表不溢出圆角） -->
+    <!-- A1①（去分层窗口）：不再 AllowsTransparency——窗口即卡片本体（620 = 原卡片宽），
+         整窗 DWM 硬件合成，圆角/阴影交 DWM（Services/DwmWindowEffects.cs + 下面的
+         WindowChrome 保留 DWM 帧位取阴影）。 -->
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="0"
+                      ResizeBorderThickness="0"
+                      UseAeroCaptionButtons="False"
+                      GlassFrameThickness="-1"/>
+    </WindowChrome.WindowChrome>
+    <Grid Margin="0">
+        <!-- 主卡片：窗口背景即卡片背景；1px Divider 边框保留（DWM 自带边框已在
+             DwmWindowEffects 里隐藏）；圆角与列表溢出裁剪均由 DWM 窗口遮罩承担。 -->
         <Border x:Name="Card"
                 Background="{DynamicResource BgWindow}"
                 BorderBrush="{DynamicResource Divider}"
                 BorderThickness="1"
-                CornerRadius="10"
                 SnapsToDevicePixels="True">
-            <Border.Effect>
-                <DropShadowEffect BlurRadius="24"
-                                  Opacity="0.2"
-                                  ShadowDepth="6"
-                                  Direction="270"
-                                  Color="Black"
-                                  RenderingBias="Performance"/>
-            </Border.Effect>
-            <Border.Clip>
-                <RectangleGeometry x:Name="CardClip" RadiusX="10" RadiusY="10"/>
-            </Border.Clip>
             <StackPanel>
                 <controls:SearchHeader x:Name="Header"/>
                 <!-- 范围降级提示（识别失败 / 宿主关闭 / 路径无效时说明已回到全局） -->
@@ -63,11 +58,11 @@
             </StackPanel>
         </Border>
 
-        <!-- PinButton：锚在卡片右上角外侧（右移 12、上移 12） -->
+        <!-- PinButton：内嵌卡片右上角（去透明后无法悬挂在圆角外，见 A1①） -->
         <controls:PinButton x:Name="Pin"
                             HorizontalAlignment="Right"
                             VerticalAlignment="Top"
-                            Margin="0,-12,-12,0"
+                            Margin="0,10,10,0"
                             Panel.ZIndex="10"/>
     </Grid>
 </Window>
