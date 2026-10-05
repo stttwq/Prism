@@ -289,6 +289,7 @@ fn match_name_single(name: &str, query: &str) -> Option<PinyinMatch> {
 
 /// P3：把原始查询按空白切成 2~3 个**全部有效**（各自通过 normalize_query）
 /// 的拼音 term；返回 None 表示走整串单口径（单 term / 超限 / 含无效 term）。
+/// 返回的各 term 已归一化（normalize_query 幂等，下游无需再归一化）。
 pub(crate) fn split_query_terms(query: &str) -> Option<Vec<String>> {
     let terms: Vec<&str> = query.split_whitespace().collect();
     if !(2..=3).contains(&terms.len()) {
@@ -296,8 +297,7 @@ pub(crate) fn split_query_terms(query: &str) -> Option<Vec<String>> {
     }
     let mut normalized = Vec::with_capacity(terms.len());
     for term in terms {
-        normalize_query(term)?;
-        normalized.push(term.to_owned());
+        normalized.push(normalize_query(term)?);
     }
     Some(normalized)
 }
@@ -474,7 +474,8 @@ pub(crate) fn match_compact(bytes: &[u8], query: &str) -> Option<PinyinMatch> {
 }
 
 /// P3：多 term 记录匹配（compact）——每 term 独立过全部策略，全部命中才
-/// 返回合并结果。terms 由 `split_query_terms` 预先校验（各 term 必有效）。
+/// 返回合并结果。terms 由 `split_query_terms` 预先归一化并校验（各 term 必
+/// 有效），本函数处于 sidecar 全表扫描热路径，循环内不做任何归一化/分配。
 pub(crate) fn match_compact_terms(
     bytes: &[u8],
     terms: &[String],
@@ -482,8 +483,7 @@ pub(crate) fn match_compact_terms(
 ) -> Option<PinyinMatch> {
     let mut parts = Vec::with_capacity(terms.len());
     for term in terms {
-        let normalized = normalize_query(term)?;
-        parts.push(match_compact_normalized(bytes, normalized.as_bytes(), scratch)?);
+        parts.push(match_compact_normalized(bytes, term.as_bytes(), scratch)?);
     }
     Some(combine_term_matches(parts))
 }

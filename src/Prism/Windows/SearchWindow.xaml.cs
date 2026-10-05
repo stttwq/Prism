@@ -1120,6 +1120,8 @@ public partial class SearchWindow : Window
         _vm.State.SelectedIndex = index;
     }
 
+    private bool _applyStateQueued;
+
     private void OnStateChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (!Dispatcher.CheckAccess())
@@ -1144,7 +1146,24 @@ public partial class SearchWindow : Window
         if (e.PropertyName == nameof(AppState.IsWebMode))
             ApplyScopeUi();
 
-        ApplyState(_vm?.State, animatePanel: true);
+        // 一次搜索响应是 4~6 条 PropertyChanged 的突发，ApplyState 全程幂等守卫
+        // （SetMode / 可见性 / 引用比较 / 高度目标值），同帧合并成一次即可——
+        // 逐键 UI 线程工作量直接除以突发条数。Loaded 优先级在本帧输入与渲染
+        // 之前执行，时序上仍是"通知同帧内生效"。
+        QueueApplyState();
+    }
+
+    private void QueueApplyState()
+    {
+        if (_applyStateQueued) return;
+        _applyStateQueued = true;
+        Dispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.Loaded,
+            () =>
+            {
+                _applyStateQueued = false;
+                ApplyState(_vm?.State, animatePanel: true);
+            });
     }
 
     private void SyncGenerationPolling()

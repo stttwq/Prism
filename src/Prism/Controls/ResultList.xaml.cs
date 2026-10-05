@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -30,6 +31,8 @@ public partial class ResultList : UserControl
     private Brush? _matchBrush;
     private Brush? _normalBrush;
     private ImageSource? _moreIcon;
+    // 容器 → 已解析的四个模板控件引用。ConditionalWeakTable：容器被回收释放后缓存自动失效。
+    private readonly ConditionalWeakTable<ListBoxItem, RowRefs> _rowRefs = new();
 
     public ResultList()
     {
@@ -58,12 +61,13 @@ public partial class ResultList : UserControl
         _webIcons = provider;
     }
 
-    /// <summary>主题切换后丢弃缓存画刷，下次装饰时重新取。</summary>
+    /// <summary>主题切换后丢弃缓存画刷与行引用缓存，下次装饰时重新取。</summary>
     public void InvalidateThemeBrushes()
     {
         _matchBrush = null;
         _normalBrush = null;
         _moreIcon = null;
+        _rowRefs.Clear();
         DecorateVisibleItems();
     }
 
@@ -346,10 +350,26 @@ public partial class ResultList : UserControl
                 continue;
             var item = _items[i];
 
-            var titleBlock = FindDescendant<TextBlock>(container, "TitleBlock");
-            var subtitleBlock = FindDescendant<TextBlock>(container, "SubtitleBlock");
-            var hotkey = FindDescendant<TextBlock>(container, "HotkeyHint");
-            var icon = FindDescendant<Image>(container, "IconImage");
+            // 模板固定、回收容器不换子元素——按容器缓存四个控件引用，省掉每次
+            // 装饰 4 趟递归视觉树扫描（本方法每按键周期执行 2-4 遍）。
+            // 模板未应用（子元素全空）时不缓存，留待下次装饰重试。
+            if (!_rowRefs.TryGetValue(container, out var refs))
+            {
+                refs = new RowRefs
+                {
+                    Title = FindDescendant<TextBlock>(container, "TitleBlock"),
+                    Subtitle = FindDescendant<TextBlock>(container, "SubtitleBlock"),
+                    Hotkey = FindDescendant<TextBlock>(container, "HotkeyHint"),
+                    Icon = FindDescendant<Image>(container, "IconImage"),
+                };
+                if (refs.Title is not null)
+                    _rowRefs.Add(container, refs);
+            }
+
+            var titleBlock = refs.Title;
+            var subtitleBlock = refs.Subtitle;
+            var hotkey = refs.Hotkey;
+            var icon = refs.Icon;
 
             if (titleBlock is not null)
             {
@@ -578,5 +598,14 @@ public partial class ResultList : UserControl
     {
         public required string Title { get; init; }
         public required int[] Spans { get; init; }
+    }
+
+    /// <summary>容器模板内四个被装饰控件的引用缓存（Title 非空即模板已应用）。</summary>
+    private sealed class RowRefs
+    {
+        public TextBlock? Title { get; init; }
+        public TextBlock? Subtitle { get; init; }
+        public TextBlock? Hotkey { get; init; }
+        public Image? Icon { get; init; }
     }
 }
