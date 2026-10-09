@@ -202,6 +202,22 @@ impl PartialOrd for MatchMetadata {
     }
 }
 
+impl MatchMetadata {
+    /// 启动器档比较（第一期）：在默认 `cmp`（class→kind→usage_tier→…）基础上，
+    /// 把 usage_tier 提到 kind 之前。全局快速呼出时，常开项（同 class 内）压过
+    /// 从未打开、kind 更优的项——「启动器打开我常开的那个」。跨 class 仍由 class
+    /// 决胜，S1 的「强匹配 class 不被弱 class 子串反超」不破。
+    pub fn cmp_launcher(&self, other: &Self) -> Ordering {
+        self.class
+            .cmp(&other.class)
+            .then(usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
+            .then(self.kind.cmp(&other.kind))
+            .then(self.position.cmp(&other.position))
+            .then(other.history_score.cmp(&self.history_score))
+            .then(self.score.cmp(&other.score))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOutcome {
     pub items: Vec<IndexHit>,

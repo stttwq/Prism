@@ -200,7 +200,12 @@ public sealed class SearchViewModel
     private static string StripWindowPrefix(string query) =>
         IsWindowQuery(query) ? query[1..] : query;
 
-    /// <summary>本次请求的上下文：窗口模式下把 root/filters 一并清掉，窗口不受目录范围约束。</summary>
+    /// <summary>
+    /// 本次请求的上下文：
+    /// - 窗口模式（`>` 前缀）下把 root/filters 一并清掉，窗口不受目录范围约束；
+    /// - 否则，全局快速呼出（无目录范围、无过滤）走启动器档，排序偏向常开项优先（第一期）；
+    /// - 目录范围或带过滤时保持默认档（AllMode），即「查找」语义。
+    /// </summary>
     private SearchContext ContextFor(string query) =>
         IsWindowQuery(query)
             ? _searchContext with
@@ -209,7 +214,9 @@ public sealed class SearchViewModel
                 Root = null,
                 Filters = [],
             }
-            : _searchContext;
+            : string.IsNullOrWhiteSpace(_searchContext.Root) && _searchContext.Filters.Count == 0
+                ? _searchContext with { Mode = SearchContext.LauncherMode }
+                : _searchContext;
 
     /// <summary>
     /// 切换搜索范围（G4）：root 为 null 表示全局。其余上下文字段（排除路径等）保持不变，

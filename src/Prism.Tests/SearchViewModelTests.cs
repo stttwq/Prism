@@ -692,7 +692,7 @@ public sealed class SearchViewModelTests
     }
 
     [Fact]
-    public async Task GlobalSearchStillSendsNoModeSoOldBrokersAreUnaffected()
+    public async Task GlobalSearchSendsLauncherModeAndOldBrokersFallBackToAll()
     {
         var (vm, _, client, timers, _) = WindowFixture();
         client.Enqueue(Response("a", false, 1, Result("alpha")));
@@ -701,7 +701,9 @@ public sealed class SearchViewModelTests
         timers.Input.Fire();
         await Eventually(() => client.SearchCount == 1);
 
-        Assert.Equal(SearchContext.AllMode, client.LastContext?.Mode);
+        // 全局快速呼出走启动器档（第一期）。旧 broker 不认识该取值，经
+        // SearchMode 的 #[serde(other)] 回落到 All，行为与改动前一致。
+        Assert.Equal(SearchContext.LauncherMode, client.LastContext?.Mode);
         Assert.False(client.LastContext?.IsWindowMode);
     }
 
@@ -717,7 +719,7 @@ public sealed class SearchViewModelTests
 
         // A `>` inside a filename must not switch modes.
         Assert.Equal("a>b", client.LastQuery);
-        Assert.Equal(SearchContext.AllMode, client.LastContext?.Mode);
+        Assert.Equal(SearchContext.LauncherMode, client.LastContext?.Mode);
     }
 
     [Fact]
@@ -735,7 +737,7 @@ public sealed class SearchViewModelTests
         vm.OnQueryChanged("a");
         timers.Input.Fire();
         await Eventually(() => client.SearchCount == 2);
-        Assert.Equal(SearchContext.AllMode, client.LastContext?.Mode);
+        Assert.Equal(SearchContext.LauncherMode, client.LastContext?.Mode);
     }
 
     [Fact]
