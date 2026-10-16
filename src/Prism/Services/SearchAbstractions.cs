@@ -16,6 +16,9 @@ public sealed record SearchContext(
     /// <summary>窗口模式（G5）：只搜可切换的顶层窗口，不与其他类型混排。</summary>
     public const string WindowMode = "window";
 
+    /// <summary>启动器档（第一期）：全局快速呼出且无目录范围、无过滤。排序偏向常开项优先。</summary>
+    public const string LauncherMode = "launcher";
+
     public static SearchContext Default { get; } = new(AllMode, null, [], 1);
 
     public bool IsWindowMode =>

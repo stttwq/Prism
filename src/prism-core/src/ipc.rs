@@ -172,6 +172,9 @@ pub enum SearchMode {
     #[default]
     All,
     Window,
+    /// 启动器档（第一期）：全局快速呼出，无目录范围、无 ext:/path: 过滤。
+    /// 排序偏向「常开项优先」，broker 侧还会再按 root/filters 复核一次。
+    Launcher,
     #[serde(other)]
     Unknown,
 }
@@ -1923,7 +1926,10 @@ async fn search_service(
             .map(|item| history.query_pick_by_key(&item.target, key))
             .collect()
     });
-    sort_search_results_with_picks(&mut ranked, pick_flags.as_deref());
+    // 启动器档（第一期）：仅全局快速呼出启用（无目录范围、无 ext:/path: 过滤）。
+    // 前端已按同样条件发 mode，broker 这里再复核一次，避免越过范围语义。
+    let launcher = mode == SearchMode::Launcher && root.is_none() && !has_filters;
+    sort_search_results_with_picks(&mut ranked, pick_flags.as_deref(), launcher);
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
     items.extend(ranked);
@@ -2560,7 +2566,7 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 /// Sorts results by `compare_search_results` but pre-computes the lowercased title
 /// once per item instead of once per comparison (O(n) vs O(n log n) allocations).
 fn sort_search_results(items: &mut Vec<SearchResult>) {
-    sort_search_results_with_picks(items, None);
+    sort_search_results_with_picks(items, None, false);
 }
 
 /// `picks` 与 items 对齐：true = 该项被当前（规范化）查询串选中过，排在所有
@@ -2574,7 +2580,7 @@ fn sort_search_results(items: &mut Vec<SearchResult>) {
 ///
 /// 审计 P4：重建用 `Option::take` 按序取出，零 String clone、无环特例
 /// （替代旧实现的全量 clone 重建）。
-fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&[bool]>) {
+fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&[bool]>, launcher: bool) {
     // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
     // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
@@ -2591,7 +2597,12 @@ fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&
                 Some(picks) => picks[b].cmp(&picks[a]),
                 None => std::cmp::Ordering::Equal,
             })
-            .then_with(|| items[a].match_metadata.cmp(&items[b].match_metadata))
+            .then_with(|| match (launcher, &items[a].match_metadata, &items[b].match_metadata) {
+                // 启动器档：两边都有元数据时用 usage_tier 前置的档比较；
+                // 其余情况（含 None）回落默认 Option::cmp，与非启动器逐字节一致。
+                (true, Some(am), Some(bm)) => am.cmp_launcher(bm),
+                _ => items[a].match_metadata.cmp(&items[b].match_metadata),
+            })
             .then_with(|| lowercased[a].cmp(&lowercased[b]))
             .then_with(|| items[a].subtitle.cmp(&items[b].subtitle))
             .then(items[a].kind.cmp(&items[b].kind))
@@ -2836,6 +2847,16 @@ mod window_protocol_tests {
             serde_json::from_str(r#"{"type":"search","query":">a","mode":"window"}"#).unwrap();
         match request {
             Request::Search { mode, .. } => assert_eq!(mode, Some(SearchMode::Window)),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launcher_mode_decodes() {
+        let request: Request =
+            serde_json::from_str(r#"{"type":"search","query":"a","mode":"launcher"}"#).unwrap();
+        match request {
+            Request::Search { mode, .. } => assert_eq!(mode, Some(SearchMode::Launcher)),
             other => panic!("unexpected request: {other:?}"),
         }
     }
@@ -3801,13 +3822,69 @@ mod protocol_tests {
             item(MatchKind::FullPinyin, "pinyin", 0),
         ];
         let picks = vec![false, true, true];
-        sort_search_results_with_picks(&mut items, Some(&picks));
+        sort_search_results_with_picks(&mut items, Some(&picks), false);
         // picked 的两个字面/拼音项（class 2/0）都越过未 picked 的 class 0 精确命中；
         // picked 内部 class 0 的拼音项先于 class 2 的字面项。
         assert_eq!(
             items.iter().map(|entry| &*entry.title).collect::<Vec<_>>(),
             ["pinyin", "picked", "plain"],
             "picked items promote above match quality; within picks, class decides"
+        );
+    }
+
+    /// 启动器档（第一期）：同 class 内，常开项（usage_tier 高）压过从未打开、kind
+    /// 更优的项；跨 class 仍由 class 决胜（S1 不破）。默认档则相反——同 class 内
+    /// kind 优先。两档对比锚定在同一组数据上。
+    #[test]
+    fn launcher_profile_promotes_frequently_used_within_class_but_keeps_class_locked() {
+        let item = |kind: MatchKind, title: &str, class: u8, history_score: u32| SearchResult {
+            kind: SearchResultKind::File,
+            title: title.into(),
+            subtitle: title.into(),
+            execute_id: title.into(),
+            target: ActionTarget::new(TargetKind::File, title),
+            match_spans: Vec::new(),
+            match_metadata: Some(MatchMetadata {
+                kind,
+                class,
+                position: 0,
+                score: 10,
+                history_score,
+            }),
+        };
+        // 同 class（都是 2）：fresh 是更优 kind（Literal）但从未打开；
+        // used 是较弱 kind（FullPinyin）但重度使用（usage_tier 3）。
+        let fresh = || item(MatchKind::Literal, "fresh", 2, 0);
+        let used = || item(MatchKind::FullPinyin, "used", 2, 100);
+
+        // 默认档：同 class 内 kind 优先 → fresh 在前。
+        let mut default_order = vec![used(), fresh()];
+        sort_search_results_with_picks(&mut default_order, None, false);
+        assert_eq!(
+            default_order.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+            ["fresh", "used"],
+            "default profile: within one class, better kind wins"
+        );
+
+        // 启动器档：同 class 内 usage_tier 优先 → used 在前。
+        let mut launcher_order = vec![fresh(), used()];
+        sort_search_results_with_picks(&mut launcher_order, None, true);
+        assert_eq!(
+            launcher_order.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+            ["used", "fresh"],
+            "launcher profile: within one class, frequently-used wins"
+        );
+
+        // 跨 class：class 0 的从未打开项仍压过 class 2 的重度使用项——S1 不破。
+        let mut cross_class = vec![
+            used(),
+            item(MatchKind::Literal, "exact", 0, 0),
+        ];
+        sort_search_results_with_picks(&mut cross_class, None, true);
+        assert_eq!(
+            cross_class.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+            ["exact", "used"],
+            "launcher profile: class still dominates usage (S1 preserved)"
         );
     }
 

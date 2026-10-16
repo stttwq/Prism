@@ -39,6 +39,22 @@ Rust backend + named-pipe JSON protocol. Prefer small modules, no panics on the 
   `hierarchy.rs` (`match_tiers_and_history_cannot_cross_locked_boundaries`,
   `s1_strong_pinyin_class_beats_weak_literal_class`) and `ipc.rs`
   (`query_pick_promotes_above_match_quality_but_orders_within`).
+- Launcher ranking profile (L1, phase 1): the quick-launch invocation — global,
+  no `root` scope, no `ext:`/`path:` filters — sends `SearchMode::Launcher`. The
+  broker re-checks `root.is_none() && !has_filters` before applying it (never trust
+  the wire alone), then sorts with `MatchMetadata::cmp_launcher`, which lifts
+  `usage_tier(history)` **above kind** (still **below class**). So within one class
+  a frequently-opened item outranks a never-used item of a better kind, while
+  **class still dominates** — S1's "strong match class is never reverse-ranked by a
+  weaker class" holds. The default profile (`MatchMetadata::cmp`) is unchanged and
+  stays in use for scoped/filtered ("find") searches; window mode is untouched.
+  Launcher does **not** hard-truncate results — it is an ordering profile only, so
+  the scrollable list width is unaffected. Picks (query memory) still promote above
+  everything. Unknown mode on an older broker falls back to `All` via
+  `#[serde(other)]`. Test anchors: `ipc.rs`
+  (`launcher_profile_promotes_frequently_used_within_class_but_keeps_class_locked`,
+  `launcher_mode_decodes`); frontend
+  (`GlobalSearchSendsLauncherModeAndOldBrokersFallBackToAll`).
 - Pinyin matching (S3, 2026-08-20): three strategies tried in order — whole-name
   full pinyin, whole-name initials, then **mixed** per-character (initial or full
   per token, contiguous token run, tail-partial terminal; bitmask DP, query ≤ 63
