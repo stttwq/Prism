@@ -158,10 +158,7 @@ impl VersionedData for AliasData {
             return Err("alias store contains more than 2000 entries".into());
         }
         for entry in &self.entries {
-            if !matches!(
-                entry.kind.as_str(),
-                "file" | "directory" | "application"
-            ) {
+            if !matches!(entry.kind.as_str(), "file" | "directory" | "application") {
                 return Err("alias entry has an unsupported target kind".into());
             }
             if entry.target.is_empty()

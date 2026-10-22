@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
 use crate::persistence::{
-    AliasData, AliasEntry, VersionedEnvelope, ALIAS_MAX_WORD_CHARS, ALIAS_MAX_WORDS_PER_TARGET,
+    AliasData, AliasEntry, VersionedEnvelope, ALIAS_MAX_WORDS_PER_TARGET, ALIAS_MAX_WORD_CHARS,
 };
 use crate::shell::ActionTarget;
 
@@ -65,7 +65,12 @@ impl AliasStore {
     /// M1（复审 2026-08-21）：目标值校验**前置**——persist 的
     /// VersionedEnvelope::new 会整表 validate，一个坏条目曾能把内存态
     /// 改成功但落盘失败，此后所有 set/delete 都卡在同一条坏数据上直到重启。
-    pub fn set(&self, target: &ActionTarget, words: &[String], now_utc: u64) -> AliasMutationResult {
+    pub fn set(
+        &self,
+        target: &ActionTarget,
+        words: &[String],
+        now_utc: u64,
+    ) -> AliasMutationResult {
         let kind = target_kind(target)?;
         if target.value.is_empty()
             || target.value.contains('\0')
@@ -83,7 +88,9 @@ impl AliasStore {
             return Err("别名词在 trim 后必须非空".into());
         }
         if normalized.len() > ALIAS_MAX_WORDS_PER_TARGET {
-            return Err(format!("每个目标最多 {ALIAS_MAX_WORDS_PER_TARGET} 个别名词"));
+            return Err(format!(
+                "每个目标最多 {ALIAS_MAX_WORDS_PER_TARGET} 个别名词"
+            ));
         }
         {
             let mut state = self
@@ -100,13 +107,15 @@ impl AliasStore {
                 .entries
                 .iter()
                 .any(|entry| entry.kind == kind && entry.target == target.value);
-            if !replacing && state.entries.len() + existing_word_count >= crate::persistence::ALIAS_MAX_ENTRIES
+            if !replacing
+                && state.entries.len() + existing_word_count
+                    >= crate::persistence::ALIAS_MAX_ENTRIES
             {
                 return Err("别名总条数已达上限（2000）".into());
             }
-            state.entries.retain(|entry| {
-                !(entry.kind == kind && entry.target == target.value)
-            });
+            state
+                .entries
+                .retain(|entry| !(entry.kind == kind && entry.target == target.value));
             state.entries.push(AliasEntry {
                 kind: kind.to_owned(),
                 target: target.value.clone(),
@@ -129,7 +138,9 @@ impl AliasStore {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let before = state.entries.len();
-            state.entries.retain(|entry| !(entry.kind == kind && entry.target == value));
+            state
+                .entries
+                .retain(|entry| !(entry.kind == kind && entry.target == value));
             if state.entries.len() == before {
                 return Ok(()); // 本就不存在：幂等成功。
             }
@@ -220,9 +231,7 @@ fn target_kind(target: &ActionTarget) -> Result<&'static str, String> {
 pub fn target_path_is_bindable(target: &ActionTarget) -> bool {
     target_kind(target).is_ok() && {
         let value = target.value.as_str();
-        !value.is_empty()
-            && !value.contains('\0')
-            && Path::new(value).is_absolute()
+        !value.is_empty() && !value.contains('\0') && Path::new(value).is_absolute()
     }
 }
 
@@ -254,7 +263,10 @@ mod tests {
         assert_eq!(store.lookup_word("wx").len(), 1);
         assert_eq!(store.lookup_word("WX").len(), 1, "查词大小写不敏感");
         assert_eq!(store.lookup_word("weix").len(), 0, "精确触发：前缀不命中");
-        assert!(store.lookup_word("微信").iter().all(|e| e.target == weixin.value));
+        assert!(store
+            .lookup_word("微信")
+            .iter()
+            .all(|e| e.target == weixin.value));
 
         // 重新 set 整体替换词表。
         store.set(&weixin, &["wx".into()], 2000).unwrap();

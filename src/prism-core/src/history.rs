@@ -416,11 +416,7 @@ impl HistoryStore {
             }
             return Ok(());
         }
-        let snapshot = self
-            .state
-            .read()
-            .ok()
-            .map(|state| state.entries.clone());
+        let snapshot = self.state.read().ok().map(|state| state.entries.clone());
         match snapshot {
             Some(entries) => persist(&self.path, entries),
             None => Ok(()),
@@ -699,7 +695,10 @@ fn seed_legacy_frecency(entries: &mut [HistoryEntry]) {
 /// 最近 250ms 内的动作记录不丢。
 impl Drop for HistoryStore {
     fn drop(&mut self) {
-        let gate = self.persist_gate.get_mut().unwrap_or_else(|p| p.into_inner());
+        let gate = self
+            .persist_gate
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner());
         if !gate.dirty || !self.is_enabled() {
             return;
         }
@@ -821,7 +820,12 @@ mod tests {
         let dir = test_dir("clear-abort");
         let store = HistoryStore::load_at(&dir, true, 1_000_000);
         store
-            .record_at(&target("C:\\gone.txt"), HistoryUse::Execute, None, 1_000_000)
+            .record_at(
+                &target("C:\\gone.txt"),
+                HistoryUse::Execute,
+                None,
+                1_000_000,
+            )
             .unwrap();
         assert!(store.path.exists(), "首条 record 立即落盘");
         // 模拟在飞路径：快照代际 → clear → persist。
@@ -853,10 +857,7 @@ mod tests {
             .unwrap();
         // entries 插入序 = [first, second]；MRU 序 = [second, first]。
         let weights = store.weights();
-        let values: Vec<&str> = weights
-            .iter()
-            .map(|w| w.target.value.as_str())
-            .collect();
+        let values: Vec<&str> = weights.iter().map(|w| w.target.value.as_str()).collect();
         assert_eq!(
             values,
             vec!["C:\\second.txt", "C:\\first.txt"],
@@ -867,10 +868,7 @@ mod tests {
             .record_at(&target("C:\\first.txt"), HistoryUse::Execute, None, 3_000)
             .unwrap();
         let after = store.weights();
-        let values_after: Vec<&str> = after
-            .iter()
-            .map(|w| w.target.value.as_str())
-            .collect();
+        let values_after: Vec<&str> = after.iter().map(|w| w.target.value.as_str()).collect();
         assert_eq!(values_after, vec!["C:\\first.txt", "C:\\second.txt"]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -903,8 +901,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        let entries =
-            read_history_file(&store.path, 1_000_016).expect("历史文件必须保持可解析");
+        let entries = read_history_file(&store.path, 1_000_016).expect("历史文件必须保持可解析");
         assert_eq!(entries.len(), 16);
         assert!(
             !dir.join(format!("{HISTORY_FILE}.tmp")).exists(),
@@ -946,10 +943,7 @@ mod tests {
         // 无任何 record：连续两拍只读判定都为假。
         assert!(!store.persist_if_due_and_dirty());
         assert!(!store.persist_if_due_and_dirty());
-        assert!(
-            !store.path.exists(),
-            "空闲判定不得触发落盘"
-        );
+        assert!(!store.path.exists(), "空闲判定不得触发落盘");
 
         // 第一条 record 立即落盘（G4 首条语义），第二条在 250ms 窗口内置脏
         // 不落盘，随后定时判定接管冲刷。
@@ -963,10 +957,7 @@ mod tests {
         // 窗口未到：不冲刷（脏标记留在门上）。
         assert!(!store.persist_if_due_and_dirty());
         std::thread::sleep(MIN_PERSIST_INTERVAL + MIN_PERSIST_INTERVAL / 2);
-        assert!(
-            store.persist_if_due_and_dirty(),
-            "到期且脏必须冲刷"
-        );
+        assert!(store.persist_if_due_and_dirty(), "到期且脏必须冲刷");
         // 冲刷清脏后，下一拍回到空闲静默。
         std::thread::sleep(MIN_PERSIST_INTERVAL + MIN_PERSIST_INTERVAL / 2);
         assert!(!store.persist_if_due_and_dirty());
