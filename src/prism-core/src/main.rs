@@ -57,8 +57,16 @@ async fn main() {
     }
 
     log(format!("broker pipe listening at {PIPE_NAME}"));
-    if let Err(error) =
-        ipc::serve(PIPE_NAME, apps, engines, shell, history, preferences, aliases).await
+    if let Err(error) = ipc::serve(
+        PIPE_NAME,
+        apps,
+        engines,
+        shell,
+        history,
+        preferences,
+        aliases,
+    )
+    .await
     {
         log(format!("broker pipe failed: {error}"));
         std::process::exit(1);

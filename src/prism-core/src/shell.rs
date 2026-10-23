@@ -141,10 +141,9 @@ impl ShellExecutor {
                         ShellErrorKind::System,
                         "shell worker queue is saturated (worker stuck on a modal operation?)",
                     ),
-                    mpsc::TrySendError::Disconnected(_) => ShellError::new(
-                        ShellErrorKind::System,
-                        "Shell worker is closed",
-                    ),
+                    mpsc::TrySendError::Disconnected(_) => {
+                        ShellError::new(ShellErrorKind::System, "Shell worker is closed")
+                    }
                 })?;
             // M4：清单扫描解析数百个 .lnk 可合法耗时，给满慢预算防挂死。
             receiver
@@ -206,22 +205,19 @@ impl ShellExecutor {
                     ShellErrorKind::System,
                     "shell worker queue is saturated (worker stuck on a modal operation?)",
                 ),
-                mpsc::TrySendError::Disconnected(_) => ShellError::new(
-                    ShellErrorKind::System,
-                    "Shell worker is closed",
-                ),
+                mpsc::TrySendError::Disconnected(_) => {
+                    ShellError::new(ShellErrorKind::System, "Shell worker is closed")
+                }
             })?;
-        receiver
-            .recv_timeout(budget)
-            .map_err(|_| {
-                ShellError::new(
-                    ShellErrorKind::System,
-                    format!(
-                        "Shell worker did not reply within {}s (operation may still be in flight)",
-                        budget.as_secs()
-                    ),
-                )
-            })?
+        receiver.recv_timeout(budget).map_err(|_| {
+            ShellError::new(
+                ShellErrorKind::System,
+                format!(
+                    "Shell worker did not reply within {}s (operation may still be in flight)",
+                    budget.as_secs()
+                ),
+            )
+        })?
     }
 }
 
@@ -690,10 +686,22 @@ mod tests {
     fn m4_sta_wait_budgets_split_modal_from_fast_verbs() {
         use std::time::Duration;
         let target = || ActionTarget::new(TargetKind::File, r"C:\x.txt");
-        assert_eq!(sta_wait_budget(&ShellOperation::Open(target())), Duration::from_secs(60));
-        assert_eq!(sta_wait_budget(&ShellOperation::Reveal(target())), Duration::from_secs(60));
-        assert_eq!(sta_wait_budget(&ShellOperation::Properties(target())), Duration::from_secs(300));
-        assert_eq!(sta_wait_budget(&ShellOperation::OpenWith(target())), Duration::from_secs(300));
+        assert_eq!(
+            sta_wait_budget(&ShellOperation::Open(target())),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            sta_wait_budget(&ShellOperation::Reveal(target())),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            sta_wait_budget(&ShellOperation::Properties(target())),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            sta_wait_budget(&ShellOperation::OpenWith(target())),
+            Duration::from_secs(300)
+        );
         assert_eq!(
             sta_wait_budget(&ShellOperation::RunAction {
                 target: target(),

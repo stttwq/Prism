@@ -7,7 +7,10 @@ fn main() {
         println!("=== Query: {} ===", query);
         for name in &["知乎", "之火", "心之火", "知乎日报"] {
             if let Some(m) = pinyin::match_name(name, query) {
-                println!("  MATCH: {} -> kind={:?} class={} pos={}", name, m.kind, m.class, m.position);
+                println!(
+                    "  MATCH: {} -> kind={:?} class={} pos={}",
+                    name, m.kind, m.class, m.position
+                );
             } else {
                 println!("  no match: {}", name);
             }

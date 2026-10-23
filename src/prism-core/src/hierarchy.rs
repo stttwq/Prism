@@ -36,7 +36,10 @@ impl std::fmt::Display for VolumeError {
                 write!(f, "MFT record {record} exceeds compact-index limit")
             }
             Self::SparseSlots { required, present } => {
-                write!(f, "MFT slot table is pathologically sparse: {required}/{present}")
+                write!(
+                    f,
+                    "MFT slot table is pathologically sparse: {required}/{present}"
+                )
             }
             Self::NameNul => write!(f, "file name contains NUL"),
             Self::NamePoolOverflow => write!(f, "name pool exceeds u32"),
@@ -203,17 +206,23 @@ impl PartialOrd for MatchMetadata {
 }
 
 impl MatchMetadata {
-    /// 启动器档比较（第一期）：在默认 `cmp`（class→kind→usage_tier→…）基础上，
-    /// 把 usage_tier 提到 kind 之前。全局快速呼出时，常开项（同 class 内）压过
-    /// 从未打开、kind 更优的项——「启动器打开我常开的那个」。跨 class 仍由 class
-    /// 决胜，S1 的「强匹配 class 不被弱 class 子串反超」不破。
-    pub fn cmp_launcher(&self, other: &Self) -> Ordering {
+    /// 启动器档比较（第二期）：class 仍是最高优先级。`usage_before_kind` 由查询
+    /// 长度决定——短查询（缩写型输入）把 usage_tier 提到 kind 之前，让常开项压过
+    /// 匹配方式；长查询输入已足够明确，kind 先于 usage_tier。两种顺序下都在同
+    /// tier 内先比原始 history_score、再比命中位置：同为「常开」时更常开的优先。
+    /// 跨 class 永远由 class 决胜，S1 的「强匹配 class 不被弱 class 子串反超」不破。
+    pub fn cmp_launcher(&self, other: &Self, usage_before_kind: bool) -> Ordering {
+        let by_kind = self.kind.cmp(&other.kind);
+        let by_usage = usage_tier(other.history_score).cmp(&usage_tier(self.history_score));
         self.class
             .cmp(&other.class)
-            .then(usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
-            .then(self.kind.cmp(&other.kind))
-            .then(self.position.cmp(&other.position))
+            .then(if usage_before_kind {
+                by_usage.then(by_kind)
+            } else {
+                by_kind.then(by_usage)
+            })
             .then(other.history_score.cmp(&self.history_score))
+            .then(self.position.cmp(&other.position))
             .then(self.score.cmp(&other.score))
     }
 }
@@ -713,9 +722,7 @@ impl VolumeIndex {
         // if the pool has grown far past its initial size the counter may be
         // underreporting, and a full scan is the safe thing to do.
         self.dead_name_bytes > threshold
-            || self
-                .names
-                .len()
+            || self.names.len()
                 > self
                     .initial_name_bytes
                     .saturating_add(threshold.saturating_mul(2))
@@ -870,8 +877,7 @@ impl VolumeIndex {
         if name.contains('\0') {
             return Err(VolumeError::NameNul);
         }
-        let offset = u32::try_from(self.names.len())
-            .map_err(|_| VolumeError::NamePoolOverflow)?;
+        let offset = u32::try_from(self.names.len()).map_err(|_| VolumeError::NamePoolOverflow)?;
         self.names.extend_from_slice(name.as_bytes());
         self.names.push(0);
         // F3: 滚入追加字节（含终止符）——与全池整算在相同追加顺序下结果一致。
@@ -1146,9 +1152,7 @@ fn map_lowered_offset(name: &str, lowered_offset: usize) -> usize {
 pub(crate) fn name_eq_ignore_case(left: &str, right: &str) -> bool {
     if left.is_ascii() && right.is_ascii() {
         left.eq_ignore_ascii_case(right)
-    } else if !left.chars().any(char::is_uppercase)
-        && !right.chars().any(char::is_uppercase)
-    {
+    } else if !left.chars().any(char::is_uppercase) && !right.chars().any(char::is_uppercase) {
         // N1: 双方都无大写字符（典型中文/纯数字名）——小写化是恒等变换，直接比较。
         left == right
     } else {
@@ -1337,9 +1341,7 @@ fn scan_slot_range<'a>(
             continue;
         };
         acc.scanned_nodes = acc.scanned_nodes.saturating_add(1);
-        if slot.flags & (FLAG_PRESENT | FLAG_EXCLUDED) != FLAG_PRESENT
-            || slot.name_off == NO_NAME
-        {
+        if slot.flags & (FLAG_PRESENT | FLAG_EXCLUDED) != FLAG_PRESENT || slot.name_off == NO_NAME {
             continue;
         }
         acc.name_candidates = acc.name_candidates.saturating_add(1);
@@ -1552,8 +1554,7 @@ fn parallel_scan<'a>(
                     let mut local = ScanAccumulator::new(max);
                     let mut root_filter = root.map(RootFilter::new);
                     loop {
-                        let index =
-                            next_chunk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let index = next_chunk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if index >= chunks.len() {
                             break;
                         }
@@ -1671,14 +1672,20 @@ mod tests {
     fn n1_ascii_query_matches_non_ascii_name_at_original_offset() {
         let name = "微信ABC文档.txt";
         assert_eq!(find_case_insensitive(name, "abc"), Some("微信".len()));
-        assert_eq!(find_case_insensitive(name, "txt"), Some("微信ABC文档.".len()));
+        assert_eq!(
+            find_case_insensitive(name, "txt"),
+            Some("微信ABC文档.".len())
+        );
         assert_eq!(find_case_insensitive(name, "zzz"), None);
     }
 
     /// 非 ASCII 查询 + 无大写字符的名字（典型中文）：直接命中，零分配路径。
     #[test]
     fn n1_non_ascii_query_matches_plain_name() {
-        assert_eq!(find_case_insensitive("微信文档", "文档"), Some("微信".len()));
+        assert_eq!(
+            find_case_insensitive("微信文档", "文档"),
+            Some("微信".len())
+        );
         assert_eq!(find_case_insensitive("微信文档", "工作"), None);
     }
 
@@ -1727,7 +1734,10 @@ mod tests {
         let terms = NameTerms::parse("a A b  a");
         assert_eq!(terms.iter().count(), 2);
         // 封顶 16：超出的 term 诚实降级（不参与 AND）。
-        let long = (0..24).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" ");
+        let long = (0..24)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let capped = NameTerms::parse(&long);
         assert_eq!(capped.iter().count(), 16);
         assert!(capped.iter().all(|term| term.starts_with('t')));
@@ -1743,8 +1753,8 @@ mod tests {
         assert_eq!(hit.class, 1, "「抖音」在位置 0 → class 1");
         assert_eq!(hit.position, 0);
         // term 顺序无关：命中位置取最小值。
-        let reversed = match_metadata("视频-抖音.mp4", &NameTerms::parse("视频 抖音"))
-            .expect("顺序无关");
+        let reversed =
+            match_metadata("视频-抖音.mp4", &NameTerms::parse("视频 抖音")).expect("顺序无关");
         assert_eq!(reversed.position, 0);
         // AND 不退化成 OR：只含一个 term 的名字不命中。
         assert!(match_metadata("抖音-别的.mp4", &terms).is_none());
@@ -1823,9 +1833,7 @@ mod tests {
         let volumes = vec![dense_volume("C:", 30_000)];
         let filters = QueryFilters::none();
         for query in ["file", "文档", "mixed", "file-0000"] {
-            let serial = search_volumes_impl(
-                &volumes, query, 8, &[], None, &filters, usize::MAX,
-            );
+            let serial = search_volumes_impl(&volumes, query, 8, &[], None, &filters, usize::MAX);
             let parallel = search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
             assert_eq!(parallel.items.len(), serial.items.len(), "query={query}");
             for (p, s) in parallel.items.iter().zip(serial.items.iter()) {
@@ -1854,7 +1862,10 @@ mod tests {
         let parallel = search_volumes_impl(&volumes, "file", 16, &[], None, &filters, 1);
         assert_eq!(parallel.items.len(), serial.items.len());
         for (p, s) in parallel.items.iter().zip(serial.items.iter()) {
-            assert_eq!((p.name.clone(), p.path.clone()), (s.name.clone(), s.path.clone()));
+            assert_eq!(
+                (p.name.clone(), p.path.clone()),
+                (s.name.clone(), s.path.clone())
+            );
         }
         assert_eq!(parallel.matched_count, serial.matched_count);
         assert_eq!(parallel.scanned_nodes, serial.scanned_nodes);
@@ -1869,7 +1880,10 @@ mod tests {
         let second = search_volumes_impl(&volumes, "file", 8, &[], None, &filters, 1);
         assert_eq!(first.items.len(), second.items.len());
         for (a, b) in first.items.iter().zip(second.items.iter()) {
-            assert_eq!((a.name.as_str(), a.path.as_str()), (b.name.as_str(), b.path.as_str()));
+            assert_eq!(
+                (a.name.as_str(), a.path.as_str()),
+                (b.name.as_str(), b.path.as_str())
+            );
         }
     }
 
@@ -1883,7 +1897,12 @@ mod tests {
             .unwrap();
         for i in 100..200u32 {
             volumes[0]
-                .upsert(frn(3000 + i, 1), frn(2000, 1), &format!("file-{i:06}.txt"), false)
+                .upsert(
+                    frn(3000 + i, 1),
+                    frn(2000, 1),
+                    &format!("file-{i:06}.txt"),
+                    false,
+                )
                 .unwrap();
         }
         let root = Some(RootBound {
@@ -1891,15 +1910,18 @@ mod tests {
             root_record: frn(2000, 1) as u32,
         });
         let filters = QueryFilters::none();
-        let serial =
-            search_volumes_impl(&volumes, "file", 32, &[], root, &filters, usize::MAX);
+        let serial = search_volumes_impl(&volumes, "file", 32, &[], root, &filters, usize::MAX);
         let parallel = search_volumes_impl(&volumes, "file", 32, &[], root, &filters, 1);
         assert!(!serial.items.is_empty());
         assert_eq!(serial.matched_count, parallel.matched_count);
         assert_eq!(serial.items.len(), parallel.items.len());
         for (s, p) in serial.items.iter().zip(parallel.items.iter()) {
             assert_eq!(s.path, p.path);
-            assert!(p.path.ends_with("sub\\") || p.path.contains("sub\\"), "{}", p.path);
+            assert!(
+                p.path.ends_with("sub\\") || p.path.contains("sub\\"),
+                "{}",
+                p.path
+            );
         }
     }
 
@@ -1908,9 +1930,7 @@ mod tests {
     #[test]
     fn m1_reserved_names_capacity_absorbs_upserts_without_regrowth() {
         let mut volume = volume();
-        volume
-            .upsert(frn(10, 1), frn(5, 0), "dir", true)
-            .unwrap();
+        volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
         let estimate = 64 * 1024;
         volume.reserve_names_capacity(estimate);
         let capacity_after_reserve = volume.names.capacity();
@@ -1947,8 +1967,7 @@ mod tests {
             let serial = search_volumes_impl(&volumes, query, 8, &[], None, &filters, usize::MAX);
             let serial_ms = serial_start.elapsed().as_millis();
             let parallel_start = std::time::Instant::now();
-            let parallel =
-                search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
+            let parallel = search_volumes_impl(&volumes, query, 8, &[], None, &filters, 1);
             let parallel_ms = parallel_start.elapsed().as_millis();
             assert_eq!(parallel.items.len(), serial.items.len());
             println!(
@@ -2199,12 +2218,16 @@ mod tests {
     fn g4_present_slot_counter_tracks_upserts_and_deletes() {
         let mut volume = volume(); // 根节点 1 个在位
         volume.upsert(frn(10, 1), frn(5, 0), "a", true).unwrap();
-        volume.upsert(frn(11, 1), frn(10, 1), "b.txt", false).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "b.txt", false)
+            .unwrap();
         assert_eq!(volume.present_slots, 3);
         volume.delete(frn(11, 1)).unwrap();
         assert_eq!(volume.present_slots, 2);
         // 复活同号槽：净计数不变。
-        volume.upsert(frn(11, 1), frn(10, 1), "c.txt", false).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "c.txt", false)
+            .unwrap();
         assert_eq!(volume.present_slots, 3);
         let before = volume.present_slots;
         volume.recompute_derived_counters();
@@ -2243,8 +2266,12 @@ mod tests {
     fn m1_validate_tolerates_tombstoned_ancestor_at_any_depth() {
         let mut volume = volume(); // 根=5
         volume.upsert(frn(10, 1), frn(5, 0), "dir", true).unwrap();
-        volume.upsert(frn(11, 1), frn(10, 1), "child", true).unwrap();
-        volume.upsert(frn(12, 1), frn(11, 1), "grandchild.txt", false).unwrap();
+        volume
+            .upsert(frn(11, 1), frn(10, 1), "child", true)
+            .unwrap();
+        volume
+            .upsert(frn(12, 1), frn(11, 1), "grandchild.txt", false)
+            .unwrap();
 
         // 直接父墓碑：record 12 的父 11 已删（既有容忍行为）。
         volume.nodes[11].flags &= !FLAG_PRESENT;
@@ -2403,7 +2430,10 @@ mod tests {
             score: 11,
             history_score: 0,
         };
-        assert!(douyin < kennedy, "class 0 拼音命中必须压过 class 2 字面噪声");
+        assert!(
+            douyin < kennedy,
+            "class 0 拼音命中必须压过 class 2 字面噪声"
+        );
         let dy_txt = MatchMetadata {
             kind: MatchKind::Literal,
             class: 0,

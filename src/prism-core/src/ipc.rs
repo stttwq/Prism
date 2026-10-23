@@ -416,8 +416,7 @@ fn current_user_sid() -> std::io::Result<&'static str> {
         let _ = CloseHandle(token);
         let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
         let mut sid_string = windows::core::PWSTR::null();
-        ConvertSidToStringSidW(user.User.Sid, &mut sid_string)
-            .map_err(std::io::Error::other)?;
+        ConvertSidToStringSidW(user.User.Sid, &mut sid_string).map_err(std::io::Error::other)?;
         let len = PCWSTR(sid_string.0).len();
         let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_string.0, len));
         let _ = LocalFree(HLOCAL(sid_string.0 as _));
@@ -802,8 +801,7 @@ async fn handle_connection(
     let writer_task = tokio::spawn(ordered_writer(writer, rx));
     // B5：在途 search 并发上限。超出（本地进程灌请求）立即回错——仍走保序
     // 通道，不破配对。Arc<Semaphore> 的 permit 随任务结束释放。
-    let search_permits =
-        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_SEARCHES));
+    let search_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_SEARCHES));
 
     let mut next_seq: u64 = 0;
     let mut first_line = true;
@@ -892,9 +890,16 @@ async fn handle_connection(
                 });
             }
             Ok(req) => {
-                let response =
-                    dispatch_non_search(req, &engines, &shell, &history, &preferences, &windows, &aliases)
-                        .await;
+                let response = dispatch_non_search(
+                    req,
+                    &engines,
+                    &shell,
+                    &history,
+                    &preferences,
+                    &windows,
+                    &aliases,
+                )
+                .await;
                 let _ = tx.send((seq, response));
             }
             Err(e) => {
@@ -931,8 +936,7 @@ async fn ordered_writer<W>(
 {
     let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
     const RESPONSE_BUFFER_KEEP: usize = 256 * 1024;
-    let mut buffered: std::collections::BTreeMap<u64, Response> =
-        std::collections::BTreeMap::new();
+    let mut buffered: std::collections::BTreeMap<u64, Response> = std::collections::BTreeMap::new();
     let mut next_seq: u64 = 0;
     while let Some((seq, response)) = rx.recv().await {
         buffered.insert(seq, response);
@@ -942,8 +946,7 @@ async fn ordered_writer<W>(
                 // 序列化中途失败：丢掉半截字节，回一条自造的错误行（与旧行为一致）。
                 out.clear();
                 out.extend_from_slice(
-                    format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}")
-                        .as_bytes(),
+                    format!("{{\"type\":\"error\",\"message\":\"序列化失败:{error}\"}}").as_bytes(),
                 );
             }
             out.push(b'\n');
@@ -1892,7 +1895,12 @@ async fn search_service(
         let alias_word = name_query.trim().to_lowercase();
         let alias_limit = result_slots;
         tokio::task::spawn_blocking(move || {
-            alias_search_hits(&aliases_for_blocking, &alias_word, &history_for_alias, alias_limit)
+            alias_search_hits(
+                &aliases_for_blocking,
+                &alias_word,
+                &history_for_alias,
+                alias_limit,
+            )
         })
         .await
         .unwrap_or_default()
@@ -1904,13 +1912,10 @@ async fn search_service(
         //（既有行的 class/kind 不会更差，保既有行改动最小）。
         let existing: HashSet<String> = ranked
             .iter()
-            .map(|item| {
-                crate::history::target_key(&item.target.kind, &item.target.value)
-            })
+            .map(|item| crate::history::target_key(&item.target.kind, &item.target.value))
             .collect();
         for row in alias_rows {
-            let key =
-                crate::history::target_key(&row.target.kind, &row.target.value);
+            let key = crate::history::target_key(&row.target.kind, &row.target.value);
             if !existing.contains(&key) {
                 ranked.push(row);
             }
@@ -1928,8 +1933,12 @@ async fn search_service(
     });
     // 启动器档（第一期）：仅全局快速呼出启用（无目录范围、无 ext:/path: 过滤）。
     // 前端已按同样条件发 mode，broker 这里再复核一次，避免越过范围语义。
-    let launcher = mode == SearchMode::Launcher && root.is_none() && !has_filters;
-    sort_search_results_with_picks(&mut ranked, pick_flags.as_deref(), launcher);
+    // 第二期：短查询（≤3 个非空白字符，缩写型输入）让 usage_tier 先于 kind；
+    // 长查询输入已足够明确，kind 先于 usage_tier。同 tier 内都是原始历史分先于
+    // 命中位置（见 MatchMetadata::cmp_launcher）。
+    let launcher_usage_first = (mode == SearchMode::Launcher && root.is_none() && !has_filters)
+        .then(|| is_short_launcher_query(&name_query));
+    sort_search_results_with_picks(&mut ranked, pick_flags.as_deref(), launcher_usage_first);
     let is_truncated = index_truncated || ranked.len() > result_slots;
     ranked.truncate(result_slots);
     items.extend(ranked);
@@ -2566,7 +2575,15 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 /// Sorts results by `compare_search_results` but pre-computes the lowercased title
 /// once per item instead of once per comparison (O(n) vs O(n log n) allocations).
 fn sort_search_results(items: &mut Vec<SearchResult>) {
-    sort_search_results_with_picks(items, None, false);
+    sort_search_results_with_picks(items, None, None);
+}
+
+/// 启动器档第二期的查询长度门槛：≤3 个非空白字符视为缩写型输入，历史频率优先；
+/// 更长的输入已足够明确，匹配方式优先。
+const LAUNCHER_SHORT_QUERY_CHARS: usize = 3;
+
+fn is_short_launcher_query(query: &str) -> bool {
+    query.chars().filter(|ch| !ch.is_whitespace()).count() <= LAUNCHER_SHORT_QUERY_CHARS
 }
 
 /// `picks` 与 items 对齐：true = 该项被当前（规范化）查询串选中过，排在所有
@@ -2578,9 +2595,16 @@ fn sort_search_results(items: &mut Vec<SearchResult>) {
 /// 跨 kind 置顶（「上次在同样输入下选的就是它」强于任何匹配质量信号），
 /// picked 内部仍按匹配质量排序。
 ///
+/// `launcher_usage_first`：None = 默认档；Some(bool) = 启动器档，bool 表示
+/// usage_tier 是否先于 kind（短查询 true / 长查询 false）。
+///
 /// 审计 P4：重建用 `Option::take` 按序取出，零 String clone、无环特例
 /// （替代旧实现的全量 clone 重建）。
-fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&[bool]>, launcher: bool) {
+fn sort_search_results_with_picks(
+    items: &mut Vec<SearchResult>,
+    picks: Option<&[bool]>,
+    launcher_usage_first: Option<bool>,
+) {
     // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
     // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
@@ -2597,11 +2621,18 @@ fn sort_search_results_with_picks(items: &mut Vec<SearchResult>, picks: Option<&
                 Some(picks) => picks[b].cmp(&picks[a]),
                 None => std::cmp::Ordering::Equal,
             })
-            .then_with(|| match (launcher, &items[a].match_metadata, &items[b].match_metadata) {
-                // 启动器档：两边都有元数据时用 usage_tier 前置的档比较；
-                // 其余情况（含 None）回落默认 Option::cmp，与非启动器逐字节一致。
-                (true, Some(am), Some(bm)) => am.cmp_launcher(bm),
-                _ => items[a].match_metadata.cmp(&items[b].match_metadata),
+            .then_with(|| {
+                match (
+                    launcher_usage_first,
+                    &items[a].match_metadata,
+                    &items[b].match_metadata,
+                ) {
+                    // 启动器档：两边都有元数据时走启动器比较，bool 决定
+                    // usage_tier 是否先于 kind；其余情况（含 None）回落默认
+                    // Option::cmp，与非启动器逐字节一致。
+                    (Some(usage_first), Some(am), Some(bm)) => am.cmp_launcher(bm, usage_first),
+                    _ => items[a].match_metadata.cmp(&items[b].match_metadata),
+                }
             })
             .then_with(|| lowercased[a].cmp(&lowercased[b]))
             .then_with(|| items[a].subtitle.cmp(&items[b].subtitle))
@@ -3334,7 +3365,12 @@ mod protocol_tests {
         let _ = std::fs::remove_dir_all(&history_dir);
         let history = Arc::new(HistoryStore::load(&history_dir, true));
         let rows = alias_search_hits(&aliases, "WX", &history, 8);
-        assert_eq!(rows.len(), 2, "悬空绑定静默跳过：{:?}", rows.iter().map(|r| r.title.as_ref()).collect::<Vec<_>>());
+        assert_eq!(
+            rows.len(),
+            2,
+            "悬空绑定静默跳过：{:?}",
+            rows.iter().map(|r| r.title.as_ref()).collect::<Vec<_>>()
+        );
         for row in &rows {
             let metadata = row.match_metadata.unwrap();
             assert_eq!(metadata.class, 0);
@@ -3358,7 +3394,9 @@ mod protocol_tests {
             r#"{"type":"alias_set","target":{"kind":"file","value":"C:\\a.exe"},"words":["wx","微信"]}"#,
         )
         .unwrap();
-        assert!(matches!(set, Request::AliasSet { ref target, ref words } if target.kind == "file" && words.len() == 2));
+        assert!(
+            matches!(set, Request::AliasSet { ref target, ref words } if target.kind == "file" && words.len() == 2)
+        );
         let delete: Request = serde_json::from_str(
             r#"{"type":"alias_delete","target":{"kind":"file","value":"C:\\a.exe"}}"#,
         )
@@ -3822,7 +3860,7 @@ mod protocol_tests {
             item(MatchKind::FullPinyin, "pinyin", 0),
         ];
         let picks = vec![false, true, true];
-        sort_search_results_with_picks(&mut items, Some(&picks), false);
+        sort_search_results_with_picks(&mut items, Some(&picks), None);
         // picked 的两个字面/拼音项（class 2/0）都越过未 picked 的 class 0 精确命中；
         // picked 内部 class 0 的拼音项先于 class 2 的字面项。
         assert_eq!(
@@ -3835,6 +3873,7 @@ mod protocol_tests {
     /// 启动器档（第一期）：同 class 内，常开项（usage_tier 高）压过从未打开、kind
     /// 更优的项；跨 class 仍由 class 决胜（S1 不破）。默认档则相反——同 class 内
     /// kind 优先。两档对比锚定在同一组数据上。
+    /// 第二期：短查询 usage_tier 先于 kind；长查询输入更明确，kind 先于 usage_tier。
     #[test]
     fn launcher_profile_promotes_frequently_used_within_class_but_keeps_class_locked() {
         let item = |kind: MatchKind, title: &str, class: u8, history_score: u32| SearchResult {
@@ -3859,33 +3898,94 @@ mod protocol_tests {
 
         // 默认档：同 class 内 kind 优先 → fresh 在前。
         let mut default_order = vec![used(), fresh()];
-        sort_search_results_with_picks(&mut default_order, None, false);
+        sort_search_results_with_picks(&mut default_order, None, None);
         assert_eq!(
             default_order.iter().map(|e| &*e.title).collect::<Vec<_>>(),
             ["fresh", "used"],
             "default profile: within one class, better kind wins"
         );
 
-        // 启动器档：同 class 内 usage_tier 优先 → used 在前。
-        let mut launcher_order = vec![fresh(), used()];
-        sort_search_results_with_picks(&mut launcher_order, None, true);
+        // 启动器档（短查询）：同 class 内 usage_tier 优先 → used 在前。
+        let mut short_query = vec![fresh(), used()];
+        sort_search_results_with_picks(&mut short_query, None, Some(true));
         assert_eq!(
-            launcher_order.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+            short_query.iter().map(|e| &*e.title).collect::<Vec<_>>(),
             ["used", "fresh"],
-            "launcher profile: within one class, frequently-used wins"
+            "launcher short query: within one class, frequently-used wins"
         );
 
-        // 跨 class：class 0 的从未打开项仍压过 class 2 的重度使用项——S1 不破。
-        let mut cross_class = vec![
-            used(),
-            item(MatchKind::Literal, "exact", 0, 0),
-        ];
-        sort_search_results_with_picks(&mut cross_class, None, true);
+        // 启动器档（长查询）：输入已足够明确，kind 仍先于 usage_tier → fresh 在前。
+        let mut long_query = vec![used(), fresh()];
+        sort_search_results_with_picks(&mut long_query, None, Some(false));
         assert_eq!(
-            cross_class.iter().map(|e| &*e.title).collect::<Vec<_>>(),
-            ["exact", "used"],
-            "launcher profile: class still dominates usage (S1 preserved)"
+            long_query.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+            ["fresh", "used"],
+            "launcher long query: better kind still wins within one class"
         );
+
+        // 跨 class：class 0 的从未打开项仍压过 class 2 的重度使用项——S1 不破；
+        // 两期、长短查询下都成立。
+        for usage_first in [true, false] {
+            let mut cross_class = vec![used(), item(MatchKind::Literal, "exact", 0, 0)];
+            sort_search_results_with_picks(&mut cross_class, None, Some(usage_first));
+            assert_eq!(
+                cross_class.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+                ["exact", "used"],
+                "launcher profile: class still dominates usage (S1 preserved)"
+            );
+        }
+    }
+
+    /// 启动器档第二期：同 class、同 kind、同 usage_tier 内，原始 history_score 先于
+    /// 命中位置——更常开的项即使命中更靠后也排在前面。默认档仍是位置优先。
+    #[test]
+    fn launcher_profile_prefers_raw_history_over_match_position_within_tier() {
+        let item = |title: &str, position: u32, history_score: u32| SearchResult {
+            kind: SearchResultKind::File,
+            title: title.into(),
+            subtitle: title.into(),
+            execute_id: title.into(),
+            target: ActionTarget::new(TargetKind::File, title),
+            match_spans: Vec::new(),
+            match_metadata: Some(MatchMetadata {
+                kind: MatchKind::Literal,
+                class: 2,
+                position,
+                score: 10,
+                history_score,
+            }),
+        };
+        // 两项都是 tier 3（≥64），但 later-used 的历史分明显更高。
+        let earlier = || item("earlier", 0, 64);
+        let later_used = || item("later-used", 8, 200);
+
+        let mut default_order = vec![later_used(), earlier()];
+        sort_search_results_with_picks(&mut default_order, None, None);
+        assert_eq!(
+            default_order.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+            ["earlier", "later-used"],
+            "default profile: match position wins within one tier"
+        );
+
+        for usage_first in [true, false] {
+            let mut launcher_order = vec![earlier(), later_used()];
+            sort_search_results_with_picks(&mut launcher_order, None, Some(usage_first));
+            assert_eq!(
+                launcher_order.iter().map(|e| &*e.title).collect::<Vec<_>>(),
+                ["later-used", "earlier"],
+                "launcher profile: raw history wins within one tier"
+            );
+        }
+    }
+
+    /// 第二期门槛：非空白字符 ≤3 才算短查询（缩写型输入）。
+    #[test]
+    fn launcher_usage_first_only_for_short_queries() {
+        assert!(is_short_launcher_query("dy"));
+        assert!(is_short_launcher_query("dyx"));
+        assert!(is_short_launcher_query("抖 音"));
+        assert!(!is_short_launcher_query("douyin"));
+        assert!(!is_short_launcher_query("visual studio"));
     }
 
     /// 旧的原地置换在 2/3 元素环上会自抵消或乱序：三档排序必须真正落位。
@@ -4502,9 +4602,30 @@ mod pipe_lifecycle_tests {
         let writer = tokio::spawn(super::ordered_writer(server, rx));
 
         // 乱序投递：2 先到、0 后到，1 最晚。
-        tx.send((2, Response::Error { message: "two".into(), category: None })).unwrap();
-        tx.send((0, Response::Error { message: "zero".into(), category: None })).unwrap();
-        tx.send((1, Response::Error { message: "one".into(), category: None })).unwrap();
+        tx.send((
+            2,
+            Response::Error {
+                message: "two".into(),
+                category: None,
+            },
+        ))
+        .unwrap();
+        tx.send((
+            0,
+            Response::Error {
+                message: "zero".into(),
+                category: None,
+            },
+        ))
+        .unwrap();
+        tx.send((
+            1,
+            Response::Error {
+                message: "one".into(),
+                category: None,
+            },
+        ))
+        .unwrap();
         drop(tx);
 
         // 给 writer 一点时间写完（三条消息都很小）。
