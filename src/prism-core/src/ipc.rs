@@ -2605,6 +2605,10 @@ fn sort_search_results_with_picks(
     picks: Option<&[bool]>,
     launcher_usage_first: Option<bool>,
 ) {
+    // 0/1 条无需排序：跳过标题小写化、下标数组与重建的分配。
+    if items.len() < 2 {
+        return;
+    }
     // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
     // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
