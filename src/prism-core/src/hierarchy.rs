@@ -189,13 +189,14 @@ impl Ord for MatchMetadata {
         // 的字面噪声（Kennedy.docx，class 2）无条件压过「抖音」（Initials，
         // class 0），拼音命中再被 Top-8 截断。同 class 内 kind 仍锁死：
         // 字面 > 全拼 > 首字母。
+        // 比较键惰性求值：class 不同时不再计算 kind/usage_tier 等后续键。
         self.class
             .cmp(&other.class)
-            .then(self.kind.cmp(&other.kind))
-            .then(usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
-            .then(self.position.cmp(&other.position))
-            .then(other.history_score.cmp(&self.history_score))
-            .then(self.score.cmp(&other.score))
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
+            .then_with(|| self.position.cmp(&other.position))
+            .then_with(|| other.history_score.cmp(&self.history_score))
+            .then_with(|| self.score.cmp(&other.score))
     }
 }
 
