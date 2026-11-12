@@ -48,9 +48,17 @@ Windows 全盘文件名即时搜索与快速启动器。Listary 的轻量开源�
 
 ## 安装
 
-下载 `dist\PrismSetup-1.1beta.exe` 运行。向导全程中文，可选安装目录（支持中文路径如
+从 [`dist/PrismSetup-1.1beta.exe`](https://github.com/stttwq/Prism/raw/main/dist/PrismSetup-1.1beta.exe)
+下载安装包运行。向导全程中文，可选安装目录（支持中文路径如
 `D:\工具\Prism`）、开始菜单与桌面快捷方式、开机自启。安装需管理员权限（索引服务注册为
 LocalSystem 服务）。开机自启走注册表 `HKCU\...\Run`，无需管理员常驻。
+
+## 快速上手
+
+- 双击 `Ctrl` 呼出，输入即搜；`↑` / `↓` 选择，`Enter` 打开，`→` 展开动作面板。
+- `Esc` 关闭窗口；失焦即隐，再次双击 `Ctrl` 呼出。
+- 搜索词后加 `ext:pdf` 或 `path:"Project Docs"` 过滤；从资源管理器呼出时 `Ctrl+G`
+  在当前目录与全局间切换。
 
 ## 卸载
 

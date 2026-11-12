@@ -189,13 +189,14 @@ impl Ord for MatchMetadata {
         // 的字面噪声（Kennedy.docx，class 2）无条件压过「抖音」（Initials，
         // class 0），拼音命中再被 Top-8 截断。同 class 内 kind 仍锁死：
         // 字面 > 全拼 > 首字母。
+        // 比较键惰性求值：class 不同时不再计算 kind/usage_tier 等后续键。
         self.class
             .cmp(&other.class)
-            .then(self.kind.cmp(&other.kind))
-            .then(usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
-            .then(self.position.cmp(&other.position))
-            .then(other.history_score.cmp(&self.history_score))
-            .then(self.score.cmp(&other.score))
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| usage_tier(other.history_score).cmp(&usage_tier(self.history_score)))
+            .then_with(|| self.position.cmp(&other.position))
+            .then_with(|| other.history_score.cmp(&self.history_score))
+            .then_with(|| self.score.cmp(&other.score))
     }
 }
 
@@ -211,19 +212,25 @@ impl MatchMetadata {
     /// 匹配方式；长查询输入已足够明确，kind 先于 usage_tier。两种顺序下都在同
     /// tier 内先比原始 history_score、再比命中位置：同为「常开」时更常开的优先。
     /// 跨 class 永远由 class 决胜，S1 的「强匹配 class 不被弱 class 子串反超」不破。
+    /// 比较键全部惰性求值：class 不同时短路整体；同档内先比较的键分出大小时，
+    /// kind/usage_tier 中的另一个也不再计算。
     pub fn cmp_launcher(&self, other: &Self, usage_before_kind: bool) -> Ordering {
-        let by_kind = self.kind.cmp(&other.kind);
-        let by_usage = usage_tier(other.history_score).cmp(&usage_tier(self.history_score));
         self.class
             .cmp(&other.class)
-            .then(if usage_before_kind {
-                by_usage.then(by_kind)
-            } else {
-                by_kind.then(by_usage)
+            .then_with(|| {
+                if usage_before_kind {
+                    usage_tier(other.history_score)
+                        .cmp(&usage_tier(self.history_score))
+                        .then_with(|| self.kind.cmp(&other.kind))
+                } else {
+                    self.kind.cmp(&other.kind).then_with(|| {
+                        usage_tier(other.history_score).cmp(&usage_tier(self.history_score))
+                    })
+                }
             })
-            .then(other.history_score.cmp(&self.history_score))
-            .then(self.position.cmp(&other.position))
-            .then(self.score.cmp(&other.score))
+            .then_with(|| other.history_score.cmp(&self.history_score))
+            .then_with(|| self.position.cmp(&other.position))
+            .then_with(|| self.score.cmp(&other.score))
     }
 }
 

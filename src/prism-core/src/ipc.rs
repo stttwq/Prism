@@ -2493,7 +2493,18 @@ fn recent_windows(
 ///（前端 ResultList 用 cursor 推进消费，要求升序不倒退）。单 term 与旧实现
 /// 逐字节等价。
 fn literal_match_lowered(title: &str, terms: &NameTerms) -> Option<(MatchMetadata, Vec<i32>)> {
-    let title_lower = title.to_lowercase();
+    // N1 同族（ipc 侧）：标题不含大写字符时小写化是恒等变换（判据与
+    // hierarchy::find_case_insensitive / name_eq_ignore_case 一致），这里直接借用
+    // 原串，不再为每个候选分配一份完整小写副本——本函数是 broker 字面匹配的
+    // 唯一入口，每次击键对每个候选各调一次，中文/数字/全小写名（绝大多数文件）
+    // 的分配就此归零。含大写字符时仍走原路径，spans 与 position 依旧在小写串上算。
+    let lowered;
+    let title_lower: &str = if title.chars().any(char::is_uppercase) {
+        lowered = title.to_lowercase();
+        lowered.as_str()
+    } else {
+        title
+    };
     if let Some(single) = terms.single() {
         let byte_position = title_lower.find(single)?;
         let metadata = MatchMetadata {
@@ -2605,6 +2616,10 @@ fn sort_search_results_with_picks(
     picks: Option<&[bool]>,
     launcher_usage_first: Option<bool>,
 ) {
+    // 0/1 条无需排序：跳过标题小写化、下标数组与重建的分配。
+    if items.len() < 2 {
+        return;
+    }
     // Pre-compute lowercased titles once (O(n) allocations) and sort by index so the
     // comparator borrows from the cache instead of re-allocating per comparison.
     let lowercased: Vec<String> = items.iter().map(|item| item.title.to_lowercase()).collect();
@@ -2857,6 +2872,41 @@ mod window_protocol_tests {
         assert_eq!(merged, [0, 5], "重叠 term 合并为一段");
         // 单 term 与旧行为一致。
         assert_eq!(match_spans("prism 报告", "prism"), [0, 5]);
+    }
+
+    /// N1 同族（ipc 侧）：标题不含大写字符时 `literal_match_lowered` 借用原串、
+    /// 不再分配小写副本。匹配结果必须与含大写字符的同形标题逐字段一致——
+    /// class/position/score/spans 全部由同一份字符内容推出，大小写折叠不改变
+    /// 任何一项（长度也不变，score 才可比）。
+    #[test]
+    fn literal_match_borrows_titles_without_uppercase() {
+        let cases = [
+            ("weixin.exe", "Weixin.exe", "wx"),
+            ("weixin.exe", "WEIXIN.EXE", "weixin"),
+            ("readme.md", "ReadMe.md", "me.m"),
+            ("report-2026.pdf", "Report-2026.pdf", "port 2026"),
+        ];
+        for (plain, mixed, query) in cases {
+            let plain_meta = rank_title(plain, query).expect("plain hit");
+            let mixed_meta = rank_title(mixed, query).expect("mixed hit");
+            assert_eq!(plain_meta.class, mixed_meta.class, "{query}: class");
+            assert_eq!(
+                plain_meta.position, mixed_meta.position,
+                "{query}: position"
+            );
+            assert_eq!(plain_meta.score, mixed_meta.score, "{query}: score");
+            assert_eq!(
+                match_spans(plain, query),
+                match_spans(mixed, query),
+                "{query}: spans"
+            );
+        }
+        // 空查询（仅 ext:/path: 过滤时的路径）两边同样等价。
+        assert_eq!(
+            rank_title("readme.md", ""),
+            rank_title("README.md", ""),
+            "empty query"
+        );
     }
 
     #[test]
